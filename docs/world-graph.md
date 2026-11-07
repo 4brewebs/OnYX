@@ -57,7 +57,7 @@ identificadores entre instancias. WorldGraph utiliza su exportación privada com
 sonda completa en la misma instancia; no exige bytes canónicos a otros souls.
 Las pruebas privadas del codec cubren datos truncados, corruptos y límites.
 
-Los seis controles defectuosos de `onyx-core/tests/conformance_probes.rs`
+Los ocho controles defectuosos de `onyx-core/tests/conformance_probes.rs`
 usan IDs no consecutivos que empiezan en 42. Cada caso pasa sin el defecto y
 falla al activarlo. El doble solo cubre esos casos y rechaza toda importación;
 no implementa snapshots correctos ni demuestra intercambio entre souls.

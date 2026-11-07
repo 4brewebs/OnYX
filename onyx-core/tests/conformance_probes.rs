@@ -13,6 +13,8 @@ enum Defect {
     PartialImport,
     AdvanceHigh,
     LeakName,
+    KeepConceptReferences,
+    KeepIncomingEdges,
 }
 
 // Doble limitado a los cuatro casos ejercitados: solo admite importaciones fallidas.
@@ -108,10 +110,13 @@ impl Graph for MutationProbe {
     }
     fn destroy(&mut self, id: ConceptId) {
         self.nodes.remove(&id.0);
-        self.edges
-            .retain(|(from, _, to)| *from != id.0 && *to != id.0);
-        for props in self.nodes.values_mut() {
-            props.retain(|_, v| !matches!(v,Value::Concept(to) if *to == id));
+        self.edges.retain(|(from, _, to)| {
+            *from != id.0 && (self.defect == Some(Defect::KeepIncomingEdges) || *to != id.0)
+        });
+        if self.defect != Some(Defect::KeepConceptReferences) {
+            for props in self.nodes.values_mut() {
+                props.retain(|_, v| !matches!(v,Value::Concept(to) if *to == id));
+            }
         }
     }
     fn set(&mut self, id: ConceptId, attr: Attr, value: Value) {
@@ -213,5 +218,19 @@ fn suite_detects_failed_import_leaking_only_a_name() {
             b"invalid",
             |g| (g.names.clone(), g.high),
         )
+    });
+}
+
+#[test]
+fn suite_detects_destroy_leaving_concept_properties() {
+    assert_detected(Defect::KeepConceptReferences, |d| {
+        graph::destruction(|| MutationProbe::new(d))
+    });
+}
+
+#[test]
+fn suite_detects_destroy_leaving_incoming_edges() {
+    assert_detected(Defect::KeepIncomingEdges, |d| {
+        graph::destruction(|| MutationProbe::new(d))
     });
 }
