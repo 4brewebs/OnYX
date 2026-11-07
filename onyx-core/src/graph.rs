@@ -159,7 +159,9 @@ pub trait Graph: GraphView + AttrRegistry {
     fn destroy(&mut self, id: ConceptId);
 
     /// Escribe o sustituye una propiedad. Si `id` no existe, no modifica nada.
-    /// Nunca crea un concepto implícitamente.
+    /// Si `value` es `Value::Concept(destino)` y el destino no existe,
+    /// no modifica nada, incluida la propiedad anterior.
+    /// Nunca crea un concepto implícitamente ni guarda referencias colgantes.
     fn set(&mut self, id: ConceptId, attr: Attr, value: Value);
 
     /// Añade una relación dirigida. Repetir `(from, rel, to)` es idempotente.
@@ -249,6 +251,6 @@ pub trait PlatformDriver {
     /// Vuelca eventos de entrada de la plataforma.
     fn poll_into(&mut self, bus: &mut dyn crate::EventBus);
 
-    /// La fachada solo proyecta mediante una referencia de lectura al grafo.
-    fn present(&mut self, view: &dyn Graph);
+    /// Proyecta el estado mediante el puerto mínimo de lectura.
+    fn present(&mut self, view: &dyn GraphView);
 }

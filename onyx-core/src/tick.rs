@@ -6,7 +6,7 @@
 use crate::bus::EventBus;
 use crate::detrng::DetRng;
 use crate::event::{OnyxEvent, SystemEvent};
-use crate::graph::{Graph, PlatformDriver, SnapshotStore};
+use crate::graph::{AttrOnly, Graph, PlatformDriver, ReadOnly, SnapshotStore};
 use crate::system::{Ctx, OnyxSystem, SystemState};
 
 /// Ejecuta un tick completo.
@@ -28,6 +28,8 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 /// `init` no debe reiniciar el estado durable restaurado.
 /// Un fallo cambia el estado a Blocked sin hooks. Un éxito cambia Blocked
 /// a Stopped, sin activarlo ni llamar hooks. Los demás estados se conservan.
+/// Solo Active con `init` correcto recibe `on_restore` con una vista de lectura,
+/// nunca `on_start`. Stopped reconstruye sus cachés de conceptos al próximo Start.
 /// Si el supervisor llama a `init` fuera del tick, debe aplicar la misma política.
 ///
 /// # Panics
@@ -81,12 +83,12 @@ pub fn tick(
                 Ok(bytes) => match graph.import(&bytes) {
                     Ok(()) => {
                         for (system, state) in systems.iter_mut().zip(states.iter_mut()) {
-                            match system.init(graph) {
-                                Ok(()) => {
-                                    if *state == SystemState::Blocked {
-                                        *state = SystemState::Stopped;
-                                    }
-                                }
+                            match system.init(&mut AttrOnly(&mut *graph)) {
+                                Ok(()) => match *state {
+                                    SystemState::Active => system.on_restore(&ReadOnly(&*graph)),
+                                    SystemState::Blocked => *state = SystemState::Stopped,
+                                    SystemState::Stopped => {}
+                                },
                                 Err(e) => {
                                     *state = SystemState::Blocked;
                                     bus.push(OnyxEvent::System(SystemEvent::Fault(format!(
@@ -148,5 +150,5 @@ pub fn tick(
         }
     }
 
-    driver.present(graph);
+    driver.present(&ReadOnly(&*graph));
 }

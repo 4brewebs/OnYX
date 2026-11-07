@@ -3,8 +3,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use onyx_core::{
-    Attr, AttrRegistry, ConceptId, Ctx, EventBus, Graph, GraphView, OnyxError, OnyxEvent,
-    OnyxSystem, PlatformDriver, SnapshotStore, SystemEvent, SystemState, Value, tick,
+    Attr, AttrOnly, AttrRegistry, ConceptId, Ctx, EventBus, Graph, GraphView, OnyxError, OnyxEvent,
+    OnyxSystem, PlatformDriver, ReadOnly, SnapshotStore, SystemEvent, SystemState, Value, tick,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -146,7 +146,7 @@ struct TestDriver(Log);
 
 impl PlatformDriver for TestDriver {
     fn poll_into(&mut self, _: &mut dyn EventBus) {}
-    fn present(&mut self, graph: &dyn Graph) {
+    fn present(&mut self, graph: &dyn GraphView) {
         self.0.borrow_mut().push(format!(
             "present:{:?}",
             graph.get(ConceptId(1), Attr::from_raw(0))
@@ -164,14 +164,17 @@ impl OnyxSystem for TestSystem {
     fn name(&self) -> &str {
         self.name
     }
-    fn init(&mut self, graph: &mut dyn Graph) -> Result<(), OnyxError> {
-        let attr = graph.attr("value");
-        self.log.borrow_mut().push(format!(
-            "init:{}:{:?}",
-            self.name,
-            graph.get(ConceptId(1), attr)
-        ));
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        attrs.attr("value");
+        self.log.borrow_mut().push(format!("init:{}", self.name));
         Ok(())
+    }
+    fn on_restore(&mut self, graph: &dyn GraphView) {
+        self.log.borrow_mut().push(format!(
+            "restore:{}:{:?}",
+            self.name,
+            graph.get(ConceptId(1), Attr::from_raw(0))
+        ));
     }
     fn run(&mut self, ctx: &mut Ctx) {
         self.log.borrow_mut().push(format!("run:{}", self.name));
@@ -235,8 +238,10 @@ fn restore_reinitializes_every_system_before_presenting_restored_state() {
         [
             "run:first",
             "run:second",
-            "init:first:Some(Int(42))",
-            "init:second:Some(Int(42))",
+            "init:first",
+            "restore:first:Some(Int(42))",
+            "init:second",
+            "restore:second:Some(Int(42))",
             "present:Some(Int(42))",
         ]
     );
@@ -407,7 +412,7 @@ impl OnyxSystem for RngSystem {
     fn name(&self) -> &str {
         self.name
     }
-    fn init(&mut self, _: &mut dyn Graph) -> Result<(), OnyxError> {
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
         Ok(())
     }
     fn run(&mut self, ctx: &mut Ctx) {
@@ -467,7 +472,7 @@ impl OnyxSystem for EventSystem {
     fn name(&self) -> &str {
         "events"
     }
-    fn init(&mut self, _: &mut dyn Graph) -> Result<(), OnyxError> {
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
         Ok(())
     }
     fn run(&mut self, ctx: &mut Ctx) {
@@ -580,7 +585,7 @@ fn inactive_system_reinitializes_before_a_start_hook_after_restore() {
     assert_eq!(
         *log.borrow(),
         [
-            "init:worker:Some(Int(42))",
+            "init:worker",
             "start:worker:Some(Int(42))",
             "present:Some(Int(42))",
         ]
@@ -683,7 +688,7 @@ impl OnyxSystem for FallibleSystem {
     fn name(&self) -> &str {
         "fallible"
     }
-    fn init(&mut self, _: &mut dyn Graph) -> Result<(), OnyxError> {
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
         if self.fail_init.get() {
             self.log.borrow_mut().push("init:failed".into());
             Err(OnyxError::Missing)
@@ -700,6 +705,9 @@ impl OnyxSystem for FallibleSystem {
     }
     fn on_stop(&mut self, _: &mut dyn Graph) {
         self.log.borrow_mut().push("stop:fallible".into());
+    }
+    fn on_restore(&mut self, _: &dyn GraphView) {
+        self.log.borrow_mut().push("restore:fallible".into());
     }
 }
 
@@ -737,10 +745,9 @@ fn failed_reinit_blocks_every_previous_state_without_running_hooks() {
                 .any(|event| matches!(event, OnyxEvent::System(SystemEvent::Fault(_))))
         );
         let log = log.borrow();
-        assert!(
-            !log.iter()
-                .any(|entry| entry.starts_with("start:") || entry.starts_with("stop:"))
-        );
+        assert!(!log.iter().any(|entry| entry.starts_with("start:")
+            || entry.starts_with("stop:")
+            || entry.starts_with("restore:")));
     }
 }
 
@@ -798,10 +805,9 @@ fn blocked_system_rejects_start_and_stop_without_run_or_hooks_across_ticks() {
             .count(),
         1
     );
-    assert!(
-        !log.iter()
-            .any(|entry| entry.starts_with("start:") || entry.starts_with("stop:"))
-    );
+    assert!(!log.iter().any(|entry| entry.starts_with("start:")
+        || entry.starts_with("stop:")
+        || entry.starts_with("restore:")));
 }
 
 #[test]
@@ -890,7 +896,7 @@ impl PlatformDriver for IngressDriver {
             bus.push(event);
         }
     }
-    fn present(&mut self, _: &dyn Graph) {}
+    fn present(&mut self, _: &dyn GraphView) {}
 }
 
 #[test]
@@ -943,4 +949,199 @@ fn tick_uses_fifo_bus_for_driver_input_and_next_tick_output() {
         OnyxEvent::System(SystemEvent::StageLoaded(next)),
         OnyxEvent::System(SystemEvent::Tick { n: 11 }),
     ] if next == "next"));
+}
+
+#[test]
+fn restore_hook_only_reaches_active_systems_after_successful_init() {
+    for previous in [
+        SystemState::Active,
+        SystemState::Stopped,
+        SystemState::Blocked,
+    ] {
+        for fail in [false, true] {
+            let log = Log::default();
+            let mut graph = TestGraph::new();
+            let mut store = TestStore::default();
+            let mut driver = TestDriver(Rc::clone(&log));
+            let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(FallibleSystem {
+                log: Rc::clone(&log),
+                fail_init: Rc::new(Cell::new(fail)),
+            })];
+            let mut states = [previous];
+            let mut bus = TestBus::from(vec![restore()]);
+            tick(
+                0,
+                7,
+                &mut driver,
+                &mut graph,
+                &mut store,
+                &mut bus,
+                &mut systems,
+                &mut states,
+            );
+            let entries = log.borrow();
+            let expected = match (previous, fail) {
+                (SystemState::Active, false) => vec![
+                    "run:fallible",
+                    "init:ok",
+                    "restore:fallible",
+                    "present:Some(Int(42))",
+                ],
+                (SystemState::Active, true) => {
+                    vec!["run:fallible", "init:failed", "present:Some(Int(42))"]
+                }
+                (_, false) => vec!["init:ok", "present:Some(Int(42))"],
+                (_, true) => vec!["init:failed", "present:Some(Int(42))"],
+            };
+            assert_eq!(*entries, expected, "previous={previous:?}, fail={fail}");
+            let expected_state = if fail {
+                SystemState::Blocked
+            } else if previous == SystemState::Blocked {
+                SystemState::Stopped
+            } else {
+                previous
+            };
+            assert_eq!(states, [expected_state]);
+            assert_eq!(
+                bus.events
+                    .iter()
+                    .filter(|event| matches!(event, OnyxEvent::System(SystemEvent::Fault(_))))
+                    .count(),
+                usize::from(fail)
+            );
+            assert_eq!(
+                bus.events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        OnyxEvent::System(SystemEvent::SnapshotRestored(_))
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn each_successful_restore_rebuilds_active_caches_without_starting_again() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems = [system("worker", &log)];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::default();
+    for n in 0..2 {
+        bus.push(restore());
+        tick(
+            n,
+            7,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            &mut states,
+        );
+    }
+    let entries = log.borrow();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.as_str() == "restore:worker:Some(Int(42))")
+            .count(),
+        2
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.as_str() == "init:worker")
+            .count(),
+        2
+    );
+    assert!(!entries.iter().any(|entry| entry.starts_with("start:")));
+    assert_eq!(states, [SystemState::Active]);
+}
+
+// Sistema consumidor de prueba: el core no aporta sistemas de negocio.
+// La fábrica permite comparar instancias independientes, no la misma caché consigo misma.
+#[derive(Default)]
+struct CachedIncrement {
+    value: Option<Attr>,
+}
+
+impl OnyxSystem for CachedIncrement {
+    fn name(&self) -> &str {
+        "increment"
+    }
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        self.value = Some(attrs.attr("value"));
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        let attr = self.value.expect("init antes de run");
+        let Some(Value::Int(value)) = ctx.graph.get(ConceptId(1), attr) else {
+            panic!("valor entero de prueba")
+        };
+        let value = Value::Int(value + 1);
+        ctx.graph.set(ConceptId(1), attr, value.clone());
+        ctx.outbox.push(OnyxEvent::Domain(onyx_core::DomainEvent {
+            kind: attr,
+            subject: Some(ConceptId(1)),
+            data: vec![(attr, value)],
+        }));
+    }
+}
+
+#[test]
+fn repeated_init_matches_a_fresh_system_from_the_same_factory() {
+    fn observe(
+        graph_factory: impl Fn() -> TestGraph,
+        system_factory: impl Fn() -> Box<dyn OnyxSystem>,
+        repetitions: usize,
+    ) -> (Vec<(String, Value)>, Vec<Value>) {
+        let mut graph = graph_factory();
+        let mut system = system_factory();
+        let before = graph.props(ConceptId(1));
+        for _ in 0..repetitions {
+            system.init(&mut AttrOnly(&mut graph)).unwrap();
+            assert_eq!(graph.props(ConceptId(1)), before);
+        }
+        let mut outbox = Vec::new();
+        let mut rng = onyx_core::DetRng::from_seed_and_tick(7, 0);
+        system.on_start(&mut graph);
+        system.run(&mut Ctx {
+            graph: &mut graph,
+            inbox: &[],
+            outbox: &mut outbox,
+            rng: &mut rng,
+        });
+        let values = outbox
+            .into_iter()
+            .map(|event| match event {
+                OnyxEvent::Domain(event) => {
+                    assert_eq!(event.subject, Some(ConceptId(1)));
+                    assert_eq!(event.kind, graph.attr("value"));
+                    assert_eq!(event.data.len(), 1);
+                    assert_eq!(event.data[0].0, graph.attr("value"));
+                    event.data.into_iter().next().unwrap().1
+                }
+                _ => panic!("solo se espera el evento de dominio del incremento"),
+            })
+            .collect();
+        (ReadOnly(&graph).props(ConceptId(1)), values)
+    }
+    let graph_factory = || {
+        let mut graph = TestGraph::new();
+        graph.value = Value::Int(41);
+        graph
+    };
+    let system_factory = || Box::new(CachedIncrement::default()) as Box<dyn OnyxSystem>;
+    let once = observe(graph_factory, system_factory, 1);
+    assert_eq!(
+        once,
+        (vec![("value".into(), Value::Int(42))], vec![Value::Int(42)])
+    );
+    assert_eq!(observe(graph_factory, system_factory, 3), once);
 }

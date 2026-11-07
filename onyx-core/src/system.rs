@@ -1,12 +1,13 @@
 //! Sistemas, contexto y blueprints.
-//! Los sistemas solo ven el `Ctx`. Nunca el bus ni el soul.
+//! `run` recibe `Ctx`; los hooks reciben puertos de capacidad restringida.
+//! Ninguno recibe el bus ni el soul.
 
 use crate::detrng::DetRng;
 use crate::event::OnyxEvent;
-use crate::graph::{Graph, OnyxError, Value};
+use crate::graph::{AttrRegistry, Graph, GraphView, OnyxError, Value};
 
 /// Contexto que recibe cada sistema en cada tick.
-/// Es la única ventana al mundo.
+/// Agrupa las capacidades disponibles durante `run`.
 pub struct Ctx<'a> {
     /// Estado del cerebro. Lectura y escritura.
     pub graph: &'a mut dyn Graph,
@@ -39,16 +40,26 @@ pub trait OnyxSystem {
 
     /// Se llama al construir el sistema y tras cada importación correcta.
     /// Resuelve los `Attr` sin reiniciar el estado durable del grafo.
+    /// Es idempotente: repetirlo no cambia el comportamiento respecto a una llamada.
+    /// Solo registra atributos y reconstruye cachés de esos identificadores;
+    /// no puede leer ni escribir conceptos mediante este puerto.
     /// Debe poder repetirse también mientras el sistema está parado o bloqueado.
     /// Si falla, el runtime lo marca Blocked sin llamar hooks.
     /// Un éxito desbloquea a Stopped y necesita un Start explícito para activarse.
     /// Si no estaba bloqueado, un re-init correcto conserva su estado de ejecución.
-    fn init(&mut self, graph: &mut dyn Graph) -> Result<(), OnyxError>;
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError>;
 
     /// Se llama en cada tick mientras el sistema esté activo.
     fn run(&mut self, ctx: &mut Ctx);
 
-    /// Hooks opcionales de ciclo de vida.
+    /// Reconstruye cachés desde el grafo restaurado, sin modificarlo.
+    /// Tras una importación correcta, solo se llama a sistemas Active cuyo
+    /// `init` acaba de terminar bien. Restaurar nunca provoca un `on_start`.
+    /// Stopped y Blocked no reciben este hook. No devuelve errores recuperables;
+    /// el core no captura pánicos.
+    fn on_restore(&mut self, _graph: &dyn GraphView) {}
+
+    /// Hooks opcionales de activación y parada.
     fn on_start(&mut self, _graph: &mut dyn Graph) {}
     fn on_stop(&mut self, _graph: &mut dyn Graph) {}
 }

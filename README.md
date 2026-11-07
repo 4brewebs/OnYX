@@ -48,6 +48,8 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 - Puertos `Graph`, `SnapshotStore` y `PlatformDriver` (solo contratos: no hay implementación). `Graph` separa lectura (`GraphView`) y registro de atributos (`AttrRegistry`), con adaptadores `ReadOnly` y `AttrOnly` compatibles con Rust 1.85.1.
 - `get` devuelve `Option<Value>`. El contrato documenta consultas, IDs e importación; `exists`, `props` y `links` permiten inspeccionar el estado. `Value` compara flotantes por sus bits, y `OnyxError` implementa `Display` y `Error`.
 - `OnyxSystem`, estados `Active` / `Stopped` / `Blocked`, y tipos de blueprint (solo datos).
+- `init` idempotente recibe solo `AttrRegistry`. Tras importar, el tick llama a `init` en todos los sistemas: solo los Active con éxito reciben `on_restore`, con `GraphView` y nunca `on_start`. Un Blocked con éxito pasa a Stopped, sin hook.
+- `PlatformDriver::present` recibe `GraphView`: expone solo consultas, sin registro de atributos ni métodos mutantes.
 - Puertos `BlueprintLoader` y `SystemRegistry` (definidos, el tick aún no los usa).
 - `tick` síncrono, ordenado y sin reloj de pared, y `DetRng` (RNG no criptográfico con semilla explícita).
 
@@ -55,7 +57,7 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 
 - `InMemoryBus`.
 
-Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. Las pruebas cubren RNG, tick, bus, valores y adaptadores del puerto; no demuestran todavía la conformidad de un grafo. `cargo tree --workspace` permite comprobar que no hay dependencias externas.
+Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. Las pruebas cubren RNG, tick, bus, valores, adaptadores del puerto y selección de hooks tras restaurar. La idempotencia se comprueba con una fábrica de sistemas consumidores de prueba, no para cualquier sistema externo. No demuestran todavía la conformidad de un grafo, incluido el no-op de `set` con propietario o destino `Concept` inexistente. `cargo tree --workspace` permite comprobar que no hay dependencias externas.
 
 ## Qué NO existe todavía
 
@@ -65,7 +67,6 @@ Con la versión actual no se puede arrancar un cerebro completo: falta una imple
 
 Estas decisiones están acordadas en diseño y **no son código disponible**:
 
-- Aplicación de `AttrRegistry` a `init` y de `GraphView` al nuevo hook `on_restore`. Los puertos restringidos ya existen, pero los hooks aún conservan sus firmas anteriores.
 - `SystemTable` en core que impone el ciclo de vida, y `TickOutcome` con la política de `Shutdown`.
 - `TickState`: dato plano con el siguiente `n`, la semilla y los estados por nombre único. La tabla expone sus estados; el llamador aporta `n` y semilla. No hay setter libre: la restauración valida nombres y orden de sistemas y aplica el protocolo `init` / `on_restore`, sin poder saltarse transiciones; la compatibilidad del stage y de la configuración es responsabilidad del llamador.
 - Unidad de recuperación: grafo, `TickState` y la identificación del stage, la configuración y el orden de sistemas compatibles, **capturados en la misma frontera de tick**. Conservarlos juntos es obligación del llamador: core no impone formato al store ni puede comprobar que correspondan al mismo punto de captura.
@@ -75,7 +76,7 @@ Estas decisiones están acordadas en diseño y **no son código disponible**:
 
 ## Escribe tu propio soul
 
-Un soul aporta una o varias implementaciones de los puertos (grafo, persistencia de snapshots, driver de plataforma y, cuando existan, gestor de stages y registro de sistemas). No tiene que cubrirlos todos: la aplicación compone el resto con otros componentes y adaptadores. Los sistemas solo ven un `Ctx` (grafo, inbox, outbox, RNG), nunca el bus ni el soul.
+Un soul aporta una o varias implementaciones de los puertos (grafo, persistencia de snapshots, driver de plataforma y, cuando existan, gestor de stages y registro de sistemas). No tiene que cubrirlos todos: la aplicación compone el resto con otros componentes y adaptadores. Durante `run`, los sistemas reciben `Ctx` (grafo, inbox, outbox, RNG). Los hooks reciben sus puertos de ciclo de vida. Ninguno recibe el bus ni el soul.
 
 Reglas que protegen el intercambio de souls:
 
