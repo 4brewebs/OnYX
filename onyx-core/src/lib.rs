@@ -26,7 +26,7 @@ pub use tick::tick;
 
 pub use detrng::DetRng;
 
-pub use surface::{SufaceId, Surface binding};
+pub use surface::{SufaceId, SurfaceBinding};
 
 pub use driver::PlatformDriver;
 
