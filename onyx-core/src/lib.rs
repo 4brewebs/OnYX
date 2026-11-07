@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! OnYX Core — Contratos del cerebro.
+//! Cero dependencias. Solo reglas y puertos.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod event;
+pub mod graph;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use event::{DomainEvent, IngressEvent, Key, KeyCode, Mods, OnyxEvent, SystemEvent};
+pub use graph::{Attr, ConceptId, Graph, OnyxError, PlatformDriver, SnapshotStore, Value};
