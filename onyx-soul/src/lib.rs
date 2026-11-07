@@ -4,3 +4,6 @@
 pub mod bus;
 
 pub use bus::InMemoryBus;
+
+pub mod graph;
+pub use graph::WorldGraph;

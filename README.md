@@ -45,7 +45,7 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 
 - `OnyxEvent` (System / Ingress / Domain).
 - Puerto `EventBus` (FIFO, sin backpressure).
-- Puertos `Graph`, `SnapshotStore` y `PlatformDriver` (solo contratos: no hay implementación). `Graph` separa lectura (`GraphView`) y registro de atributos (`AttrRegistry`), con adaptadores `ReadOnly` y `AttrOnly` compatibles con Rust 1.85.1.
+- Puertos `Graph`, `SnapshotStore` y `PlatformDriver` (core define sus contratos; soul ya aporta `WorldGraph`). `Graph` separa lectura (`GraphView`) y registro de atributos (`AttrRegistry`), con adaptadores `ReadOnly` y `AttrOnly` compatibles con Rust 1.85.1.
 - `get` devuelve `Option<Value>`. El contrato documenta consultas, IDs e importación; `exists`, `props` y `links` permiten inspeccionar el estado. `Value` compara flotantes por sus bits, y `OnyxError` implementa `Display` y `Error`.
 - `OnyxSystem`, estados `Active` / `Stopped` / `Blocked`, y tipos de blueprint (solo datos).
 - `init` idempotente recibe solo `AttrRegistry`. Tras importar, el tick llama a `init` en todos los sistemas: solo los Active con éxito reciben `on_restore`, con `GraphView` y nunca `on_start`. Un Blocked con éxito pasa a Stopped, sin hook. El recorrido sigue el orden de sistemas: `init` y el posible `on_restore` de uno terminan antes del `init` del siguiente.
@@ -56,12 +56,18 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 **`onyx-soul`**
 
 - `InMemoryBus`.
+- `WorldGraph`: grafo EAV en memoria con conceptos, propiedades, relaciones dirigidas, consultas ordenadas y exportación/importación atómica en un formato privado. Su [diseño y límites](docs/world-graph.md) no forman parte del contrato de otros souls.
 
-Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. Las pruebas cubren RNG, tick, bus, valores, adaptadores del puerto y selección de hooks tras restaurar. La idempotencia se comprueba con una fábrica de sistemas consumidores de prueba, no para cualquier sistema externo. No demuestran todavía la conformidad de un grafo, incluido el no-op de `set` con propietario o destino `Concept` inexistente. `cargo tree --workspace` permite comprobar que no hay dependencias externas.
+**Suite de grafo (`onyx-core`, feature `conformance`)**
+
+- Casos genéricos que reciben fábricas, sin exigir `Default`. La feature está apagada por defecto y no añade dependencias. `onyx-soul` la activa solo en `[dev-dependencies]`.
+- API pública de verificación, fuera de la estabilidad de v0: sus casos pueden crecer o endurecerse entre versiones. Seis grafos defectuosos de prueba demuestran que detecta reutilización de IDs, consultas desordenadas, creación implícita desde `set` e importación no atómica, incluidas fugas que solo alteran nombres o el contador. Cada caso pasa primero con el defecto desactivado.
+
+Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. `WorldGraph` pasa los casos genéricos de consultas, referencias, destrucción, remapeo de atributos y continuidad tras restaurar, además de pruebas privadas de rechazo atómico de snapshots inválidos. Las mutaciones de bytes no se presuponen inválidas: solo si `import` devuelve `Err` se exige conservación del observable y de una sonda de estado privado suministrada por el soul, que cubre registro completo y contador. La suite no exige igualdad de snapshots entre instancias. Esto no demuestra todavía intercambio con una segunda implementación de grafo ni recuperación completa del runtime. También se prueban RNG, tick, bus y capacidades de los puertos. La idempotencia de `init` se comprueba con una fábrica de sistemas consumidores de prueba, no para cualquier sistema externo. `cargo tree --workspace` permite comprobar que no hay dependencias externas. Para ejecutar solo los controles defectuosos: `cargo test -p onyx-core --features conformance --test conformance_probes`.
 
 ## Qué NO existe todavía
 
-Con la versión actual no se puede arrancar un cerebro completo: falta una implementación de `Graph`, de `SnapshotStore` y de `PlatformDriver`. Hoy solo hay un runtime de tick utilizable si la aplicación aporta esos puertos.
+El soul ya aporta grafo y bus, pero falta una implementación de `SnapshotStore` y de `PlatformDriver`. La aplicación debe aportar esos puertos y sus sistemas para ejecutar el tick; la recuperación completa y el cambio de stage siguen pendientes.
 
 ## Qué está diseñado, pero no implementado
 
@@ -71,8 +77,7 @@ Estas decisiones están acordadas en diseño y **no son código disponible**:
 - `TickState`: dato plano con el siguiente `n`, la semilla y los estados por nombre único. La tabla expone sus estados; el llamador aporta `n` y semilla. No hay setter libre: la restauración valida nombres y orden de sistemas y aplica el protocolo `init` / `on_restore`, sin poder saltarse transiciones; la compatibilidad del stage y de la configuración es responsabilidad del llamador.
 - Unidad de recuperación: grafo, `TickState` y la identificación del stage, la configuración y el orden de sistemas compatibles, **capturados en la misma frontera de tick**. Conservarlos juntos es obligación del llamador: core no impone formato al store ni puede comprobar que correspondan al mismo punto de captura.
 - Cambio de stage (`LoadStage`) mediante un gestor que aporta el soul.
-- Suite de conformidad genérica para que cualquier soul demuestre que cumple el contrato.
-- `WorldGraph` (soul por defecto del grafo), que nacerá pasando esa suite.
+- Extensión de la suite genérica a otros puertos y al ciclo de vida; actualmente cubre el grafo.
 
 ## Escribe tu propio soul
 
@@ -84,9 +89,11 @@ Reglas que protegen el intercambio de souls:
 2. El tick no depende del tiempo de reloj.
 3. La concurrencia vive en los adaptadores; el cerebro es síncrono.
 
-Reproducir una ejecución exige las mismas entradas, semilla, siguiente `n`, configuración, orden y estado de sistemas, además de implementaciones compatibles.
+Reproducir una ejecución exige el mismo estado inicial del grafo, las mismas entradas, semilla, siguiente `n`, configuración, orden y estado de sistemas, además de implementaciones con la misma semántica.
 
-Hasta que exista la suite de conformidad, "cumple el contrato" no está demostrado para ningún soul.
+Intercambiar souls busca conservar los sistemas y blueprints compatibles con el contrato, no reutilizar snapshots. Cada soul define su formato y rechaza capturas incompatibles sin borrar datos.
+
+`WorldGraph` pasa la suite de grafo disponible. No equivale a demostrar todos los contratos del soul ni el intercambio con otra implementación.
 
 ## Qué no es
 

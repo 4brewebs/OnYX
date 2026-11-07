@@ -6,3 +6,6 @@ edition = "2024"
 
 [dependencies]
 onyx-core = { path = "../onyx-core" }
+
+[dev-dependencies]
+onyx-core = { path = "../onyx-core", features = ["conformance"] }
