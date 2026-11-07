@@ -13,7 +13,7 @@ pub mod driver;
 pub use bus::EventBus;
 pub use event::{DomainEvent, IngressEvent, Key, KeyCode, Mods, OnyxEvent, SystemEvent};
 pub use graph::{
-    Attr, AttrOnly, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, PlatformDriver, ReadOnly,
+    Attr, AttrOnly, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, ReadOnly,
     SnapshotStore, Value,
 };
 
