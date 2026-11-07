@@ -11,6 +11,8 @@ enum Defect {
     ReverseQuery,
     SetCreatesOwner,
     PartialImport,
+    AdvanceHigh,
+    LeakName,
 }
 
 // Doble limitado a los cuatro casos ejercitados: solo admite importaciones fallidas.
@@ -137,9 +139,18 @@ impl Graph for MutationProbe {
         panic!("MutationProbe only supports cases without successful snapshots")
     }
     fn import(&mut self, _: &[u8]) -> Result<(), OnyxError> {
-        if self.defect == Some(Defect::PartialImport) {
-            self.nodes.clear();
-            self.attr("leaked-name");
+        match self.defect {
+            Some(Defect::PartialImport) => {
+                self.nodes.clear();
+                self.attr("leaked-name");
+            }
+            Some(Defect::AdvanceHigh) => {
+                self.high += 7;
+            }
+            Some(Defect::LeakName) => {
+                self.attr("leaked-name");
+            }
+            _ => {}
         }
         Err(OnyxError::Format("unsupported test snapshot".into()))
     }
@@ -175,6 +186,32 @@ fn suite_detects_set_creating_a_missing_owner() {
 #[test]
 fn suite_detects_non_atomic_import() {
     assert_detected(Defect::PartialImport, |d| {
-        graph::rejected_import_is_atomic(|| MutationProbe::new(d), b"invalid")
+        graph::rejected_import_is_atomic(
+            || MutationProbe::new(d),
+            b"invalid",
+            |g| (g.names.clone(), g.high),
+        )
+    });
+}
+
+#[test]
+fn suite_detects_failed_import_advancing_only_the_counter() {
+    assert_detected(Defect::AdvanceHigh, |d| {
+        graph::rejected_import_is_atomic(
+            || MutationProbe::new(d),
+            b"invalid",
+            |g| (g.names.clone(), g.high),
+        )
+    });
+}
+
+#[test]
+fn suite_detects_failed_import_leaking_only_a_name() {
+    assert_detected(Defect::LeakName, |d| {
+        graph::rejected_import_is_atomic(
+            || MutationProbe::new(d),
+            b"invalid",
+            |g| (g.names.clone(), g.high),
+        )
     });
 }

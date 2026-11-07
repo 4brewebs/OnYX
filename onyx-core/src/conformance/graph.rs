@@ -318,8 +318,14 @@ pub fn continuation<G: Graph>(factory: impl Fn() -> G) {
     assert_eq!(state(&restored), state(&uninterrupted));
 }
 
-/// El soul suministra bytes inválidos para su propio formato, sin imponer un formato genérico.
-pub fn rejected_import_is_atomic<G: Graph>(factory: impl Fn() -> G, invalid: &[u8]) {
+/// El soul suministra bytes inválidos y una sonda de su registro completo y máximo ID.
+/// La sonda no debe modificar el grafo. Su representación no se impone a otros souls;
+/// no se comparan snapshots ni identificadores entre instancias.
+pub fn rejected_import_is_atomic<G: Graph, S: std::fmt::Debug + PartialEq>(
+    factory: impl Fn() -> G,
+    invalid: &[u8],
+    observe: impl Fn(&G) -> S,
+) {
     let mut g = factory();
     let z = g.attr("z");
     let a = g.attr("a");
@@ -329,8 +335,10 @@ pub fn rejected_import_is_atomic<G: Graph>(factory: impl Fn() -> G, invalid: &[u
     g.relate(x, z, y);
     g.destroy(y);
     let before = state(&g);
+    let private_before = observe(&g);
     assert!(g.import(invalid).is_err());
     assert_eq!(state(&g), before);
+    assert_eq!(observe(&g), private_before);
     assert_eq!(g.attr("z"), z);
     assert_eq!(g.attr("a"), a);
     assert!(g.create().0 > y.0);
@@ -423,10 +431,17 @@ pub fn cyclic_roundtrip<G: Graph>(factory: impl Fn() -> G) {
 }
 
 /// Truncar o cambiar bytes no garantiza invalidez. Se exige ausencia de pánico y,
-/// solo ante Err, conservación del observable y de los Attr conocidos.
-/// El formato de cada soul debe probar además su registro completo y su contador.
-pub fn modified_import_preserves_state_on_error<G: Graph>(factory: impl Fn() -> G) {
-    fn check<G: Graph>(factory: &impl Fn() -> G, bytes: &[u8]) {
+/// solo ante Err, conservación del observable, Attr conocidos y estado de la sonda.
+/// La sonda debe cubrir registro completo y máximo ID sin modificar el grafo.
+pub fn modified_import_preserves_state_on_error<G: Graph, S: std::fmt::Debug + PartialEq>(
+    factory: impl Fn() -> G,
+    observe: impl Fn(&G) -> S,
+) {
+    fn check<G: Graph, S: std::fmt::Debug + PartialEq>(
+        factory: &impl Fn() -> G,
+        bytes: &[u8],
+        observe: &impl Fn(&G) -> S,
+    ) {
         let mut receiver = factory();
         let known: Vec<_> = ["z", "a", "receiver-only"]
             .into_iter()
@@ -438,8 +453,10 @@ pub fn modified_import_preserves_state_on_error<G: Graph>(factory: impl Fn() -> 
         receiver.relate(owner, known[0].1, owner);
         receiver.destroy(deleted);
         let before = state(&receiver);
+        let private_before = observe(&receiver);
         if receiver.import(bytes).is_err() {
             assert_eq!(state(&receiver), before);
+            assert_eq!(observe(&receiver), private_before);
             for (name, attr) in known {
                 assert_eq!(receiver.attr(name), attr);
             }
@@ -452,11 +469,11 @@ pub fn modified_import_preserves_state_on_error<G: Graph>(factory: impl Fn() -> 
     source.set(owner, incoming, Value::Text("snapshot".into()));
     let bytes = source.export();
     for end in 0..bytes.len() {
-        check(&factory, &bytes[..end]);
+        check(&factory, &bytes[..end], &observe);
     }
     for index in 0..bytes.len() {
         let mut changed = bytes.clone();
         changed[index] ^= 0xff;
-        check(&factory, &changed);
+        check(&factory, &changed, &observe);
     }
 }
