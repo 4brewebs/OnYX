@@ -7,6 +7,8 @@ pub mod event;
 pub mod graph;
 pub mod system;
 pub mod tick;
+pub mod surface;
+pub mod driver;
 
 pub use bus::EventBus;
 pub use event::{DomainEvent, IngressEvent, Key, KeyCode, Mods, OnyxEvent, SystemEvent};
@@ -23,6 +25,10 @@ pub use system::{
 pub use tick::tick;
 
 pub use detrng::DetRng;
+
+pub use surface::{SufaceId, Surface binding};
+
+pub use driver::PlatformDriver;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
