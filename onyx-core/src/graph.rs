@@ -245,12 +245,4 @@ pub trait SnapshotStore {
     fn load(&self, key: &str) -> Result<Vec<u8>, OnyxError>;
 }
 
-/// Puerto de plataforma.
-/// Solo vuelca ingress y proyecta el grafo, nunca lo escribe.
-pub trait PlatformDriver {
-    /// Vuelca eventos de entrada de la plataforma.
-    fn poll_into(&mut self, bus: &mut dyn crate::EventBus);
 
-    /// Proyecta el estado mediante el puerto mínimo de lectura.
-    fn present(&mut self, view: &dyn GraphView);
-}
