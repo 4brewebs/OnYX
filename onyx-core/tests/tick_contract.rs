@@ -1145,3 +1145,104 @@ fn repeated_init_matches_a_fresh_system_from_the_same_factory() {
     );
     assert_eq!(observe(graph_factory, system_factory, 3), once);
 }
+
+#[test]
+fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
+    struct CacheReader {
+        attr: Option<Attr>,
+        cached: Option<Value>,
+        log: Log,
+    }
+
+    impl OnyxSystem for CacheReader {
+        fn name(&self) -> &str {
+            "reader"
+        }
+        fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+            self.attr = Some(attrs.attr("value"));
+            Ok(())
+        }
+        fn on_start(&mut self, graph: &mut dyn Graph) {
+            self.cached = graph.get(ConceptId(1), self.attr.unwrap());
+            self.log
+                .borrow_mut()
+                .push(format!("start:{:?}", self.cached));
+        }
+        fn on_restore(&mut self, graph: &dyn GraphView) {
+            self.cached = graph.get(ConceptId(1), self.attr.unwrap());
+            self.log
+                .borrow_mut()
+                .push(format!("restore:{:?}", self.cached));
+        }
+        fn run(&mut self, _: &mut Ctx) {
+            // Consume la caché, no vuelve a consultar el grafo.
+            self.log.borrow_mut().push(format!("run:{:?}", self.cached));
+        }
+    }
+
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(CacheReader {
+        attr: None,
+        cached: None,
+        log: Rc::clone(&log),
+    })];
+    systems[0].init(&mut AttrOnly(&mut graph)).unwrap();
+    let mut states = [SystemState::Stopped];
+    let mut bus = TestBus::from(vec![
+        OnyxEvent::System(SystemEvent::Start("reader".into())),
+        restore(),
+    ]);
+
+    tick(
+        0,
+        7,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+    );
+    assert_eq!(states, [SystemState::Active]);
+    assert_eq!(
+        *log.borrow(),
+        [
+            "start:Some(Int(0))",
+            "restore:Some(Int(42))",
+            "present:Some(Int(42))",
+        ]
+    );
+    tick(
+        1,
+        7,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+    );
+    let entries = log.borrow();
+    assert_eq!(
+        *entries,
+        [
+            "start:Some(Int(0))",
+            "restore:Some(Int(42))",
+            "present:Some(Int(42))",
+            "run:Some(Int(42))",
+            "present:Some(Int(42))",
+        ]
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.starts_with("start:"))
+            .count(),
+        1
+    );
+    assert_eq!(store.loads.get(), 1);
+    assert_eq!(states, [SystemState::Active]);
+}

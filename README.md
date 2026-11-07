@@ -48,7 +48,7 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 - Puertos `Graph`, `SnapshotStore` y `PlatformDriver` (solo contratos: no hay implementación). `Graph` separa lectura (`GraphView`) y registro de atributos (`AttrRegistry`), con adaptadores `ReadOnly` y `AttrOnly` compatibles con Rust 1.85.1.
 - `get` devuelve `Option<Value>`. El contrato documenta consultas, IDs e importación; `exists`, `props` y `links` permiten inspeccionar el estado. `Value` compara flotantes por sus bits, y `OnyxError` implementa `Display` y `Error`.
 - `OnyxSystem`, estados `Active` / `Stopped` / `Blocked`, y tipos de blueprint (solo datos).
-- `init` idempotente recibe solo `AttrRegistry`. Tras importar, el tick llama a `init` en todos los sistemas: solo los Active con éxito reciben `on_restore`, con `GraphView` y nunca `on_start`. Un Blocked con éxito pasa a Stopped, sin hook.
+- `init` idempotente recibe solo `AttrRegistry`. Tras importar, el tick llama a `init` en todos los sistemas: solo los Active con éxito reciben `on_restore`, con `GraphView` y nunca `on_start`. Un Blocked con éxito pasa a Stopped, sin hook. El recorrido sigue el orden de sistemas: `init` y el posible `on_restore` de uno terminan antes del `init` del siguiente.
 - `PlatformDriver::present` recibe `GraphView`: expone solo consultas, sin registro de atributos ni métodos mutantes.
 - Puertos `BlueprintLoader` y `SystemRegistry` (definidos, el tick aún no los usa).
 - `tick` síncrono, ordenado y sin reloj de pared, y `DetRng` (RNG no criptográfico con semilla explícita).

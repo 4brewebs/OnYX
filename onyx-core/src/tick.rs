@@ -25,6 +25,9 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 ///
 /// Tras cada importación correcta, todos los sistemas vuelven a ejecutar `init`
 /// antes de atender la siguiente petición. Esto incluye los sistemas parados.
+/// Se recorre el slice en orden, sistema a sistema: su `init` y, si procede,
+/// su `on_restore` terminan antes de iniciar el `init` del siguiente sistema.
+/// No hay una fase global de `init` seguida de otra de `on_restore`.
 /// `init` no debe reiniciar el estado durable restaurado.
 /// Un fallo cambia el estado a Blocked sin hooks. Un éxito cambia Blocked
 /// a Stopped, sin activarlo ni llamar hooks. Los demás estados se conservan.
