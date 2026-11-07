@@ -12,6 +12,91 @@ onyx-soul   = implementaciones por defecto de esos contratos · 0 dependencias e
 adaptadores = TUI, WASM, TOML, Redis, Kafka...               · (aún no existen)
 ```
 
+## Estado al 7 de noviembre de 2026
+
+La última modificación de código de este cierre es `c22927e`.
+Esta actualización del README no cambia los contratos ni la implementación.
+El workspace contiene solo `onyx-core` y `onyx-soul`, sin dependencias externas.
+
+### Verificación del cierre
+
+Comprobado con Rust 1.85.1 y edición 2024:
+
+- Pasan 63 pruebas y 3 doctests tanto en debug como en release.
+- Las 63 pruebas son 29 de contratos de core, 8 controles defectuosos,
+  3 de bus, 13 de la suite sobre WorldGraph y 10 privadas del codec.
+- Cada control defectuoso pasa el mismo caso con el defecto desactivado y
+  provoca el fallo de la suite al activarlo. Cubren reutilización de IDs,
+  consultas desordenadas, creación implícita desde `set`, importación parcial,
+  fuga aislada de nombres, avance aislado del máximo ID y las dos omisiones
+  de limpieza de `destroy`: propiedades `Concept` y relaciones entrantes.
+- La API `conformance` no está disponible en la compilación por defecto.
+  Al activar la feature sí está disponible. Soul la activa solo para pruebas.
+- Clippy conserva un único aviso conocido: `tick` recibe 8 argumentos y
+  supera el umbral de 7 de `too_many_arguments`. No se ha silenciado.
+
+Comandos para repetir las comprobaciones desde la raíz:
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --lib
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo test --workspace --release
+cargo test -p onyx-core --features conformance --test conformance_probes
+cargo test -p onyx-core --no-default-features
+cargo doc --workspace --no-deps --all-features
+cargo tree --workspace
+```
+
+### Correspondencia entre contrato y pruebas
+
+Los casos están en [la suite de grafo](onyx-core/src/conformance/graph.rs).
+WorldGraph los ejecuta en [sus pruebas de conformidad](onyx-soul/tests/graph_contract.rs).
+
+| Garantía del contrato | Casos de la suite |
+| --- | --- |
+| Nombres exactos, registro idempotente y estabilidad de `Attr` tras importar | `registry`, `import_remaps_attributes` |
+| Conceptos vacíos, IDs ascendentes sin reutilización y consultas AND por presencia | `creation_and_queries`, `high_water` |
+| `set` no crea conceptos ni guarda destinos inexistentes; `get` devuelve texto poseído | `set_and_missing_references` |
+| Orden, unicidad, separación de propiedades y relaciones y eliminación de la terna exacta | `ordering_and_relations` |
+| `destroy` limpia referencias sin borrar propietarios ni datos ajenos | `destruction` |
+| Conservación de variantes, extremos enteros y bits de flotantes | `values_roundtrip`, `float_bits` |
+| Autorref, ciclos e importación repetida | `cyclic_roundtrip` |
+| Sustitución exacta, remapeo, máximo de ambos grafos y continuidad del grafo restaurado | `import_remaps_attributes`, `high_water`, `continuation` |
+| Rechazo sin cambios de conceptos, nombres ni máximo ID | `rejected_import_is_atomic`, `modified_import_preserves_state_on_error` |
+
+Los casos de errores reciben una sonda privada suministrada por el soul.
+No presuponen que cualquier byte modificado sea inválido ni comparan números
+`Attr` entre instancias. WorldGraph usa su exportación privada como sonda sobre
+la misma instancia. No se impone una serialización canónica a otros souls.
+
+Los [controles defectuosos](onyx-core/tests/conformance_probes.rs) comprueban
+la detección de los ocho fallos anteriores. Las [pruebas privadas del codec](onyx-soul/src/graph/snapshot.rs)
+cubren truncados, corrupciones, longitudes, duplicados, referencias colgantes,
+fallos tardíos y agotamiento de `u64` sin modificar el estado.
+Los adaptadores de capacidades se comprueban también en
+[graph_api](onyx-core/tests/graph_api.rs) y en los tres doctests de compilación fallida.
+
+### Límites y punto de retomada
+
+- Estas pruebas no demuestran el intercambio con un segundo soul ni la
+  recuperación completa del runtime. Los dobles defectuosos no son otro soul.
+- No se ha ejecutado el agotamiento real del registro de atributos `u32`.
+  La implementación usa una conversión comprobada antes de añadir un nombre.
+- `destroy` recorre los conceptos restantes y sus referencias. No hay mediciones
+  de rendimiento ni garantías de latencia o de ausencia de asignaciones.
+- El formato del snapshot es privado y no incorpora suma de comprobación.
+  Una alteración que siga describiendo un grafo válido puede aceptarse.
+- Siguen pendientes `SystemTable`, `TickOutcome`, `Shutdown`, `TickState`,
+  la unidad completa de recuperación y el gestor de stages. Tampoco hay
+  implementaciones de `SnapshotStore` ni de `PlatformDriver`.
+- Para retomar, el siguiente diseño propuesto es `SystemTable` y `TickOutcome`
+  con la política de `Shutdown`, antes de implementar la recuperación completa.
+  El tratamiento de eventos pendientes en la captura aún debe acordarse.
+  Cualquier cambio del contrato requiere acuerdo previo y actualización de este README.
+
 ## Criterio de diseño
 
 El core fija el **significado observable** (conceptos, atributos, relaciones, orden y reglas de ejecución), no cómo se almacena o indexa. Un alma puede usar SQL, ECS u OCS si respeta ese significado. Core también fija restricciones de capacidades y de ejecución (por ejemplo, qué puede hacer cada hook), pero nunca la representación interna del almacenamiento. **Si no es observable ni una restricción de ejecución, no es obligación del core.**
