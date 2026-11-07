@@ -10,7 +10,10 @@ pub mod tick;
 
 pub use bus::EventBus;
 pub use event::{DomainEvent, IngressEvent, Key, KeyCode, Mods, OnyxEvent, SystemEvent};
-pub use graph::{Attr, ConceptId, Graph, OnyxError, PlatformDriver, SnapshotStore, Value};
+pub use graph::{
+    Attr, AttrOnly, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, PlatformDriver, ReadOnly,
+    SnapshotStore, Value,
+};
 
 pub use system::{
     BlueprintLoader, Ctx, EntitySpec, OnyxSystem, StageBlueprint, SystemRegistry, SystemSpec,

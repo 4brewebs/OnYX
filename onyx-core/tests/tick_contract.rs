@@ -3,8 +3,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use onyx_core::{
-    Attr, ConceptId, Ctx, EventBus, Graph, OnyxError, OnyxEvent, OnyxSystem, PlatformDriver,
-    SnapshotStore, SystemEvent, SystemState, Value, tick,
+    Attr, AttrRegistry, ConceptId, Ctx, EventBus, Graph, GraphView, OnyxError, OnyxEvent,
+    OnyxSystem, PlatformDriver, SnapshotStore, SystemEvent, SystemState, Value, tick,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -37,6 +37,7 @@ impl EventBus for TestBus {
 struct TestGraph {
     value: Value,
     reject_import: bool,
+    attrs: Vec<String>,
 }
 
 impl TestGraph {
@@ -44,36 +45,69 @@ impl TestGraph {
         Self {
             value: Value::Int(0),
             reject_import: false,
+            attrs: vec!["value".into()],
         }
     }
 }
 
-impl Graph for TestGraph {
-    fn attr(&mut self, _: &str) -> Attr {
-        Attr(0)
+impl AttrRegistry for TestGraph {
+    fn attr(&mut self, name: &str) -> Attr {
+        let index = match self.attrs.iter().position(|existing| existing == name) {
+            Some(index) => index,
+            None => {
+                self.attrs.push(name.into());
+                self.attrs.len() - 1
+            }
+        };
+        Attr::from_raw(u32::try_from(index).expect("registro de prueba pequeño"))
     }
+}
+
+impl GraphView for TestGraph {
+    fn exists(&self, id: ConceptId) -> bool {
+        id == ConceptId(1)
+    }
+    fn get(&self, id: ConceptId, attr: Attr) -> Option<Value> {
+        (self.exists(id) && attr.raw() == 0).then(|| self.value.clone())
+    }
+    fn related(&self, _: ConceptId, _: Attr) -> Vec<ConceptId> {
+        Vec::new()
+    }
+    fn query(&self, with: &[Attr]) -> Vec<ConceptId> {
+        if with.iter().all(|attr| attr.raw() == 0) {
+            vec![ConceptId(1)]
+        } else {
+            Vec::new()
+        }
+    }
+    fn props(&self, id: ConceptId) -> Vec<(String, Value)> {
+        if self.exists(id) {
+            vec![("value".into(), self.value.clone())]
+        } else {
+            Vec::new()
+        }
+    }
+    fn links(&self, _: ConceptId) -> Vec<(String, ConceptId)> {
+        Vec::new()
+    }
+}
+
+impl Graph for TestGraph {
     fn create(&mut self) -> ConceptId {
         panic!("no se usa en estas pruebas")
     }
     fn destroy(&mut self, _: ConceptId) {
         panic!("no se usa en estas pruebas")
     }
-    fn get(&self, _: ConceptId, _: Attr) -> Option<&Value> {
-        Some(&self.value)
-    }
-    fn set(&mut self, _: ConceptId, _: Attr, value: Value) {
-        self.value = value;
+    fn set(&mut self, id: ConceptId, attr: Attr, value: Value) {
+        if self.exists(id) && attr.raw() == 0 {
+            self.value = value;
+        }
     }
     fn relate(&mut self, _: ConceptId, _: Attr, _: ConceptId) {
         panic!("no se usa en estas pruebas")
     }
     fn unrelate(&mut self, _: ConceptId, _: Attr, _: ConceptId) {
-        panic!("no se usa en estas pruebas")
-    }
-    fn related(&self, _: ConceptId, _: Attr) -> Vec<ConceptId> {
-        panic!("no se usa en estas pruebas")
-    }
-    fn query(&self, _: &[Attr]) -> Vec<ConceptId> {
         panic!("no se usa en estas pruebas")
     }
     fn export(&self) -> Vec<u8> {
@@ -113,9 +147,10 @@ struct TestDriver(Log);
 impl PlatformDriver for TestDriver {
     fn poll_into(&mut self, _: &mut dyn EventBus) {}
     fn present(&mut self, graph: &dyn Graph) {
-        self.0
-            .borrow_mut()
-            .push(format!("present:{:?}", graph.get(ConceptId(1), Attr(0))));
+        self.0.borrow_mut().push(format!(
+            "present:{:?}",
+            graph.get(ConceptId(1), Attr::from_raw(0))
+        ));
     }
 }
 
@@ -152,7 +187,7 @@ impl OnyxSystem for TestSystem {
         self.log.borrow_mut().push(format!(
             "start:{}:{:?}",
             self.name,
-            graph.get(ConceptId(1), Attr(0))
+            graph.get(ConceptId(1), Attr::from_raw(0))
         ));
     }
     fn on_stop(&mut self, _: &mut dyn Graph) {
@@ -449,9 +484,11 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
     let mut graph = TestGraph::new();
     let mut store = TestStore::default();
     let mut driver = TestDriver(log);
+    let first_kind = graph.attr("domain.first");
+    let second_kind = graph.attr("domain.second");
     let domain = |kind| {
         OnyxEvent::Domain(DomainEvent {
-            kind: Attr(kind),
+            kind,
             subject: None,
             data: Vec::new(),
         })
@@ -459,10 +496,10 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
     let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(EventSystem {
         seen: Rc::clone(&seen),
         emit: vec![
-            domain(1),
+            domain(first_kind),
             OnyxEvent::System(SystemEvent::SnapshotRequested("saved".into())),
             OnyxEvent::System(SystemEvent::StageLoaded("stage".into())),
-            domain(2),
+            domain(second_kind),
         ],
     })];
     let mut states = [SystemState::Active];
@@ -503,11 +540,11 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
 
     let seen = seen.borrow();
     assert!(matches!(seen[1].as_slice(), [
-        OnyxEvent::Domain(DomainEvent { kind: Attr(1), .. }),
+        OnyxEvent::Domain(DomainEvent { kind: first, .. }),
         OnyxEvent::System(SystemEvent::StageLoaded(stage)),
-        OnyxEvent::Domain(DomainEvent { kind: Attr(2), .. }),
+        OnyxEvent::Domain(DomainEvent { kind: second, .. }),
         OnyxEvent::System(SystemEvent::Tick { n: 1 }),
-    ] if stage == "stage"));
+    ] if stage == "stage" && *first == first_kind && *second == second_kind));
     assert!(matches!(
         seen[2].as_slice(),
         [OnyxEvent::System(SystemEvent::Tick { n: 2 })]

@@ -1,7 +1,24 @@
 use onyx_core::{
-    Attr, ConceptId, DomainEvent, EventBus, IngressEvent, OnyxEvent, SystemEvent, Value,
+    Attr, AttrRegistry, ConceptId, DomainEvent, EventBus, IngressEvent, OnyxEvent, SystemEvent,
+    Value,
 };
 use onyx_soul::InMemoryBus;
+
+#[derive(Default)]
+struct TestRegistry(Vec<String>);
+
+impl AttrRegistry for TestRegistry {
+    fn attr(&mut self, name: &str) -> Attr {
+        let index = match self.0.iter().position(|existing| existing == name) {
+            Some(index) => index,
+            None => {
+                self.0.push(name.into());
+                self.0.len() - 1
+            }
+        };
+        Attr::from_raw(u32::try_from(index).expect("registro de prueba pequeño"))
+    }
+}
 
 #[test]
 fn new_and_default_buses_are_empty_and_can_be_drained_repeatedly() {
@@ -15,6 +32,9 @@ fn new_and_default_buses_are_empty_and_can_be_drained_repeatedly() {
 
 #[test]
 fn drain_preserves_fifo_and_payloads_without_replaying_any_event() {
+    let mut registry = TestRegistry::default();
+    let kind = registry.attr("event.kind");
+    let payload = registry.attr("event.payload");
     let mut bus = InMemoryBus::new();
     let port: &mut dyn EventBus = &mut bus;
     port.push(OnyxEvent::System(SystemEvent::Tick { n: 42 }));
@@ -23,9 +43,9 @@ fn drain_preserves_fifo_and_payloads_without_replaying_any_event() {
         bytes: vec![0, 255],
     }));
     port.push(OnyxEvent::Domain(DomainEvent {
-        kind: Attr(7),
+        kind,
         subject: Some(ConceptId(3)),
-        data: vec![(Attr(2), Value::Text("payload".into()))],
+        data: vec![(payload, Value::Text("payload".into()))],
     }));
     assert!(!port.is_empty());
     let events = port.drain();
@@ -34,9 +54,9 @@ fn drain_preserves_fifo_and_payloads_without_replaying_any_event() {
     assert!(matches!(events.as_slice(), [
         OnyxEvent::System(SystemEvent::Tick { n: 42 }),
         OnyxEvent::Ingress(IngressEvent::Raw { source, bytes }),
-        OnyxEvent::Domain(DomainEvent { kind: Attr(7), subject: Some(ConceptId(3)), data }),
-    ] if source == "device" && bytes == &[0, 255]
-        && matches!(data.as_slice(), [(Attr(2), Value::Text(text))] if text == "payload")));
+        OnyxEvent::Domain(DomainEvent { kind: received_kind, subject: Some(ConceptId(3)), data }),
+    ] if *received_kind == kind && source == "device" && bytes == &[0, 255]
+        && matches!(data.as_slice(), [(received_attr, Value::Text(text))] if *received_attr == payload && text == "payload")));
 }
 
 #[test]

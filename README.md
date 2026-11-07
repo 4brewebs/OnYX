@@ -45,7 +45,8 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 
 - `OnyxEvent` (System / Ingress / Domain).
 - Puerto `EventBus` (FIFO, sin backpressure).
-- Puertos `Graph`, `SnapshotStore` y `PlatformDriver` (solo contratos: no hay implementación).
+- Puertos `Graph`, `SnapshotStore` y `PlatformDriver` (solo contratos: no hay implementación). `Graph` separa lectura (`GraphView`) y registro de atributos (`AttrRegistry`), con adaptadores `ReadOnly` y `AttrOnly` compatibles con Rust 1.85.1.
+- `get` devuelve `Option<Value>`. El contrato documenta consultas, IDs e importación; `exists`, `props` y `links` permiten inspeccionar el estado. `Value` compara flotantes por sus bits, y `OnyxError` implementa `Display` y `Error`.
 - `OnyxSystem`, estados `Active` / `Stopped` / `Blocked`, y tipos de blueprint (solo datos).
 - Puertos `BlueprintLoader` y `SystemRegistry` (definidos, el tick aún no los usa).
 - `tick` síncrono, ordenado y sin reloj de pared, y `DetRng` (RNG no criptográfico con semilla explícita).
@@ -54,7 +55,7 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 
 - `InMemoryBus`.
 
-Verificado: 21 tests de contrato (RNG, tick, bus) pasan en debug y release, y no hay dependencias externas.
+Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. Las pruebas cubren RNG, tick, bus, valores y adaptadores del puerto; no demuestran todavía la conformidad de un grafo. `cargo tree --workspace` permite comprobar que no hay dependencias externas.
 
 ## Qué NO existe todavía
 
@@ -64,8 +65,7 @@ Con la versión actual no se puede arrancar un cerebro completo: falta una imple
 
 Estas decisiones están acordadas en diseño y **no son código disponible**:
 
-- Contrato de `Graph` completo: semántica de ids inexistentes, `query` como conjunción, ids no reutilizables, `import` atómico. `get` pasará de `Option<&Value>` a `Option<Value>` (cambio rompedor), para no exigir una caché residente a almacenes externos.
-- Separación de tipos para restringir hooks (`GraphView`, `AttrRegistry`) y un hook `on_restore`.
+- Aplicación de `AttrRegistry` a `init` y de `GraphView` al nuevo hook `on_restore`. Los puertos restringidos ya existen, pero los hooks aún conservan sus firmas anteriores.
 - `SystemTable` en core que impone el ciclo de vida, y `TickOutcome` con la política de `Shutdown`.
 - `TickState`: dato plano con el siguiente `n`, la semilla y los estados por nombre único. La tabla expone sus estados; el llamador aporta `n` y semilla. No hay setter libre: la restauración valida nombres y orden de sistemas y aplica el protocolo `init` / `on_restore`, sin poder saltarse transiciones; la compatibilidad del stage y de la configuración es responsabilidad del llamador.
 - Unidad de recuperación: grafo, `TickState` y la identificación del stage, la configuración y el orden de sistemas compatibles, **capturados en la misma frontera de tick**. Conservarlos juntos es obligación del llamador: core no impone formato al store ni puede comprobar que correspondan al mismo punto de captura.
