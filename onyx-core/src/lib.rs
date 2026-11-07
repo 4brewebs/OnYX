@@ -23,3 +23,6 @@ pub use system::{
 pub use tick::tick;
 
 pub use detrng::DetRng;
+
+#[cfg(feature = "conformance")]
+pub mod conformance;
