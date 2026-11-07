@@ -92,7 +92,7 @@ pub trait SnapshotStore {
 /// Solo vuelca ingress y proyecta el grafo, nunca lo escribe.
 pub trait PlatformDriver {
     /// Vuelca eventos de entrada de la plataforma.
-    fn poll(&mut self, out: &mut Vec<crate::OnyxEvent>);
+    fn poll_into(&mut self, bus: &mut dyn crate::EventBus);
 
     /// La fachada solo proyecta mediante una referencia de lectura al grafo.
     fn present(&mut self, view: &dyn Graph);

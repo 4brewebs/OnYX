@@ -3,6 +3,7 @@
 //! Las peticiones de control se atienden después de ejecutar los sistemas.
 //! Los demás eventos nuevos se entregan en el siguiente tick.
 
+use crate::bus::EventBus;
 use crate::detrng::DetRng;
 use crate::event::{OnyxEvent, SystemEvent};
 use crate::graph::{Graph, PlatformDriver, SnapshotStore};
@@ -18,6 +19,9 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 /// Start y Stop cambian ese estado al final del tick, con hooks solo en transiciones.
 /// Las peticiones del inbox se procesan antes que las nuevas del outbox.
 /// El inbox ya entregado no se vuelve a encolar.
+/// El bus se drena una vez al inicio, tras añadir Tick y la entrada del driver.
+/// Los eventos nuevos que no son peticiones de control vuelven al bus
+/// para el siguiente tick. Los sistemas nunca reciben acceso al bus.
 ///
 /// Tras cada importación correcta, todos los sistemas vuelven a ejecutar `init`
 /// antes de atender la siguiente petición. Esto incluye los sistemas parados.
@@ -34,29 +38,29 @@ pub fn tick(
     driver: &mut dyn PlatformDriver,
     graph: &mut dyn Graph,
     store: &mut dyn SnapshotStore,
+    bus: &mut dyn EventBus,
     systems: &mut [Box<dyn OnyxSystem>],
     states: &mut [SystemState],
-    pending: &mut Vec<OnyxEvent>,
 ) {
     assert_eq!(systems.len(), states.len());
     let mut rng = DetRng::from_seed_and_tick(seed, n);
 
-    pending.push(OnyxEvent::System(SystemEvent::Tick { n }));
-    driver.poll(pending);
+    bus.push(OnyxEvent::System(SystemEvent::Tick { n }));
+    driver.poll_into(bus);
 
-    let inbox = std::mem::take(pending);
+    let inbox = bus.drain();
+    let mut outbox = Vec::new();
     for (system, state) in systems.iter_mut().zip(states.iter()) {
         if *state == SystemState::Active {
             system.run(&mut Ctx {
                 graph: &mut *graph,
                 inbox: &inbox,
-                outbox: pending,
+                outbox: &mut outbox,
                 rng: &mut rng,
             });
         }
     }
 
-    let outbox = std::mem::take(pending);
     let events = inbox
         .into_iter()
         .map(|event| (event, false))
@@ -67,7 +71,7 @@ pub fn tick(
             OnyxEvent::System(SystemEvent::SnapshotRequested(key)) => {
                 let bytes = graph.export();
                 if let Err(e) = store.save(&key, &bytes) {
-                    pending.push(OnyxEvent::System(SystemEvent::Fault(format!(
+                    bus.push(OnyxEvent::System(SystemEvent::Fault(format!(
                         "snapshot save failed: {:?}",
                         e
                     ))));
@@ -85,7 +89,7 @@ pub fn tick(
                                 }
                                 Err(e) => {
                                     *state = SystemState::Blocked;
-                                    pending.push(OnyxEvent::System(SystemEvent::Fault(format!(
+                                    bus.push(OnyxEvent::System(SystemEvent::Fault(format!(
                                         "re-init failed for {}: {:?}",
                                         system.name(),
                                         e
@@ -93,17 +97,17 @@ pub fn tick(
                                 }
                             }
                         }
-                        pending.push(OnyxEvent::System(SystemEvent::SnapshotRestored(key)));
+                        bus.push(OnyxEvent::System(SystemEvent::SnapshotRestored(key)));
                     }
                     Err(e) => {
-                        pending.push(OnyxEvent::System(SystemEvent::Fault(format!(
+                        bus.push(OnyxEvent::System(SystemEvent::Fault(format!(
                             "snapshot import failed: {:?}",
                             e
                         ))));
                     }
                 },
                 Err(e) => {
-                    pending.push(OnyxEvent::System(SystemEvent::Fault(format!(
+                    bus.push(OnyxEvent::System(SystemEvent::Fault(format!(
                         "snapshot load failed: {:?}",
                         e
                     ))));
@@ -118,7 +122,7 @@ pub fn tick(
                                 *state = SystemState::Active;
                             }
                             SystemState::Blocked => {
-                                pending.push(OnyxEvent::System(SystemEvent::Fault(format!(
+                                bus.push(OnyxEvent::System(SystemEvent::Fault(format!(
                                     "start rejected for blocked system {}",
                                     system.name()
                                 ))));
@@ -138,7 +142,7 @@ pub fn tick(
             }
             event => {
                 if is_new {
-                    pending.push(event);
+                    bus.push(event);
                 }
             }
         }

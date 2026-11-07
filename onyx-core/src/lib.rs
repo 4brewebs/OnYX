@@ -1,12 +1,14 @@
 //! OnYX Core — Contratos del cerebro.
 //! Cero dependencias. Solo reglas y puertos.
 
+pub mod bus;
 pub mod detrng;
 pub mod event;
 pub mod graph;
 pub mod system;
 pub mod tick;
 
+pub use bus::EventBus;
 pub use event::{DomainEvent, IngressEvent, Key, KeyCode, Mods, OnyxEvent, SystemEvent};
 pub use graph::{Attr, ConceptId, Graph, OnyxError, PlatformDriver, SnapshotStore, Value};
 
