@@ -1,6 +1,6 @@
 use onyx_soul::{
     event::{IngressEvent, OnyxEvent},
-    graph::{Attr, ConceptId, Value, AttrRegistry, OnyxError},
+    Attr, ConceptId, Value, AttrRegistry, OnyxError,
     system::{Ctx, OnyxSystem, StageBlueprint, SystemSpec},
     tick,
     FileSnapshotStore, HeadlessDriver, InMemoryBus,
