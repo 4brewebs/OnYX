@@ -1,13 +1,15 @@
 use std::io::{self, Write};
 use onyx_soul::{
     event::{IngressEvent, OnyxEvent},
-    system::{BlueprintLoader, SystemRegistry, SystemSpec},
-    tick, HeadlessDriver, InMemoryBus, InMemorySystemRegistry, OnyxError,
-    RustLoader, Supervisor, Graph, SnapshotStore,
+    system::SystemSpec,
+    tick, HeadlessDriver, InMemoryBus, InMemorySystemRegistry,
+    RustLoader, Supervisor, Graph, SnapshotStore, OnyxError,
 };
 use onyx_soul::store::FileSnapshotStore;
 
 mod boot_system;
+mod stages;
+
 use boot_system::BootSystem;
 
 fn make_boot(_: &SystemSpec) -> Result<Box<dyn onyx_soul::OnyxSystem>, OnyxError> {
@@ -22,24 +24,15 @@ fn main() {
     let mut registry = InMemorySystemRegistry::new();
     let mut loader = RustLoader::new();
 
-    registry.register("boot", make_boot);
-
-    loader.register(onyx_soul::system::StageBlueprint {
-        name: "boot".into(),
-        systems: vec![SystemSpec {
-            kind: "boot".into(),
-            params: vec![],
-            persistent: true,
-        }],
-        entities: vec![],
-    });
-
-    let bp = loader.load("boot").unwrap();
-    let mut systems: Vec<Box<dyn onyx_soul::OnyxSystem>> = bp
-        .systems
-        .iter()
-        .map(|spec| registry.build(spec).unwrap())
-        .collect();
+    // El loader registra sistemas y stages, y devuelve los sistemas listos
+    let mut systems = loader
+        .load_app(
+            &mut registry,
+            &[("boot", make_boot)],
+            &stages::all_stages(),
+            "boot",
+        )
+        .unwrap();
 
     // LOAD
     let save_key = "repl_savegame";
