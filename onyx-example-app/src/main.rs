@@ -1,13 +1,11 @@
+use std::io::{self, Write};
 use onyx_soul::{
     event::{IngressEvent, OnyxEvent},
-    Attr, ConceptId, Value, AttrRegistry, OnyxError,
     system::{
-        Ctx, OnyxSystem, StageBlueprint, SystemSpec,
-        BlueprintLoader, SystemRegistry,
+        BlueprintLoader, Ctx, OnyxSystem, StageBlueprint, SystemRegistry, SystemSpec,
     },
-    tick,
-    FileSnapshotStore, HeadlessDriver, InMemoryBus,
-    InMemorySystemRegistry, RustLoader, Supervisor, WorldGraph,
+    tick, Attr, AttrRegistry, ConceptId, FileSnapshotStore, HeadlessDriver, InMemoryBus,
+    InMemorySystemRegistry, OnyxError, RustLoader, Supervisor, Value, WorldGraph,
 };
 
 struct BootSystem {
@@ -38,23 +36,37 @@ impl OnyxSystem for BootSystem {
     }
 
     fn run(&mut self, ctx: &mut Ctx) {
+        // Initialize player on the very first run (Tick 0)
         if self.player.is_none() {
             let id = ctx.graph.create();
             ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
             ctx.graph.set(id, self.clearance_attr, Value::Int(0));
             self.player = Some(id);
-            println!("[BOOT] Esperando 'agree'...");
+            println!("[BOOT] System online. Awaiting 'agree' command...");
         }
 
+        // Process all pending events in the inbox for this tick
         for event in ctx.inbox {
             if let OnyxEvent::Ingress(IngressEvent::Command(cmd)) = event {
-                if cmd.trim().eq_ignore_ascii_case("agree") {
-                    if let Some(id) = self.player {
-                        ctx.graph.set(id, self.clearance_attr, Value::Int(1));
-                        println!("[BOOT] NDA aceptado. Clearance = 1");
+                let clean_cmd = cmd.trim().to_lowercase();
+                
+                match clean_cmd.as_str() {
+                    "agree" => {
+                        if let Some(id) = self.player {
+                            ctx.graph.set(id, self.clearance_attr, Value::Int(1));
+                            println!("[BOOT] NDA accepted. Clearance updated to 1.");
+                        }
                     }
-                } else {
-                    println!("[BOOT] Comando no reconocido: {}", cmd);
+                    "status" => {
+                        // Prove that state is retained across ticks in the WorldGraph
+                        if let Some(id) = self.player {
+                            let clearance = ctx.graph.get(id, self.clearance_attr);
+                            println!("[BOOT] Graph State -> Concept: {:?}, Clearance: {:?}", id, clearance);
+                        }
+                    }
+                    _ => {
+                        println!("[BOOT] Unknown command: {}", cmd);
+                    }
                 }
             }
         }
@@ -96,20 +108,48 @@ fn main() {
     supervisor.init_all(&mut systems, &mut graph);
     supervisor.start(0);
 
-    driver.push_event(OnyxEvent::Ingress(IngressEvent::Command("agree".into())));
+    println!("========================================");
+    println!("  OnYX Engine REPL (v0.1.0)");
+    println!("  Type 'agree', 'status', or 'exit'");
+    println!("========================================");
 
+    let mut tick_count = 0;
     let seed = 42u64;
-    tick(
-        0,
-        seed,
-        &mut driver,
-        &mut graph,
-        &mut store,
-        &mut bus,
-        &mut systems,
-        supervisor.states_mut(),
-        &[],
-    );
 
-    println!("Tick ejecutado.");
+    // Interactive Engine Loop
+    loop {
+        print!("onyx> ");
+        // Flush stdout to ensure the prompt is printed before blocking on stdin
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        let command = input.trim();
+
+        if command.eq_ignore_ascii_case("exit") {
+            println!("Shutting down...");
+            break;
+        }
+
+        // Only inject an event if the user actually typed something
+        if !command.is_empty() {
+            driver.push_event(OnyxEvent::Ingress(IngressEvent::Command(command.into())));
+        }
+
+        tick(
+            tick_count,
+            seed,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            supervisor.states_mut(),
+            &[],
+        );
+
+        tick_count += 1;
+    }
+
+    println!("Engine stopped safely after {} ticks.", tick_count);
 }
