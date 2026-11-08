@@ -28,14 +28,13 @@ impl OnyxSystem for BootSystem {
         "boot"
     }
 
-    fn init(&mut self, attrs: &mut dyn onyx_core::graph::AttrRegistry) -> Result<(), onyx_core::OnyxError> {
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
         self.name_attr = attrs.attr("name");
         self.clearance_attr = attrs.attr("clearance_level");
         Ok(())
     }
 
     fn run(&mut self, ctx: &mut Ctx) {
-        // Crear jugador la primera vez
         if self.player.is_none() {
             let id = ctx.graph.create();
             ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
@@ -50,7 +49,6 @@ impl OnyxSystem for BootSystem {
                     if let Some(id) = self.player {
                         ctx.graph.set(id, self.clearance_attr, Value::Int(1));
                         println!("[BOOT] NDA aceptado. Clearance = 1");
-                        // Aquí podrías emitir un evento para cambiar de stage
                     }
                 } else {
                     println!("[BOOT] Comando no reconocido: {}", cmd);
@@ -60,7 +58,7 @@ impl OnyxSystem for BootSystem {
     }
 }
 
-fn make_boot(_: &SystemSpec) -> Result<Box<dyn OnyxSystem>, onyx_core::OnyxError> {
+fn make_boot(_: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
     Ok(Box::new(BootSystem::new()))
 }
 
@@ -93,9 +91,8 @@ fn main() {
 
     let mut supervisor = Supervisor::new(systems.len());
     supervisor.init_all(&mut systems, &mut graph);
-    supervisor.start(0); // activa el boot
+    supervisor.start(0);
 
-    // Simulamos entrada
     driver.push_event(OnyxEvent::Ingress(IngressEvent::Command("agree".into())));
 
     let seed = 42u64;
@@ -108,8 +105,8 @@ fn main() {
         &mut bus,
         &mut systems,
         supervisor.states_mut(),
-        &[], // surfaces vacías por ahora
+        &[],
     );
 
-    println!("Tick ejecutado. Revisa el grafo o añade más lógica.");
+    println!("Tick ejecutado.");
 }
