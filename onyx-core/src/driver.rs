@@ -3,7 +3,7 @@
 //! Nunca escribe en el grafo.
 
 use crate::bus::EventBus;
-use crate::graph::Graph;
+use crate::graph::GraphView;
 use crate::surface::SurfaceBinding;
 
 /// Adaptador de plataforma.
