@@ -2,7 +2,7 @@
 //! Implementaciones por defecto de los puertos de OnYX.
 //! Cero dependencias externas.
 
-pub mod promt;
+pub mod prompt;
 pub mod headless;
 pub mod bus;
 pub mod graph;
