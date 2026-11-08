@@ -21,4 +21,6 @@ pub use store::FileSnapshotStore;
 pub use supervisor::Supervisor;
 
 pub use onyx_core::{event, system, tick};
-pub use onyx_core::graph::{Attr, ConceptId, Value, AttrRegistry, OnyxError, GraphView};
+pub use onyx_core::graph::{
+    Attr, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, SnapshotStore, Value
+};
