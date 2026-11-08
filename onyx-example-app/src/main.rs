@@ -4,10 +4,10 @@ use onyx_soul::{
     system::{
         BlueprintLoader, Ctx, OnyxSystem, StageBlueprint, SystemRegistry, SystemSpec,
     },
-    tick, Attr, AttrRegistry, ConceptId, FileSnapshotStore, HeadlessDriver, InMemoryBus,
+    tick, Attr, AttrRegistry, ConceptId, HeadlessDriver, InMemoryBus,
     InMemorySystemRegistry, OnyxError, RustLoader, Supervisor, Value, WorldGraph,
 };
-use onyx_soul::graph::SnapshotStore;
+use onyx_soul::store::FileSnapshotStore;
 
 struct BootSystem {
     name_attr: Attr,
