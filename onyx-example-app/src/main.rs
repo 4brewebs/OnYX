@@ -1,7 +1,10 @@
 use onyx_soul::{
     event::{IngressEvent, OnyxEvent},
     Attr, ConceptId, Value, AttrRegistry, OnyxError,
-    system::{Ctx, OnyxSystem, StageBlueprint, SystemSpec},
+    system::{
+        Ctx, OnyxSystem, StageBlueprint, SystemSpec,
+        BlueprintLoader, SystemRegistry,
+    },
     tick,
     FileSnapshotStore, HeadlessDriver, InMemoryBus,
     InMemorySystemRegistry, RustLoader, Supervisor, WorldGraph,
