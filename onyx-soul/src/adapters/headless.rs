@@ -5,7 +5,7 @@
 
 use onyx_core::bus::EventBus;
 use onyx_core::event::OnyxEvent;
-use onyx_core::graph::Graph;
+use onyx_core::graph::GraphView;
 use onyx_core::surface::SurfaceBinding;
 use onyx_core::PlatformDriver;
 
@@ -47,7 +47,7 @@ impl PlatformDriver for HeadlessDriver {
         }
     }
 
-    fn present(&mut self, _graph: &dyn Graph, surfaces: &[SurfaceBinding]) {
+    fn present(&mut self, _graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
         self.present_count += 1;
         self.last_surfaces = surfaces.to_vec();
     }
