@@ -1,0 +1,11 @@
+[package]
+name = "onyx-example-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "onyx-example-app"
+path = "src/main.rs"
+
+[dependencies]
+onyx-soul = { path = "../onyx-soul" }
