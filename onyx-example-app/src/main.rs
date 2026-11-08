@@ -7,6 +7,7 @@ use onyx_soul::{
     tick, Attr, AttrRegistry, ConceptId, FileSnapshotStore, HeadlessDriver, InMemoryBus,
     InMemorySystemRegistry, OnyxError, RustLoader, Supervisor, Value, WorldGraph,
 };
+use onyx_core::graph::SnapshotStore;
 
 struct BootSystem {
     name_attr: Attr,
@@ -36,7 +37,7 @@ impl OnyxSystem for BootSystem {
     }
 
     fn run(&mut self, ctx: &mut Ctx) {
-        // Initialize player on the very first run (Tick 0)
+        // Initialize player on the very first run (Tick 0) ONLY if there is no loaded player
         if self.player.is_none() {
             let id = ctx.graph.create();
             ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
@@ -104,6 +105,26 @@ fn main() {
         .map(|spec| registry.build(spec).unwrap())
         .collect();
 
+    // ==========================================
+    // 1. FASE DE RECUPERACIÓN (LOAD)
+    // ==========================================
+    let save_key = "repl_savegame";
+    
+    match store.load(save_key) {
+        Ok(bytes) => {
+            println!("[CORE] Snapshot '{}' encontrado. Restaurando estado en WorldGraph...", save_key);
+            // Inyectamos los bytes al grafo. (Si tu método se llama distinto, ajusta 'import')
+            if let Err(e) = graph.import(&bytes) {
+                println!("[CORE ERROR] Fallo al importar estado: {}", e);
+            } else {
+                println!("[CORE] Grafo restaurado con éxito.");
+            }
+        }
+        Err(_) => {
+            println!("[CORE] No hay snapshot previo. Arrancando el universo desde cero.");
+        }
+    }
+
     let mut supervisor = Supervisor::new(systems.len());
     supervisor.init_all(&mut systems, &mut graph);
     supervisor.start(0);
@@ -127,6 +148,19 @@ fn main() {
         let command = input.trim();
 
         if command.eq_ignore_ascii_case("exit") {
+            println!("Iniciando apagado seguro...");
+            
+            // ==========================================
+            // 2. FASE DE PERSISTENCIA (SAVE)
+            // ==========================================
+            // Extraemos la representación binaria del grafo (ajusta 'export' si es necesario)
+            let snap_bytes = graph.export(); 
+            
+            match store.save(save_key, &snap_bytes) {
+                Ok(_) => println!("[CORE] Grafo persistido en disco (./snapshots/{}.snap).", save_key),
+                Err(e) => println!("[CORE ERROR] Fallo crítico guardando la partida: {}", e),
+            }
+            
             println!("Shutting down...");
             break;
         }
