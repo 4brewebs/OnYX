@@ -51,7 +51,7 @@ pub fn tick(
     let mut rng = DetRng::from_seed_and_tick(seed, n);
 
     bus.push(OnyxEvent::System(SystemEvent::Tick { n }));
-    driver.poll_into(bus);
+    driver.poll(bus);
 
     let inbox = bus.drain();
     let mut outbox = Vec::new();
@@ -153,5 +153,5 @@ pub fn tick(
         }
     }
 
-    driver.present(&ReadOnly(&*graph));
+    driver.present(&ReadOnly(&*graph), surfaces);
 }
