@@ -1,96 +1,232 @@
-//! Agent-oriented graph.
-//!
-//! Wraps `WorldGraph` and adds helpers that agent systems expect.
-//! The contract remains `Graph`. The application can still use the raw graph.
-
-use onyx_core::{Attr, ConceptId, Graph, OnyxError, Value};
-use onyx_soul::WorldGraph;
+//! Grafo EAV en memoria del soul de agentes.
+//! Sin esquema de negocio ni inferencia. Colecciones ordenadas.
+use onyx_core::{Attr, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::vocab::{AgentState, Vocab};
 
+mod snapshot;
+
+#[derive(Clone, Default)]
+struct Registry {
+    names: Vec<String>,
+    ids: BTreeMap<String, Attr>,
+}
+
+impl Registry {
+    fn intern(&mut self, name: &str) -> Result<Attr, OnyxError> {
+        if let Some(id) = self.ids.get(name) {
+            return Ok(*id);
+        }
+        let raw = u32::try_from(self.names.len())
+            .map_err(|_| OnyxError::Format("attribute IDs exhausted".into()))?;
+        let id = Attr::from_raw(raw);
+        self.names.push(name.into());
+        self.ids.insert(name.into(), id);
+        Ok(id)
+    }
+    fn check(&self, attr: Attr) {
+        assert!(
+            (attr.raw() as usize) < self.names.len(),
+            "attribute not registered in this graph"
+        );
+    }
+}
+
+#[derive(Default)]
+struct Node {
+    props: BTreeMap<u32, Value>,
+    links: BTreeMap<u32, BTreeSet<u64>>,
+}
+
+/// Implementación EAV de `Graph` para el soul de agentes.
+/// Usa únicamente la biblioteca estándar. `new` crea un grafo vacío.
+/// El snapshot es privado de este soul.
+///
+/// # Panics
+/// `create` al agotar IDs; `attr` al agotar identificadores de atributo.
+/// `set` y `relate` requieren atributos obtenidos del registro de esta instancia.
+#[derive(Default)]
 pub struct AgentGraph {
-    inner: WorldGraph,
+    registry: Registry,
+    nodes: BTreeMap<u64, Node>,
+    high_water: u64,
 }
 
 impl AgentGraph {
     pub fn new() -> Self {
-        Self {
-            inner: WorldGraph::new(),
-        }
+        Self::default()
     }
 
-    pub fn inner(&self) -> &WorldGraph {
-        &self.inner
-    }
-
-    pub fn inner_mut(&mut self) -> &mut WorldGraph {
-        &mut self.inner
-    }
-
-    /// Spawn an agent concept with the minimal attributes.
-    /// The application can set more afterwards.
+    /// Helper de dominio. No forma parte del contrato `Graph`.
     pub fn spawn_agent(&mut self, vocab: &Vocab, name: &str, goal: &str) -> ConceptId {
-        let id = self.inner.create();
-        self.inner.set(id, vocab.name, Value::Text(name.into()));
-        self.inner.set(id, vocab.goal, Value::Text(goal.into()));
-        self.inner
-            .set(id, vocab.state, Value::Text(AgentState::Idle.as_str().into()));
-        self.inner.set(id, vocab.steps, Value::Int(0));
+        let id = self.create();
+        self.set(id, vocab.name, Value::Text(name.into()));
+        self.set(id, vocab.goal, Value::Text(goal.into()));
+        self.set(id, vocab.state, Value::Text(AgentState::Idle.as_str().into()));
+        self.set(id, vocab.steps, Value::Int(0));
         id
     }
 
-    /// Count concepts that have an agent state.
+    /// Cuenta conceptos que tienen estado de agente.
     pub fn agent_count(&self, vocab: &Vocab) -> usize {
-        self.inner
-            .query(&[])
+        self.query(&[])
             .into_iter()
-            .filter(|id| self.inner.get(*id, vocab.state).is_some())
+            .filter(|id| self.get(*id, vocab.state).is_some())
             .count()
     }
 }
 
-impl Graph for AgentGraph {
+impl AttrRegistry for AgentGraph {
     fn attr(&mut self, name: &str) -> Attr {
-        self.inner.attr(name)
+        self.registry.intern(name).expect("attribute IDs exhausted")
     }
+}
 
-    fn create(&mut self) -> ConceptId {
-        self.inner.create()
+impl GraphView for AgentGraph {
+    fn exists(&self, id: ConceptId) -> bool {
+        self.nodes.contains_key(&id.0)
     }
-
-    fn destroy(&mut self, id: ConceptId) {
-        self.inner.destroy(id);
+    fn get(&self, id: ConceptId, attr: Attr) -> Option<Value> {
+        self.nodes.get(&id.0)?.props.get(&attr.raw()).cloned()
     }
-
-    fn get(&self, id: ConceptId, attr: Attr) -> Option<&Value> {
-        self.inner.get(id, attr)
-    }
-
-    fn set(&mut self, id: ConceptId, attr: Attr, value: Value) {
-        self.inner.set(id, attr, value);
-    }
-
-    fn query(&self, with: &[Attr]) -> Vec<ConceptId> {
-        self.inner.query(with)
-    }
-
-    fn relate(&mut self, from: ConceptId, rel: Attr, to: ConceptId) {
-        self.inner.relate(from, rel, to);
-    }
-
-    fn unrelate(&mut self, from: ConceptId, rel: Attr, to: ConceptId) {
-        self.inner.unrelate(from, rel, to);
-    }
-
     fn related(&self, from: ConceptId, rel: Attr) -> Vec<ConceptId> {
-        self.inner.related(from, rel)
+        self.nodes
+            .get(&from.0)
+            .and_then(|n| n.links.get(&rel.raw()))
+            .map(|targets| targets.iter().copied().map(ConceptId).collect())
+            .unwrap_or_default()
     }
+    fn query(&self, with: &[Attr]) -> Vec<ConceptId> {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| with.iter().all(|a| node.props.contains_key(&a.raw())))
+            .map(|(&id, _)| ConceptId(id))
+            .collect()
+    }
+    fn props(&self, id: ConceptId) -> Vec<(String, Value)> {
+        let Some(node) = self.nodes.get(&id.0) else {
+            return Vec::new();
+        };
+        let mut props: Vec<_> = node
+            .props
+            .iter()
+            .map(|(&a, v)| (self.registry.names[a as usize].clone(), v.clone()))
+            .collect();
+        props.sort_by(|a, b| a.0.cmp(&b.0));
+        props
+    }
+    fn links(&self, id: ConceptId) -> Vec<(String, ConceptId)> {
+        let Some(node) = self.nodes.get(&id.0) else {
+            return Vec::new();
+        };
+        let mut links: Vec<_> = node
+            .links
+            .iter()
+            .flat_map(|(&a, targets)| {
+                targets
+                    .iter()
+                    .map(move |&to| (self.registry.names[a as usize].clone(), ConceptId(to)))
+            })
+            .collect();
+        links.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
+        links
+    }
+}
 
+impl Graph for AgentGraph {
+    fn create(&mut self) -> ConceptId {
+        let id = self
+            .high_water
+            .checked_add(1)
+            .expect("concept IDs exhausted");
+        self.nodes.insert(id, Node::default());
+        self.high_water = id;
+        ConceptId(id)
+    }
+    fn destroy(&mut self, id: ConceptId) {
+        if self.nodes.remove(&id.0).is_none() {
+            return;
+        }
+        for node in self.nodes.values_mut() {
+            node.props
+                .retain(|_, value| !matches!(value, Value::Concept(to) if *to == id));
+            node.links.retain(|_, targets| {
+                targets.remove(&id.0);
+                !targets.is_empty()
+            });
+        }
+    }
+    fn set(&mut self, id: ConceptId, attr: Attr, value: Value) {
+        if !self.exists(id) || matches!(&value, Value::Concept(to) if !self.exists(*to)) {
+            return;
+        }
+        self.registry.check(attr);
+        self.nodes
+            .get_mut(&id.0)
+            .expect("live owner")
+            .props
+            .insert(attr.raw(), value);
+    }
+    fn relate(&mut self, from: ConceptId, rel: Attr, to: ConceptId) {
+        if !self.exists(from) || !self.exists(to) {
+            return;
+        }
+        self.registry.check(rel);
+        self.nodes
+            .get_mut(&from.0)
+            .expect("live source")
+            .links
+            .entry(rel.raw())
+            .or_default()
+            .insert(to.0);
+    }
+    fn unrelate(&mut self, from: ConceptId, rel: Attr, to: ConceptId) {
+        let Some(node) = self.nodes.get_mut(&from.0) else {
+            return;
+        };
+        if let Some(targets) = node.links.get_mut(&rel.raw()) {
+            targets.remove(&to.0);
+            if targets.is_empty() {
+                node.links.remove(&rel.raw());
+            }
+        }
+    }
     fn export(&self) -> Vec<u8> {
-        self.inner.export()
+        snapshot::encode(self)
     }
-
     fn import(&mut self, bytes: &[u8]) -> Result<(), OnyxError> {
-        self.inner.import(bytes)
+        let source = snapshot::decode(bytes)?;
+        let mut registry = self.registry.clone();
+        let remap: Vec<_> = source
+            .registry
+            .names
+            .iter()
+            .map(|name| registry.intern(name))
+            .collect::<Result<_, _>>()?;
+        let mut nodes = BTreeMap::new();
+        for (id, node) in source.nodes {
+            nodes.insert(
+                id,
+                Node {
+                    props: node
+                        .props
+                        .into_iter()
+                        .map(|(a, v)| (remap[a as usize].raw(), v))
+                        .collect(),
+                    links: node
+                        .links
+                        .into_iter()
+                        .map(|(a, to)| (remap[a as usize].raw(), to))
+                        .collect(),
+                },
+            );
+        }
+        *self = Self {
+            registry,
+            nodes,
+            high_water: self.high_water.max(source.high_water),
+        };
+        Ok(())
     }
 }
