@@ -38,12 +38,24 @@ impl OnyxSystem for BootSystem {
     }
 
     fn run(&mut self, ctx: &mut Ctx) {
+        // Fase de "Reconexión o Creación"
         if self.player.is_none() {
-            let id = ctx.graph.create();
-            ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
-            ctx.graph.set(id, self.clearance_attr, Value::Int(0));
-            self.player = Some(id);
-            println!("[BOOT] System online. Awaiting 'agree' command...");
+            // 1. Consultar al grafo: ¿Hay algún concepto que tenga 'name' y 'clearance_level'?
+            let existing_players = ctx.graph.query(&[self.name_attr, self.clearance_attr]);
+            
+            if let Some(&id) = existing_players.first() {
+                // 2A. El concepto ya existe en el disco. Nos reconectamos a él.
+                self.player = Some(id);
+                let current_clearance = ctx.graph.get(id, self.clearance_attr).unwrap();
+                println!("[BOOT] Sesión restaurada reconectada al ConceptId({:?}). Clearance actual: {:?}", id.0, current_clearance);
+            } else {
+                // 2B. Universo virgen. Creamos el concepto desde cero.
+                let id = ctx.graph.create();
+                ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
+                ctx.graph.set(id, self.clearance_attr, Value::Int(0));
+                self.player = Some(id);
+                println!("[BOOT] System online. Awaiting 'agree' command...");
+            }
         }
 
         for event in ctx.inbox {
