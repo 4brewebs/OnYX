@@ -2,6 +2,9 @@
 members = [
     "onyx-core",
     "onyx-soul",
+    "onyx-soul-agents",
     "onyx-example-app",
+    "onyx-example-agents",
+
 ]
 resolver = "2"
