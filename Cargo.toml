@@ -1,3 +1,7 @@
 [workspace]
+members = [
+    "onyx-core",
+    "onyx-soul",
+    "onyx-example-app",
+]
 resolver = "2"
-members = ["onyx-core", "onyx-soul"]
