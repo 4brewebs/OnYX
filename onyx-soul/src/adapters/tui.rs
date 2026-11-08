@@ -18,7 +18,7 @@ use ratatui::{
 
 use onyx_core::bus::EventBus;
 use onyx_core::event::{IngressEvent, Key, KeyCode, Mods, OnyxEvent};
-use onyx_core::graph::Graph;
+use onyx_core::graph::GraphView;
 use onyx_core::surface::{SurfaceBinding, SurfaceId};
 use onyx_core::PlatformDriver;
 
@@ -61,7 +61,7 @@ impl PlatformDriver for TuiDriver {
         }
     }
 
-    fn present(&mut self, graph: &dyn Graph, surfaces: &[SurfaceBinding]) {
+    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
         let _ = self.terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
