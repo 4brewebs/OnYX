@@ -6,12 +6,12 @@ use std::collections::{HashMap, VecDeque};
 
 use onyx_core::bus::EventBus;
 use onyx_core::event::{DomainEvent, IngressEvent, OnyxEvent};
-use onyx_core::graph::{Attr, ConceptId, Graph, Value};
+use onyx_core::graph::{Attr, ConceptId, GraphView, Value};
 use onyx_core::surface::{SurfaceBinding, SurfaceId};
 use onyx_core::PlatformDriver;
 
 /// Proyector: convierte una vista del grafo en texto.
-pub type TextProjector = fn(&dyn Graph, Attr, bool) -> String;
+pub type TextProjector = fn(&dyn GraphView, Attr, bool) -> String;
 
 /// Tool call ya parseada, lista para convertirse en `DomainEvent`.
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ impl PlatformDriver for PromptDriver {
         }
     }
 
-    fn present(&mut self, graph: &dyn Graph, surfaces: &[SurfaceBinding]) {
+    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
         self.last_rendered_prompt.clear();
 
         for binding in surfaces {
