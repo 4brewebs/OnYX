@@ -19,3 +19,5 @@ pub use loader::RustLoader;
 pub use registry::InMemorySystemRegistry;
 pub use store::FileSnapshotStore;
 pub use supervisor::Supervisor;
+
+pub use onyx_core::{event, graph, system, tick};
