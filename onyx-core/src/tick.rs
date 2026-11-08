@@ -5,35 +5,18 @@
 
 use crate::bus::EventBus;
 use crate::detrng::DetRng;
+use crate::driver::PlatformDriver;
 use crate::event::{OnyxEvent, SystemEvent};
-use crate::graph::{AttrOnly, Graph, PlatformDriver, ReadOnly, SnapshotStore};
+use crate::graph::{AttrOnly, Graph, ReadOnly, SnapshotStore};
+use crate::surface::SurfaceBinding;
 use crate::system::{Ctx, OnyxSystem, SystemState};
 
 /// Ejecuta un tick completo.
-/// `seed` es común a todos los ticks de la aplicación. El llamador la aporta.
-/// Para continuar tras restaurar, también debe recuperar el contador `n`.
 ///
-/// `states` tiene una entrada por sistema y lo conserva el llamador entre ticks.
-/// Solo Active ejecuta `run`. Blocked impide `run` y los hooks.
-/// Un Start dirigido a un sistema Blocked emite Fault y no lo activa.
-/// Start y Stop cambian ese estado al final del tick, con hooks solo en transiciones.
-/// Las peticiones del inbox se procesan antes que las nuevas del outbox.
-/// El inbox ya entregado no se vuelve a encolar.
-/// El bus se drena una vez al inicio, tras añadir Tick y la entrada del driver.
-/// Los eventos nuevos que no son peticiones de control vuelven al bus
-/// para el siguiente tick. Los sistemas nunca reciben acceso al bus.
+/// `surfaces` son las proyecciones activas que el cerebro declara en este tick.
+/// El driver las recibe en `present`. Puede ser un slice vacío.
 ///
-/// Tras cada importación correcta, todos los sistemas vuelven a ejecutar `init`
-/// antes de atender la siguiente petición. Esto incluye los sistemas parados.
-/// Se recorre el slice en orden, sistema a sistema: su `init` y, si procede,
-/// su `on_restore` terminan antes de iniciar el `init` del siguiente sistema.
-/// No hay una fase global de `init` seguida de otra de `on_restore`.
-/// `init` no debe reiniciar el estado durable restaurado.
-/// Un fallo cambia el estado a Blocked sin hooks. Un éxito cambia Blocked
-/// a Stopped, sin activarlo ni llamar hooks. Los demás estados se conservan.
-/// Solo Active con `init` correcto recibe `on_restore` con una vista de lectura,
-/// nunca `on_start`. Stopped reconstruye sus cachés de conceptos al próximo Start.
-/// Si el supervisor llama a `init` fuera del tick, debe aplicar la misma política.
+/// `seed` es común a todos los ticks. El llamador la aporta y debe recuperarla tras restore.
 ///
 /// # Panics
 /// Si `systems` y `states` tienen longitudes distintas.
@@ -46,6 +29,7 @@ pub fn tick(
     bus: &mut dyn EventBus,
     systems: &mut [Box<dyn OnyxSystem>],
     states: &mut [SystemState],
+    surfaces: &[SurfaceBinding],
 ) {
     assert_eq!(systems.len(), states.len());
     let mut rng = DetRng::from_seed_and_tick(seed, n);
@@ -55,6 +39,7 @@ pub fn tick(
 
     let inbox = bus.drain();
     let mut outbox = Vec::new();
+
     for (system, state) in systems.iter_mut().zip(states.iter()) {
         if *state == SystemState::Active {
             system.run(&mut Ctx {
