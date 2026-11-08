@@ -1,5 +1,3 @@
-// onyx-example-app/src/systems/boot.rs
-
 use onyx_soul::{
     event::{IngressEvent, OnyxEvent},
     Attr, AttrRegistry, ConceptId, Ctx, OnyxError, OnyxSystem, Value,
@@ -38,10 +36,7 @@ impl OnyxSystem for BootSystem {
             if let Some(&id) = existing.first() {
                 self.player = Some(id);
                 let clearance = ctx.graph.get(id, self.clearance_attr);
-                println!(
-                    "[BOOT] Reconectado a {:?}. Clearance: {:?}",
-                    id, clearance
-                );
+                println!("[BOOT] Reconectado a {:?}. Clearance: {:?}", id, clearance);
             } else {
                 let id = ctx.graph.create();
                 ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
