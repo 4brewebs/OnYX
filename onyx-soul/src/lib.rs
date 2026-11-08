@@ -1,6 +1,9 @@
 //! Implementaciones por defecto de los puertos de OnYX.
 //! Cero dependencias externas.
 
+// Adaptadores con dependencias externas.
+// Temporalmente aquí. El soul zero-deps no los incluye.
+// En el futuro vivirán en crates aparte.
 pub mod adapters;
 pub mod bus;
 pub mod graph;
