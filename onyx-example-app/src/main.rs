@@ -6,6 +6,7 @@ use onyx_soul::{
     },
     tick, Attr, AttrRegistry, ConceptId, HeadlessDriver, InMemoryBus,
     InMemorySystemRegistry, OnyxError, RustLoader, Supervisor, Value, WorldGraph,
+    Graph, SnapshotStore // Importados limpiamente a través de soul
 };
 use onyx_soul::store::FileSnapshotStore;
 
@@ -37,7 +38,6 @@ impl OnyxSystem for BootSystem {
     }
 
     fn run(&mut self, ctx: &mut Ctx) {
-        // Initialize player on the very first run (Tick 0) ONLY if there is no loaded player
         if self.player.is_none() {
             let id = ctx.graph.create();
             ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
@@ -46,7 +46,6 @@ impl OnyxSystem for BootSystem {
             println!("[BOOT] System online. Awaiting 'agree' command...");
         }
 
-        // Process all pending events in the inbox for this tick
         for event in ctx.inbox {
             if let OnyxEvent::Ingress(IngressEvent::Command(cmd)) = event {
                 let clean_cmd = cmd.trim().to_lowercase();
@@ -59,7 +58,6 @@ impl OnyxSystem for BootSystem {
                         }
                     }
                     "status" => {
-                        // Prove that state is retained across ticks in the WorldGraph
                         if let Some(id) = self.player {
                             let clearance = ctx.graph.get(id, self.clearance_attr);
                             println!("[BOOT] Graph State -> Concept: {:?}, Clearance: {:?}", id, clearance);
@@ -113,7 +111,6 @@ fn main() {
     match store.load(save_key) {
         Ok(bytes) => {
             println!("[CORE] Snapshot '{}' encontrado. Restaurando estado en WorldGraph...", save_key);
-            // Inyectamos los bytes al grafo. (Si tu método se llama distinto, ajusta 'import')
             if let Err(e) = graph.import(&bytes) {
                 println!("[CORE ERROR] Fallo al importar estado: {}", e);
             } else {
@@ -137,10 +134,8 @@ fn main() {
     let mut tick_count = 0;
     let seed = 42u64;
 
-    // Interactive Engine Loop
     loop {
         print!("onyx> ");
-        // Flush stdout to ensure the prompt is printed before blocking on stdin
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
@@ -153,7 +148,6 @@ fn main() {
             // ==========================================
             // 2. FASE DE PERSISTENCIA (SAVE)
             // ==========================================
-            // Extraemos la representación binaria del grafo (ajusta 'export' si es necesario)
             let snap_bytes = graph.export(); 
             
             match store.save(save_key, &snap_bytes) {
@@ -165,7 +159,6 @@ fn main() {
             break;
         }
 
-        // Only inject an event if the user actually typed something
         if !command.is_empty() {
             driver.push_event(OnyxEvent::Ingress(IngressEvent::Command(command.into())));
         }
