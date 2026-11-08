@@ -19,6 +19,6 @@ pub trait PlatformDriver {
 
     /// Proyecta el estado sobre las superficies lógicas activas.
     /// `surfaces` puede estar vacío.
-    /// El driver no muta el grafo.
-    fn present(&mut self, graph: &dyn Graph, surfaces: &[SurfaceBinding]);
+    /// El driver no muta el grafo (solo recibe `GraphView`).
+    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]);
 }
