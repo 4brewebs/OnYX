@@ -12,7 +12,7 @@ pub mod registry;
 pub mod store;
 pub mod supervisor;
 
-pub use adapters::{HeadlessDriver, PromptDriver, TuiDriver}; // Dependencias temporales
+pub use adapters::{HeadlessDriver, PromptDriver}; // Dependencias temporales TuiDriver
 pub use bus::InMemoryBus;
 pub use graph::WorldGraph;
 pub use loader::RustLoader;
