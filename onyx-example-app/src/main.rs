@@ -7,7 +7,7 @@ use onyx_soul::{
     tick, Attr, AttrRegistry, ConceptId, FileSnapshotStore, HeadlessDriver, InMemoryBus,
     InMemorySystemRegistry, OnyxError, RustLoader, Supervisor, Value, WorldGraph,
 };
-use onyx_core::graph::SnapshotStore;
+use onyx_soul::graph::SnapshotStore;
 
 struct BootSystem {
     name_attr: Attr,
