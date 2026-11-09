@@ -8,3 +8,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 onyx-core = { path = "../onyx-core" }
+
+[dev-dependencies]
+onyx-core = { path = "../onyx-core", features = ["conformance"] }
