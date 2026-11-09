@@ -133,6 +133,21 @@ impl ToolExecutor for MirrorTool {
     }
 }
 
+struct VocabReader;
+
+impl ToolExecutor for VocabReader {
+    fn name(&self) -> &str {
+        "lookup"
+    }
+
+    fn call(&mut self, call: &ToolCall, ctx: &mut ToolCtx) -> Result<String, String> {
+        match ctx.graph.get(call.agent, ctx.vocab.goal) {
+            Some(Value::Text(s)) => Ok(s.clone()),
+            _ => Ok("missing".into()),
+        }
+    }
+}
+
 struct Harness {
     g: AgentGraph,
     v: Vocab,
@@ -472,6 +487,28 @@ fn executor_rng_differs_across_seeds() {
         seq_a, seq_b,
         "distintas semillas deben producir distintas secuencias"
     );
+}
+
+#[test]
+fn the_executor_sees_the_system_vocab() {
+    let mut g = AgentGraph::new();
+    // Un Vocab resuelto en un grafo vacío reutiliza los mismos Attr (0, 1, …).
+    // Este relleno hace que un vocabulario ajeno no coincida por accidente.
+    let _ = g.attr("test.pad");
+    let mut tools = ToolSystem::new(cfg()).with_tool(Box::new(VocabReader));
+    tools.init(&mut AttrOnly(&mut g)).unwrap();
+    let v = Vocab::resolve_with(&mut g, &cfg().vocab_prefix);
+    let mut h = Harness {
+        g,
+        v,
+        tools,
+        n: 0,
+        seed: 1,
+    };
+    let id = h.agent();
+    h.g.set(id, h.v.goal, Value::Text("find-it".into()));
+    let out = h.run(vec![echo_call(&h.v, id, 1, "lookup", "")]);
+    assert_eq!(results(&h.v, &out), [(id, 1, true, "find-it".into())]);
 }
 
 #[test]
