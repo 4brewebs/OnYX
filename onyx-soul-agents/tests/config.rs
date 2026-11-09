@@ -1,7 +1,7 @@
 //! `AgentConfig`: lectura de `SystemSpec::params` y fábrica del spawner.
 use onyx_soul_agents::{
     AgentConfig, AgentGraph, AgentSpec, AttrOnly, AttrRegistry, Ctx, DEFAULT_PREFIX, DetRng,
-    OnyxError, OnyxEvent, SystemSpec, Value, Vocab, make_spawner, spawn_event,
+    OnyxError, OnyxEvent, SystemEvent, SystemSpec, Value, Vocab, make_spawner, spawn_event,
 };
 
 fn p(key: &str, value: Value) -> (String, Value) {
@@ -101,8 +101,9 @@ fn spawner_factory_applies_max_agents() {
     spawner.init(&mut AttrOnly(&mut graph)).unwrap();
     let vocab = Vocab::resolve(&mut graph);
     let inbox = [
-        spawn_event(&vocab, &AgentSpec::new("a", "uno")),
-        spawn_event(&vocab, &AgentSpec::new("b", "dos")),
+        OnyxEvent::System(SystemEvent::Tick { n: 0 }),
+        spawn_event(&vocab, &AgentSpec::new("a", "uno"), None),
+        spawn_event(&vocab, &AgentSpec::new("b", "dos"), None),
     ];
     let mut outbox = Vec::new();
     let mut rng = DetRng::from_seed_and_tick(0, 0);

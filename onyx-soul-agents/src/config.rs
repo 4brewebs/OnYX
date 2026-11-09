@@ -14,22 +14,12 @@ pub const DEFAULT_PREFIX: &str = "agent";
 pub struct AgentConfig {
     /// Prefijo de los nombres de atributo, relación y evento (`<prefix>.goal`...).
     /// Permite convivir con otro modelo de agentes o con otra instancia.
-    ///
-    /// TODO(zip, paso 2): hoy solo lo usa [`AgentConfig::attr`]; `Vocab` sigue
-    /// registrando nombres fijos `agent.*` hasta que entre el vocabulario con prefijo.
     pub vocab_prefix: String,
-    /// Tope de agentes. Lo aplica el spawner creado por `make_spawner`.
-    ///
-    /// TODO(zip, paso 6): el spawner actual cuenta todos los agentes; el del zip
-    /// descuenta los `Done`/`Failed`.
+    /// Tope de agentes vivos. Los `Done`/`Failed` no cuentan.
     pub max_agents: usize,
     /// Presupuesto de decisiones si el `AgentSpec` no fija uno.
-    ///
-    /// TODO(zip, paso 2): se valida pero aún nadie lo lee; entra con `spec`.
     pub default_max_steps: i64,
     /// Ticks de espera si el `AgentSpec` no fija un plazo.
-    ///
-    /// TODO(zip, paso 2): se valida pero aún nadie lo lee; entra con `spec`.
     pub default_timeout_ticks: i64,
     /// Entradas de memoria que se conservan; 0 = sin poda.
     ///

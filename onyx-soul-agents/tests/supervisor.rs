@@ -94,7 +94,7 @@ fn a_tick_with_only_this_souls_ports_spawns_and_projects_an_agent() {
 
     let vocab = Vocab::resolve(&mut graph);
     driver.set_vocab(vocab);
-    bus.push(spawn_event(&vocab, &AgentSpec::new("a1", "resumir")));
+    bus.push(spawn_event(&vocab, &AgentSpec::new("a1", "resumir"), None));
 
     tick(
         1,

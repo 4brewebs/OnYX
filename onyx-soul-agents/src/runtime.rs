@@ -5,18 +5,30 @@
 
 use onyx_core::{AttrRegistry, Ctx, DomainEvent, OnyxEvent, OnyxSystem, Value};
 
+use crate::config::AgentConfig;
 use crate::vocab::{AgentState, Vocab};
 
 pub const RUNTIME_NAME: &str = "agent_runtime";
 
-#[derive(Default)]
 pub struct AgentRuntime {
+    /// Prefijo del vocabulario; debe ser el mismo que el del spawner.
+    prefix: String,
     vocab: Option<Vocab>,
 }
 
 impl AgentRuntime {
-    pub fn new() -> Self {
-        Self::default()
+    /// Runtime con el prefijo de `config`.
+    pub fn new(config: &AgentConfig) -> Self {
+        Self {
+            prefix: config.vocab_prefix.clone(),
+            vocab: None,
+        }
+    }
+}
+
+impl Default for AgentRuntime {
+    fn default() -> Self {
+        Self::new(&AgentConfig::default())
     }
 }
 
@@ -26,7 +38,7 @@ impl OnyxSystem for AgentRuntime {
     }
 
     fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), onyx_core::OnyxError> {
-        self.vocab = Some(Vocab::resolve(attrs));
+        self.vocab = Some(Vocab::resolve_with(attrs, &self.prefix));
         Ok(())
     }
 

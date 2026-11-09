@@ -29,6 +29,8 @@ pub mod spec;
 pub mod supervisor;
 pub mod vocab;
 
+mod util;
+
 pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest, Reply};
@@ -38,7 +40,7 @@ pub use registry::{InMemorySystemRegistry, SystemFactory};
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
-pub use spec::{AgentSpec, spawn_event};
+pub use spec::{AgentSpec, Policy, spawn_event};
 pub use supervisor::Supervisor;
 pub use vocab::{AgentState, Vocab};
 
@@ -59,11 +61,13 @@ pub use onyx_core::{detrng, event, surface, system, tick};
 /// Lee la configuración de `spec.params` con [`AgentConfig::from_params`].
 pub fn make_spawner(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
     let config = AgentConfig::from_params(&spec.params)?;
-    Ok(Box::new(AgentSpawner::new(config.max_agents)))
+    Ok(Box::new(AgentSpawner::new(config)))
 }
 
-pub fn make_runtime(_spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
-    Ok(Box::new(AgentRuntime::new()))
+/// Lee la misma configuración que el spawner para compartir prefijo.
+pub fn make_runtime(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
+    let config = AgentConfig::from_params(&spec.params)?;
+    Ok(Box::new(AgentRuntime::new(&config)))
 }
 
 type Factory = fn(&SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>;
@@ -71,22 +75,23 @@ type Factory = fn(&SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>;
 pub const FACTORIES: [(&str, Factory); 2] =
     [(SPAWNER_NAME, make_spawner), (RUNTIME_NAME, make_runtime)];
 
-/// Base stage. The application extends or replaces this.
+/// Stage base con spawner y runtime, en ese orden, y la configuración por
+/// defecto. La aplicación lo amplía o lo sustituye.
 pub fn stage(name: &str) -> StageBlueprint {
+    stage_with(name, &AgentConfig::default())
+}
+
+/// Como [`stage`], con `config` en los params de ambos sistemas para que
+/// compartan prefijo y límites.
+pub fn stage_with(name: &str, config: &AgentConfig) -> StageBlueprint {
+    let spec = |kind: &str| SystemSpec {
+        kind: kind.to_string(),
+        params: config.to_params(),
+        persistent: true,
+    };
     StageBlueprint {
         name: name.to_string(),
-        systems: vec![
-            SystemSpec {
-                kind: SPAWNER_NAME.to_string(),
-                params: Vec::new(),
-                persistent: true,
-            },
-            SystemSpec {
-                kind: RUNTIME_NAME.to_string(),
-                params: Vec::new(),
-                persistent: true,
-            },
-        ],
+        systems: vec![spec(SPAWNER_NAME), spec(RUNTIME_NAME)],
         entities: Vec::new(),
     }
 }
