@@ -1,11 +1,14 @@
 //! Runtime de agentes: máquina de estados, `Reply`, memoria, plazos y políticas.
 //! Solo se usa la API pública del soul.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use onyx_soul_agents::{
     AgentConfig, AgentGraph, AgentRuntime, AgentSpawner, AgentSpec, AgentState, AgentView, Attr,
-    AttrOnly, ConceptId, Ctx, Decision, DetRng, DomainEvent, Graph, GraphView, IngressEvent,
-    MemoryEntry, MemoryPolicy, OnyxEvent, OnyxSystem, Policy, REPLY_SOURCE, Reply, ScriptedPolicy,
-    SystemEvent, UniformTool, Value, Vocab, spawn_event,
+    AttrOnly, AttrRegistry, ConceptId, Ctx, Decision, DetRng, DomainEvent, Graph, GraphView,
+    IngressEvent, MemoryEntry, MemoryPolicy, OnyxEvent, OnyxSystem, Policy, REPLY_SOURCE, Reply,
+    ScriptedPolicy, SystemEvent, UniformTool, Value, Vocab, spawn_event,
 };
 
 struct World {
@@ -456,6 +459,106 @@ fn a_custom_scripted_policy_replaces_the_default() {
     let id = w.spawn(&AgentSpec::new("bot", "g").with_policy(Policy::Scripted));
     assert_eq!(w.state(id), AgentState::Done);
     assert_eq!(w.text(id, w.v.result), "custom");
+}
+
+#[test]
+fn scripted_policy_receives_the_full_agent_view() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut w = World::with_runtime(
+        cfg(),
+        AgentRuntime::new(cfg()).with_scripted(Box::new(RecordViews(seen.clone()))),
+    );
+    let mood = w.g.attr("agent.mood");
+    let id = w.spawn(
+        &AgentSpec::new("bob", "summarize")
+            .with_policy(Policy::Scripted)
+            .with_tools(["search", "read"])
+            .with_extra(mood, Value::Text("curious".into())),
+    );
+
+    {
+        let views = seen.borrow();
+        assert_eq!(
+            views.len(),
+            1,
+            "Say deja al agente Idle hasta el tick siguiente"
+        );
+        assert_eq!(
+            views[0],
+            full_view(
+                id,
+                1,
+                vec![],
+                &[("agent.mood", Value::Text("curious".into()))],
+            )
+        );
+    }
+
+    let out = w.run(vec![]);
+    assert!(faults(&out).is_empty(), "{out:?}");
+    assert_eq!(w.state(id), AgentState::Done);
+    assert_eq!(w.text(id, w.v.result), "ok");
+
+    let views = seen.borrow();
+    assert_eq!(views.len(), 2);
+    assert_eq!(
+        views[1],
+        full_view(
+            id,
+            2,
+            vec![("say".into(), "noted".into())],
+            &[("agent.mood", Value::Text("curious".into()))],
+        )
+    );
+}
+
+struct RecordViews(Rc<RefCell<Vec<AgentView>>>);
+
+impl ScriptedPolicy for RecordViews {
+    fn decide(&mut self, view: &AgentView, _: &mut DetRng) -> Decision {
+        self.0.borrow_mut().push(view.clone());
+        if view.memory.is_empty() {
+            Decision::Say("noted".into())
+        } else {
+            Decision::Done("ok".into())
+        }
+    }
+}
+
+fn full_view(
+    id: ConceptId,
+    request: u64,
+    memory: Vec<(String, String)>,
+    extra: &[(&str, Value)],
+) -> AgentView {
+    let steps = i64::try_from(request).expect("request cabe en i64");
+    let mut props = vec![
+        ("agent.born".into(), Value::Int(1)),
+        ("agent.goal".into(), Value::Text("summarize".into())),
+        ("agent.max_steps".into(), Value::Int(8)),
+        (
+            "agent.mem_count".into(),
+            Value::Int(i64::try_from(memory.len()).expect("memoria cabe en i64")),
+        ),
+        ("agent.name".into(), Value::Text("bob".into())),
+        ("agent.pending".into(), Value::Int(steps)),
+        ("agent.policy".into(), Value::Text("scripted".into())),
+        ("agent.remaining".into(), Value::Int(0)),
+        ("agent.state".into(), Value::Text("idle".into())),
+        ("agent.steps".into(), Value::Int(steps)),
+        ("agent.timeout".into(), Value::Int(4)),
+    ];
+    props.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+    props.sort_by(|a, b| a.0.cmp(&b.0));
+    AgentView {
+        agent: id,
+        request,
+        name: "bob".into(),
+        goal: "summarize".into(),
+        tools: vec!["search".into(), "read".into()],
+        memory,
+        props,
+    }
 }
 
 #[test]
