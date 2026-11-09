@@ -4,82 +4,67 @@
 //! - stages and systems registered via the Loader
 //! - tick-indexed snapshots
 //! - agent spawn via events
-//! - a simple scripted responder that drives the agents
+//! - an external decider with `RecordingBridge` (record/replay)
 
-use onyx_core::{
-    BlueprintLoader, InMemorySystemRegistry, PlatformDriver, RustLoader, SystemRegistry,
-};
 use onyx_soul_agents::{
-    spawn_event, AgentBus, AgentDriver, AgentGraph, AgentSnapshotStore, AgentSpec, FACTORIES, Reply,
-    Vocab, stage,
+    AgentBus, AgentGraph, AgentSnapshotStore, AgentSpec, AgentView, EventBus, FACTORIES, Graph,
+    InMemorySystemRegistry, RecordingBridge, Reply, RustLoader, Supervisor, Vocab, spawn_event,
+    stage, tick,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = AgentGraph::new();
     let mut store = AgentSnapshotStore::new("snapshots");
     let mut bus = AgentBus::new();
-    let mut driver = AgentDriver::new();
-
     let mut registry = InMemorySystemRegistry::new();
     let mut loader = RustLoader::new();
+    let mut systems = loader.load_app(&mut registry, &FACTORIES, &[stage("agents")], "agents")?;
 
-    for (name, factory) in FACTORIES {
-        registry.register(name, factory);
+    let mut supervisor = Supervisor::new(systems.len());
+    supervisor.init_all(&mut systems, &mut graph);
+    for i in 0..systems.len() {
+        assert!(
+            supervisor.start(i),
+            "el stage de agentes debe poder arrancar el sistema {i}"
+        );
     }
 
-    let agents = stage("agents");
-    let mut systems = loader.load_app(&mut registry, &[agents], "agents")?;
+    let vocab = Vocab::resolve(&mut graph);
+    let mut driver = RecordingBridge::new(vocab, |req: &AgentView| {
+        Some(Reply::done(
+            req.agent,
+            req.request,
+            format!("done at request {}", req.request),
+        ))
+    });
 
-    let vocab = Vocab::resolve(graph.inner_mut());
-    driver.set_vocab(vocab);
+    let spec_a = AgentSpec::new("alice", "research topic A")
+        .with_tools(["search"])
+        .with_max_steps(8)
+        .with_timeout_ticks(16);
+    let spec_b = AgentSpec::new("bob", "summarize topic B")
+        .with_tools(["read"])
+        .with_max_steps(8)
+        .with_timeout_ticks(16);
+    bus.push(spawn_event(&vocab, &spec_a, None));
+    bus.push(spawn_event(&vocab, &spec_b, None));
 
-    let spec_a = AgentSpec {
-        name: "alice".into(),
-        goal: "research topic A".into(),
-        max_steps: 8,
-        timeout: 16,
-        tools: vec!["search".into()],
-    };
-    let spec_b = AgentSpec {
-        name: "bob".into(),
-        goal: "summarize topic B".into(),
-        max_steps: 8,
-        timeout: 16,
-        tools: vec!["read".into()],
-    };
-
-    bus.push(spawn_event(&vocab, &spec_a));
-    bus.push(spawn_event(&vocab, &spec_b));
-
-    for tick in 0..12u64 {
-        let bytes = graph.export();
-        store.save_tick(tick, &bytes)?;
-
-        for req in driver.last_requests() {
-            driver.submit_reply(Reply {
-                agent: req.agent,
-                verb: "finish".into(),
-                tool: None,
-                args: None,
-                text: Some(format!("done at tick {tick}")),
-            });
-        }
-
-        let outcome = onyx_core::tick(
+    for n in 0..12u64 {
+        store.save_tick(n, &graph.export())?;
+        tick(
+            n,
+            1,
             &mut driver,
-            graph.inner_mut(),
-            &mut systems,
-            &mut bus,
+            &mut graph,
             &mut store,
-            tick,
-        )?;
-
-        println!("tick {tick}: agents={}", graph.agent_count(&vocab));
-        if outcome.shutdown {
-            break;
-        }
+            &mut bus,
+            &mut systems,
+            supervisor.states_mut(),
+            &[],
+        );
+        println!("tick {n}: agents={}", graph.agent_count(&vocab));
     }
 
-    println!("finished");
+    println!("recorded {} replies", driver.transcript().entries.len());
     Ok(())
 }

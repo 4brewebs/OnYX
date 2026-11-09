@@ -11,5 +11,4 @@ name = "onyx-example-agents"
 path = "src/main.rs"
 
 [dependencies]
-onyx-core = { path = "../onyx-core" }
 onyx-soul-agents = { path = "../onyx-soul-agents" }

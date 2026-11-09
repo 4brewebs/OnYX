@@ -5,14 +5,11 @@ members = [
     "onyx-soul",
     "onyx-soul-agents",
     "onyx-example-app",
-]
-# En desarrollo: todavía no compilan con la API actual de core.
-# Se excluyen para que `--workspace` siga en verde; cuando un crate compile,
-# muévelo a `members`. Para probarlo por separado sin crear otro `target/`:
-# `cargo check --manifest-path <crate>/Cargo.toml --target-dir target`
-# (el `Cargo.lock` local que genera Cargo ya lo ignora `.gitignore`).
-# - onyx-example-agents: usa la API antigua de onyx-soul-agents.
-exclude = [
     "onyx-example-agents",
 ]
+# Si un crate WIP no compila con la API actual, muévelo a `exclude`
+# para que `--workspace` siga en verde. Para probarlo por separado
+# sin crear otro `target/`:
+# `cargo check --manifest-path <crate>/Cargo.toml --target-dir target`
+# (el `Cargo.lock` local que genera Cargo ya lo ignora `.gitignore`).
 resolver = "3"

@@ -8,7 +8,10 @@ Uses the architecture:
 - systems registered from the soul's `FACTORIES`
 - tick-indexed snapshots
 - agents spawned as events
-- replies submitted through the driver
+- an external decider through `RecordingBridge`
+
+The crate depends only on `onyx-soul-agents`. The soul reexports the
+core contracts the app needs.
 
 ```bash
 cargo run -p onyx-example-agents
