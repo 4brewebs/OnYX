@@ -121,3 +121,19 @@ fn spawner_factory_applies_max_agents() {
         .collect();
     assert_eq!(kinds, [vocab.ev_spawned, vocab.ev_rejected]);
 }
+
+#[test]
+fn to_params_saturates_counts_instead_of_wrapping() {
+    let c = AgentConfig {
+        max_agents: usize::MAX,
+        memory_keep_last: usize::MAX,
+        ..AgentConfig::default()
+    };
+    let params = c.to_params();
+    for key in ["max_agents", "memory_keep_last"] {
+        let v = &params.iter().find(|(k, _)| k == key).unwrap().1;
+        assert_eq!(*v, Value::Int(i64::MAX), "{key}");
+    }
+    // Lo escrito vuelve a leerse sin error.
+    assert!(AgentConfig::from_params(&params).is_ok());
+}
