@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "onyx-core",
 ]
+
+[[package]]
+name = "onyx-soul-agents"
+version = "0.1.0"
+dependencies = [
+ "onyx-core",
+]
