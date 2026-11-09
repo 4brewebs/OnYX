@@ -17,6 +17,8 @@
 pub mod bus;
 pub mod driver;
 pub mod graph;
+pub mod loader;
+pub mod registry;
 pub mod runtime;
 pub mod snapshot;
 pub mod spawner;
@@ -26,6 +28,8 @@ pub mod vocab;
 pub use bus::AgentBus;
 pub use driver::{AgentDriver, AgentRequest, Reply};
 pub use graph::AgentGraph;
+pub use loader::RustLoader;
+pub use registry::{InMemorySystemRegistry, SystemFactory};
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
