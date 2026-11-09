@@ -11,6 +11,7 @@
 //! - Tick-indexed snapshots (rewind to any tick)
 //! - Agent-oriented graph helpers (spawn, relate tools/memory)
 //! - A driver that projects pending agent requests and accepts replies
+//! - Deterministic in-brain tools (`ToolSystem` / `ToolExecutor`)
 //! - Systems that only speak `OnyxEvent`
 //!
 //! The application decides stages, systems, tools, and policies.
@@ -29,6 +30,7 @@ pub mod snapshot;
 pub mod spawner;
 pub mod spec;
 pub mod supervisor;
+pub mod tools;
 pub mod vocab;
 
 mod util;
@@ -48,6 +50,7 @@ pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
 pub use spec::{AgentSpec, Policy, spawn_event};
 pub use supervisor::Supervisor;
+pub use tools::{TOOLS_NAME, ToolCall, ToolCtx, ToolExecutor, ToolSystem};
 pub use vocab::{AgentState, Vocab};
 
 // Contratos de core que una aplicación necesita, reexportados para que la app
@@ -78,6 +81,8 @@ pub fn make_runtime(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>
 
 type Factory = fn(&SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>;
 
+/// Fábricas para el loader. No incluye [`ToolSystem`]: sin ejecutores no
+/// tiene efecto, y las herramientas las aporta la app.
 pub const FACTORIES: [(&str, Factory); 2] =
     [(SPAWNER_NAME, make_spawner), (RUNTIME_NAME, make_runtime)];
 
