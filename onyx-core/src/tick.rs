@@ -17,7 +17,9 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 ///
 /// 1. Entrada: se añade `SystemEvent::Tick { n }` al bus y después
 ///    `driver.poll` vuelca su ingress. El bus se drena una sola vez: ese
-///    lote es el inbox del tick.
+///    lote es el inbox del tick. Con un bus FIFO, el inbox empieza por lo
+///    que quedó pendiente del tick anterior, sigue con `Tick { n }` y
+///    termina con el ingress.
 /// 2. Ejecución: cada sistema `Active` ejecuta `run`, en el orden del slice,
 ///    con el mismo inbox, un outbox compartido y un único `DetRng` derivado de
 ///    `seed` y `n`. Los sistemas no `Active` no ejecutan `run`. Los sistemas

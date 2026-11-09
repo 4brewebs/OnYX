@@ -1277,3 +1277,71 @@ fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
     assert_eq!(store.loads.get(), 1);
     assert_eq!(states, [SystemState::Active]);
 }
+
+struct InboxProbe(Rc<RefCell<Vec<Vec<String>>>>);
+
+impl OnyxSystem for InboxProbe {
+    fn name(&self) -> &str {
+        "probe"
+    }
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        let seen = ctx.inbox.iter().map(|event| format!("{event:?}")).collect();
+        self.0.borrow_mut().push(seen);
+    }
+}
+
+fn inboxes_after_two_ticks(reject_import: bool) -> Vec<Vec<String>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut graph = TestGraph::new();
+    graph.reject_import = reject_import;
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Log::default());
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(InboxProbe(Rc::clone(&seen)))];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::from(vec![restore()]);
+
+    for n in 0..2 {
+        tick(
+            n,
+            7,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            &mut states,
+            &[],
+        );
+    }
+    seen.take()
+}
+
+#[test]
+fn events_emitted_by_the_tick_reach_systems_in_the_next_tick() {
+    let restored = inboxes_after_two_ticks(false);
+    assert_eq!(restored.len(), 2);
+    assert!(!restored[0].iter().any(|e| e.contains("SnapshotRestored")));
+    assert_eq!(
+        restored[1],
+        [
+            format!(
+                "{:?}",
+                OnyxEvent::System(SystemEvent::SnapshotRestored("saved".into()))
+            ),
+            format!("{:?}", OnyxEvent::System(SystemEvent::Tick { n: 1 })),
+        ]
+    );
+
+    let rejected = inboxes_after_two_ticks(true);
+    assert_eq!(rejected.len(), 2);
+    assert!(!rejected[0].iter().any(|e| e.contains("Fault")));
+    assert_eq!(rejected[1].len(), 2);
+    assert!(rejected[1][0].contains("Fault"));
+    assert_eq!(
+        rejected[1][1],
+        format!("{:?}", OnyxEvent::System(SystemEvent::Tick { n: 1 }))
+    );
+}
