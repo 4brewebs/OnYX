@@ -10,8 +10,8 @@
 //!
 //! - Tick-indexed snapshots (rewind to any tick)
 //! - Agent-oriented graph helpers (spawn, relate tools/memory)
-//! - A driver that projects pending agent requests and accepts replies
 //! - External deciders with record/replay (`RecordingBridge` / `ReplayBridge`)
+//! - A headless monitor (`HeadlessDriver` / `HeadlessHandle`) that survives `wrapping`
 //! - Deterministic in-brain tools (`ToolSystem` / `ToolExecutor`)
 //! - Systems that only speak `OnyxEvent`
 //!
@@ -23,6 +23,7 @@ pub mod bus;
 pub mod config;
 pub mod driver;
 pub mod graph;
+pub mod headless;
 pub mod loader;
 pub mod policy;
 pub mod registry;
@@ -42,6 +43,7 @@ pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest};
 pub use graph::AgentGraph;
+pub use headless::{HeadlessDriver, HeadlessHandle};
 pub use loader::RustLoader;
 pub use policy::{
     AgentView, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool,
