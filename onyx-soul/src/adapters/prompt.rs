@@ -4,11 +4,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use onyx_core::PlatformDriver;
 use onyx_core::bus::EventBus;
 use onyx_core::event::{DomainEvent, IngressEvent, OnyxEvent};
 use onyx_core::graph::{Attr, ConceptId, GraphView, Value};
 use onyx_core::surface::{SurfaceBinding, SurfaceId};
-use onyx_core::PlatformDriver;
 
 /// Proyector: convierte una vista del grafo en texto.
 pub type TextProjector = fn(&dyn GraphView, Attr, bool) -> String;
@@ -63,11 +63,8 @@ impl PromptDriver {
         target: Option<ConceptId>,
         args: Vec<(Attr, Value)>,
     ) {
-        self.pending_tool_calls.push_back(AgentToolCall {
-            kind,
-            target,
-            args,
-        });
+        self.pending_tool_calls
+            .push_back(AgentToolCall { kind, target, args });
     }
 
     /// Prompt generado en el último `present`.

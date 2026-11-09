@@ -61,8 +61,11 @@ impl OnyxSystem for AgentSpawner {
                     for (attr, val) in &d.data {
                         ctx.graph.set(id, *attr, val.clone());
                     }
-                    ctx.graph
-                        .set(id, vocab.state, Value::Text(AgentState::Idle.as_str().into()));
+                    ctx.graph.set(
+                        id,
+                        vocab.state,
+                        Value::Text(AgentState::Idle.as_str().into()),
+                    );
                     ctx.graph.set(id, vocab.steps, Value::Int(0));
                     ctx.outbox.push(OnyxEvent::Domain(DomainEvent {
                         kind: vocab.ev_spawned,

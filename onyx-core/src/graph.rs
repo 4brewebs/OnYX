@@ -244,5 +244,3 @@ pub trait SnapshotStore {
     fn save(&mut self, key: &str, bytes: &[u8]) -> Result<(), OnyxError>;
     fn load(&self, key: &str) -> Result<Vec<u8>, OnyxError>;
 }
-
-

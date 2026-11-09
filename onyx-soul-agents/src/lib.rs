@@ -29,7 +29,7 @@ pub use graph::AgentGraph;
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
-pub use spec::{AgentSpec, spawn_event};
+pub use spec::{spawn_event, AgentSpec};
 pub use vocab::{AgentState, Vocab};
 
 use onyx_core::{OnyxError, OnyxSystem, StageBlueprint, SystemSpec, Value};
@@ -45,7 +45,9 @@ pub fn make_spawner(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>
         .unwrap_or(Value::Int(DEFAULT_MAX_AGENTS));
     match max {
         Value::Int(n) if n >= 1 => Ok(Box::new(AgentSpawner::new(n as usize))),
-        _ => Err(OnyxError::Format("max_agents must be an integer >= 1".into())),
+        _ => Err(OnyxError::Format(
+            "max_agents must be an integer >= 1".into(),
+        )),
     }
 }
 
@@ -55,10 +57,8 @@ pub fn make_runtime(_spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError
 
 type Factory = fn(&SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>;
 
-pub const FACTORIES: [(&str, Factory); 2] = [
-    (SPAWNER_NAME, make_spawner),
-    (RUNTIME_NAME, make_runtime),
-];
+pub const FACTORIES: [(&str, Factory); 2] =
+    [(SPAWNER_NAME, make_spawner), (RUNTIME_NAME, make_runtime)];
 
 /// Base stage. The application extends or replaces this.
 pub fn stage(name: &str) -> StageBlueprint {

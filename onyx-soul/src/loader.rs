@@ -89,9 +89,6 @@ impl RustLoader {
 
 impl BlueprintLoader for RustLoader {
     fn load(&self, name: &str) -> Result<StageBlueprint, OnyxError> {
-        self.blueprints
-            .get(name)
-            .cloned()
-            .ok_or(OnyxError::Missing)
+        self.blueprints.get(name).cloned().ok_or(OnyxError::Missing)
     }
 }

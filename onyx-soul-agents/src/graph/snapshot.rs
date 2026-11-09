@@ -1,5 +1,5 @@
 //! Codec privado de AgentGraph. No se expone ni impone al core.
-use super::{Node, AgentGraph};
+use super::{AgentGraph, Node};
 use onyx_core::{ConceptId, OnyxError, Value};
 
 const MAGIC: &[u8; 8] = b"ONYXAG\x01\0";

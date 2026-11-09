@@ -63,7 +63,11 @@ impl AgentGraph {
         let id = self.create();
         self.set(id, vocab.name, Value::Text(name.into()));
         self.set(id, vocab.goal, Value::Text(goal.into()));
-        self.set(id, vocab.state, Value::Text(AgentState::Idle.as_str().into()));
+        self.set(
+            id,
+            vocab.state,
+            Value::Text(AgentState::Idle.as_str().into()),
+        );
         self.set(id, vocab.steps, Value::Int(0));
         id
     }
@@ -129,7 +133,7 @@ impl GraphView for AgentGraph {
                     .map(move |&to| (self.registry.names[a as usize].clone(), ConceptId(to)))
             })
             .collect();
-        links.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
+        links.sort_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
         links
     }
 }

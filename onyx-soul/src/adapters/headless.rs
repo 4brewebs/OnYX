@@ -3,11 +3,11 @@
 //! Sirve para tests, CI y ejecución sin UI.
 //! Guarda las superficies y eventos para inspección.
 
+use onyx_core::PlatformDriver;
 use onyx_core::bus::EventBus;
 use onyx_core::event::OnyxEvent;
 use onyx_core::graph::GraphView;
 use onyx_core::surface::SurfaceBinding;
-use onyx_core::PlatformDriver;
 
 /// Driver sin salida.
 /// Acumula lo que recibe para poder assertar en tests.

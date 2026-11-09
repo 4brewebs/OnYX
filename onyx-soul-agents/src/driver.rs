@@ -5,8 +5,7 @@
 //! (LLM, human, script) by calling `submit_reply`.
 
 use onyx_core::{
-    ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, SurfaceBinding,
-    Value,
+    ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, SurfaceBinding, Value,
 };
 
 use crate::vocab::{AgentState, Vocab};
