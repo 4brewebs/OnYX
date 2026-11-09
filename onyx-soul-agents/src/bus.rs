@@ -1,29 +1,35 @@
-//! In-memory bus. Reuses the semantics of `InMemoryBus`.
+//! Bus FIFO síncrono en memoria de este soul.
 //!
-//! Provided so the application does not have to depend on `onyx-soul`
-//! for the common case. The application can still swap it.
+//! Implementa el puerto `EventBus` de core para que una aplicación de agentes
+//! pueda pasar este bus a `tick` sin depender de `onyx-soul`. Es una copia
+//! propia, no compartida: los souls no están acoplados entre sí.
 
-use onyx_core::OnyxEvent;
+use std::collections::VecDeque;
 
+use onyx_core::{EventBus, OnyxEvent};
+
+/// Cola local de eventos. No aporta persistencia ni transporte externo.
 #[derive(Default)]
 pub struct AgentBus {
-    pending: Vec<OnyxEvent>,
+    queue: VecDeque<OnyxEvent>,
 }
 
 impl AgentBus {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    pub fn push(&mut self, ev: OnyxEvent) {
-        self.pending.push(ev);
+impl EventBus for AgentBus {
+    fn push(&mut self, event: OnyxEvent) {
+        self.queue.push_back(event);
     }
 
-    pub fn take(&mut self) -> Vec<OnyxEvent> {
-        std::mem::take(&mut self.pending)
+    fn drain(&mut self) -> Vec<OnyxEvent> {
+        self.queue.drain(..).collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 }
