@@ -2,7 +2,7 @@
 //!
 //! The application can build spawn events itself or use these.
 
-use onyx_core::{ConceptId, DomainEvent, OnyxEvent, Value};
+use onyx_core::{DomainEvent, OnyxEvent, Value};
 
 use crate::vocab::Vocab;
 
