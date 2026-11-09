@@ -3,7 +3,7 @@
 //! de Active / Stopped / Blocked entre ticks.
 
 use onyx_core::system::{OnyxSystem, SystemState};
-use onyx_core::graph::Graph;
+use onyx_core::graph::{AttrOnly, Graph};
 
 /// Mantiene el estado de ejecución de cada sistema.
 pub struct Supervisor {
@@ -72,7 +72,7 @@ impl Supervisor {
         graph: &mut dyn Graph,
     ) {
         for (i, system) in systems.iter_mut().enumerate() {
-            match system.init(graph) {
+            match system.init(&mut AttrOnly(&mut *graph)) {
                 Ok(()) => {
                     if self.states.get(i) == Some(&SystemState::Blocked) {
                         self.unblock(i);
