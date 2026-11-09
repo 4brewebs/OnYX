@@ -121,6 +121,18 @@ impl ToolExecutor for Reporter {
     }
 }
 
+struct MirrorTool;
+
+impl ToolExecutor for MirrorTool {
+    fn name(&self) -> &str {
+        "search"
+    }
+
+    fn call(&mut self, call: &ToolCall, _: &mut ToolCtx) -> Result<String, String> {
+        Ok(call.tool.clone())
+    }
+}
+
 struct Harness {
     g: AgentGraph,
     v: Vocab,
@@ -423,6 +435,42 @@ fn executor_rng_is_deterministic_for_the_same_seed_and_tick() {
         results(&a.v, &out_a)[0].3,
         "",
         "el ejecutor debía producir un número"
+    );
+}
+
+#[test]
+fn the_executor_receives_the_tool_name_from_the_call() {
+    let mut h = Harness::with(Box::new(MirrorTool));
+    let id = h.agent();
+    let out = h.run(vec![echo_call(&h.v, id, 1, "search", "ignored")]);
+    assert_eq!(results(&h.v, &out), [(id, 1, true, "search".into())]);
+}
+
+#[test]
+fn executor_rng_differs_across_seeds() {
+    let mut a = Harness::with(Box::new(Dice));
+    let mut b = Harness::with(Box::new(Dice));
+    a.seed = 1;
+    b.seed = 2;
+    let id_a = a.agent();
+    let id_b = b.agent();
+    let va = a.v;
+    let vb = b.v;
+    let calls_a: Vec<_> = (1..=4)
+        .map(|i| echo_call(&va, id_a, i, "dice", ""))
+        .collect();
+    let calls_b: Vec<_> = (1..=4)
+        .map(|i| echo_call(&vb, id_b, i, "dice", ""))
+        .collect();
+    let out_a = a.run(calls_a);
+    let out_b = b.run(calls_b);
+    let seq_a: Vec<_> = results(&va, &out_a).into_iter().map(|r| r.3).collect();
+    let seq_b: Vec<_> = results(&vb, &out_b).into_iter().map(|r| r.3).collect();
+    assert_eq!(seq_a.len(), 4, "{seq_a:?}");
+    assert_eq!(seq_b.len(), 4, "{seq_b:?}");
+    assert_ne!(
+        seq_a, seq_b,
+        "distintas semillas deben producir distintas secuencias"
     );
 }
 
