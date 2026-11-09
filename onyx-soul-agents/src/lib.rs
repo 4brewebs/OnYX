@@ -3,8 +3,10 @@
 //! This is an implementation of the core ports, specialized for building
 //! deterministic multi-agent applications.
 //!
-//! It reuses pieces from `onyx-soul` where they fit, and adds the
-//! peculiarities that agent harnesses need:
+//! It depends only on `onyx-core`. Where a piece of `onyx-soul` fits (loader,
+//! registry, bus, supervisor), this crate keeps its own copy instead of
+//! depending on it, so souls stay decoupled. It adds the peculiarities that
+//! agent harnesses need:
 //!
 //! - Tick-indexed snapshots (rewind to any tick)
 //! - Agent-oriented graph helpers (spawn, relate tools/memory)
