@@ -9,13 +9,14 @@ use crate::vocab::{AgentState, Vocab};
 
 pub const RUNTIME_NAME: &str = "agent_runtime";
 
+#[derive(Default)]
 pub struct AgentRuntime {
     vocab: Option<Vocab>,
 }
 
 impl AgentRuntime {
     pub fn new() -> Self {
-        Self { vocab: None }
+        Self::default()
     }
 }
 

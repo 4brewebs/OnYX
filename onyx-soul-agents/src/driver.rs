@@ -26,6 +26,7 @@ pub struct Reply {
     pub text: Option<String>,
 }
 
+#[derive(Default)]
 pub struct AgentDriver {
     vocab: Option<Vocab>,
     pending_replies: Vec<Reply>,
@@ -34,11 +35,7 @@ pub struct AgentDriver {
 
 impl AgentDriver {
     pub fn new() -> Self {
-        Self {
-            vocab: None,
-            pending_replies: Vec::new(),
-            last_requests: Vec::new(),
-        }
+        Self::default()
     }
 
     /// The application (or a bridge) submits a reply for an agent.

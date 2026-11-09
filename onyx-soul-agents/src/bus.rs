@@ -5,15 +5,14 @@
 
 use onyx_core::OnyxEvent;
 
+#[derive(Default)]
 pub struct AgentBus {
     pending: Vec<OnyxEvent>,
 }
 
 impl AgentBus {
     pub fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn push(&mut self, ev: OnyxEvent) {
