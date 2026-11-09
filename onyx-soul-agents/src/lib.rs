@@ -12,6 +12,7 @@
 //! - Agent-oriented graph helpers (spawn, relate tools/memory)
 //! - External deciders with record/replay (`RecordingBridge` / `ReplayBridge`)
 //! - A headless monitor (`HeadlessDriver` / `HeadlessHandle`) that survives `wrapping`
+//! - `AgentHost`, which mounts the tick loop so an app does not wire core itself
 //! - Deterministic in-brain tools (`ToolSystem` / `ToolExecutor`)
 //! - Systems that only speak `OnyxEvent`
 //!
@@ -24,6 +25,7 @@ pub mod config;
 pub mod driver;
 pub mod graph;
 pub mod headless;
+pub mod host;
 pub mod loader;
 pub mod policy;
 pub mod registry;
@@ -44,6 +46,7 @@ pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest};
 pub use graph::AgentGraph;
 pub use headless::{HeadlessDriver, HeadlessHandle};
+pub use host::{AgentHost, Fingerprint, HostBuilder, MemStore};
 pub use loader::RustLoader;
 pub use policy::{
     AgentView, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool,
