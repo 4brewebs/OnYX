@@ -20,21 +20,39 @@ This soul closes the framework so the app can be written against it.
 
 ## Usage
 
+The full tour — a `ToolExecutor`, `step_with` with a surface, a snapshot after `say`, a second host, `set_tick` and `ReplayBridge::starting_at` — lives in the `onyx-example-agents` crate.
+
 ```rust
 use onyx_soul_agents::{
     AgentHost, AgentSpec, HeadlessDriver, RecordingBridge, Reply,
+    SurfaceBinding, SurfaceId,
 };
 
-let mut host = AgentHost::builder(1).build()?;
-host.spawn(&AgentSpec::new("alice", "research topic A"));
+let mut host = AgentHost::builder(1)
+    .tool(Box::new(Search))
+    .build()?;
+host.spawn(&AgentSpec::new("alice", "research topic A").with_tools(["search"]));
 
+let view = host.attr("view.main");
+let surfaces = [SurfaceBinding {
+    surface: SurfaceId(1),
+    view,
+    focused: true,
+}];
 let headless = HeadlessDriver::new();
 let monitor = headless.handle();
 let mut driver = RecordingBridge::new(host.vocab(), |req| {
-    Some(Reply::done(req.agent, req.request, "done"))
+    let has = |kind: &str| req.memory.iter().any(|(k, _)| k == kind);
+    if has("observe") {
+        Some(Reply::done(req.agent, req.request, "ok"))
+    } else if has("say") {
+        Some(Reply::call(req.agent, req.request, "search q"))
+    } else {
+        Some(Reply::say(req.agent, req.request, "thinking"))
+    }
 })
 .wrapping(headless);
 
-host.run_until_settled(&mut driver, 16);
+host.step_with(&mut driver, &surfaces);
 let _seen = monitor.last_surfaces();
 ```
