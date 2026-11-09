@@ -33,7 +33,7 @@ pub use registry::{InMemorySystemRegistry, SystemFactory};
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
-pub use spec::{spawn_event, AgentSpec};
+pub use spec::{AgentSpec, spawn_event};
 pub use vocab::{AgentState, Vocab};
 
 use onyx_core::{OnyxError, OnyxSystem, StageBlueprint, SystemSpec, Value};

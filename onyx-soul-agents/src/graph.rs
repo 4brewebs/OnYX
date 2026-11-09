@@ -133,7 +133,7 @@ impl GraphView for AgentGraph {
                     .map(move |&to| (self.registry.names[a as usize].clone(), ConceptId(to)))
             })
             .collect();
-        links.sort_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
+        links.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
         links
     }
 }

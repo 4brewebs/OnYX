@@ -3,7 +3,7 @@
 
 use onyx_core::OnyxError;
 use onyx_soul_agents::{
-    stage, InMemorySystemRegistry, RustLoader, FACTORIES, RUNTIME_NAME, SPAWNER_NAME,
+    FACTORIES, InMemorySystemRegistry, RUNTIME_NAME, RustLoader, SPAWNER_NAME, stage,
 };
 
 #[test]
