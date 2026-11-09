@@ -10,7 +10,7 @@ members = [
 # Se excluyen para que `--workspace` siga en verde; cuando un crate compile,
 # muévelo a `members`. Para probarlo por separado sin crear otro `target/`:
 # `cargo check --manifest-path <crate>/Cargo.toml --target-dir target`
-# (Cargo genera un `Cargo.lock` local en el crate; no lo subas).
+# (el `Cargo.lock` local que genera Cargo ya lo ignora `.gitignore`).
 # - onyx-example-agents: usa la API antigua de onyx-soul-agents.
 exclude = [
     "onyx-example-agents",
