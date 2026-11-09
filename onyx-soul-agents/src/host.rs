@@ -9,8 +9,9 @@
 //!
 //! El host no inventa `SurfaceId` ni impone un layout: [`AgentHost::step`]
 //! pasa un slice vacío y [`AgentHost::step_with`] reenvía el que declare la
-//! app. Un restore del grafo no retrocede [`AgentHost::ticks`]: `Tick { n }`
-//! es el contador de este proceso.
+//! app. Tras un restore, [`AgentHost::set_tick`] fija el `n` del próximo
+//! `step` (el que reciben `tick` y `DetRng`). No va acoplado a
+//! [`AgentHost::request_restore`].
 
 use std::collections::HashMap;
 
@@ -230,10 +231,18 @@ impl AgentHost {
         self.graph.attr(name)
     }
 
-    /// Ticks ejecutados por este host desde que se construyó.
-    /// Un restore del grafo no retrocede este contador.
+    /// El `n` del próximo [`step`](Self::step). Tras un `step` es el
+    /// siguiente contador; un restore no lo realinea.
     pub fn ticks(&self) -> u64 {
         self.n
+    }
+
+    /// Fija el `n` del próximo [`step`](Self::step), el que reciben `tick`
+    /// y `DetRng`. Justo después del step que atiende un snapshot,
+    /// [`ticks`](Self::ticks) ya es ese valor: no hay que poner el `n` del
+    /// tick que guardó. No se llama desde [`request_restore`](Self::request_restore).
+    pub fn set_tick(&mut self, n: u64) {
+        self.n = n;
     }
 
     pub fn system_names(&self) -> Vec<&str> {

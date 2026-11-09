@@ -1,9 +1,35 @@
 //! Host de este soul: fingerprint, replay, restore y superficies.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use onyx_soul_agents::{
-    AgentHost, AgentSpec, AgentState, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge,
-    Reply, SurfaceBinding, SurfaceId, TOOLS_NAME, ToolCall, ToolCtx, ToolExecutor,
+    AgentHost, AgentSpec, AgentState, AgentView, AttrRegistry, Ctx, HeadlessDriver, OnyxError,
+    OnyxEvent, OnyxSystem, RecordingBridge, ReplayBridge, Reply, SurfaceBinding, SurfaceId,
+    SystemEvent, TOOLS_NAME, ToolCall, ToolCtx, ToolExecutor,
 };
+
+struct TickLog {
+    seen: Rc<RefCell<Vec<u64>>>,
+}
+
+impl OnyxSystem for TickLog {
+    fn name(&self) -> &str {
+        "tick_log"
+    }
+
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+
+    fn run(&mut self, ctx: &mut Ctx) {
+        for event in ctx.inbox {
+            if let OnyxEvent::System(SystemEvent::Tick { n }) = event {
+                self.seen.borrow_mut().push(*n);
+            }
+        }
+    }
+}
 
 struct Search;
 
@@ -174,4 +200,81 @@ fn mem_store_overwrites_a_key_and_misses_unknown_ones() {
         store.load("missing"),
         Err(onyx_soul_agents::OnyxError::Missing)
     ));
+}
+
+#[test]
+fn set_tick_sets_the_n_of_the_next_step() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut host = AgentHost::builder(1)
+        .system(Box::new(TickLog { seen: seen.clone() }))
+        .build()
+        .unwrap();
+    let mut idle = HeadlessDriver::new();
+    host.step(&mut idle);
+    host.step(&mut idle);
+    assert_eq!(*seen.borrow(), [0, 1]);
+    assert_eq!(host.ticks(), 2);
+
+    host.set_tick(7);
+    assert_eq!(host.ticks(), 7);
+    host.step(&mut idle);
+    assert_eq!(
+        *seen.borrow(),
+        [0, 1, 7],
+        "set_tick tiene que cambiar el n que ve el próximo tick, no el que ya se guardó"
+    );
+    assert_eq!(host.ticks(), 8);
+}
+
+fn say_then_done(req: &AgentView) -> Option<Reply> {
+    if req.memory.iter().any(|(kind, _)| kind == "say") {
+        Some(Reply::done(req.agent, req.request, "ok"))
+    } else {
+        Some(Reply::say(req.agent, req.request, "thinking"))
+    }
+}
+
+#[test]
+fn set_tick_and_a_new_replay_bridge_continue_like_an_uninterrupted_run() {
+    let mut recorded = AgentHost::builder(13).build().unwrap();
+    recorded.spawn(&spec("alice"));
+    let mut rec = RecordingBridge::new(recorded.vocab(), say_then_done);
+    recorded.step(&mut rec);
+    recorded.request_snapshot("mid");
+    recorded.step(&mut rec);
+    let n = recorded.ticks();
+    let mid = recorded.fingerprint();
+    assert!(recorded.run_until_settled(&mut rec, 32));
+    let done = recorded.fingerprint();
+    let transcript = rec.transcript().clone();
+    assert_ne!(
+        mid, done,
+        "el snapshot tiene que pillarse antes de terminar, si no el restore no demuestra nada"
+    );
+
+    let mut host = AgentHost::builder(13).build().unwrap();
+    host.spawn(&spec("alice"));
+    let mut replay = ReplayBridge::new(transcript.clone());
+    host.step(&mut replay);
+    host.request_snapshot("mid");
+    host.step(&mut replay);
+    assert_eq!(host.ticks(), n);
+    assert_eq!(host.fingerprint(), mid);
+    assert!(host.run_until_settled(&mut replay, 32));
+    assert_eq!(host.fingerprint(), done);
+
+    host.request_restore("mid");
+    let mut idle = HeadlessDriver::new();
+    host.step(&mut idle);
+    assert_eq!(host.fingerprint(), mid);
+    assert_ne!(
+        host.ticks(),
+        n,
+        "request_restore no debe realinear n: ese tick corre sobre el grafo anterior"
+    );
+
+    host.set_tick(n);
+    let mut replay = ReplayBridge::new(transcript).starting_at(n);
+    assert!(host.run_until_settled(&mut replay, 32));
+    assert_eq!(host.fingerprint(), done);
 }
