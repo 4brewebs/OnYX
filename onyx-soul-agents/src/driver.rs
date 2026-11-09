@@ -5,7 +5,8 @@
 //! (LLM, human, script) by calling `submit_reply`.
 
 use onyx_core::{
-    ConceptId, DomainEvent, Graph, IngressEvent, OnyxEvent, PlatformDriver, Value,
+    ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, SurfaceBinding,
+    Value,
 };
 
 use crate::vocab::{AgentState, Vocab};
@@ -53,15 +54,11 @@ impl AgentDriver {
 }
 
 impl PlatformDriver for AgentDriver {
-    fn init(&mut self) -> Result<(), onyx_core::DriverError> {
-        Ok(())
-    }
-
-    fn poll(&mut self, out: &mut Vec<OnyxEvent>) {
+    fn poll(&mut self, bus: &mut dyn EventBus) {
         // Turn pending replies into ingress events.
         // The runtime system is expected to interpret them.
         for reply in self.pending_replies.drain(..) {
-            out.push(OnyxEvent::Ingress(IngressEvent::Raw {
+            bus.push(OnyxEvent::Ingress(IngressEvent::Raw {
                 source: "agent.reply".into(),
                 bytes: format!(
                     "{}|{}|{}|{}|{}",
@@ -76,7 +73,7 @@ impl PlatformDriver for AgentDriver {
         }
     }
 
-    fn present(&mut self, view: &dyn Graph) {
+    fn present(&mut self, view: &dyn GraphView, _surfaces: &[SurfaceBinding]) {
         // Project concepts that are currently Thinking.
         self.last_requests.clear();
         // We cannot call attr() on a shared view, so we rely on the
@@ -91,14 +88,14 @@ impl PlatformDriver for AgentDriver {
                         let goal = view
                             .get(id, vocab.goal)
                             .and_then(|v| match v {
-                                Value::Text(s) => Some(s.clone()),
+                                Value::Text(s) => Some(s),
                                 _ => None,
                             })
                             .unwrap_or_default();
                         let steps = view
                             .get(id, vocab.steps)
                             .and_then(|v| match v {
-                                Value::Int(n) => Some(*n),
+                                Value::Int(n) => Some(n),
                                 _ => None,
                             })
                             .unwrap_or(0);
@@ -111,10 +108,6 @@ impl PlatformDriver for AgentDriver {
                 }
             }
         }
-    }
-
-    fn shutdown(&mut self) -> Result<(), onyx_core::DriverError> {
-        Ok(())
     }
 }
 
