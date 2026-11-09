@@ -14,7 +14,7 @@ fn text(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-pub(super) fn encode(g: &WorldGraph) -> Vec<u8> {
+pub(super) fn encode(g: &AgentGraph) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     word(&mut out, g.high_water);
     word(&mut out, g.registry.names.len() as u64);
@@ -120,14 +120,14 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<WorldGraph, OnyxError> {
+pub(super) fn decode(bytes: &[u8]) -> Result<AgentGraph, OnyxError> {
     let mut input = Reader { bytes };
     if input.take(MAGIC.len())? != MAGIC {
         return Err(invalid());
     }
-    let mut g = WorldGraph {
+    let mut g = AgentGraph {
         high_water: input.word()?,
-        ..WorldGraph::new()
+        ..AgentGraph::new()
     };
     let names = input.count(8)?;
     for _ in 0..names {
@@ -188,8 +188,8 @@ mod tests {
     use super::*;
     use onyx_core::{AttrRegistry, Graph, GraphView};
 
-    fn fixture() -> WorldGraph {
-        let mut g = WorldGraph::new();
+    fn fixture() -> AgentGraph {
+        let mut g = AgentGraph::new();
         let value = g.attr("value");
         let rel = g.attr("rel");
         g.attr("unused");
@@ -254,14 +254,14 @@ mod tests {
         for end in 0..bytes.len() {
             check_rejection(&bytes[..end]);
         }
-        let mut restored = WorldGraph::new();
+        let mut restored = AgentGraph::new();
         restored.import(&bytes).unwrap();
         assert_eq!(restored.export(), bytes);
     }
 
     #[test]
     fn late_failure_leaks_neither_new_names_nor_incoming_high_water() {
-        let mut incoming = WorldGraph::new();
+        let mut incoming = AgentGraph::new();
         let new_name = incoming.attr("nuevo");
         for _ in 0..10 {
             incoming.create();
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn receiver_registry_and_deleted_high_water_survive_repeated_imports() {
-        let mut g = WorldGraph::new();
+        let mut g = AgentGraph::new();
         let unused = g.attr("unused");
         let own = g.attr("own");
         let bytes = fixture().export();
