@@ -7,8 +7,9 @@ use onyx_core::graph::OnyxError;
 use onyx_core::system::{BlueprintLoader, OnyxSystem, StageBlueprint, SystemRegistry};
 // `SystemSpec` no se importa por nombre: `load_systems` recorre
 // `blueprint.systems` y entrega cada spec a `SystemRegistry::build`, que ya
-// conoce el tipo. Si se implementan los TODO de `load_systems`, vuelve a
-// hacer falta: `use onyx_core::system::SystemSpec;`.
+// conoce el tipo. Leer campos como `spec.persistent` tampoco lo requiere;
+// solo hará falta `use onyx_core::system::SystemSpec;` si se nombra el tipo,
+// por ejemplo en la firma de una función auxiliar.
 
 use crate::registry::{InMemorySystemRegistry, SystemFactory};
 
