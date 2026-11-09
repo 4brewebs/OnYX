@@ -17,6 +17,7 @@
 //! This soul closes the framework so the app can be written against it.
 
 pub mod bus;
+pub mod config;
 pub mod driver;
 pub mod graph;
 pub mod loader;
@@ -29,6 +30,7 @@ pub mod supervisor;
 pub mod vocab;
 
 pub use bus::AgentBus;
+pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest, Reply};
 pub use graph::AgentGraph;
 pub use loader::RustLoader;
@@ -54,21 +56,10 @@ pub use onyx_core::{
 };
 pub use onyx_core::{detrng, event, surface, system, tick};
 
-pub const DEFAULT_MAX_AGENTS: i64 = 64;
-
+/// Lee la configuración de `spec.params` con [`AgentConfig::from_params`].
 pub fn make_spawner(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
-    let max = spec
-        .params
-        .iter()
-        .find(|(k, _)| k == "max_agents")
-        .map(|(_, v)| v.clone())
-        .unwrap_or(Value::Int(DEFAULT_MAX_AGENTS));
-    match max {
-        Value::Int(n) if n >= 1 => Ok(Box::new(AgentSpawner::new(n as usize))),
-        _ => Err(OnyxError::Format(
-            "max_agents must be an integer >= 1".into(),
-        )),
-    }
+    let config = AgentConfig::from_params(&spec.params)?;
+    Ok(Box::new(AgentSpawner::new(config.max_agents)))
 }
 
 pub fn make_runtime(_spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
