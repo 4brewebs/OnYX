@@ -4,7 +4,8 @@ use std::rc::Rc;
 
 use onyx_core::{
     Attr, AttrOnly, AttrRegistry, ConceptId, Ctx, EventBus, Graph, GraphView, OnyxError, OnyxEvent,
-    OnyxSystem, PlatformDriver, ReadOnly, SnapshotStore, SystemEvent, SystemState, Value, tick,
+    OnyxSystem, PlatformDriver, ReadOnly, SnapshotStore, SurfaceBinding, SystemEvent, SystemState,
+    Value, tick,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -145,8 +146,8 @@ impl SnapshotStore for TestStore {
 struct TestDriver(Log);
 
 impl PlatformDriver for TestDriver {
-    fn poll_into(&mut self, _: &mut dyn EventBus) {}
-    fn present(&mut self, graph: &dyn GraphView) {
+    fn poll(&mut self, _: &mut dyn EventBus) {}
+    fn present(&mut self, graph: &dyn GraphView, _: &[SurfaceBinding]) {
         self.0.borrow_mut().push(format!(
             "present:{:?}",
             graph.get(ConceptId(1), Attr::from_raw(0))
@@ -229,6 +230,7 @@ fn restore_reinitializes_every_system_before_presenting_restored_state() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(store.loads.get(), 1);
@@ -270,6 +272,7 @@ fn rejected_import_emits_fault_without_reinitializing_systems() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert!(matches!(graph.value, Value::Int(0)));
@@ -303,6 +306,7 @@ fn snapshot_request_from_outbox_is_processed_in_the_same_tick() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.saves, 1);
     tick(
@@ -314,6 +318,7 @@ fn snapshot_request_from_outbox_is_processed_in_the_same_tick() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.saves, 1);
 }
@@ -337,6 +342,7 @@ fn restore_notification_does_not_restore_the_snapshot_again() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     tick(
         1,
@@ -347,6 +353,7 @@ fn restore_notification_does_not_restore_the_snapshot_again() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(
@@ -375,6 +382,7 @@ fn stopped_system_does_not_run_again_without_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     tick(
         1,
@@ -385,6 +393,7 @@ fn stopped_system_does_not_run_again_without_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     let log = log.borrow();
@@ -450,6 +459,7 @@ fn tick_shares_the_seeded_rng_in_system_order() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     // Primeras dos salidas del vector de referencia seed=1, tick=2.
@@ -519,6 +529,7 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.saves, 1);
     assert_eq!(bus.events.len(), 3);
@@ -531,6 +542,7 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     tick(
         2,
@@ -541,6 +553,7 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     let seen = seen.borrow();
@@ -579,6 +592,7 @@ fn inactive_system_reinitializes_before_a_start_hook_after_restore() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(states, [SystemState::Active]);
@@ -599,6 +613,7 @@ fn inactive_system_reinitializes_before_a_start_hook_after_restore() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.loads.get(), 1);
     assert_eq!(
@@ -631,6 +646,7 @@ fn repeated_start_and_stop_only_call_hooks_on_state_transitions() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Stopped]);
     bus.events.extend([
@@ -646,6 +662,7 @@ fn repeated_start_and_stop_only_call_hooks_on_state_transitions() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Active]);
     tick(
@@ -657,6 +674,7 @@ fn repeated_start_and_stop_only_call_hooks_on_state_transitions() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     let log = log.borrow();
     assert_eq!(
@@ -737,6 +755,7 @@ fn failed_reinit_blocks_every_previous_state_without_running_hooks() {
             &mut bus,
             &mut systems,
             &mut states,
+            &[],
         );
         assert_eq!(states, [SystemState::Blocked]);
         assert!(
@@ -779,6 +798,7 @@ fn blocked_system_rejects_start_and_stop_without_run_or_hooks_across_ticks() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     drop(bus.drain());
     bus.events.extend(commands());
@@ -791,6 +811,7 @@ fn blocked_system_rejects_start_and_stop_without_run_or_hooks_across_ticks() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(states, [SystemState::Blocked]);
@@ -831,6 +852,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Stopped]);
     assert_eq!(*log.borrow(), ["init:ok", "present:Some(Int(42))"]);
@@ -843,6 +865,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert!(
         !log.borrow()
@@ -859,6 +882,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Active]);
     tick(
@@ -870,6 +894,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     let log = log.borrow();
     assert_eq!(
@@ -891,12 +916,12 @@ struct IngressDriver {
 }
 
 impl PlatformDriver for IngressDriver {
-    fn poll_into(&mut self, bus: &mut dyn EventBus) {
+    fn poll(&mut self, bus: &mut dyn EventBus) {
         if let Some(event) = self.input.take() {
             bus.push(event);
         }
     }
-    fn present(&mut self, _: &dyn GraphView) {}
+    fn present(&mut self, _: &dyn GraphView, _: &[SurfaceBinding]) {}
 }
 
 #[test]
@@ -925,6 +950,7 @@ fn tick_uses_fifo_bus_for_driver_input_and_next_tick_output() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(bus.drains, 1);
     assert!(!bus.is_empty());
@@ -942,6 +968,7 @@ fn tick_uses_fifo_bus_for_driver_input_and_next_tick_output() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(bus.drains, 2);
     assert!(bus.is_empty());
@@ -978,6 +1005,7 @@ fn restore_hook_only_reaches_active_systems_after_successful_init() {
                 &mut bus,
                 &mut systems,
                 &mut states,
+                &[],
             );
             let entries = log.borrow();
             let expected = match (previous, fail) {
@@ -1043,6 +1071,7 @@ fn each_successful_restore_rebuilds_active_caches_without_starting_again() {
             &mut bus,
             &mut systems,
             &mut states,
+            &[],
         );
     }
     let entries = log.borrow();
@@ -1205,6 +1234,7 @@ fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Active]);
     assert_eq!(
@@ -1224,6 +1254,7 @@ fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     let entries = log.borrow();
     assert_eq!(
