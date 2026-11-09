@@ -13,8 +13,9 @@
 //!   `wrapping`: el puente añade su canal sin quitar el del resto de la app.
 //!
 //! El número de `poll` coincide con el número de tick mientras el llamador
-//! haga un tick por `poll` desde el principio. El core aún no define un
-//! protocolo de recuperación; tras un restore hay que alinear la transcripción.
+//! haga un tick por `poll` desde el principio. Tras un restore, `starting_at`
+//! alinea el cursor con el siguiente `poll` sin reescribir la transcripción;
+//! el host elige el offset. El core aún no define un protocolo de recuperación.
 
 use std::collections::BTreeSet;
 
@@ -149,6 +150,14 @@ impl<R: Responder> RecordingBridge<R> {
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
     }
+
+    /// Continúa grabando desde un `poll` concreto, por ejemplo tras un restore.
+    /// No reescribe la transcripción ya guardada; las entradas nuevas usarán
+    /// este valor y los siguientes.
+    pub fn starting_at(mut self, poll: u64) -> Self {
+        self.polls = poll;
+        self
+    }
 }
 
 impl<R: Responder> PlatformDriver for RecordingBridge<R> {
@@ -201,6 +210,15 @@ impl ReplayBridge {
     /// Envuelve otro driver: sus eventos y su `present` siguen funcionando.
     pub fn wrapping(mut self, inner: impl PlatformDriver + 'static) -> Self {
         self.inner = Some(Box::new(inner));
+        self
+    }
+
+    /// Continúa el replay desde un `poll` concreto sin reescribir la
+    /// transcripción. Las entradas con `Logged.poll` anterior no se reinyectan
+    /// y no cuentan en [`remaining`](Self::remaining). El host elige el offset.
+    pub fn starting_at(mut self, poll: u64) -> Self {
+        self.polls = poll;
+        self.cursor = self.transcript.partition_point(|entry| entry.poll < poll);
         self
     }
 

@@ -397,3 +397,136 @@ fn transcript_codec_round_trips_and_rejects_corruption() {
     };
     assert!(Transcript::from_bytes(&swapped.to_bytes()).is_err());
 }
+
+#[test]
+fn replay_starting_at_skips_earlier_replies() {
+    let early = Reply::done(ConceptId(1), 1, "early");
+    let later = Reply::done(ConceptId(1), 2, "later");
+    let same_poll = Reply::say(ConceptId(2), 1, "also later");
+    let transcript = Transcript {
+        entries: vec![
+            Logged {
+                poll: 1,
+                reply: early.clone(),
+            },
+            Logged {
+                poll: 5,
+                reply: later.clone(),
+            },
+            Logged {
+                poll: 5,
+                reply: same_poll.clone(),
+            },
+        ],
+    };
+
+    let fresh = ReplayBridge::new(transcript.clone());
+    assert_eq!(fresh.remaining(), 3);
+    let mut replay = fresh.starting_at(5);
+    assert_eq!(
+        replay.remaining(),
+        2,
+        "las respuestas con poll < 5 no quedan pendientes"
+    );
+
+    let mut bus = AgentBus::new();
+    replay.poll(&mut bus);
+    let injected = bus.drain();
+    assert_eq!(injected.len(), 2, "solo se reinyectan las de poll == 5");
+    assert_eq!(
+        format!("{:?}", injected[0]),
+        format!("{:?}", later.to_event())
+    );
+    assert_eq!(
+        format!("{:?}", injected[1]),
+        format!("{:?}", same_poll.to_event())
+    );
+    assert_eq!(replay.remaining(), 0);
+
+    replay.poll(&mut bus);
+    assert!(
+        bus.drain().is_empty(),
+        "un poll posterior no debe reinyectar nada"
+    );
+
+    let past_end = ReplayBridge::new(transcript).starting_at(6);
+    assert_eq!(past_end.remaining(), 0);
+}
+
+#[test]
+fn recording_starting_at_labels_new_replies_with_the_offset() {
+    let mut world = World::new(1);
+    world.spawn(&AgentSpec::new("alice", "g"));
+    let mut bridge = RecordingBridge::new(world.v, |req: &AgentView| {
+        Some(Reply::done(req.agent, req.request, "hi"))
+    })
+    .starting_at(7);
+    world.step(&mut bridge, 7);
+    assert!(
+        bridge.transcript().entries.is_empty(),
+        "el present encola; el poll siguiente inyecta"
+    );
+    world.step(&mut bridge, 8);
+    assert_eq!(bridge.transcript().entries.len(), 1);
+    assert_eq!(
+        bridge.transcript().entries[0].poll,
+        8,
+        "sin starting_at la primera respuesta quedaría en poll 1"
+    );
+}
+
+#[test]
+fn replay_starting_at_continues_a_partial_run_without_reinjecting() {
+    let spec = || AgentSpec::new("alice", "find").with_tools(["search"]);
+    let decide = |req: &AgentView| {
+        Some(match req.request {
+            1 => Reply::call(req.agent, 1, "search rust"),
+            n => Reply::done(req.agent, n, "ok"),
+        })
+    };
+
+    let mut world = World::with_search(1);
+    world.spawn(&spec());
+    let mut recorder = RecordingBridge::new(world.v, decide);
+    assert!(world.run_until_settled(&mut recorder, 20));
+    let recorded = world.graph.export();
+    let transcript = recorder.transcript().clone();
+    assert!(
+        transcript.entries.len() >= 2,
+        "call y done en polls distintos"
+    );
+    assert!(
+        transcript.entries[0].poll < transcript.entries[1].poll,
+        "la segunda respuesta entra en un poll posterior"
+    );
+    let mid_poll = transcript.entries[1].poll;
+
+    let mut full = World::with_search(1);
+    full.spawn(&spec());
+    let mut replay = ReplayBridge::new(transcript.clone());
+    assert!(full.run_until_settled(&mut replay, 20));
+    assert_eq!(full.graph.export(), recorded);
+
+    let mut partial = World::with_search(1);
+    partial.spawn(&spec());
+    let mut head = ReplayBridge::new(transcript.clone());
+    partial.run(&mut head, 0, mid_poll);
+    let remaining_after = head.remaining();
+    assert!(remaining_after > 0, "aún queda la segunda respuesta");
+
+    let mut cont = ReplayBridge::new(transcript).starting_at(mid_poll);
+    assert_eq!(
+        cont.remaining(),
+        remaining_after,
+        "starting_at deja el mismo tramo pendiente que el replay continuo"
+    );
+    for n in mid_poll..20 {
+        if partial.settled() {
+            break;
+        }
+        partial.step(&mut cont, n);
+    }
+    assert!(partial.settled());
+    assert_eq!(cont.remaining(), 0);
+    assert_eq!(partial.graph.export(), recorded);
+}
