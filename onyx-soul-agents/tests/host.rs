@@ -226,19 +226,37 @@ fn set_tick_sets_the_n_of_the_next_step() {
     assert_eq!(host.ticks(), 8);
 }
 
-fn say_then_done(req: &AgentView) -> Option<Reply> {
-    if req.memory.iter().any(|(kind, _)| kind == "say") {
-        Some(Reply::done(req.agent, req.request, "ok"))
-    } else {
-        Some(Reply::say(req.agent, req.request, "thinking"))
+fn say_twice_then_done(req: &AgentView) -> Option<Reply> {
+    let says = req.memory.iter().filter(|(kind, _)| kind == "say").count();
+    match says {
+        0 => Some(Reply::say(req.agent, req.request, "thinking")),
+        1 => Some(Reply::say(req.agent, req.request, "more")),
+        _ => Some(Reply::done(req.agent, req.request, "ok")),
     }
+}
+
+fn host_replayed_to_mid(
+    seed: u64,
+    transcript: onyx_soul_agents::Transcript,
+) -> (AgentHost, ReplayBridge) {
+    let mut host = AgentHost::builder(seed).build().unwrap();
+    host.spawn(&spec("alice"));
+    let mut replay = ReplayBridge::new(transcript);
+    host.step(&mut replay);
+    host.request_snapshot("mid");
+    host.step(&mut replay);
+    (host, replay)
 }
 
 #[test]
 fn set_tick_and_a_new_replay_bridge_continue_like_an_uninterrupted_run() {
+    // Tras el snapshot el primer Say ya está en memoria y el runtime ya
+    // abrió la siguiente petición. Un Done no escribe mem.tick ni usa el
+    // rng; el segundo Say sí graba el now, así que el fingerprint exige
+    // el n que fija set_tick.
     let mut recorded = AgentHost::builder(13).build().unwrap();
     recorded.spawn(&spec("alice"));
-    let mut rec = RecordingBridge::new(recorded.vocab(), say_then_done);
+    let mut rec = RecordingBridge::new(recorded.vocab(), say_twice_then_done);
     recorded.step(&mut rec);
     recorded.request_snapshot("mid");
     recorded.step(&mut rec);
@@ -252,17 +270,16 @@ fn set_tick_and_a_new_replay_bridge_continue_like_an_uninterrupted_run() {
         "el snapshot tiene que pillarse antes de terminar, si no el restore no demuestra nada"
     );
 
-    let mut host = AgentHost::builder(13).build().unwrap();
-    host.spawn(&spec("alice"));
-    let mut replay = ReplayBridge::new(transcript.clone());
-    host.step(&mut replay);
-    host.request_snapshot("mid");
-    host.step(&mut replay);
-    assert_eq!(host.ticks(), n);
-    assert_eq!(host.fingerprint(), mid);
-    assert!(host.run_until_settled(&mut replay, 32));
-    assert_eq!(host.fingerprint(), done);
+    let (mut replayed, mut replay) = host_replayed_to_mid(13, transcript.clone());
+    assert_eq!(replayed.ticks(), n);
+    assert_eq!(replayed.fingerprint(), mid);
+    assert!(replayed.run_until_settled(&mut replay, 32));
+    assert_eq!(replayed.fingerprint(), done);
 
+    // Restore en un host que no ha pasado de mid: import conserva el
+    // high_water más alto de esta ejecución, y un create posterior no
+    // reutilizaría el id del segundo recuerdo.
+    let (mut host, _) = host_replayed_to_mid(13, transcript.clone());
     host.request_restore("mid");
     let mut idle = HeadlessDriver::new();
     host.step(&mut idle);
@@ -274,7 +291,18 @@ fn set_tick_and_a_new_replay_bridge_continue_like_an_uninterrupted_run() {
     );
 
     host.set_tick(n);
-    let mut replay = ReplayBridge::new(transcript).starting_at(n);
+    let mut replay = ReplayBridge::new(transcript.clone()).starting_at(n);
     assert!(host.run_until_settled(&mut replay, 32));
     assert_eq!(host.fingerprint(), done);
+
+    let (mut drifted, _) = host_replayed_to_mid(13, transcript.clone());
+    drifted.request_restore("mid");
+    drifted.step(&mut HeadlessDriver::new());
+    let mut replay = ReplayBridge::new(transcript).starting_at(n);
+    assert!(drifted.run_until_settled(&mut replay, 32));
+    assert_ne!(
+        drifted.fingerprint(),
+        done,
+        "sin set_tick el segundo Say tiene que grabar otro mem.tick"
+    );
 }
