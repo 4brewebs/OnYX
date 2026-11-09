@@ -57,11 +57,6 @@ impl AgentState {
 /// Atributos, relaciones y claves de eventos ya resueltos contra un registro.
 #[derive(Copy, Clone, Debug)]
 pub struct Vocab {
-    // TODO(zip, pasos 3-6): `policy`, `pending`, `remaining`, `mem_count`, los
-    // `mem_*`, `ok` y la relación `rel_memory` ya se registran y el spawner
-    // inicializa las propiedades, pero aún no las lee ningún sistema; entran con
-    // `policy`, `tools` y el runtime del zip.
-
     // Propiedades del concepto agente.
     pub name: Attr,
     pub goal: Attr,

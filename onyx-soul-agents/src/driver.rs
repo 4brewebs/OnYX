@@ -4,26 +4,18 @@
 //! replies as ingress. The application implements the actual decision
 //! (LLM, human, script) by calling `submit_reply`.
 
-use onyx_core::{
-    ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, SurfaceBinding, Value,
-};
+use onyx_core::{ConceptId, EventBus, GraphView, PlatformDriver, SurfaceBinding, Value};
 
+use crate::reply::Reply;
 use crate::vocab::{AgentState, Vocab};
 
 #[derive(Clone, Debug)]
 pub struct AgentRequest {
     pub agent: ConceptId,
+    /// Identificador de la petición pendiente. Una [`Reply`] debe citarlo.
+    pub request: u64,
     pub goal: String,
     pub steps: i64,
-}
-
-#[derive(Clone, Debug)]
-pub struct Reply {
-    pub agent: ConceptId,
-    pub verb: String,
-    pub tool: Option<String>,
-    pub args: Option<String>,
-    pub text: Option<String>,
 }
 
 #[derive(Default)]
@@ -54,18 +46,7 @@ impl PlatformDriver for AgentDriver {
         // Turn pending replies into ingress events.
         // The runtime system is expected to interpret them.
         for reply in self.pending_replies.drain(..) {
-            bus.push(OnyxEvent::Ingress(IngressEvent::Raw {
-                source: "agent.reply".into(),
-                bytes: format!(
-                    "{}|{}|{}|{}|{}",
-                    reply.agent.0,
-                    reply.verb,
-                    reply.tool.unwrap_or_default(),
-                    reply.args.unwrap_or_default(),
-                    reply.text.unwrap_or_default()
-                )
-                .into_bytes(),
-            }));
+            bus.push(reply.to_event());
         }
     }
 
@@ -78,7 +59,7 @@ impl PlatformDriver for AgentDriver {
         // Here we keep it simple: the application sets the vocab via
         // a method if it wants projection.
         if let Some(vocab) = self.vocab {
-            for id in view.query(&[]) {
+            for id in view.query(&[vocab.state]) {
                 if let Some(Value::Text(state)) = view.get(id, vocab.state) {
                     if state == AgentState::Thinking.as_str() {
                         let goal = view
@@ -95,8 +76,13 @@ impl PlatformDriver for AgentDriver {
                                 _ => None,
                             })
                             .unwrap_or(0);
+                        let request = match view.get(id, vocab.pending) {
+                            Some(Value::Int(n)) => u64::try_from(n).unwrap_or(0),
+                            _ => 0,
+                        };
                         self.last_requests.push(AgentRequest {
                             agent: id,
+                            request,
                             goal,
                             steps,
                         });

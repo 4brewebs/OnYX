@@ -21,7 +21,9 @@ pub mod config;
 pub mod driver;
 pub mod graph;
 pub mod loader;
+pub mod policy;
 pub mod registry;
+pub mod reply;
 pub mod runtime;
 pub mod snapshot;
 pub mod spawner;
@@ -33,10 +35,14 @@ mod util;
 
 pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};
-pub use driver::{AgentDriver, AgentRequest, Reply};
+pub use driver::{AgentDriver, AgentRequest};
 pub use graph::AgentGraph;
 pub use loader::RustLoader;
+pub use policy::{
+    AgentView, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool,
+};
 pub use registry::{InMemorySystemRegistry, SystemFactory};
+pub use reply::{REPLY_SOURCE, Reply, Verb};
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
@@ -67,7 +73,7 @@ pub fn make_spawner(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>
 /// Lee la misma configuración que el spawner para compartir prefijo.
 pub fn make_runtime(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
     let config = AgentConfig::from_params(&spec.params)?;
-    Ok(Box::new(AgentRuntime::new(&config)))
+    Ok(Box::new(AgentRuntime::new(config)))
 }
 
 type Factory = fn(&SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>;

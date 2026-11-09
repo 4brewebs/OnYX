@@ -115,6 +115,7 @@ fn a_tick_with_only_this_souls_ports_spawns_and_projects_an_agent() {
         "el agente creado debe pedir su primer paso"
     );
     assert_eq!(requests[0].goal, "resumir");
+    assert_eq!(requests[0].request, 1);
 
     let _ = std::fs::remove_dir(&dir);
 }

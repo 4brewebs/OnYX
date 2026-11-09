@@ -666,7 +666,10 @@ fn a_custom_prefix_flows_through_loader_spawner_runtime_and_driver() {
     assert_eq!(graph.get(ids[0], v.steps), Some(Value::Int(1)));
     let req = driver.last_requests();
     assert_eq!(req.len(), 1);
-    assert_eq!((req[0].agent, req[0].goal.as_str()), (ids[0], "resumir"));
+    assert_eq!(
+        (req[0].agent, req[0].goal.as_str(), req[0].request),
+        (ids[0], "resumir", 1)
+    );
     // El spawned del tick 1 queda en el bus para el siguiente ciclo.
     let pending = bus.drain();
     assert!(

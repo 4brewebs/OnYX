@@ -2,8 +2,6 @@
 
 use onyx_core::{Attr, ConceptId, DomainEvent, GraphView, OnyxEvent, SystemEvent, Value};
 
-// TODO(zip, pasos 3-4): `int` y `fault` entran con las piezas que las usan.
-
 /// El tick actual llega en el inbox como `SystemEvent::Tick`.
 /// El core no entrega el número de tick de otra forma a los sistemas.
 pub(crate) fn current_tick(inbox: &[OnyxEvent]) -> Option<u64> {
@@ -11,6 +9,13 @@ pub(crate) fn current_tick(inbox: &[OnyxEvent]) -> Option<u64> {
         OnyxEvent::System(SystemEvent::Tick { n }) => Some(*n),
         _ => None,
     })
+}
+
+pub(crate) fn int<G: GraphView + ?Sized>(g: &G, id: ConceptId, attr: Attr) -> Option<i64> {
+    match g.get(id, attr) {
+        Some(Value::Int(i)) => Some(i),
+        _ => None,
+    }
 }
 
 pub(crate) fn text<G: GraphView + ?Sized>(g: &G, id: ConceptId, attr: Attr) -> Option<String> {
@@ -30,6 +35,10 @@ pub(crate) fn domain(
         subject,
         data,
     })
+}
+
+pub(crate) fn fault(msg: String) -> OnyxEvent {
+    OnyxEvent::System(SystemEvent::Fault(msg))
 }
 
 /// Valor de `key` en el evento. Si la clave se repite, gana la última

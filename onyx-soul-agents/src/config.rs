@@ -22,9 +22,7 @@ pub struct AgentConfig {
     /// Ticks de espera si el `AgentSpec` no fija un plazo.
     pub default_timeout_ticks: i64,
     /// Entradas de memoria que se conservan; 0 = sin poda.
-    ///
-    /// TODO(zip, paso 3): se valida pero aún nadie lo lee; entra con la
-    /// política de memoria.
+    /// Lo aplica [`crate::DefaultMemory`] al construir el runtime.
     pub memory_keep_last: usize,
 }
 
