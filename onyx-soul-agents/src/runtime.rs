@@ -3,7 +3,7 @@
 //! Advances agents according to the rules of this soul.
 //! The application can add other systems that react to the same events.
 
-use onyx_core::{Ctx, DomainEvent, OnyxEvent, OnyxSystem, Value};
+use onyx_core::{AttrRegistry, Ctx, DomainEvent, OnyxEvent, OnyxSystem, Value};
 
 use crate::vocab::{AgentState, Vocab};
 
@@ -24,8 +24,8 @@ impl OnyxSystem for AgentRuntime {
         RUNTIME_NAME
     }
 
-    fn init(&mut self, g: &mut dyn onyx_core::Graph) -> Result<(), onyx_core::OnyxError> {
-        self.vocab = Some(Vocab::resolve(g));
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), onyx_core::OnyxError> {
+        self.vocab = Some(Vocab::resolve(attrs));
         Ok(())
     }
 
@@ -59,11 +59,11 @@ impl OnyxSystem for AgentRuntime {
             if let Some(Value::Text(state)) = ctx.graph.get(id, vocab.state) {
                 if state == AgentState::Idle.as_str() {
                     let steps = match ctx.graph.get(id, vocab.steps) {
-                        Some(Value::Int(n)) => *n,
+                        Some(Value::Int(n)) => n,
                         _ => 0,
                     };
                     let max = match ctx.graph.get(id, vocab.max_steps) {
-                        Some(Value::Int(n)) => *n,
+                        Some(Value::Int(n)) => n,
                         _ => 32,
                     };
                     if steps >= max {

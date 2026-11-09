@@ -3,7 +3,7 @@
 //! Listens for spawn events and creates agent concepts.
 //! Limit is configurable via SystemSpec params.
 
-use onyx_core::{Ctx, DomainEvent, OnyxEvent, OnyxSystem, Value};
+use onyx_core::{AttrRegistry, Ctx, DomainEvent, OnyxEvent, OnyxSystem, Value};
 
 use crate::vocab::{AgentState, Vocab};
 
@@ -28,8 +28,8 @@ impl OnyxSystem for AgentSpawner {
         SPAWNER_NAME
     }
 
-    fn init(&mut self, g: &mut dyn onyx_core::Graph) -> Result<(), onyx_core::OnyxError> {
-        self.vocab = Some(Vocab::resolve(g));
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), onyx_core::OnyxError> {
+        self.vocab = Some(Vocab::resolve(attrs));
         Ok(())
     }
 
