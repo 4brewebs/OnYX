@@ -23,6 +23,7 @@ pub mod runtime;
 pub mod snapshot;
 pub mod spawner;
 pub mod spec;
+pub mod supervisor;
 pub mod vocab;
 
 pub use bus::AgentBus;
@@ -34,6 +35,7 @@ pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
 pub use spec::{AgentSpec, spawn_event};
+pub use supervisor::Supervisor;
 pub use vocab::{AgentState, Vocab};
 
 use onyx_core::{OnyxError, OnyxSystem, StageBlueprint, SystemSpec, Value};
