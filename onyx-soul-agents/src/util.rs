@@ -32,6 +32,8 @@ pub(crate) fn domain(
     })
 }
 
+/// Valor de `key` en el evento. Si la clave se repite, gana la última
+/// aparición, igual que en [`crate::AgentConfig::from_params`].
 pub(crate) fn data(d: &DomainEvent, key: Attr) -> Option<&Value> {
-    d.data.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    d.data.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| v)
 }

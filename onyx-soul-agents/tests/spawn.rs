@@ -72,10 +72,15 @@ fn outcomes(v: &Vocab, out: &[OnyxEvent]) -> Vec<Outcome> {
             if d.kind == v.ev_spawned {
                 Outcome::Spawned(d.subject.expect("spawned lleva el agente como subject"))
             } else if d.kind == v.ev_rejected {
-                let reason = match d.data.as_slice() {
-                    [(k, Value::Text(r))] if *k == v.reason => r.clone(),
-                    other => panic!("rechazo mal formado: {other:?}"),
-                };
+                let reason = d
+                    .data
+                    .iter()
+                    .rev()
+                    .find_map(|(k, val)| match val {
+                        Value::Text(r) if *k == v.reason => Some(r.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("rechazo sin motivo: {d:?}"));
                 Outcome::Rejected(reason, d.subject)
             } else {
                 panic!("evento inesperado {d:?}")
@@ -305,7 +310,7 @@ fn spawned_agent_has_every_framework_property_and_nothing_else() {
 }
 
 #[test]
-fn spec_budget_overrides_config_and_invalid_values_fall_back_to_it() {
+fn spec_budget_overrides_config() {
     let mut g = AgentGraph::new();
     let (mut s, v) = spawner(&mut g, config(16));
     let explicit = AgentSpec::new("a", "g")
@@ -317,27 +322,6 @@ fn spec_budget_overrides_config_and_invalid_values_fall_back_to_it() {
     );
     assert_eq!(g.get(id, v.max_steps), Some(Value::Int(11)));
     assert_eq!(g.get(id, v.timeout), Some(Value::Int(2)));
-
-    // Valores no positivos o de otro tipo no se aceptan: se usa AgentConfig.
-    for (max, timeout) in [
-        (Value::Int(0), Value::Int(0)),
-        (Value::Int(-3), Value::Int(i64::MIN)),
-        (text("7"), Value::Float(2.0)),
-    ] {
-        let ev = OnyxEvent::Domain(DomainEvent {
-            kind: v.ev_spawn,
-            subject: None,
-            data: vec![
-                (v.name, text("b")),
-                (v.goal, text("g")),
-                (v.max_steps, max.clone()),
-                (v.timeout, timeout.clone()),
-            ],
-        });
-        let id = spawned_id(&v, &run(&mut s, &mut g, 1, vec![ev]));
-        assert_eq!(g.get(id, v.max_steps), Some(Value::Int(5)), "{max:?}");
-        assert_eq!(g.get(id, v.timeout), Some(Value::Int(3)), "{timeout:?}");
-    }
 }
 
 #[test]
@@ -398,15 +382,20 @@ fn app_cannot_forge_framework_state_but_keeps_its_own_properties() {
     let (mut s, v) = spawner(&mut g, config(8));
     let mood = g.attr("agent.mood");
     let spec = AgentSpec::new("a", "g")
+        .with_max_steps(11)
         .with_extra(v.state, text("done"))
         .with_extra(v.steps, Value::Int(99))
         .with_extra(v.born, Value::Int(-1))
         .with_extra(v.result, text("falso"))
+        .with_extra(v.name, text("hacker"))
+        .with_extra(v.max_steps, Value::Int(1))
         .with_extra(mood, text("calma"));
     let id = spawned_id(
         &v,
         &run(&mut s, &mut g, 6, vec![spawn_event(&v, &spec, None)]),
     );
+    assert_eq!(g.get(id, v.name), Some(text("a")));
+    assert_eq!(g.get(id, v.max_steps), Some(Value::Int(11)));
     assert_eq!(g.get(id, v.state), Some(text("idle")));
     assert_eq!(g.get(id, v.steps), Some(Value::Int(0)));
     assert_eq!(g.get(id, v.born), Some(Value::Int(6)));
@@ -701,4 +690,207 @@ fn an_event_without_policy_defaults_to_external() {
     });
     let id = spawned_id(&v, &run(&mut s, &mut g, 1, vec![ev]));
     assert_eq!(g.get(id, v.policy), Some(text("external")));
+}
+
+#[test]
+fn repeated_keys_in_the_event_keep_the_last_value() {
+    let mut g = AgentGraph::new();
+    let (mut s, v) = spawner(&mut g, config(8));
+    let mood = g.attr("agent.mood");
+    let ev = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: None,
+        data: vec![
+            (v.name, text("primero")),
+            (v.goal, text("viejo")),
+            (v.max_steps, Value::Int(2)),
+            (v.timeout, Value::Int(1)),
+            (v.policy, text("llm")),
+            (v.tools_csv, text("a")),
+            (mood, text("triste")),
+            (v.name, text("ultimo")),
+            (v.goal, text("nuevo")),
+            (v.max_steps, Value::Int(9)),
+            (v.timeout, Value::Int(4)),
+            (v.policy, text("scripted")),
+            (v.tools_csv, text("b")),
+            (mood, text("alegre")),
+        ],
+    });
+    let id = spawned_id(&v, &run(&mut s, &mut g, 1, vec![ev]));
+    assert_eq!(g.get(id, v.name), Some(text("ultimo")));
+    assert_eq!(g.get(id, v.goal), Some(text("nuevo")));
+    assert_eq!(g.get(id, v.max_steps), Some(Value::Int(9)));
+    assert_eq!(g.get(id, v.timeout), Some(Value::Int(4)));
+    assert_eq!(g.get(id, v.policy), Some(text("scripted")));
+    assert_eq!(g.get(id, mood), Some(text("alegre")));
+    let tools = g.related(id, v.rel_tool);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(g.get(tools[0], v.tool_name), Some(text("b")));
+
+    // El último valor decide también si el evento es válido.
+    let first_bad = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: None,
+        data: vec![
+            (v.name, Value::Int(1)),
+            (v.name, text("ok")),
+            (v.goal, text("g")),
+        ],
+    });
+    let id = spawned_id(&v, &run(&mut s, &mut g, 2, vec![first_bad]));
+    assert_eq!(g.get(id, v.name), Some(text("ok")));
+    let last_bad = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: None,
+        data: vec![
+            (v.name, text("ok")),
+            (v.name, Value::Int(1)),
+            (v.goal, text("g")),
+        ],
+    });
+    assert_eq!(
+        outcomes(&v, &run(&mut s, &mut g, 3, vec![last_bad])),
+        [Outcome::Rejected("invalid_spec".into(), None)]
+    );
+}
+
+#[test]
+fn invalid_budget_is_rejected_as_invalid_spec() {
+    let mut g = AgentGraph::new();
+    let (mut s, v) = spawner(&mut g, config(8));
+    let before = g.export();
+    let cases = [
+        (Value::Int(0), Value::Int(3)),
+        (Value::Int(-3), Value::Int(3)),
+        (text("7"), Value::Int(3)),
+        (Value::Int(5), Value::Int(0)),
+        (Value::Int(5), Value::Int(i64::MIN)),
+        (Value::Int(5), Value::Float(2.0)),
+    ];
+    for (max, timeout) in cases {
+        let ev = OnyxEvent::Domain(DomainEvent {
+            kind: v.ev_spawn,
+            subject: None,
+            data: vec![
+                (v.name, text("b")),
+                (v.goal, text("g")),
+                (v.max_steps, max.clone()),
+                (v.timeout, timeout.clone()),
+            ],
+        });
+        let out = run(&mut s, &mut g, 1, vec![ev]);
+        assert_eq!(
+            outcomes(&v, &out),
+            [Outcome::Rejected("invalid_spec".into(), None)],
+            "{max:?} {timeout:?}"
+        );
+        assert_eq!(
+            domain(&out[0]).data,
+            vec![(v.reason, text("invalid_spec")), (v.name, text("b"))],
+            "{max:?} {timeout:?}"
+        );
+    }
+    for spec in [
+        AgentSpec::new("z", "g").with_max_steps(0),
+        AgentSpec::new("z", "g").with_timeout_ticks(0),
+    ] {
+        let out = run(&mut s, &mut g, 1, vec![spawn_event(&v, &spec, None)]);
+        assert_eq!(
+            outcomes(&v, &out),
+            [Outcome::Rejected("invalid_spec".into(), None)],
+            "{spec:?}"
+        );
+    }
+    assert_eq!(
+        g.export(),
+        before,
+        "un presupuesto inválido no toca el grafo"
+    );
+}
+
+#[test]
+fn rejected_event_includes_the_name_when_present() {
+    let mut g = AgentGraph::new();
+    let (mut s, v) = spawner(&mut g, config(8));
+    let parent = spawned_id(
+        &v,
+        &run(
+            &mut s,
+            &mut g,
+            1,
+            vec![spawn_event(&v, &AgentSpec::new("p", "g"), None)],
+        ),
+    );
+    let ok = spawn_event(&v, &AgentSpec::new("ok", "g"), Some(parent));
+    let bad = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: Some(parent),
+        data: vec![
+            (v.name, text("bad")),
+            (v.goal, text("g")),
+            (v.policy, text("llm")),
+        ],
+    });
+    let out = run(&mut s, &mut g, 2, vec![ok, bad]);
+    let o = outcomes(&v, &out);
+    assert!(
+        matches!(
+            o[..],
+            [Outcome::Spawned(_), Outcome::Rejected(ref r, Some(p))]
+                if r == "invalid_policy" && p == parent
+        ),
+        "{o:?}"
+    );
+    assert_eq!(
+        domain(&out[1]).data,
+        vec![(v.reason, text("invalid_policy")), (v.name, text("bad"))]
+    );
+
+    let anon = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: Some(parent),
+        data: vec![(v.goal, text("g"))],
+    });
+    let out = run(&mut s, &mut g, 3, vec![anon]);
+    assert_eq!(domain(&out[0]).data, vec![(v.reason, text("invalid_spec"))]);
+
+    let numbered = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: None,
+        data: vec![(v.name, Value::Int(1)), (v.goal, text("g"))],
+    });
+    let out = run(&mut s, &mut g, 4, vec![numbered]);
+    assert_eq!(domain(&out[0]).data, vec![(v.reason, text("invalid_spec"))]);
+}
+
+#[test]
+fn a_full_quota_rejects_as_max_agents_even_if_the_spec_is_invalid() {
+    let mut g = AgentGraph::new();
+    let (mut s, v) = spawner(&mut g, config(1));
+    let _ = spawned_id(
+        &v,
+        &run(
+            &mut s,
+            &mut g,
+            1,
+            vec![spawn_event(&v, &AgentSpec::new("a", "g"), None)],
+        ),
+    );
+    let ev = OnyxEvent::Domain(DomainEvent {
+        kind: v.ev_spawn,
+        subject: None,
+        data: vec![(v.name, text("tarde"))],
+    });
+    let out = run(&mut s, &mut g, 2, vec![ev]);
+    assert_eq!(
+        outcomes(&v, &out),
+        [Outcome::Rejected("max_agents".into(), None)]
+    );
+    assert_eq!(
+        domain(&out[0]).data,
+        vec![(v.reason, text("max_agents")), (v.name, text("tarde"))],
+        "el cupo se comprueba antes que la spec; el nombre viaja igual"
+    );
+    assert_eq!(agents(&g, &v).len(), 1);
 }

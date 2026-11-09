@@ -56,12 +56,13 @@ impl OnyxSystem for AgentSpawner {
 }
 
 impl AgentSpawner {
+    /// Motivo y, si el evento traía un nombre en texto, ese nombre.
     fn reject(&self, ctx: &mut Ctx, v: &Vocab, d: &DomainEvent, reason: &str) {
-        ctx.outbox.push(domain(
-            v.ev_rejected,
-            d.subject,
-            vec![(v.reason, Value::Text(reason.to_string()))],
-        ));
+        let mut payload = vec![(v.reason, Value::Text(reason.to_string()))];
+        if let Some(Value::Text(name)) = data(d, v.name) {
+            payload.push((v.name, Value::Text(name.clone())));
+        }
+        ctx.outbox.push(domain(v.ev_rejected, d.subject, payload));
     }
 
     fn live_agents(&self, ctx: &Ctx, v: &Vocab) -> usize {
@@ -76,6 +77,8 @@ impl AgentSpawner {
     }
 
     fn spawn(&self, ctx: &mut Ctx, v: &Vocab, now: u64, d: &DomainEvent) {
+        // El cupo se comprueba antes que la spec: una spec inválida con el
+        // cupo lleno se rechaza como `max_agents`.
         if self.live_agents(ctx, v) >= self.config.max_agents {
             return self.reject(ctx, v, d, "max_agents");
         }
@@ -93,12 +96,14 @@ impl AgentSpawner {
             Some(_) => return self.reject(ctx, v, d, "invalid_policy"),
         };
         let max_steps = match data(d, v.max_steps) {
+            None => self.config.default_max_steps,
             Some(Value::Int(i)) if *i >= 1 => *i,
-            _ => self.config.default_max_steps,
+            Some(_) => return self.reject(ctx, v, d, "invalid_spec"),
         };
         let timeout = match data(d, v.timeout) {
+            None => self.config.default_timeout_ticks,
             Some(Value::Int(i)) if *i >= 1 => *i,
-            _ => self.config.default_timeout_ticks,
+            Some(_) => return self.reject(ctx, v, d, "invalid_spec"),
         };
         let tool_names: Vec<String> = match data(d, v.tools_csv) {
             Some(Value::Text(csv)) => csv

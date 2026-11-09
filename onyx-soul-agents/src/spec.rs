@@ -96,6 +96,10 @@ impl AgentSpec {
 ///
 /// Se entrega por el bus como cualquier otro evento (el llamador lo empuja, o
 /// lo emite un sistema). Si `parent` existe, el agente nuevo queda enlazado a él.
+///
+/// Las claves reservadas en `spec.extra` no se incluyen: no pueden pisar las
+/// del propio spec. Si una clave se repite en el evento, el spawner se queda
+/// con la última aparición.
 pub fn spawn_event(vocab: &Vocab, spec: &AgentSpec, parent: Option<ConceptId>) -> OnyxEvent {
     let mut data = vec![
         (vocab.name, Value::Text(spec.name.clone())),
@@ -109,6 +113,11 @@ pub fn spawn_event(vocab: &Vocab, spec: &AgentSpec, parent: Option<ConceptId>) -
     if let Some(n) = spec.timeout_ticks {
         data.push((vocab.timeout, Value::Int(n)));
     }
-    data.extend(spec.extra.iter().cloned());
+    data.extend(
+        spec.extra
+            .iter()
+            .filter(|(key, _)| !vocab.is_reserved(*key))
+            .cloned(),
+    );
     domain(vocab.ev_spawn, parent, data)
 }
