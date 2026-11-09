@@ -1,6 +1,7 @@
 use onyx_soul::{
     event::{IngressEvent, OnyxEvent},
-    Attr, AttrRegistry, ConceptId, Ctx, OnyxError, OnyxSystem, Value,
+    system::{Ctx, OnyxSystem},
+    Attr, AttrRegistry, ConceptId, OnyxError, Value,
 };
 
 pub struct BootSystem {

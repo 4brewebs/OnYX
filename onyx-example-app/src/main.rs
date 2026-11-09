@@ -12,7 +12,7 @@ mod stages;
 
 use boot_system::BootSystem;
 
-fn make_boot(_: &SystemSpec) -> Result<Box<dyn onyx_soul::OnyxSystem>, OnyxError> {
+fn make_boot(_: &SystemSpec) -> Result<Box<dyn onyx_soul::system::OnyxSystem>, OnyxError> {
     Ok(Box::new(BootSystem::new()))
 }
 
