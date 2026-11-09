@@ -1,11 +1,12 @@
-use std::io::{self, Write};
+use onyx_soul::store::FileSnapshotStore;
 use onyx_soul::{
+    Graph, HeadlessDriver, InMemoryBus, InMemorySystemRegistry, OnyxError, RustLoader,
+    SnapshotStore, Supervisor,
     event::{IngressEvent, OnyxEvent},
     system::SystemSpec,
-    tick, HeadlessDriver, InMemoryBus, InMemorySystemRegistry,
-    RustLoader, Supervisor, Graph, SnapshotStore, OnyxError,
+    tick,
 };
-use onyx_soul::store::FileSnapshotStore;
+use std::io::{self, Write};
 
 mod boot_system;
 mod stages;

@@ -1,7 +1,7 @@
 use onyx_soul::{
+    Attr, AttrRegistry, ConceptId, OnyxError, Value,
     event::{IngressEvent, OnyxEvent},
     system::{Ctx, OnyxSystem},
-    Attr, AttrRegistry, ConceptId, OnyxError, Value,
 };
 
 pub struct BootSystem {
@@ -40,7 +40,8 @@ impl OnyxSystem for BootSystem {
                 println!("[BOOT] Reconectado a {:?}. Clearance: {:?}", id, clearance);
             } else {
                 let id = ctx.graph.create();
-                ctx.graph.set(id, self.name_attr, Value::Text("engineer_2233".into()));
+                ctx.graph
+                    .set(id, self.name_attr, Value::Text("engineer_2233".into()));
                 ctx.graph.set(id, self.clearance_attr, Value::Int(0));
                 self.player = Some(id);
                 println!("[BOOT] System online. Awaiting 'agree'...");
