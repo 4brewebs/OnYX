@@ -40,7 +40,19 @@ pub use spec::{AgentSpec, spawn_event};
 pub use supervisor::Supervisor;
 pub use vocab::{AgentState, Vocab};
 
-use onyx_core::{OnyxError, OnyxSystem, StageBlueprint, SystemSpec, Value};
+// Contratos de core que una aplicación necesita, reexportados para que la app
+// dependa solo de este soul y no declare `onyx-core` en su `Cargo.toml`.
+// Incluye los traits de los puertos (`EventBus`, `PlatformDriver`, `Graph`...):
+// sin ellos la app no podría llamar a sus métodos.
+// Los módulos `bus`, `driver` y `graph` de core no se reexportan con ese
+// nombre porque este soul tiene los suyos; sus tipos sí van en la raíz.
+pub use onyx_core::{
+    Attr, AttrOnly, AttrRegistry, BlueprintLoader, ConceptId, Ctx, DetRng, DomainEvent, EntitySpec,
+    EventBus, Graph, GraphView, IngressEvent, Key, KeyCode, Mods, OnyxError, OnyxEvent, OnyxSystem,
+    PlatformDriver, ReadOnly, SnapshotStore, StageBlueprint, SurfaceBinding, SurfaceId,
+    SystemEvent, SystemRegistry, SystemSpec, SystemState, Value,
+};
+pub use onyx_core::{detrng, event, surface, system, tick};
 
 pub const DEFAULT_MAX_AGENTS: i64 = 64;
 

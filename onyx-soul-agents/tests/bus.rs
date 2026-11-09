@@ -1,7 +1,7 @@
 //! `AgentBus` cumple la semántica FIFO del puerto `EventBus` de core.
 
-use onyx_core::{EventBus, OnyxEvent, SystemEvent};
 use onyx_soul_agents::AgentBus;
+use onyx_soul_agents::{EventBus, OnyxEvent, SystemEvent};
 
 fn tick(n: u64) -> OnyxEvent {
     OnyxEvent::System(SystemEvent::Tick { n })

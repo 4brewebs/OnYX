@@ -1,12 +1,15 @@
 //! El supervisor propio de soul-agents aplica las reglas de `SystemState`
 //! del contrato de core, y junto con los demás puertos de este soul basta
 //! para ejecutar un `tick` sin depender de `onyx-soul`.
+//!
+//! Como una aplicación, estas pruebas solo nombran `onyx_soul_agents`: todo
+//! lo de core que usan llega por sus reexportaciones.
 
-use onyx_core::{AttrRegistry, Ctx, EventBus, OnyxError, OnyxSystem, SystemState, tick};
 use onyx_soul_agents::{
     AgentBus, AgentDriver, AgentGraph, AgentSnapshotStore, AgentSpec, FACTORIES,
     InMemorySystemRegistry, RustLoader, Supervisor, Vocab, spawn_event, stage,
 };
+use onyx_soul_agents::{AttrRegistry, Ctx, EventBus, OnyxError, OnyxSystem, SystemState, tick};
 
 /// Sistema cuyo `init` falla mientras `fail` sea true.
 struct Flaky {

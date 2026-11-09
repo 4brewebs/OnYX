@@ -1,7 +1,7 @@
 //! El loader y el registry propios de soul-agents arrancan su stage base
 //! sin depender de onyx-soul.
 
-use onyx_core::OnyxError;
+use onyx_soul_agents::OnyxError;
 use onyx_soul_agents::{
     FACTORIES, InMemorySystemRegistry, RUNTIME_NAME, RustLoader, SPAWNER_NAME, stage,
 };
