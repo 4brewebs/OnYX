@@ -1,4 +1,4 @@
-//! Sistema que hace avanzar a los agentes, un paso por tick como máximo.
+//! Sistema que hace avanzar a los agentes.
 //!
 //! Máquina de estados (todo el estado vive en el grafo, no en este struct):
 //!
@@ -10,9 +10,20 @@
 //!             │                      └──fail──► Failed
 //!             └──(scripted: ScriptedPolicy decide, con DetRng)──► igual que arriba
 //!
-//!   Thinking / Acting ──(sin respuesta en `timeout` ticks)──► Failed("timeout")
+//!   Thinking / Acting ──(sin respuesta en `timeout + 1` ticks vacíos)──► Failed("timeout")
 //!   Idle ──(steps >= max_steps)──► Failed("max_steps")
 //! ```
+//!
+//! Cada tick, si hay un `Tick { n }`, recorre tres fases:
+//!
+//! 0. Decrementa `remaining` de quien espera (`Thinking` o `Acting`), antes
+//!    de procesar respuestas.
+//! 1. Aplica replies (`agent.reply`) y resultados de herramienta
+//!    (`ev_tool_result`). Un `Say`, un `observe`, un `tool_error` o una
+//!    herramienta denegada vuelven el agente a `Idle`.
+//! 2. Comprueba plazos vencidos y planifica, en orden ascendente de id. Un
+//!    agente que volvió a `Idle` en la fase 1 puede abrir la siguiente
+//!    petición en este mismo tick.
 //!
 //! Una decisión externa se proyecta como estado: un agente `Thinking` con su
 //! `pending` es la petición. El [`crate::AgentDriver`] la lee en `present`
@@ -21,9 +32,10 @@
 //! `ev_finished` y `ev_failed` llevan el resultado en la clave `text`
 //! (no en `reason`, que usa el spawner en `ev_rejected`).
 //!
-//! El plazo se guarda como ticks restantes (`remaining`), no como tick
-//! absoluto: un snapshot restaurado en otro proceso no hace expirar de golpe
-//! a los agentes que esperaban.
+//! El plazo se inicia con `remaining = timeout + 1` (saturando) para que una
+//! espera que empieza este tick no caduque al instante, y se guarda como ticks
+//! restantes, no como tick absoluto: un snapshot restaurado en otro proceso
+//! no hace expirar de golpe a los agentes que esperaban.
 
 use onyx_core::{
     AttrRegistry, ConceptId, Ctx, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, Value,
