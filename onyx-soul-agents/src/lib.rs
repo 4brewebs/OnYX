@@ -11,12 +11,14 @@
 //! - Tick-indexed snapshots (rewind to any tick)
 //! - Agent-oriented graph helpers (spawn, relate tools/memory)
 //! - A driver that projects pending agent requests and accepts replies
+//! - External deciders with record/replay (`RecordingBridge` / `ReplayBridge`)
 //! - Deterministic in-brain tools (`ToolSystem` / `ToolExecutor`)
 //! - Systems that only speak `OnyxEvent`
 //!
 //! The application decides stages, systems, tools, and policies.
 //! This soul closes the framework so the app can be written against it.
 
+pub mod bridge;
 pub mod bus;
 pub mod config;
 pub mod driver;
@@ -35,6 +37,7 @@ pub mod vocab;
 
 mod util;
 
+pub use bridge::{Logged, RecordingBridge, ReplayBridge, Responder, Transcript, pending_requests};
 pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest};

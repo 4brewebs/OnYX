@@ -26,8 +26,9 @@
 //!    petición en este mismo tick.
 //!
 //! Una decisión externa se proyecta como estado: un agente `Thinking` con su
-//! `pending` es la petición. El [`crate::AgentDriver`] la lee en `present`
-//! (solo `GraphView`) y responde con un [`crate::Reply`] en un tick posterior.
+//! `pending` es la petición. El [`crate::RecordingBridge`] (o el
+//! [`crate::AgentDriver`]) la lee en `present` (solo `GraphView`) y responde
+//! con un [`crate::Reply`] en un tick posterior.
 //!
 //! `ev_finished` y `ev_failed` llevan el resultado en la clave `text`
 //! (no en `reason`, que usa el spawner en `ev_rejected`).
