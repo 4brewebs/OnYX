@@ -357,6 +357,11 @@ impl RootSchema {
 /// Push it on a fresh, empty graph, and let it be served before requesting
 /// the first recoverable snapshot. Resuming never uses it: a restored graph
 /// must already contain its root.
+///
+/// Use it once per [`ExecutionId`]. The spawner checks only that it has
+/// execution configuration and that the graph is empty. It does not know
+/// whether the execution already began elsewhere or before a restore, and it
+/// does not check the receiver.
 pub fn begin_event(vocab: &Vocab) -> OnyxEvent {
     domain(vocab.ev_begin, None, Vec::new())
 }

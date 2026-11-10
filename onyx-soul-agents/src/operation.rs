@@ -22,6 +22,10 @@ use crate::root::{AgentBirth, parse_canonical};
 ///
 /// Reuse it when restoring the same execution; use a distinct value for new
 /// work. The caller must provide uniqueness across executions at its receiver.
+///
+/// Begin each value once. The soul does not detect a second `begin` with the
+/// same value, for example after restoring a snapshot taken before the first
+/// `begin`. Births then start again at 1 for different work.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExecutionId(String);
 

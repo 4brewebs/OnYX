@@ -316,6 +316,11 @@ impl AgentHost {
     /// en el próximo tick, solo con grafo vacío). Pídelo antes del primer
     /// snapshot recuperable. Para reanudar no se usa: restaura un snapshot que
     /// ya contenga su raíz y compruébala con [`execution_root`](Self::execution_root).
+    ///
+    /// Comienza cada `ExecutionId` una sola vez. Solo se comprueba que haya
+    /// configuración de ejecución y que el grafo esté vacío. No se detecta un
+    /// segundo comienzo con el mismo `ExecutionId`, por ejemplo tras restaurar
+    /// un snapshot anterior al primero, ni se consulta al receptor.
     pub fn begin_execution(&mut self) {
         self.bus.push(begin_event(&self.vocab));
     }
