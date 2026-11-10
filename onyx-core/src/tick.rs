@@ -90,6 +90,7 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 ///
 /// # Panics
 /// Si `systems` y `states` tienen longitudes distintas.
+#[allow(clippy::too_many_arguments)]
 pub fn tick(
     n: u64,
     seed: u64,
