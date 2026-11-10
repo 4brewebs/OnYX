@@ -11,6 +11,7 @@
 use onyx_core::{Attr, AttrRegistry};
 
 use crate::config::DEFAULT_PREFIX;
+use crate::operation::OperationLog;
 
 /// Estado de ejecución de un agente. Vive en el grafo como `Text`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -102,6 +103,8 @@ pub struct Vocab {
     pub reason: Attr,
     /// `Bool` en `ev.tool_result`: `false` si la herramienta falló.
     pub ok: Attr,
+    /// Independent tool-operation schema under the same vocabulary prefix.
+    pub operations: OperationLog,
 }
 
 impl Vocab {
@@ -152,11 +155,13 @@ impl Vocab {
             text: a("text"),
             reason: a("reason"),
             ok: a("ok"),
+            operations: OperationLog::resolve_with(attrs, prefix),
         }
     }
 
-    /// Atributos que gestiona el framework. Una propiedad extra de la app con
-    /// uno de estos nombres se ignora: la app no puede falsear el estado.
+    /// Atributos que gestiona este vocabulario, incluidos los diez campos de
+    /// operación de su prefijo. Se ignoran al copiar extras en las dos vías de
+    /// spawn; no bloquea otros prefijos ni las escrituras directas de `Graph`.
     pub fn is_reserved(&self, attr: Attr) -> bool {
         [
             self.name,
@@ -174,5 +179,6 @@ impl Vocab {
             self.tools_csv,
         ]
         .contains(&attr)
+            || self.operations.is_reserved(attr)
     }
 }

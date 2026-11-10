@@ -27,6 +27,7 @@ pub mod graph;
 pub mod headless;
 pub mod host;
 pub mod loader;
+pub mod operation;
 pub mod policy;
 pub mod registry;
 pub mod reply;
@@ -48,6 +49,10 @@ pub use graph::AgentGraph;
 pub use headless::{HeadlessDriver, HeadlessHandle};
 pub use host::{AgentHost, Fingerprint, HostBuilder, MemStore};
 pub use loader::RustLoader;
+pub use operation::{
+    ExecutionId, OperationError, OperationKey, OperationLog, OperationState, ToolDescriptor,
+    ToolOperation, ToolOutcome,
+};
 pub use policy::{
     AgentView, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool,
 };
