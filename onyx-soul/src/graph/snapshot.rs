@@ -1,5 +1,5 @@
 //! Codec privado de WorldGraph. No se expone ni impone al core.
-use super::{Node, WorldGraph, rebuild_incoming};
+use super::{Node, WorldGraph};
 use onyx_core::{ConceptId, OnyxError, Value};
 
 const MAGIC: &[u8; 8] = b"ONYXWG\x01\0";
@@ -180,7 +180,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<WorldGraph, OnyxError> {
             return Err(invalid());
         }
     }
-    rebuild_incoming(&mut g.nodes);
+    // Incoming indexes are rebuilt by import after attribute remapping.
     Ok(g)
 }
 
