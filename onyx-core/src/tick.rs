@@ -24,6 +24,13 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 ///    con el mismo inbox, un outbox compartido y un único `DetRng` derivado de
 ///    `seed` y `n`. Los sistemas no `Active` no ejecutan `run`. Los sistemas
 ///    nunca reciben el bus.
+///
+///    Las escrituras en el grafo se aplican en el momento, sin aislamiento
+///    ni fusión: un sistema ve sus propias escrituras dentro de su `run`, y
+///    cada sistema ve todo lo que escribieron los anteriores del slice en
+///    este mismo tick. Si dos sistemas escriben el mismo atributo, queda el
+///    valor del último en ejecutarse. Los eventos, en cambio, nunca se ven
+///    en el tick en que se emiten (salvo el control de la fase 3).
 /// 3. Control: se recorre primero el inbox y después el outbox, en orden.
 ///    `SnapshotRequested`, `RestoreRequested`, `Start` y `Stop` se atienden
 ///    aquí, dentro del mismo tick. El resto de eventos nuevos del outbox
