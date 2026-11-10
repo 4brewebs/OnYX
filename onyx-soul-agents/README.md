@@ -37,7 +37,7 @@ The full tour, a `ToolExecutor`, `step_with` with a surface, a snapshot after `s
 
 ```rust
 use onyx_soul_agents::{
-    AgentHost, AgentSpec, HeadlessDriver, RecordingBridge, Reply,
+    AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, Reply,
     SurfaceBinding, SurfaceId,
 };
 
@@ -54,7 +54,7 @@ let surfaces = [SurfaceBinding {
 }];
 let headless = HeadlessDriver::new();
 let monitor = headless.handle();
-let mut driver = RecordingBridge::new(host.vocab(), |req| {
+let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
     let has = |kind: &str| req.memory.iter().any(|(k, _)| k == kind);
     if has("observe") {
         Some(Reply::done(req.agent, req.request, "ok"))
