@@ -15,6 +15,8 @@ It prints the sequence, `present_count`, that `last_surfaces` was not empty, and
 
 The store writes under `./snapshots` relative to the current working directory. That path is gitignored at the repository root.
 
+This successful path never consults the decider while the agent is `Acting`. `pending_requests` only lists agents in `Thinking`. The `has("call") => None` arm in `src/main.rs` is therefore unused here. After a `tool_error` that arm would leave the new request unanswered and the agent would fail by timeout. Updating it to treat `tool_error` with `Reply::fail` is pending in the example code.
+
 This example does not exercise TR2 or external tools. Those are proposed work, not a current capability. See [onyx-soul-agents/README.md](../onyx-soul-agents/README.md).
 
 ```bash

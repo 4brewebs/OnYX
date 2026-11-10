@@ -59,11 +59,11 @@ A second soul, specialized for deterministic multi-agent apps, documented in [on
 
 ## Recovery today
 
-Graph snapshots are implemented. The format is private to each soul, has no checksum, and has no migration scheme. An incompatible capture is rejected and left untouched. A snapshot of the graph does not include the bus, in-flight events, the tick counter `n`, the seed, or system states.
+Graph snapshots are implemented. The format is private to each soul, has no checksum, and has no migration scheme. An incompatible capture is rejected and left untouched. A snapshot of the graph does not include the bus, in-flight events, the tick counter `n`, the seed, or system states. The events the outbox returns to the bus for the next tick stay with the caller.
 
-After a successful import, `tick` re-runs `init` on every system and calls `on_restore` only on `Active` systems whose `init` succeeded. `AgentHost::request_restore` does not realign `n`. After restore, the caller uses `set_tick` so the next `step` presents the intended `n` to `tick` and `DetRng`. `RecordingBridge` and `ReplayBridge` expose `starting_at` to align the TR1 transcript with that next poll.
+After a successful import, `tick` re-runs `init` on every system and calls `on_restore` only on `Active` systems whose `init` succeeded. `AgentHost::request_restore` does not realign `n`. After restore, the caller uses `set_tick` so the next `step` presents the intended `n` to `tick` and `DetRng`. `RecordingBridge` and `ReplayBridge` expose `starting_at` to align the TR1 transcript with that next poll. To continue like an uninterrupted run after a cut that left events in the outbox, the caller must also re-inject those events.
 
-Within one compatible configuration, tests and `onyx-example-agents` check that save, restore, `set_tick`, and continue can match an uninterrupted run when the snapshot is taken with no in-flight events. That is not the complete recovery unit described as proposed design in [README_es.md](README_es.md).
+Within one compatible configuration, the recovery tests of both souls cut every tick from 0 through 28 of a 30-tick run and re-inject the pending outbox (`Reinsert` in `onyx-soul`, `AgentHost::push` in `onyx-soul-agents`), then `set_tick` and continue. They compare the observable graph (and, in the agents soul, `fingerprint`) and the contract events, not snapshot bytes. Without that re-injection, the match holds only for a quiet cut, when the outbox is empty. A dedicated control in each recovery suite checks that case, and `onyx-example-agents` snapshots after `say`, with no in-flight tool event. That is not the complete recovery unit described as proposed design in [README_es.md](README_es.md).
 
 ## Designed, not implemented
 

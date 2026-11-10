@@ -19,7 +19,7 @@ The application decides stages, systems, tools, and policies. This soul closes t
 
 ## Recovery today
 
-`request_snapshot` and `request_restore` are served at the end of the next tick, like any other control event. The graph snapshot does not include in-flight events (values the outbox returns to the bus). Take a snapshot at a quiet frontier, or the continued run will not match an uninterrupted one unless those events are supplied again.
+`request_snapshot` and `request_restore` are served at the end of the next tick, like any other control event. The graph snapshot does not include in-flight events (values the outbox returns to the bus). The caller keeps those events. After restore, to match an uninterrupted run, push them back with `AgentHost::push`. The recovery tests do that on every cut from tick 0 through 28 of a 30-tick run. Without that re-injection, only a quiet cut (empty outbox) matches, which is what the quiet-cut control and `onyx-example-agents` check.
 
 `request_restore` does not realign the host counter. `ticks` is the `n` of the next `step`. After a restore, call `set_tick` so that `tick` and `DetRng` see the intended `n`. Pair that with `ReplayBridge::starting_at` (or `RecordingBridge::starting_at`) on the same poll offset. Compare `fingerprint()` and contract events, not snapshot bytes.
 
@@ -58,10 +58,8 @@ let mut driver = RecordingBridge::new(host.vocab(), |req| {
     let has = |kind: &str| req.memory.iter().any(|(k, _)| k == kind);
     if has("observe") {
         Some(Reply::done(req.agent, req.request, "ok"))
-    } else if has("call") {
-        // The tool result arrives later as `observe`; do not invent another reply
-        // while that event is in flight.
-        None
+    } else if has("tool_error") {
+        Some(Reply::fail(req.agent, req.request, "search failed"))
     } else if has("say") {
         Some(Reply::call(req.agent, req.request, "search q"))
     } else {
@@ -74,4 +72,4 @@ host.step_with(&mut driver, &surfaces);
 let _seen = monitor.last_surfaces();
 ```
 
-`Search` in this snippet is a `ToolExecutor`. The example crate has a complete, runnable version.
+`Search` in this snippet is a `ToolExecutor`. `pending_requests` only lists agents in `Thinking`, so the bridge does not ask the decider while the agent is `Acting`. After a `tool_error`, the runtime returns the agent to `Idle` and opens a new request; this snippet answers it with `Reply::fail`. Returning `None` leaves that request unanswered and the agent fails by timeout. The example crate has a complete, runnable success path.
