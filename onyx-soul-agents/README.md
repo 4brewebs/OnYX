@@ -7,7 +7,7 @@ The application decides stages, systems, tools, and policies. This soul closes t
 ## What exists today
 
 - `AgentGraph`: in-memory EAV graph with agent helpers, a private incoming-edge index, and surgical `destroy`. Its snapshot format is private to this soul, with no checksum and no migrations. The index is not serialized; import rebuilds it after remapping attributes.
-- `AgentSnapshotStore`: stores graph bytes under a tick key (`tick-{n}.bin`) or a free-form key, so an app can reload a previous graph. The store does not save `n`, the seed, the bus, or system states.
+- `AgentSnapshotStore`: stores graph bytes under a tick key (`tick-{n}.bin`) or a free key, so an app can reload a previous graph. A key that parses as `u64` is a tick (`3`, `003`, and `+3` all mean `tick-3.bin`). A free key must be a single relative file name inside the store directory and must not be a canonical tick file name such as `tick-3.bin`; other keys are rejected with `OnyxError::Format`. The store does not save `n`, the seed, the bus, or system states.
 - `AgentBus`: in-memory bus.
 - `RecordingBridge` and `ReplayBridge`: external decider with record and replay. The transcript format is TR1 (`ONYXTR1`), with no checksum. Both expose `wrapping` (chain another `PlatformDriver`) and `starting_at` (align the poll cursor after a restore, without rewriting the transcript).
 - `HeadlessDriver` and `HeadlessHandle`: inspect surfaces and counts, including after `wrapping`.
