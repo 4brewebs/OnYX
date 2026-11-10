@@ -1,5 +1,5 @@
 //! Codec privado de AgentGraph. No se expone ni impone al core.
-use super::{AgentGraph, Node};
+use super::{AgentGraph, Node, rebuild_incoming};
 use onyx_core::{ConceptId, OnyxError, Value};
 
 const MAGIC: &[u8; 8] = b"ONYXAG\x01\0";
@@ -180,6 +180,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<AgentGraph, OnyxError> {
             return Err(invalid());
         }
     }
+    rebuild_incoming(&mut g.nodes);
     Ok(g)
 }
 
