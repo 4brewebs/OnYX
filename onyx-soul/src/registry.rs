@@ -29,10 +29,7 @@ impl InMemorySystemRegistry {
 
 impl SystemRegistry for InMemorySystemRegistry {
     fn build(&self, spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
-        let factory = self
-            .factories
-            .get(&spec.kind)
-            .ok_or_else(|| OnyxError::Missing)?;
+        let factory = self.factories.get(&spec.kind).ok_or(OnyxError::Missing)?;
 
         factory(spec)
     }

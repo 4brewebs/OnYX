@@ -13,10 +13,80 @@ use crate::system::{Ctx, OnyxSystem, SystemState};
 
 /// Ejecuta un tick completo.
 ///
-/// `surfaces` son las proyecciones activas que el cerebro declara en este tick.
-/// El driver las recibe en `present`. Puede ser un slice vacío.
+/// # Fases, en este orden
 ///
-/// `seed` es común a todos los ticks. El llamador la aporta y debe recuperarla tras restore.
+/// 1. Entrada: se añade `SystemEvent::Tick { n }` al bus y después
+///    `driver.poll` vuelca su ingress. El bus se drena una sola vez: ese
+///    lote es el inbox del tick. Con un bus FIFO, el inbox empieza por lo
+///    que quedó pendiente del tick anterior, sigue con `Tick { n }` y
+///    termina con el ingress.
+/// 2. Ejecución: cada sistema `Active` ejecuta `run`, en el orden del slice,
+///    con el mismo inbox, un outbox compartido y un único `DetRng` derivado de
+///    `seed` y `n`. Los sistemas no `Active` no ejecutan `run`. Los sistemas
+///    nunca reciben el bus.
+///
+///    Las escrituras en el grafo se aplican en el momento, sin aislamiento
+///    ni fusión: un sistema ve sus propias escrituras dentro de su `run`, y
+///    cada sistema ve todo lo que escribieron los anteriores del slice en
+///    este mismo tick. Si dos sistemas escriben el mismo atributo, queda el
+///    valor del último en ejecutarse. Los eventos, en cambio, nunca se ven
+///    en el tick en que se emiten (salvo el control de la fase 3).
+/// 3. Control: se recorre primero el inbox y después el outbox, en orden.
+///    `SnapshotRequested`, `RestoreRequested`, `Start` y `Stop` se atienden
+///    aquí, dentro del mismo tick. El resto de eventos nuevos del outbox
+///    vuelve al bus para el siguiente tick. El inbox ya entregado no se
+///    vuelve a encolar.
+/// 4. Salida: `driver.present` recibe una vista de solo lectura del grafo y
+///    `surfaces`, las proyecciones activas que el cerebro declara en este
+///    tick. Puede ser un slice vacío.
+///
+/// Los `Fault` y `SnapshotRestored` que emite el propio tick van al bus y
+/// se entregan en el siguiente tick.
+///
+/// # Estados de los sistemas
+///
+/// `states` tiene una entrada por sistema y lo conserva el llamador entre
+/// ticks.
+///
+/// - `Start` sobre `Stopped` llama a `on_start` y pasa a `Active`.
+///   Sobre `Active` no hace nada. Sobre `Blocked` emite `Fault` y no activa.
+/// - `Stop` sobre `Active` llama a `on_stop` y pasa a `Stopped`. En otro
+///   estado no hace nada.
+/// - Los hooks solo se llaman en transiciones. `Blocked` impide `run` y
+///   todos los hooks.
+///
+/// # Snapshots y restauración
+///
+/// `SnapshotRequested` exporta el grafo y lo guarda en `store`. Si falla,
+/// emite `Fault`. `RestoreRequested` carga e importa. Si la carga o la
+/// importación fallan, emite `Fault` y no reinicia ningún sistema.
+///
+/// Tras cada importación correcta, todos los sistemas vuelven a ejecutar
+/// `init`, incluidos los parados y los bloqueados, antes de atender la
+/// siguiente petición. Se recorre el slice sistema a sistema: el `init` de
+/// un sistema y, si procede, su `on_restore` terminan antes del `init` del
+/// siguiente. No hay una fase global de `init` seguida de otra de
+/// `on_restore`.
+///
+/// - Si `init` falla, el sistema pasa a `Blocked`, sin hooks, y se emite
+///   `Fault`.
+/// - Si `init` tiene éxito sobre `Active`, recibe `on_restore` con una vista
+///   de solo lectura, nunca `on_start`.
+/// - Si `init` tiene éxito sobre `Blocked`, pasa a `Stopped`, sin activarse
+///   ni recibir hooks. `Stopped` se queda igual y reconstruye sus cachés
+///   en su próximo `Start`.
+///
+/// Después se emite `SnapshotRestored`. `init` no debe reiniciar el estado
+/// durable restaurado. Si un supervisor llama a `init` fuera del tick, debe
+/// aplicar la misma política de `Blocked` y `Stopped`.
+///
+/// # Determinismo
+///
+/// `seed` es común a todos los ticks. El llamador la aporta y, para
+/// continuar tras restaurar, debe recuperar `seed` y el contador `n`.
+/// `n` es un contador, no un reloj.
+///
+/// Las pruebas de `tests/tick_contract.rs` comprueban este contrato.
 ///
 /// # Panics
 /// Si `systems` y `states` tienen longitudes distintas.

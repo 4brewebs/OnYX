@@ -1,14 +1,17 @@
 # onyx-example-agents
 
-Multi-agent application built on `onyx-soul-agents`.
+Example application on `onyx-soul-agents`. It depends only on that soul;
+the soul reexports the core contracts the app needs.
 
-Uses the architecture:
+The binary walks one agent through the harness:
 
-- stages loaded via `RustLoader`
-- systems registered from the soul's `FACTORIES`
-- tick-indexed snapshots
-- agents spawned as events
-- replies submitted through the driver
+- `AgentHost` with a deterministic `search` tool (`ToolExecutor`)
+- an external decider: `say` → `call` → `observe` → `done`
+- `RecordingBridge::wrapping` a `HeadlessDriver`, driven with `step_with` and a `SurfaceBinding` (`run` and `run_until_settled` pass an empty surface list)
+- a snapshot after `say`, requested before the step that writes it, so there is no in-flight tool event
+- a second host that opens the same `AgentSnapshotStore` directory (`snapshots/`), restores, `set_tick` and `ReplayBridge::starting_at`; the fingerprints must match
+
+It prints the sequence, `present_count`, that `last_surfaces` was not empty, and whether the fingerprints match.
 
 ```bash
 cargo run -p onyx-example-agents

@@ -7,7 +7,28 @@ name = "onyx-core"
 version = "0.1.0"
 
 [[package]]
+name = "onyx-example-agents"
+version = "0.1.0"
+dependencies = [
+ "onyx-soul-agents",
+]
+
+[[package]]
+name = "onyx-example-app"
+version = "0.1.0"
+dependencies = [
+ "onyx-soul",
+]
+
+[[package]]
 name = "onyx-soul"
+version = "0.1.0"
+dependencies = [
+ "onyx-core",
+]
+
+[[package]]
+name = "onyx-soul-agents"
 version = "0.1.0"
 dependencies = [
  "onyx-core",

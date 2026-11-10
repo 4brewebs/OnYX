@@ -1,18 +1,19 @@
-use std::io::{self, Write};
+use onyx_soul::store::FileSnapshotStore;
 use onyx_soul::{
+    Graph, HeadlessDriver, InMemoryBus, InMemorySystemRegistry, OnyxError, RustLoader,
+    SnapshotStore, Supervisor,
     event::{IngressEvent, OnyxEvent},
     system::SystemSpec,
-    tick, HeadlessDriver, InMemoryBus, InMemorySystemRegistry,
-    RustLoader, Supervisor, Graph, SnapshotStore, OnyxError,
+    tick,
 };
-use onyx_soul::store::FileSnapshotStore;
+use std::io::{self, Write};
 
 mod boot_system;
 mod stages;
 
 use boot_system::BootSystem;
 
-fn make_boot(_: &SystemSpec) -> Result<Box<dyn onyx_soul::OnyxSystem>, OnyxError> {
+fn make_boot(_: &SystemSpec) -> Result<Box<dyn onyx_soul::system::OnyxSystem>, OnyxError> {
     Ok(Box::new(BootSystem::new()))
 }
 
@@ -61,9 +62,16 @@ fn main() {
         print!("onyx> ");
         io::stdout().flush().unwrap();
 
+        // TODO: this demo reads stdin directly. Terminal I/O should go through a
+        // PlatformDriver (TuiDriver, kept outside the zero-dependency soul for now)
+        // or run headless.
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let command = input.trim();
+        // EOF (`Ok(0)`) or unreadable input (e.g. non-UTF-8) is treated as `exit`,
+        // so a closed stdin shuts down cleanly instead of spinning forever.
+        let command = match io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => "exit",
+            Ok(_) => input.trim(),
+        };
 
         if command.eq_ignore_ascii_case("exit") {
             println!("Apagado seguro...");

@@ -4,7 +4,8 @@ use std::rc::Rc;
 
 use onyx_core::{
     Attr, AttrOnly, AttrRegistry, ConceptId, Ctx, EventBus, Graph, GraphView, OnyxError, OnyxEvent,
-    OnyxSystem, PlatformDriver, ReadOnly, SnapshotStore, SystemEvent, SystemState, Value, tick,
+    OnyxSystem, PlatformDriver, ReadOnly, SnapshotStore, SurfaceBinding, SystemEvent, SystemState,
+    Value, tick,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -145,8 +146,8 @@ impl SnapshotStore for TestStore {
 struct TestDriver(Log);
 
 impl PlatformDriver for TestDriver {
-    fn poll_into(&mut self, _: &mut dyn EventBus) {}
-    fn present(&mut self, graph: &dyn GraphView) {
+    fn poll(&mut self, _: &mut dyn EventBus) {}
+    fn present(&mut self, graph: &dyn GraphView, _: &[SurfaceBinding]) {
         self.0.borrow_mut().push(format!(
             "present:{:?}",
             graph.get(ConceptId(1), Attr::from_raw(0))
@@ -229,6 +230,7 @@ fn restore_reinitializes_every_system_before_presenting_restored_state() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(store.loads.get(), 1);
@@ -270,6 +272,7 @@ fn rejected_import_emits_fault_without_reinitializing_systems() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert!(matches!(graph.value, Value::Int(0)));
@@ -303,6 +306,7 @@ fn snapshot_request_from_outbox_is_processed_in_the_same_tick() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.saves, 1);
     tick(
@@ -314,6 +318,7 @@ fn snapshot_request_from_outbox_is_processed_in_the_same_tick() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.saves, 1);
 }
@@ -337,6 +342,7 @@ fn restore_notification_does_not_restore_the_snapshot_again() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     tick(
         1,
@@ -347,6 +353,7 @@ fn restore_notification_does_not_restore_the_snapshot_again() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(
@@ -375,6 +382,7 @@ fn stopped_system_does_not_run_again_without_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     tick(
         1,
@@ -385,6 +393,7 @@ fn stopped_system_does_not_run_again_without_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     let log = log.borrow();
@@ -450,6 +459,7 @@ fn tick_shares_the_seeded_rng_in_system_order() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     // Primeras dos salidas del vector de referencia seed=1, tick=2.
@@ -519,6 +529,7 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.saves, 1);
     assert_eq!(bus.events.len(), 3);
@@ -531,6 +542,7 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     tick(
         2,
@@ -541,6 +553,7 @@ fn normal_outbox_events_are_delivered_once_in_order_without_echoing_inbox() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     let seen = seen.borrow();
@@ -579,6 +592,7 @@ fn inactive_system_reinitializes_before_a_start_hook_after_restore() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(states, [SystemState::Active]);
@@ -599,6 +613,7 @@ fn inactive_system_reinitializes_before_a_start_hook_after_restore() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(store.loads.get(), 1);
     assert_eq!(
@@ -631,6 +646,7 @@ fn repeated_start_and_stop_only_call_hooks_on_state_transitions() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Stopped]);
     bus.events.extend([
@@ -646,6 +662,7 @@ fn repeated_start_and_stop_only_call_hooks_on_state_transitions() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Active]);
     tick(
@@ -657,6 +674,7 @@ fn repeated_start_and_stop_only_call_hooks_on_state_transitions() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     let log = log.borrow();
     assert_eq!(
@@ -737,6 +755,7 @@ fn failed_reinit_blocks_every_previous_state_without_running_hooks() {
             &mut bus,
             &mut systems,
             &mut states,
+            &[],
         );
         assert_eq!(states, [SystemState::Blocked]);
         assert!(
@@ -779,6 +798,7 @@ fn blocked_system_rejects_start_and_stop_without_run_or_hooks_across_ticks() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     drop(bus.drain());
     bus.events.extend(commands());
@@ -791,6 +811,7 @@ fn blocked_system_rejects_start_and_stop_without_run_or_hooks_across_ticks() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
 
     assert_eq!(states, [SystemState::Blocked]);
@@ -831,6 +852,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Stopped]);
     assert_eq!(*log.borrow(), ["init:ok", "present:Some(Int(42))"]);
@@ -843,6 +865,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert!(
         !log.borrow()
@@ -859,6 +882,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Active]);
     tick(
@@ -870,6 +894,7 @@ fn successful_reinit_unblocks_to_stopped_until_an_explicit_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     let log = log.borrow();
     assert_eq!(
@@ -891,12 +916,12 @@ struct IngressDriver {
 }
 
 impl PlatformDriver for IngressDriver {
-    fn poll_into(&mut self, bus: &mut dyn EventBus) {
+    fn poll(&mut self, bus: &mut dyn EventBus) {
         if let Some(event) = self.input.take() {
             bus.push(event);
         }
     }
-    fn present(&mut self, _: &dyn GraphView) {}
+    fn present(&mut self, _: &dyn GraphView, _: &[SurfaceBinding]) {}
 }
 
 #[test]
@@ -925,6 +950,7 @@ fn tick_uses_fifo_bus_for_driver_input_and_next_tick_output() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(bus.drains, 1);
     assert!(!bus.is_empty());
@@ -942,6 +968,7 @@ fn tick_uses_fifo_bus_for_driver_input_and_next_tick_output() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(bus.drains, 2);
     assert!(bus.is_empty());
@@ -978,6 +1005,7 @@ fn restore_hook_only_reaches_active_systems_after_successful_init() {
                 &mut bus,
                 &mut systems,
                 &mut states,
+                &[],
             );
             let entries = log.borrow();
             let expected = match (previous, fail) {
@@ -1043,6 +1071,7 @@ fn each_successful_restore_rebuilds_active_caches_without_starting_again() {
             &mut bus,
             &mut systems,
             &mut states,
+            &[],
         );
     }
     let entries = log.borrow();
@@ -1205,6 +1234,7 @@ fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     assert_eq!(states, [SystemState::Active]);
     assert_eq!(
@@ -1224,6 +1254,7 @@ fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
         &mut bus,
         &mut systems,
         &mut states,
+        &[],
     );
     let entries = log.borrow();
     assert_eq!(
@@ -1245,4 +1276,240 @@ fn start_before_restore_rebuilds_cache_for_next_run_without_second_start() {
     );
     assert_eq!(store.loads.get(), 1);
     assert_eq!(states, [SystemState::Active]);
+}
+
+struct InboxProbe(Rc<RefCell<Vec<Vec<String>>>>);
+
+impl OnyxSystem for InboxProbe {
+    fn name(&self) -> &str {
+        "probe"
+    }
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        let seen = ctx.inbox.iter().map(|event| format!("{event:?}")).collect();
+        self.0.borrow_mut().push(seen);
+    }
+}
+
+fn inboxes_after_two_ticks(reject_import: bool) -> Vec<Vec<String>> {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut graph = TestGraph::new();
+    graph.reject_import = reject_import;
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Log::default());
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(InboxProbe(Rc::clone(&seen)))];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::from(vec![restore()]);
+
+    for n in 0..2 {
+        tick(
+            n,
+            7,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            &mut states,
+            &[],
+        );
+    }
+    seen.take()
+}
+
+#[test]
+fn events_emitted_by_the_tick_reach_systems_in_the_next_tick() {
+    let restored = inboxes_after_two_ticks(false);
+    assert_eq!(restored.len(), 2);
+    assert!(!restored[0].iter().any(|e| e.contains("SnapshotRestored")));
+    assert_eq!(
+        restored[1],
+        [
+            format!(
+                "{:?}",
+                OnyxEvent::System(SystemEvent::SnapshotRestored("saved".into()))
+            ),
+            format!("{:?}", OnyxEvent::System(SystemEvent::Tick { n: 1 })),
+        ]
+    );
+
+    let rejected = inboxes_after_two_ticks(true);
+    assert_eq!(rejected.len(), 2);
+    assert!(!rejected[0].iter().any(|e| e.contains("Fault")));
+    assert_eq!(rejected[1].len(), 2);
+    assert!(rejected[1][0].contains("Fault"));
+    assert_eq!(
+        rejected[1][1],
+        format!("{:?}", OnyxEvent::System(SystemEvent::Tick { n: 1 }))
+    );
+}
+
+// La sonda lee antes y después de escribir, y registra únicamente los eventos
+// de dominio del inbox: el outbox compartido no es una entrega de eventos.
+#[derive(Debug, PartialEq)]
+struct WriteObservation {
+    name: &'static str,
+    before: Option<Value>,
+    after: Option<Value>,
+    inbox_values: Vec<Value>,
+}
+
+struct WriteProbe {
+    name: &'static str,
+    value: i64,
+    seen: Rc<RefCell<Vec<WriteObservation>>>,
+}
+
+impl OnyxSystem for WriteProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        attrs.attr("value");
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        let attr = Attr::from_raw(0);
+        let before = ctx.graph.get(ConceptId(1), attr);
+        ctx.graph.set(ConceptId(1), attr, Value::Int(self.value));
+        let after = ctx.graph.get(ConceptId(1), attr);
+        let inbox_values = ctx
+            .inbox
+            .iter()
+            .filter_map(|event| match event {
+                OnyxEvent::Domain(d) => Some(d.data[0].1.clone()),
+                _ => None,
+            })
+            .collect();
+        self.seen.borrow_mut().push(WriteObservation {
+            name: self.name,
+            before,
+            after,
+            inbox_values,
+        });
+        ctx.outbox.push(OnyxEvent::Domain(onyx_core::DomainEvent {
+            kind: attr,
+            subject: Some(ConceptId(1)),
+            data: vec![(attr, Value::Int(self.value))],
+        }));
+    }
+}
+
+#[test]
+fn writes_reach_later_systems_now_but_events_only_next_tick() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems: [Box<dyn OnyxSystem>; 2] = [
+        Box::new(WriteProbe {
+            name: "z-first",
+            value: 11,
+            seen: Rc::clone(&seen),
+        }),
+        Box::new(WriteProbe {
+            name: "a-second",
+            value: 22,
+            seen: Rc::clone(&seen),
+        }),
+    ];
+    let mut states = [SystemState::Active; 2];
+    let mut bus = TestBus::default();
+    for n in 0..2 {
+        tick(
+            n,
+            7,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            &mut states,
+            &[],
+        );
+    }
+    let observation = |name, before, after, inbox_values| WriteObservation {
+        name,
+        before: Some(Value::Int(before)),
+        after: Some(Value::Int(after)),
+        inbox_values,
+    };
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            observation("z-first", 0, 11, vec![]),
+            observation("a-second", 11, 22, vec![]),
+            observation("z-first", 22, 11, vec![Value::Int(11), Value::Int(22)]),
+            observation("a-second", 11, 22, vec![Value::Int(11), Value::Int(22)]),
+        ]
+    );
+    assert_eq!(
+        *log.borrow(),
+        ["present:Some(Int(22))", "present:Some(Int(22))"]
+    );
+}
+
+#[test]
+fn last_active_writer_wins_by_slice_order_not_system_name() {
+    for reverse in [false, true] {
+        for second_state in [
+            SystemState::Active,
+            SystemState::Stopped,
+            SystemState::Blocked,
+        ] {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut graph = TestGraph::new();
+            let mut store = TestStore::default();
+            let mut driver = TestDriver(Log::default());
+            let mut systems: [Box<dyn OnyxSystem>; 2] = [
+                Box::new(WriteProbe {
+                    name: "z",
+                    value: 11,
+                    seen: Rc::clone(&seen),
+                }),
+                Box::new(WriteProbe {
+                    name: "a",
+                    value: 22,
+                    seen: Rc::clone(&seen),
+                }),
+            ];
+            if reverse {
+                systems.reverse();
+            }
+            let mut states = [SystemState::Active, second_state];
+            let mut bus = TestBus::default();
+            tick(
+                0,
+                7,
+                &mut driver,
+                &mut graph,
+                &mut store,
+                &mut bus,
+                &mut systems,
+                &mut states,
+                &[],
+            );
+            let expected = match (reverse, second_state) {
+                (false, SystemState::Active)
+                | (true, SystemState::Stopped | SystemState::Blocked) => 22,
+                _ => 11,
+            };
+            assert_eq!(
+                graph.get(ConceptId(1), Attr::from_raw(0)),
+                Some(Value::Int(expected)),
+                "reverse={reverse}, state={second_state:?}"
+            );
+            assert_eq!(
+                seen.borrow().len(),
+                if second_state == SystemState::Active {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
 }

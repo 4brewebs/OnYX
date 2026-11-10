@@ -3,18 +3,18 @@
 
 pub mod bus;
 pub mod detrng;
+pub mod driver;
 pub mod event;
 pub mod graph;
+pub mod surface;
 pub mod system;
 pub mod tick;
-pub mod surface;
-pub mod driver;
 
 pub use bus::EventBus;
 pub use event::{DomainEvent, IngressEvent, Key, KeyCode, Mods, OnyxEvent, SystemEvent};
 pub use graph::{
-    Attr, AttrOnly, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, ReadOnly,
-    SnapshotStore, Value,
+    Attr, AttrOnly, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, ReadOnly, SnapshotStore,
+    Value,
 };
 
 pub use system::{
@@ -26,7 +26,7 @@ pub use tick::tick;
 
 pub use detrng::DetRng;
 
-pub use surface::{SurfaceId, SurfaceBinding};
+pub use surface::{SurfaceBinding, SurfaceId};
 
 pub use driver::PlatformDriver;
 

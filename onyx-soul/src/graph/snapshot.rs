@@ -180,6 +180,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<WorldGraph, OnyxError> {
             return Err(invalid());
         }
     }
+    // Incoming indexes are rebuilt by import after attribute remapping.
     Ok(g)
 }
 

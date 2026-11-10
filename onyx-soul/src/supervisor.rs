@@ -2,8 +2,8 @@
 //! Mantiene el slice de `SystemState` y aplica las reglas
 //! de Active / Stopped / Blocked entre ticks.
 
+use onyx_core::graph::{AttrOnly, Graph};
 use onyx_core::system::{OnyxSystem, SystemState};
-use onyx_core::graph::Graph;
 
 /// Mantiene el estado de ejecución de cada sistema.
 pub struct Supervisor {
@@ -66,13 +66,9 @@ impl Supervisor {
 
     /// Inicializa todos los sistemas y aplica la política de bloqueo.
     /// Llama a `init`. Si falla → Blocked. Si tiene éxito y estaba Blocked → Stopped.
-    pub fn init_all(
-        &mut self,
-        systems: &mut [Box<dyn OnyxSystem>],
-        graph: &mut dyn Graph,
-    ) {
+    pub fn init_all(&mut self, systems: &mut [Box<dyn OnyxSystem>], graph: &mut dyn Graph) {
         for (i, system) in systems.iter_mut().enumerate() {
-            match system.init(graph) {
+            match system.init(&mut AttrOnly(&mut *graph)) {
                 Ok(()) => {
                     if self.states.get(i) == Some(&SystemState::Blocked) {
                         self.unblock(i);

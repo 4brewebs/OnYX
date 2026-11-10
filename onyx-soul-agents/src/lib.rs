@@ -3,79 +3,114 @@
 //! This is an implementation of the core ports, specialized for building
 //! deterministic multi-agent applications.
 //!
-//! It reuses pieces from `onyx-soul` where they fit, and adds the
-//! peculiarities that agent harnesses need:
+//! It depends only on `onyx-core`. Where a piece of `onyx-soul` fits (loader,
+//! registry, bus, supervisor), this crate keeps its own copy instead of
+//! depending on it, so souls stay decoupled. It adds the peculiarities that
+//! agent harnesses need:
 //!
 //! - Tick-indexed snapshots (rewind to any tick)
 //! - Agent-oriented graph helpers (spawn, relate tools/memory)
-//! - A driver that projects pending agent requests and accepts replies
+//! - External deciders with record/replay (`RecordingBridge` / `ReplayBridge`)
+//! - A headless monitor (`HeadlessDriver` / `HeadlessHandle`) that survives `wrapping`
+//! - `AgentHost`, which mounts the tick loop so an app does not wire core itself
+//! - Deterministic in-brain tools (`ToolSystem` / `ToolExecutor`)
 //! - Systems that only speak `OnyxEvent`
 //!
 //! The application decides stages, systems, tools, and policies.
 //! This soul closes the framework so the app can be written against it.
 
+pub mod bridge;
 pub mod bus;
+pub mod config;
 pub mod driver;
 pub mod graph;
+pub mod headless;
+pub mod host;
+pub mod loader;
+pub mod policy;
+pub mod registry;
+pub mod reply;
 pub mod runtime;
 pub mod snapshot;
 pub mod spawner;
 pub mod spec;
+pub mod supervisor;
+pub mod tools;
 pub mod vocab;
 
+mod util;
+
+pub use bridge::{Logged, RecordingBridge, ReplayBridge, Responder, Transcript, pending_requests};
 pub use bus::AgentBus;
-pub use driver::{AgentDriver, AgentRequest, Reply};
+pub use config::{AgentConfig, DEFAULT_PREFIX};
+pub use driver::{AgentDriver, AgentRequest};
 pub use graph::AgentGraph;
+pub use headless::{HeadlessDriver, HeadlessHandle};
+pub use host::{AgentHost, Fingerprint, HostBuilder, MemStore};
+pub use loader::RustLoader;
+pub use policy::{
+    AgentView, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool,
+};
+pub use registry::{InMemorySystemRegistry, SystemFactory};
+pub use reply::{REPLY_SOURCE, Reply, Verb};
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};
-pub use spec::{AgentSpec, spawn_event};
+pub use spec::{AgentSpec, Policy, spawn_event};
+pub use supervisor::Supervisor;
+pub use tools::{TOOLS_NAME, ToolCall, ToolCtx, ToolExecutor, ToolSystem};
 pub use vocab::{AgentState, Vocab};
 
-use onyx_core::{OnyxError, OnyxSystem, StageBlueprint, SystemSpec, Value};
+// Contratos de core que una aplicación necesita, reexportados para que la app
+// dependa solo de este soul y no declare `onyx-core` en su `Cargo.toml`.
+// Incluye los traits de los puertos (`EventBus`, `PlatformDriver`, `Graph`...):
+// sin ellos la app no podría llamar a sus métodos.
+// Los módulos `bus`, `driver` y `graph` de core no se reexportan con ese
+// nombre porque este soul tiene los suyos; sus tipos sí van en la raíz.
+pub use onyx_core::{
+    Attr, AttrOnly, AttrRegistry, BlueprintLoader, ConceptId, Ctx, DetRng, DomainEvent, EntitySpec,
+    EventBus, Graph, GraphView, IngressEvent, Key, KeyCode, Mods, OnyxError, OnyxEvent, OnyxSystem,
+    PlatformDriver, ReadOnly, SnapshotStore, StageBlueprint, SurfaceBinding, SurfaceId,
+    SystemEvent, SystemRegistry, SystemSpec, SystemState, Value,
+};
+pub use onyx_core::{detrng, event, surface, system, tick};
 
-pub const DEFAULT_MAX_AGENTS: i64 = 64;
-
+/// Lee la configuración de `spec.params` con [`AgentConfig::from_params`].
 pub fn make_spawner(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
-    let max = spec
-        .params
-        .iter()
-        .find(|(k, _)| k == "max_agents")
-        .map(|(_, v)| v.clone())
-        .unwrap_or(Value::Int(DEFAULT_MAX_AGENTS));
-    match max {
-        Value::Int(n) if n >= 1 => Ok(Box::new(AgentSpawner::new(n as usize))),
-        _ => Err(OnyxError::Format("max_agents must be an integer >= 1".into())),
-    }
+    let config = AgentConfig::from_params(&spec.params)?;
+    Ok(Box::new(AgentSpawner::new(config)))
 }
 
-pub fn make_runtime(_spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
-    Ok(Box::new(AgentRuntime::new()))
+/// Lee la misma configuración que el spawner para compartir prefijo.
+pub fn make_runtime(spec: &SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError> {
+    let config = AgentConfig::from_params(&spec.params)?;
+    Ok(Box::new(AgentRuntime::new(config)))
 }
 
 type Factory = fn(&SystemSpec) -> Result<Box<dyn OnyxSystem>, OnyxError>;
 
-pub const FACTORIES: [(&str, Factory); 2] = [
-    (SPAWNER_NAME, make_spawner),
-    (RUNTIME_NAME, make_runtime),
-];
+/// Fábricas para el loader. No incluye [`ToolSystem`]: sin ejecutores no
+/// tiene efecto, y las herramientas las aporta la app.
+pub const FACTORIES: [(&str, Factory); 2] =
+    [(SPAWNER_NAME, make_spawner), (RUNTIME_NAME, make_runtime)];
 
-/// Base stage. The application extends or replaces this.
+/// Stage base con spawner y runtime, en ese orden, y la configuración por
+/// defecto. La aplicación lo amplía o lo sustituye.
 pub fn stage(name: &str) -> StageBlueprint {
+    stage_with(name, &AgentConfig::default())
+}
+
+/// Como [`stage`], con `config` en los params de ambos sistemas para que
+/// compartan prefijo y límites.
+pub fn stage_with(name: &str, config: &AgentConfig) -> StageBlueprint {
+    let spec = |kind: &str| SystemSpec {
+        kind: kind.to_string(),
+        params: config.to_params(),
+        persistent: true,
+    };
     StageBlueprint {
         name: name.to_string(),
-        systems: vec![
-            SystemSpec {
-                kind: SPAWNER_NAME.to_string(),
-                params: Vec::new(),
-                persistent: true,
-            },
-            SystemSpec {
-                kind: RUNTIME_NAME.to_string(),
-                params: Vec::new(),
-                persistent: true,
-            },
-        ],
+        systems: vec![spec(SPAWNER_NAME), spec(RUNTIME_NAME)],
         entities: Vec::new(),
     }
 }

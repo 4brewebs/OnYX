@@ -20,8 +20,8 @@ impl AgentSnapshotStore {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).ok();
         Self {
+            index: index_existing_ticks(&dir),
             dir,
-            index: BTreeMap::new(),
         }
     }
 
@@ -54,6 +54,34 @@ impl AgentSnapshotStore {
     pub fn latest_tick(&self) -> Option<u64> {
         self.index.keys().next_back().copied()
     }
+}
+
+fn index_existing_ticks(dir: &Path) -> BTreeMap<u64, PathBuf> {
+    let mut index = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return index;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(tick_str) = name
+            .strip_prefix("tick-")
+            .and_then(|rest| rest.strip_suffix(".bin"))
+        else {
+            continue;
+        };
+        let Ok(tick) = tick_str.parse::<u64>() else {
+            continue;
+        };
+        // `tick-012.bin` no es el nombre que escribe `path_for(12)`.
+        if name != format!("tick-{tick}.bin") {
+            continue;
+        }
+        index.insert(tick, path);
+    }
+    index
 }
 
 impl SnapshotStore for AgentSnapshotStore {

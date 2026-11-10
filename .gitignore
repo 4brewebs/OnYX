@@ -6,3 +6,8 @@
 .vscode/
 *.swp
 /snapshots/
+
+# Crates WIP excluidos del workspace: al compilarlos por separado
+# Cargo genera su propio lockfile y target/.
+onyx-example-*/Cargo.lock
+onyx-example-*/target/

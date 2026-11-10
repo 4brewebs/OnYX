@@ -20,7 +20,7 @@ pub use registry::InMemorySystemRegistry;
 pub use store::FileSnapshotStore;
 pub use supervisor::Supervisor;
 
-pub use onyx_core::{event, system, tick};
 pub use onyx_core::graph::{
-    Attr, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, SnapshotStore, Value
+    Attr, AttrRegistry, ConceptId, Graph, GraphView, OnyxError, SnapshotStore, Value,
 };
+pub use onyx_core::{event, system, tick};

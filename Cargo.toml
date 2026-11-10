@@ -1,10 +1,15 @@
 [workspace]
+# Crates que compilan y se verifican con `cargo test --workspace`.
 members = [
     "onyx-core",
     "onyx-soul",
     "onyx-soul-agents",
     "onyx-example-app",
     "onyx-example-agents",
-
 ]
-resolver = "2"
+# Si un crate WIP no compila con la API actual, muévelo a `exclude`
+# para que `--workspace` siga en verde. Para probarlo por separado
+# sin crear otro `target/`:
+# `cargo check --manifest-path <crate>/Cargo.toml --target-dir target`
+# (el `Cargo.lock` local que genera Cargo ya lo ignora `.gitignore`).
+resolver = "3"
