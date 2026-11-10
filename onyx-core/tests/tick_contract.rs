@@ -1345,3 +1345,171 @@ fn events_emitted_by_the_tick_reach_systems_in_the_next_tick() {
         format!("{:?}", OnyxEvent::System(SystemEvent::Tick { n: 1 }))
     );
 }
+
+// La sonda lee antes y después de escribir, y registra únicamente los eventos
+// de dominio del inbox: el outbox compartido no es una entrega de eventos.
+#[derive(Debug, PartialEq)]
+struct WriteObservation {
+    name: &'static str,
+    before: Option<Value>,
+    after: Option<Value>,
+    inbox_values: Vec<Value>,
+}
+
+struct WriteProbe {
+    name: &'static str,
+    value: i64,
+    seen: Rc<RefCell<Vec<WriteObservation>>>,
+}
+
+impl OnyxSystem for WriteProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        attrs.attr("value");
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        let attr = Attr::from_raw(0);
+        let before = ctx.graph.get(ConceptId(1), attr);
+        ctx.graph.set(ConceptId(1), attr, Value::Int(self.value));
+        let after = ctx.graph.get(ConceptId(1), attr);
+        let inbox_values = ctx
+            .inbox
+            .iter()
+            .filter_map(|event| match event {
+                OnyxEvent::Domain(d) => Some(d.data[0].1.clone()),
+                _ => None,
+            })
+            .collect();
+        self.seen.borrow_mut().push(WriteObservation {
+            name: self.name,
+            before,
+            after,
+            inbox_values,
+        });
+        ctx.outbox.push(OnyxEvent::Domain(onyx_core::DomainEvent {
+            kind: attr,
+            subject: Some(ConceptId(1)),
+            data: vec![(attr, Value::Int(self.value))],
+        }));
+    }
+}
+
+#[test]
+fn writes_reach_later_systems_now_but_events_only_next_tick() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems: [Box<dyn OnyxSystem>; 2] = [
+        Box::new(WriteProbe {
+            name: "z-first",
+            value: 11,
+            seen: Rc::clone(&seen),
+        }),
+        Box::new(WriteProbe {
+            name: "a-second",
+            value: 22,
+            seen: Rc::clone(&seen),
+        }),
+    ];
+    let mut states = [SystemState::Active; 2];
+    let mut bus = TestBus::default();
+    for n in 0..2 {
+        tick(
+            n,
+            7,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            &mut states,
+            &[],
+        );
+    }
+    let observation = |name, before, after, inbox_values| WriteObservation {
+        name,
+        before: Some(Value::Int(before)),
+        after: Some(Value::Int(after)),
+        inbox_values,
+    };
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            observation("z-first", 0, 11, vec![]),
+            observation("a-second", 11, 22, vec![]),
+            observation("z-first", 22, 11, vec![Value::Int(11), Value::Int(22)]),
+            observation("a-second", 11, 22, vec![Value::Int(11), Value::Int(22)]),
+        ]
+    );
+    assert_eq!(
+        *log.borrow(),
+        ["present:Some(Int(22))", "present:Some(Int(22))"]
+    );
+}
+
+#[test]
+fn last_active_writer_wins_by_slice_order_not_system_name() {
+    for reverse in [false, true] {
+        for second_state in [
+            SystemState::Active,
+            SystemState::Stopped,
+            SystemState::Blocked,
+        ] {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut graph = TestGraph::new();
+            let mut store = TestStore::default();
+            let mut driver = TestDriver(Log::default());
+            let mut systems: [Box<dyn OnyxSystem>; 2] = [
+                Box::new(WriteProbe {
+                    name: "z",
+                    value: 11,
+                    seen: Rc::clone(&seen),
+                }),
+                Box::new(WriteProbe {
+                    name: "a",
+                    value: 22,
+                    seen: Rc::clone(&seen),
+                }),
+            ];
+            if reverse {
+                systems.reverse();
+            }
+            let mut states = [SystemState::Active, second_state];
+            let mut bus = TestBus::default();
+            tick(
+                0,
+                7,
+                &mut driver,
+                &mut graph,
+                &mut store,
+                &mut bus,
+                &mut systems,
+                &mut states,
+                &[],
+            );
+            let expected = match (reverse, second_state) {
+                (false, SystemState::Active)
+                | (true, SystemState::Stopped | SystemState::Blocked) => 22,
+                _ => 11,
+            };
+            assert_eq!(
+                graph.get(ConceptId(1), Attr::from_raw(0)),
+                Some(Value::Int(expected)),
+                "reverse={reverse}, state={second_state:?}"
+            );
+            assert_eq!(
+                seen.borrow().len(),
+                if second_state == SystemState::Active {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+}
