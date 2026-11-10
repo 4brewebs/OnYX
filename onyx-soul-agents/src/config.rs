@@ -13,7 +13,9 @@ pub const DEFAULT_PREFIX: &str = "agent";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     /// Prefijo de los nombres de atributo, relación y evento (`<prefix>.goal`...).
-    /// Permite convivir con otro modelo de agentes o con otra instancia.
+    /// Permite convivir con otro vocabulario si sus nombres no se solapan.
+    /// Los prefijos distintos no bastan: `agent` y `agent.operation` comparten
+    /// `agent.operation.state`. Esta condición no se valida automáticamente.
     pub vocab_prefix: String,
     /// Tope de agentes vivos. Los `Done`/`Failed` no cuentan.
     pub max_agents: usize,
@@ -119,6 +121,12 @@ impl AgentConfig {
 
     /// Atributo propio de la app bajo el mismo prefijo: `<prefix>.<name>`.
     /// Es el punto de extensión del vocabulario de la app.
+    ///
+    /// No comprueba si el nombre pertenece a [`crate::Vocab`] o a los diez
+    /// campos reservados de [`crate::OperationLog`] bajo este prefijo. Por
+    /// ejemplo, `attr(attrs, "operation.schema")` devuelve el atributo de
+    /// control del registro, no un atributo aislado de la app. Escribir ese
+    /// atributo en un concepto propio puede hacer que el log devuelva `Corrupt`.
     pub fn attr(&self, attrs: &mut dyn AttrRegistry, name: &str) -> Attr {
         attrs.attr(&format!("{}.{}", self.vocab_prefix, name))
     }

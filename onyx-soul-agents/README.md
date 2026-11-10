@@ -15,6 +15,8 @@ The application decides stages, systems, tools, and policies. This soul closes t
 - `AgentSpawner` and `AgentRuntime`: systems that only speak `OnyxEvent`.
 - `ToolSystem` and `ToolExecutor`: deterministic in-brain tools. An executor may touch only the graph and `DetRng`.
 
+When vocabularies share a graph, their attribute names must not overlap. Different prefixes alone do not ensure this: `agent` and `agent.operation` share `agent.operation.state`. Prefix validation does not detect such overlaps. `AgentConfig::attr` also resolves reserved names. It does not isolate app attributes from `Vocab` or the ten `OperationLog` fields under that prefix.
+
 `AgentDriver` remains for the older request and reply tests. New apps should use the bridge, and `AgentHost` if they do not want to wire `tick` themselves.
 
 ## Recovery today
