@@ -26,6 +26,7 @@ use crate::graph::AgentGraph;
 use crate::loader::RustLoader;
 use crate::policy::{AgentView, MemoryPolicy, ScriptedPolicy, agent_view};
 use crate::registry::{InMemorySystemRegistry, SystemFactory};
+use crate::root::{ExecutionRoot, RootError, begin_event, execution_root};
 use crate::runtime::{AgentRuntime, RUNTIME_NAME};
 use crate::spec::{AgentSpec, spawn_event};
 use crate::supervisor::Supervisor;
@@ -141,12 +142,25 @@ impl HostBuilder {
         self
     }
 
+    /// Sin `config.execution` (modo heredado) se comporta como antes: los
+    /// sistemas del blueprint leen la configuración de los params y el runtime
+    /// sustituido por `memory`/`scripted` y las herramientas reciben `config`
+    /// tal cual, sin normalizar. Con `config.execution`, la configuración debe
+    /// volver exacta de `to_params` (contadores no mayores que `i64::MAX`), de
+    /// modo que todos los sistemas y el host vean una única configuración; si
+    /// no, es un error.
     pub fn build(self) -> Result<AgentHost, OnyxError> {
+        let config = self.config;
+        if config.execution.is_some() && AgentConfig::from_params(&config.to_params())? != config {
+            return Err(OnyxError::Format(
+                "execution config does not round-trip exactly through params".into(),
+            ));
+        }
         let mut graph = AgentGraph::new();
-        let vocab = Vocab::resolve_with(&mut graph, &self.config.vocab_prefix);
+        let vocab = Vocab::resolve_with(&mut graph, &config.vocab_prefix);
 
         let blueprint = {
-            let mut b = stage_with(&self.stage_name, &self.config);
+            let mut b = stage_with(&self.stage_name, &config);
             b.systems.extend(self.extra_specs);
             b
         };
@@ -159,7 +173,7 @@ impl HostBuilder {
             loader.load_app(&mut registry, &factories, &[blueprint], &self.stage_name)?;
 
         if self.memory.is_some() || self.scripted.is_some() {
-            let mut runtime = AgentRuntime::new(self.config.clone());
+            let mut runtime = AgentRuntime::new(config.clone());
             if let Some(m) = self.memory {
                 runtime = runtime.with_memory(m);
             }
@@ -173,7 +187,7 @@ impl HostBuilder {
             systems[slot] = Box::new(runtime);
         }
         if !self.tools.is_empty() {
-            let mut tools = ToolSystem::new(self.config.clone());
+            let mut tools = ToolSystem::new(config.clone());
             for t in self.tools {
                 tools = tools.with_tool(t);
             }
@@ -196,6 +210,7 @@ impl HostBuilder {
             systems,
             supervisor,
             vocab,
+            config,
             seed: self.seed,
             n: 0,
         })
@@ -209,6 +224,7 @@ pub struct AgentHost {
     systems: Vec<Box<dyn OnyxSystem>>,
     supervisor: Supervisor,
     vocab: Vocab,
+    config: AgentConfig,
     seed: u64,
     n: u64,
 }
@@ -294,6 +310,20 @@ impl AgentHost {
 
     pub fn spawn(&mut self, spec: &AgentSpec) {
         self.bus.push(spawn_event(&self.vocab, spec, None));
+    }
+
+    /// Arranque nuevo explícito: pide crear la raíz de ejecución (se atiende
+    /// en el próximo tick, solo con grafo vacío). Pídelo antes del primer
+    /// snapshot recuperable. Para reanudar no se usa: restaura un snapshot que
+    /// ya contenga su raíz y compruébala con [`execution_root`](Self::execution_root).
+    pub fn begin_execution(&mut self) {
+        self.bus.push(begin_event(&self.vocab));
+    }
+
+    /// Valida la raíz contra la configuración del host. Solo lectura. Un `Ok`
+    /// no habilita efectos externos: la frontera del receptor y TR2 faltan.
+    pub fn execution_root(&self) -> Result<ExecutionRoot, RootError> {
+        execution_root(&self.graph, &self.vocab, &self.config)
     }
 
     /// Pide guardar el grafo (se atiende al final del próximo tick).

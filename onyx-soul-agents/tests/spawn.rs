@@ -199,6 +199,13 @@ fn reserved_attrs_are_exactly_the_framework_properties() {
         v.result,
         v.mem_count,
         v.tools_csv,
+        // Atributos de concepto herramienta y de entrada de memoria: un extra
+        // con ellos haría pasar al agente por herramienta o por memoria.
+        v.tool_name,
+        v.mem_seq,
+        v.mem_kind,
+        v.mem_text,
+        v.mem_tick,
     ] {
         assert!(v.is_reserved(attr), "{attr:?} debe estar reservado");
     }

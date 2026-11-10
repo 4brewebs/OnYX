@@ -15,6 +15,8 @@
 //! - `AgentHost`, which mounts the tick loop so an app does not wire core itself
 //! - Deterministic in-brain tools (`ToolSystem` / `ToolExecutor`)
 //! - Systems that only speak `OnyxEvent`
+//! - An explicit execution root and restorable agent births ([`root`]); they
+//!   do not enable external effects
 //!
 //! The application decides stages, systems, tools, and policies.
 //! This soul closes the framework so the app can be written against it.
@@ -31,6 +33,7 @@ pub mod operation;
 pub mod policy;
 pub mod registry;
 pub mod reply;
+pub mod root;
 pub mod runtime;
 pub mod snapshot;
 pub mod spawner;
@@ -58,6 +61,10 @@ pub use policy::{
 };
 pub use registry::{InMemorySystemRegistry, SystemFactory};
 pub use reply::{REPLY_SOURCE, Reply, Verb};
+pub use root::{
+    AgentBirth, AgentIdentity, ExecutionConfig, ExecutionRoot, ROOT_NAMESPACE, RootError,
+    RootSchema, begin_event, execution_root,
+};
 pub use runtime::{AgentRuntime, RUNTIME_NAME};
 pub use snapshot::AgentSnapshotStore;
 pub use spawner::{AgentSpawner, SPAWNER_NAME};

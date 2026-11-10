@@ -5,9 +5,9 @@
 use std::num::NonZeroU64;
 
 use onyx_soul_agents::{
-    AgentConfig, AgentGraph, AgentHost, AgentSpawner, AgentSpec, AgentState, Attr, AttrOnly,
-    AttrRegistry, ConceptId, Ctx, DetRng, DomainEvent, EventBus, ExecutionId, GraphView, OnyxError,
-    OnyxEvent, OnyxSystem, OperationKey, OperationLog, OperationState, PlatformDriver,
+    AgentBirth, AgentConfig, AgentGraph, AgentHost, AgentSpawner, AgentSpec, AgentState, Attr,
+    AttrOnly, AttrRegistry, ConceptId, Ctx, DetRng, DomainEvent, EventBus, ExecutionId, GraphView,
+    OnyxError, OnyxEvent, OnyxSystem, OperationKey, OperationLog, OperationState, PlatformDriver,
     SurfaceBinding, SystemEvent, ToolDescriptor, ToolOutcome, Value, Vocab, pending_requests,
     spawn_event,
 };
@@ -16,7 +16,7 @@ use onyx_soul_agents::{
 const FIELDS: [&str; 10] = [
     "schema",
     "execution",
-    "agent",
+    "birth",
     "request",
     "tool",
     "args",
@@ -30,10 +30,11 @@ fn field(g: &mut AgentGraph, prefix: &str, f: &str) -> Attr {
     g.attr(&format!("{prefix}.operation.{f}"))
 }
 
-fn key(agent: ConceptId, request: u64) -> OperationKey {
+/// `birth` es un nacimiento lógico de prueba, no un `ConceptId`.
+fn key(birth: u64, request: u64) -> OperationKey {
     OperationKey::new(
         ExecutionId::new("run-1").unwrap(),
-        agent,
+        AgentBirth::new(NonZeroU64::new(birth).unwrap()),
         NonZeroU64::new(request).unwrap(),
     )
 }
@@ -145,7 +146,7 @@ fn vocab_operations_is_the_same_log_as_resolving_with_the_prefix() {
         let mut g = AgentGraph::new();
         let v = Vocab::resolve_with(&mut g, prefix);
         let direct = OperationLog::resolve_with(&mut g, prefix);
-        let k = key(ConceptId(7), 1);
+        let k = key(7, 1);
         v.operations
             .record(&mut g, k.clone(), desc("t", "a"))
             .unwrap();
@@ -225,7 +226,7 @@ fn a_complete_forged_record_in_extras_cannot_duplicate_or_corrupt_the_log() {
         for via_helper in [false, true] {
             let mut g = AgentGraph::new();
             let (mut s, v) = spawner(&mut g, prefix, 8);
-            let k = key(ConceptId(42), 3);
+            let k = key(42, 3);
             let op = v
                 .operations
                 .record(&mut g, k.clone(), desc("t", "a"))
@@ -263,7 +264,7 @@ fn operations_are_not_agents_for_quota_parenting_or_tool_lookup() {
     let (mut s, v) = spawner(&mut g, "agent", 1);
     let mut ops = Vec::new();
     for r in 1..=4 {
-        let k = key(ConceptId(9), r);
+        let k = key(9, r);
         let op = v
             .operations
             .record(&mut g, k.clone(), desc("search", "q"))
@@ -322,7 +323,9 @@ impl OnyxSystem for Recorder {
         let v = self.v.unwrap();
         for agent in ctx.graph.query(&[v.state]) {
             for (r, state) in [(1, "pending"), (2, "uncertain"), (3, "resolved")] {
-                let k = key(agent, r);
+                // Agente heredado sin raíz: la prueba usa su número como
+                // nacimiento de prueba; aquí solo importa no mezclar registros.
+                let k = key(agent.0, r);
                 let found = v.operations.find(&*ctx.graph, &k).unwrap();
                 if found.is_some() {
                     continue;

@@ -6,9 +6,9 @@
 use std::num::NonZeroU64;
 
 use onyx_soul_agents::{
-    AgentGraph, Attr, AttrRegistry, ConceptId, ExecutionId, Graph, GraphView, OperationError,
-    OperationKey, OperationLog, OperationState, ToolDescriptor, ToolOperation, ToolOutcome, Value,
-    Vocab,
+    AgentBirth, AgentGraph, Attr, AttrRegistry, ConceptId, ExecutionId, Graph, GraphView,
+    OperationError, OperationKey, OperationLog, OperationState, ToolDescriptor, ToolOperation,
+    ToolOutcome, Value, Vocab,
 };
 
 type Fingerprint = Vec<(u64, Vec<(String, Value)>, Vec<(String, ConceptId)>)>;
@@ -24,10 +24,11 @@ fn fingerprint(g: &dyn GraphView) -> Fingerprint {
 fn exec(s: &str) -> ExecutionId {
     ExecutionId::new(s).unwrap()
 }
-fn key(execution: &str, agent: u64, request: u64) -> OperationKey {
+/// `birth` es el nacimiento lógico del agente, no su `ConceptId`.
+fn key(execution: &str, birth: u64, request: u64) -> OperationKey {
     OperationKey::new(
         exec(execution),
-        ConceptId(agent),
+        AgentBirth::new(NonZeroU64::new(birth).unwrap()),
         NonZeroU64::new(request).unwrap(),
     )
 }
@@ -105,7 +106,7 @@ fn identity_keeps_full_u64_and_every_component_distinguishes_records() {
         assert!(read.contains(k), "{k:?} perdido");
     }
     let found = log.find(&g, &max).unwrap().unwrap();
-    assert_eq!(found.key.agent(), ConceptId(u64::MAX));
+    assert_eq!(found.key.birth().get().get(), u64::MAX);
     assert_eq!(found.key.request().get(), u64::MAX);
     assert_eq!(found.key.execution().as_str(), "e");
 
@@ -269,7 +270,7 @@ fn descriptor_conflict_after_resolution_keeps_request_and_outcome() {
 }
 
 #[test]
-fn conflict_is_sticky_for_every_operation_and_across_snapshots() {
+fn conflict_persists_in_this_graph_and_in_a_later_snapshot_copy() {
     let (mut g, log) = setup();
     let k = key("e", 1, 1);
     let d = desc("t", "a", "r");
@@ -303,6 +304,65 @@ fn conflict_is_sticky_for_every_operation_and_across_snapshots() {
         assert_eq!(fingerprint(gr), before, "Blocked no debe mutar");
         assert_eq!(state_of(gr, lg, &k), conflict);
     }
+}
+
+/// Contrato documentado en tool.v2: el conflicto no es un diario externo
+/// irreversible. Importar una captura anterior al conflicto lo revierte.
+#[test]
+fn importing_an_older_snapshot_brings_back_the_state_before_the_conflict() {
+    let (mut g, log) = setup();
+    let k = key("e", 1, 1);
+    log.record(&mut g, k.clone(), desc("t", "a", "r")).unwrap();
+    log.complete(&mut g, &k, ok("r1")).unwrap();
+    let early = g.export();
+    assert_eq!(
+        log.complete(&mut g, &k, ok("r2")),
+        Err(OperationError::OutcomeConflict(k.clone()))
+    );
+    g.import(&early).unwrap();
+    assert_eq!(state_of(&g, &log, &k), OperationState::Resolved(ok("r1")));
+    // Tras el import, el registro vuelve a admitir el mismo resultado y
+    // vuelve a detectar el distinto: nada del conflicto anterior queda.
+    assert!(log.complete(&mut g, &k, ok("r1")).is_ok());
+    assert_eq!(
+        log.complete(&mut g, &k, ok("r2")),
+        Err(OperationError::OutcomeConflict(k.clone()))
+    );
+}
+
+#[test]
+fn a_complete_tool_v1_record_is_rejected_not_reinterpreted() {
+    let (mut g, log) = setup();
+    // Registro con la forma anterior: campo `agent` (ConceptId) y esquema tool.v1.
+    let id = g.create();
+    for (f, v) in [
+        ("execution", "e"),
+        ("agent", "4"),
+        ("request", "1"),
+        ("tool", "t"),
+        ("args", "a"),
+        ("route", "r"),
+        ("state", "pending"),
+        ("outcome_kind", "none"),
+        ("outcome_text", ""),
+        ("schema", "tool.v1"),
+    ] {
+        let a = g.attr(&format!("agent.operation.{f}"));
+        g.set(id, a, Value::Text(v.into()));
+    }
+    let before = fingerprint(&g);
+    assert_eq!(
+        log.entries(&g),
+        Err(OperationError::Corrupt {
+            concept: id,
+            field: "schema"
+        })
+    );
+    assert!(
+        log.record(&mut g, key("e", 4, 1), desc("t", "a", "r"))
+            .is_err()
+    );
+    assert_eq!(fingerprint(&g), before);
 }
 
 #[test]
@@ -383,10 +443,13 @@ fn destroying_the_agent_and_its_memory_keeps_the_record_usable() {
         g.relate(agent, v.rel_memory, m);
         mems.push(m);
     }
-    let k = OperationKey::new(exec("e"), agent, NonZeroU64::new(1).unwrap());
+    // La clave usa el nacimiento lógico; este agente de grafo no tiene raíz,
+    // así que la prueba fija uno arbitrario. Lo que importa es destroy.
+    let birth = AgentBirth::FIRST;
+    let k = OperationKey::new(exec("e"), birth, NonZeroU64::new(1).unwrap());
     let d = desc("t", "a", "r");
     let rec = log.record(&mut g, k.clone(), d.clone()).unwrap();
-    let k2 = OperationKey::new(exec("e"), agent, NonZeroU64::new(2).unwrap());
+    let k2 = OperationKey::new(exec("e"), birth, NonZeroU64::new(2).unwrap());
     log.record(&mut g, k2.clone(), d.clone()).unwrap();
     log.complete(&mut g, &k2, ok("done")).unwrap();
     let before = log.entries(&g).unwrap();
@@ -411,7 +474,7 @@ fn destroying_the_agent_and_its_memory_keeps_the_record_usable() {
     // Un resultado tardío llega aunque el agente ya no exista.
     let done = log.complete(&mut g, &k, ok("late")).unwrap();
     assert_eq!(done.id, rec.id);
-    assert_eq!(done.key.agent(), agent);
+    assert_eq!(done.key.birth(), birth);
     assert_eq!(
         log.find(&g, &k2).unwrap().unwrap().state,
         OperationState::Resolved(ok("done"))
@@ -592,13 +655,15 @@ fn every_missing_or_non_text_field_is_rejected() {
 #[test]
 fn malformed_values_are_rejected_not_repaired() {
     let cases: &[(&str, &str)] = &[
-        ("schema", "tool.v2"),
+        ("schema", "tool.v1"), // esquema anterior, clave por ConceptId
+        ("schema", "tool.v3"),
         ("execution", ""),
-        ("agent", "18446744073709551616"), // u64::MAX + 1
-        ("agent", "-1"),
-        ("agent", "04"), // no canónico: otra clave tras normalizar
-        ("agent", " 4"),
-        ("agent", "+4"),
+        ("birth", "18446744073709551616"), // u64::MAX + 1
+        ("birth", "-1"),
+        ("birth", "0"),  // el nacimiento empieza en 1
+        ("birth", "04"), // no canónico: otra clave tras normalizar
+        ("birth", " 4"),
+        ("birth", "+4"),
         ("request", "0"),
         ("request", "02"),
         ("request", "x"),

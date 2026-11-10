@@ -1,10 +1,12 @@
-//! Sistema que crea agentes a partir de eventos `<prefix>.ev.spawn`.
+//! Sistema que crea agentes a partir de eventos `<prefix>.ev.spawn` y la raíz
+//! de ejecución a partir de `<prefix>.ev.begin_execution`.
 
 use onyx_core::{
     AttrRegistry, ConceptId, Ctx, DomainEvent, Graph, OnyxError, OnyxEvent, OnyxSystem, Value,
 };
 
 use crate::config::AgentConfig;
+use crate::root::{AgentBirth, RootError, execution_root};
 use crate::spec::Policy;
 use crate::util::{current_tick, data, domain, text};
 use crate::vocab::{AgentState, Vocab};
@@ -12,6 +14,12 @@ use crate::vocab::{AgentState, Vocab};
 pub const SPAWNER_NAME: &str = "agent_spawner";
 
 /// Crea conceptos agente. No ejecuta agentes: eso lo hace `AgentRuntime`.
+///
+/// Con `AgentConfig::execution`, cada spawn válido valida la raíz y reserva el
+/// siguiente nacimiento en el mismo `run` en que crea el agente. Un spawn
+/// rechazado (cupo, spec, raíz o contador agotado) no consume nacimiento.
+/// Sin `execution` (modo heredado) no escribe identidad, y rechaza el spawn
+/// con `execution_not_configured` si el grafo ya tiene una raíz.
 ///
 /// Debe ir antes que el runtime en el slice de sistemas para que un agente
 /// recién creado pueda decidir en el mismo tick.
@@ -49,6 +57,8 @@ impl OnyxSystem for AgentSpawner {
             if let OnyxEvent::Domain(d) = event {
                 if d.kind == v.ev_spawn {
                     self.spawn(ctx, &v, now, d);
+                } else if d.kind == v.ev_begin {
+                    self.begin(ctx, &v);
                 }
             }
         }
@@ -63,6 +73,48 @@ impl AgentSpawner {
             payload.push((v.name, Value::Text(name.clone())));
         }
         ctx.outbox.push(domain(v.ev_rejected, d.subject, payload));
+    }
+
+    /// Crea la raíz solo en un grafo sin conceptos. Nunca la repara ni la
+    /// sustituye: con una raíz existente responde `graph_not_empty`.
+    fn begin(&self, ctx: &mut Ctx, v: &Vocab) {
+        let result = match &self.config.execution {
+            None => Err(RootError::NotConfigured),
+            Some(_) if !ctx.graph.query(&[]).is_empty() => Err(RootError::NotEmpty),
+            Some(execution) => Ok(v.root.write_root(ctx.graph, &self.config, execution)),
+        };
+        ctx.outbox.push(match result {
+            Ok(root) => domain(v.ev_begun, Some(root), Vec::new()),
+            Err(e) => domain(
+                v.ev_begin_rejected,
+                None,
+                vec![(v.reason, Value::Text(e.reason().into()))],
+            ),
+        });
+    }
+
+    /// Raíz validada y nacimiento siguiente, o el motivo de rechazo. `None`
+    /// en modo heredado sin raíz.
+    fn reserve(
+        &self,
+        ctx: &Ctx,
+        v: &Vocab,
+    ) -> Result<Option<(crate::root::ExecutionRoot, AgentBirth)>, RootError> {
+        if self.config.execution.is_none() {
+            return if v.root.exists(&*ctx.graph) {
+                Err(RootError::NotConfigured)
+            } else {
+                Ok(None)
+            };
+        }
+        let root = execution_root(&*ctx.graph, v, &self.config)?;
+        let next = root
+            .next_birth
+            .get()
+            .checked_add(1)
+            .map(AgentBirth::new)
+            .ok_or(RootError::Exhausted)?;
+        Ok(Some((root, next)))
     }
 
     fn live_agents(&self, ctx: &Ctx, v: &Vocab) -> usize {
@@ -114,6 +166,10 @@ impl AgentSpawner {
                 .collect(),
             _ => Vec::new(),
         };
+        let birth = match self.reserve(ctx, v) {
+            Ok(birth) => birth,
+            Err(e) => return self.reject(ctx, v, d, e.reason()),
+        };
 
         let id = ctx.graph.create();
         // Las propiedades de la app van primero: las del framework las pisan.
@@ -137,6 +193,9 @@ impl AgentSpawner {
         let born = i64::try_from(now).unwrap_or(i64::MAX);
         ctx.graph.set(id, v.born, Value::Int(born));
         ctx.graph.set(id, v.mem_count, Value::Int(0));
+        if let Some((root, next)) = &birth {
+            v.root.write_birth(ctx.graph, root, *next, id);
+        }
 
         for tool in &tool_names {
             let tool_id = find_or_create_tool(ctx.graph, v, tool);

@@ -2,6 +2,8 @@
 //!
 //! This module stores identity, the exact request and its known outcome. It
 //! neither dispatches tools nor proves that an external effect is safe to repeat.
+//! The agent part of the key is its logical [`AgentBirth`] from the execution
+//! root ([`crate::root`]), never its `ConceptId`.
 //! Runtime integration, receiver capabilities and strict replay are separate
 //! work; the existing runtime does not create these records automatically yet.
 //!
@@ -14,6 +16,7 @@ use std::{collections::BTreeSet, fmt, num::NonZeroU64};
 use onyx_core::{Attr, AttrRegistry, ConceptId, Graph, GraphView, Value};
 
 use crate::config::DEFAULT_PREFIX;
+use crate::root::{AgentBirth, parse_canonical};
 
 /// App-supplied execution identity, not a clock or a random seed.
 ///
@@ -36,27 +39,30 @@ impl ExecutionId {
     }
 }
 
-/// Identity in the tool channel. Decider requests are a separate channel.
+/// Identity in the tool channel: `(execution, birth, request)`. Decider
+/// requests are a separate channel, so the channel is implicit in the type.
 ///
-/// The origin agent's number is historical identity, not a live graph reference.
-/// It and the request counter are persisted without narrowing to `i64`.
+/// The agent's birth is historical identity, not a live graph reference: it
+/// survives `destroy` and does not depend on the `ConceptId` the graph assigns
+/// after a restore. Use [`crate::RootSchema::locate`] to find the live agent.
+/// The birth and the request counter are persisted without narrowing to `i64`.
 ///
-/// This storage key alone is not a replay-stable agent identity. Restoring a
-/// snapshot from before an agent was born into an already-used graph can give
-/// the recreated agent a different `ConceptId`. External dispatch must resolve
-/// that case before using this key for receiver deduplication.
+/// Both counters rewind with a snapshot. An equal key, or an equal key with
+/// an equal descriptor, does not prove that a continuation is the same work.
+/// Receiver deduplication by this key still needs the external frontier and
+/// replay checks that are not implemented yet; see [`crate::root`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OperationKey {
     execution: ExecutionId,
-    agent: u64,
+    birth: AgentBirth,
     request: NonZeroU64,
 }
 
 impl OperationKey {
-    pub fn new(execution: ExecutionId, agent: ConceptId, request: NonZeroU64) -> Self {
+    pub fn new(execution: ExecutionId, birth: AgentBirth, request: NonZeroU64) -> Self {
         Self {
             execution,
-            agent: agent.0,
+            birth,
             request,
         }
     }
@@ -64,8 +70,8 @@ impl OperationKey {
     pub fn execution(&self) -> &ExecutionId {
         &self.execution
     }
-    pub fn agent(&self) -> ConceptId {
-        ConceptId(self.agent)
+    pub fn birth(&self) -> AgentBirth {
+        self.birth
     }
     pub fn request(&self) -> NonZeroU64 {
         self.request
@@ -128,7 +134,9 @@ pub enum OperationState {
     Pending,
     Uncertain,
     Resolved(ToolOutcome),
-    /// Sticky conflict; any previously known outcome remains available.
+    /// Conflict that later writes to this graph do not clear; any previously
+    /// known outcome remains available. Importing an older snapshot can bring
+    /// back an earlier state: this is not an external, irreversible journal.
     Conflict {
         previous: Option<ToolOutcome>,
     },
@@ -170,7 +178,7 @@ impl fmt::Display for OperationError {
             Self::DuplicateKey(key) => write!(f, "duplicate tool operation key: {key:?}"),
             Self::DescriptorConflict(key) => write!(f, "tool request conflict: {key:?}"),
             Self::OutcomeConflict(key) => write!(f, "tool outcome conflict: {key:?}"),
-            Self::Blocked(key) => write!(f, "tool operation has a sticky conflict: {key:?}"),
+            Self::Blocked(key) => write!(f, "tool operation has a conflict in this graph: {key:?}"),
             Self::Corrupt { concept, field } => {
                 write!(f, "invalid tool operation {}: {field}", concept.0)
             }
@@ -180,10 +188,14 @@ impl fmt::Display for OperationError {
 
 impl std::error::Error for OperationError {}
 
-/// Soul-owned schema under `<prefix>.operation.*`.
+const SCHEMA: &str = "tool.v2";
+
+/// Soul-owned schema under `<prefix>.operation.*`, version `tool.v2`.
 ///
-/// The log creates a separate concept for each key. It never deletes records,
-/// touches conversation memory, or changes an agent. No `Value::Concept` or
+/// Records of the earlier `tool.v1` schema, keyed by `ConceptId`, are
+/// rejected as `Corrupt`, not reinterpreted. The log creates a separate
+/// concept for each key. It never deletes records, touches conversation
+/// memory, or changes an agent. No `Value::Concept` or
 /// relation to the agent is stored: destroying it cannot erase this identity.
 /// Tool payloads cannot supply control attributes through this API.
 ///
@@ -194,7 +206,7 @@ impl std::error::Error for OperationError {}
 pub struct OperationLog {
     schema: Attr,
     execution: Attr,
-    agent: Attr,
+    birth: Attr,
     request: Attr,
     tool: Attr,
     args: Attr,
@@ -214,7 +226,7 @@ impl OperationLog {
         Self {
             schema: a("schema"),
             execution: a("execution"),
-            agent: a("agent"),
+            birth: a("birth"),
             request: a("request"),
             tool: a("tool"),
             args: a("args"),
@@ -233,7 +245,7 @@ impl OperationLog {
         [
             self.schema,
             self.execution,
-            self.agent,
+            self.birth,
             self.request,
             self.tool,
             self.args,
@@ -274,8 +286,9 @@ impl OperationLog {
     }
 
     /// Persist before attempting an effect. Equal repeated requests reuse the
-    /// record. A changed descriptor marks a sticky conflict, keeps the original
-    /// request/outcome and returns an error. No dispatch happens here.
+    /// record. A changed descriptor marks a conflict in this graph, keeps the
+    /// original request/outcome and returns an error. No dispatch happens here.
+    /// Equality of descriptors does not prove equality of intent.
     pub fn record(
         &self,
         graph: &mut dyn Graph,
@@ -300,7 +313,7 @@ impl OperationLog {
             self.execution,
             Value::Text(key.execution.as_str().into()),
         );
-        graph.set(id, self.agent, Value::Text(key.agent.to_string()));
+        graph.set(id, self.birth, Value::Text(key.birth.to_string()));
         graph.set(id, self.request, Value::Text(key.request.to_string()));
         graph.set(id, self.tool, Value::Text(descriptor.tool.clone()));
         graph.set(id, self.args, Value::Text(descriptor.args.clone()));
@@ -312,7 +325,7 @@ impl OperationLog {
             state: OperationState::Pending,
         };
         self.write_state(graph, &operation);
-        graph.set(id, self.schema, Value::Text("tool.v1".into()));
+        graph.set(id, self.schema, Value::Text(SCHEMA.into()));
         Ok(operation)
     }
 
@@ -336,8 +349,10 @@ impl OperationLog {
     }
 
     /// Record a late or repeated observation independently of the agent's life.
-    /// Equal outcomes are idempotent; different outcomes mark a sticky conflict
-    /// while preserving the first known outcome. A conflict is never cleared.
+    /// Equal outcomes are idempotent; different outcomes mark a conflict while
+    /// preserving the first known outcome. No method of this log clears a
+    /// conflict, but importing an older snapshot replaces the whole graph and
+    /// can return the record to an earlier state.
     pub fn complete(
         &self,
         graph: &mut dyn Graph,
@@ -381,13 +396,14 @@ impl OperationLog {
             Some(Value::Text(value)) => Ok(value),
             _ => Err(invalid(field)),
         };
-        if text(self.schema, "schema")? != "tool.v1" {
+        if text(self.schema, "schema")? != SCHEMA {
             return Err(invalid("schema"));
         }
         let execution = ExecutionId::new(text(self.execution, "execution")?)
             .map_err(|_| invalid("execution"))?;
-        let agent = parse_counter(&text(self.agent, "agent")?).ok_or_else(|| invalid("agent"))?;
-        let request = parse_counter(&text(self.request, "request")?)
+        let birth =
+            AgentBirth::parse(&text(self.birth, "birth")?).ok_or_else(|| invalid("birth"))?;
+        let request = parse_canonical(&text(self.request, "request")?)
             .and_then(NonZeroU64::new)
             .ok_or_else(|| invalid("request"))?;
         let descriptor = ToolDescriptor::new(
@@ -417,7 +433,7 @@ impl OperationLog {
         };
         Ok(ToolOperation {
             id,
-            key: OperationKey::new(execution, ConceptId(agent), request),
+            key: OperationKey::new(execution, birth, request),
             descriptor,
             state,
         })
@@ -447,9 +463,4 @@ fn known_outcome(state: &OperationState) -> Option<&ToolOutcome> {
         OperationState::Conflict { previous } => previous.as_ref(),
         OperationState::Pending | OperationState::Uncertain => None,
     }
-}
-
-fn parse_counter(text: &str) -> Option<u64> {
-    let value: u64 = text.parse().ok()?;
-    (value.to_string() == text).then_some(value)
 }
