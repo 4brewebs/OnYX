@@ -557,6 +557,7 @@ fn full_view(
         goal: "summarize".into(),
         tools: vec!["search".into(), "read".into()],
         memory,
+        pending_approval: None,
         props,
     }
 }
@@ -570,6 +571,7 @@ fn uniform_tool_is_deterministic_for_a_given_rng() {
         goal: "g".into(),
         tools: vec!["search".into(), "shell".into(), "browse".into()],
         memory: vec![],
+        pending_approval: None,
         props: vec![],
     };
     let mut a = DetRng::from_seed_and_tick(7, 3);
@@ -811,4 +813,74 @@ fn invalid_policy_on_an_idle_agent_fails() {
     assert_eq!(w.state(id), AgentState::Failed);
     assert_eq!(w.text(id, w.v.result), "invalid_policy");
     assert_eq!(failed(&w.v, &out), [(id, "invalid_policy".into())]);
+}
+
+#[test]
+fn approval_gated_tool_waits_for_approve_without_timing_out() {
+    let mut w = World::new(cfg());
+    let id = w.spawn(
+        &AgentSpec::new("alice", "g")
+            .with_tools(["fs_read", "fs_write"])
+            .with_approval_tools(["fs_write"])
+            .with_timeout_ticks(2),
+    );
+    let out = w.run(vec![
+        Reply::call_structured(id, 1, "fs_write", "{\"path\":\"a.rs\"}")
+            .with_call_id("c-1")
+            .to_event(),
+    ]);
+    assert_eq!(w.state(id), AgentState::WaitingApproval);
+    assert!(tool_calls(&w.v, &out).is_empty());
+
+    let approvals = onyx_soul_agents::pending_approvals(&w.g, &w.v);
+    assert_eq!(approvals.len(), 1);
+    let pending = approvals[0].pending_approval.as_ref().unwrap();
+    assert_eq!(pending.tool, "fs_write");
+    assert_eq!(pending.args, "{\"path\":\"a.rs\"}");
+    assert_eq!(pending.call_id.as_deref(), Some("c-1"));
+
+    // Más ticks que `timeout_ticks` (2): no debe expirar mientras espera al humano.
+    for _ in 0..5 {
+        w.run(vec![]);
+        assert_eq!(w.state(id), AgentState::WaitingApproval);
+    }
+
+    let out = w.run(vec![Reply::approve(id, 1).to_event()]);
+    assert_eq!(w.state(id), AgentState::Acting);
+    assert_eq!(
+        tool_calls(&w.v, &out),
+        [(id, "fs_write".into(), "{\"path\":\"a.rs\"}".into())]
+    );
+    assert!(onyx_soul_agents::pending_approvals(&w.g, &w.v).is_empty());
+}
+
+#[test]
+fn denying_pending_approval_returns_agent_to_idle_with_reason() {
+    struct GateDangerous;
+    impl onyx_soul_agents::ApprovalPolicy for GateDangerous {
+        fn requires_approval(
+            &self,
+            _view: &AgentView,
+            tool: &str,
+            args: &str,
+        ) -> bool {
+            tool == "shell" && args.contains("rm")
+        }
+    }
+
+    let mut w = World::with_runtime(
+        cfg(),
+        AgentRuntime::new(cfg()).with_approval(Box::new(GateDangerous)),
+    );
+    let id = w.spawn(&AgentSpec::new("alice", "g").with_tools(["shell"]));
+    w.run(vec![Reply::call(id, 1, "shell rm -rf /").to_event()]);
+    assert_eq!(w.state(id), AgentState::WaitingApproval);
+
+    w.run(vec![Reply::deny(id, 1, "demasiado peligroso").to_event()]);
+    assert_eq!(w.state(id), AgentState::Thinking);
+    assert_eq!(
+        w.memory(id),
+        [("denied".into(), "shell: demasiado peligroso".into())]
+    );
+    assert!(onyx_soul_agents::pending_approvals(&w.g, &w.v).is_empty());
 }

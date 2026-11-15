@@ -21,9 +21,9 @@ use std::collections::BTreeSet;
 
 use onyx_core::{EventBus, GraphView, PlatformDriver, SurfaceBinding};
 
-use crate::policy::{AgentView, agent_view};
+use crate::policy::{AgentView, PendingApproval, agent_view};
 use crate::reply::Reply;
-use crate::util::text;
+use crate::util::{int, text};
 use crate::vocab::{AgentState, Vocab};
 
 /// Peticiones pendientes: agentes en `Thinking`, en orden de id.
@@ -36,6 +36,39 @@ pub fn pending_requests(view: &dyn GraphView, v: &Vocab) -> Vec<AgentView> {
         })
         .map(|id| agent_view(view, v, id))
         .filter(|a| a.request > 0)
+        .collect()
+}
+
+/// Aprobaciones humanas pendientes: agentes en `WaitingApproval`, en orden de id.
+pub fn pending_approvals(view: &dyn GraphView, v: &Vocab) -> Vec<AgentView> {
+    view.query(&[v.state, v.pending])
+        .into_iter()
+        .filter(|id| {
+            text(view, *id, v.state).and_then(|s| AgentState::parse(&s))
+                == Some(AgentState::WaitingApproval)
+        })
+        .map(|id| agent_view(view, v, id))
+        .filter(|a| a.request > 0 && a.pending_approval.is_some())
+        .collect()
+}
+
+/// Llamadas a herramientas en ejecución externa (`AgentState::Acting`), en orden de id.
+pub fn pending_tool_calls(view: &dyn GraphView, v: &Vocab) -> Vec<(onyx_core::ConceptId, u64, PendingApproval)> {
+    view.query(&[v.state, v.pending])
+        .into_iter()
+        .filter(|id| {
+            text(view, *id, v.state).and_then(|s| AgentState::parse(&s)) == Some(AgentState::Acting)
+        })
+        .filter_map(|id| {
+            let request = int(view, id, v.pending).and_then(|i| u64::try_from(i).ok())?;
+            if request == 0 {
+                return None;
+            }
+            let tool = text(view, id, v.pending_tool).filter(|s| !s.is_empty())?;
+            let args = text(view, id, v.pending_args).unwrap_or_default();
+            let call_id = text(view, id, v.pending_call_id).filter(|s| !s.is_empty());
+            Some((id, request, PendingApproval { tool, args, call_id }))
+        })
         .collect()
 }
 

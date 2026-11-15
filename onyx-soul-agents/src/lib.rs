@@ -40,7 +40,10 @@ pub mod vocab;
 
 mod util;
 
-pub use bridge::{Logged, RecordingBridge, ReplayBridge, Responder, Transcript, pending_requests};
+pub use bridge::{
+    Logged, RecordingBridge, ReplayBridge, Responder, Transcript, pending_approvals,
+    pending_requests, pending_tool_calls,
+};
 pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest};
@@ -49,7 +52,8 @@ pub use headless::{HeadlessDriver, HeadlessHandle};
 pub use host::{AgentHost, Fingerprint, HostBuilder, MemStore};
 pub use loader::RustLoader;
 pub use policy::{
-    AgentView, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool,
+    AgentView, ApprovalPolicy, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, NeverApprove,
+    PendingApproval, ScriptedPolicy, UniformTool,
 };
 pub use registry::{InMemorySystemRegistry, SystemFactory};
 pub use reply::{REPLY_SOURCE, Reply, Verb};

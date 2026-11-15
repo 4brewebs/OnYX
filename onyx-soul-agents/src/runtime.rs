@@ -44,7 +44,8 @@ use onyx_core::{
 
 use crate::config::AgentConfig;
 use crate::policy::{
-    Decision, DefaultMemory, MemoryEntry, MemoryPolicy, ScriptedPolicy, UniformTool, agent_view,
+    ApprovalPolicy, Decision, DefaultMemory, MemoryEntry, MemoryPolicy, NeverApprove,
+    ScriptedPolicy, UniformTool, agent_view,
 };
 use crate::reply::{REPLY_SOURCE, Reply, Verb};
 use crate::spec::Policy;
@@ -57,6 +58,7 @@ pub struct AgentRuntime {
     config: AgentConfig,
     memory: Box<dyn MemoryPolicy>,
     scripted: Box<dyn ScriptedPolicy>,
+    approval: Box<dyn ApprovalPolicy>,
     vocab: Option<Vocab>,
 }
 
@@ -68,6 +70,7 @@ impl AgentRuntime {
             config,
             memory,
             scripted: Box::new(UniformTool),
+            approval: Box::new(NeverApprove),
             vocab: None,
         }
     }
@@ -81,6 +84,12 @@ impl AgentRuntime {
     /// Sustituye el decisor de los agentes `Policy::Scripted`.
     pub fn with_scripted(mut self, scripted: Box<dyn ScriptedPolicy>) -> Self {
         self.scripted = scripted;
+        self
+    }
+
+    /// Sustituye la política dinámica de aprobación humana.
+    pub fn with_approval(mut self, approval: Box<dyn ApprovalPolicy>) -> Self {
+        self.approval = approval;
         self
     }
 }
@@ -109,6 +118,7 @@ impl OnyxSystem for AgentRuntime {
         let step = Step {
             v,
             mem: &*self.memory,
+            approval: &*self.approval,
             now,
         };
         let inbox = ctx.inbox;
@@ -157,8 +167,18 @@ impl OnyxSystem for AgentRuntime {
                         Some(Value::Bool(false)) => Verb::ToolError,
                         _ => Verb::Observe,
                     };
+                    let call_id = match data(d, v.call_id) {
+                        Some(Value::Text(c)) => Some(c.clone()),
+                        _ => None,
+                    };
                     match d.subject {
-                        Some(agent) => step.apply(ctx, Reply::new(agent, request, verb, body)),
+                        Some(agent) => {
+                            let mut reply = Reply::new(agent, request, verb, body);
+                            if let Some(cid) = call_id {
+                                reply = reply.with_call_id(cid);
+                            }
+                            step.apply(ctx, reply);
+                        }
                         None => ctx.outbox.push(fault("tool result without agent".into())),
                     }
                 }
@@ -174,10 +194,11 @@ impl OnyxSystem for AgentRuntime {
     }
 }
 
-/// Contexto de un tick: vocabulario, política de memoria y número de tick.
+/// Contexto de un tick: vocabulario, políticas y número de tick.
 struct Step<'a> {
     v: Vocab,
     mem: &'a dyn MemoryPolicy,
+    approval: &'a dyn ApprovalPolicy,
     now: u64,
 }
 
@@ -186,10 +207,19 @@ impl Step<'_> {
         text(&*ctx.graph, id, self.v.state).and_then(|s| AgentState::parse(&s))
     }
 
+    /// Estados con plazo automático (`remaining`). `WaitingApproval` espera al
+    /// humano sin caducar por timeout.
     fn is_waiting(&self, ctx: &Ctx, id: ConceptId) -> bool {
         matches!(
             self.state_of(ctx, id),
             Some(AgentState::Thinking | AgentState::Acting)
+        )
+    }
+
+    fn is_expecting_reply(&self, ctx: &Ctx, id: ConceptId) -> bool {
+        matches!(
+            self.state_of(ctx, id),
+            Some(AgentState::Thinking | AgentState::WaitingApproval | AgentState::Acting)
         )
     }
 
@@ -236,6 +266,7 @@ impl Step<'_> {
 
     fn finish(&self, ctx: &mut Ctx, id: ConceptId, state: AgentState, body: &str) {
         let v = &self.v;
+        self.clear_pending_approval(ctx, id);
         self.set_state(ctx, id, state);
         ctx.graph.set(id, v.pending, Value::Int(0));
         ctx.graph.set(id, v.result, Value::Text(body.to_string()));
@@ -258,6 +289,56 @@ impl Step<'_> {
             .any(|t| text(&*ctx.graph, t, self.v.tool_name).as_deref() == Some(name))
     }
 
+    fn tool_requires_approval(&self, ctx: &Ctx, agent: ConceptId, name: &str) -> bool {
+        ctx.graph
+            .related(agent, self.v.rel_approval_tool)
+            .into_iter()
+            .any(|t| text(&*ctx.graph, t, self.v.tool_name).as_deref() == Some(name))
+    }
+
+    fn clear_pending_approval(&self, ctx: &mut Ctx, id: ConceptId) {
+        let v = &self.v;
+        ctx.graph.set(id, v.pending_tool, Value::Text(String::new()));
+        ctx.graph.set(id, v.pending_args, Value::Text(String::new()));
+        ctx.graph
+            .set(id, v.pending_call_id, Value::Text(String::new()));
+    }
+
+    fn dispatch_tool_call(
+        &self,
+        ctx: &mut Ctx,
+        id: ConceptId,
+        request: i64,
+        tool: String,
+        args: String,
+        call_id: Option<String>,
+    ) {
+        let v = &self.v;
+        let line = if args.is_empty() {
+            tool.clone()
+        } else {
+            format!("{tool} {args}")
+        };
+        self.remember(ctx, id, "call", &line);
+        ctx.graph.set(id, v.pending_tool, Value::Text(tool.clone()));
+        ctx.graph.set(id, v.pending_args, Value::Text(args.clone()));
+        ctx.graph.set(
+            id,
+            v.pending_call_id,
+            Value::Text(call_id.clone().unwrap_or_default()),
+        );
+        let mut event_data = vec![
+            (v.request, Value::Int(request)),
+            (v.tool, Value::Text(tool)),
+            (v.args, Value::Text(args)),
+        ];
+        if let Some(cid) = call_id {
+            event_data.push((v.call_id, Value::Text(cid)));
+        }
+        ctx.outbox.push(domain(v.ev_tool_call, Some(id), event_data));
+        self.enter_wait(ctx, id, AgentState::Acting);
+    }
+
     fn enter_wait(&self, ctx: &mut Ctx, id: ConceptId, state: AgentState) {
         let timeout = int(&*ctx.graph, id, self.v.timeout).unwrap_or(1);
         ctx.graph
@@ -267,7 +348,14 @@ impl Step<'_> {
 
     /// Aplica una decisión (de un decisor externo o de un `ScriptedPolicy`)
     /// a un agente que tiene la petición `request` pendiente.
-    fn act(&self, ctx: &mut Ctx, id: ConceptId, request: i64, decision: Decision) {
+    fn act(
+        &self,
+        ctx: &mut Ctx,
+        id: ConceptId,
+        request: i64,
+        call_id: Option<String>,
+        decision: Decision,
+    ) {
         let v = &self.v;
         match decision {
             Decision::Say(t) => {
@@ -277,22 +365,32 @@ impl Step<'_> {
             }
             Decision::Call { tool, args } => {
                 if self.has_tool(ctx, id, &tool) {
-                    let line = if args.is_empty() {
-                        tool.clone()
-                    } else {
-                        format!("{tool} {args}")
-                    };
-                    self.remember(ctx, id, "call", &line);
-                    ctx.outbox.push(domain(
-                        v.ev_tool_call,
-                        Some(id),
-                        vec![
+                    let needs_approval = self.tool_requires_approval(ctx, id, &tool)
+                        || self
+                            .approval
+                            .requires_approval(&agent_view(&*ctx.graph, v, id), &tool, &args);
+                    if needs_approval {
+                        ctx.graph.set(id, v.pending_tool, Value::Text(tool.clone()));
+                        ctx.graph.set(id, v.pending_args, Value::Text(args.clone()));
+                        ctx.graph.set(
+                            id,
+                            v.pending_call_id,
+                            Value::Text(call_id.clone().unwrap_or_default()),
+                        );
+                        let mut ev_data = vec![
                             (v.request, Value::Int(request)),
                             (v.tool, Value::Text(tool)),
                             (v.args, Value::Text(args)),
-                        ],
-                    ));
-                    self.enter_wait(ctx, id, AgentState::Acting);
+                        ];
+                        if let Some(cid) = call_id {
+                            ev_data.push((v.call_id, Value::Text(cid)));
+                        }
+                        ctx.outbox
+                            .push(domain(v.ev_approval_requested, Some(id), ev_data));
+                        self.set_state(ctx, id, AgentState::WaitingApproval);
+                    } else {
+                        self.dispatch_tool_call(ctx, id, request, tool, args, call_id);
+                    }
                 } else {
                     self.remember(ctx, id, "denied", &tool);
                     ctx.graph.set(id, v.pending, Value::Int(0));
@@ -315,7 +413,7 @@ impl Step<'_> {
                 .push(fault(format!("reply for unknown agent {}", id.0)));
         };
         let pending = int(&*ctx.graph, id, v.pending).unwrap_or(0);
-        if !self.is_waiting(ctx, id) || i64::try_from(r.request).ok() != Some(pending) {
+        if !self.is_expecting_reply(ctx, id) || i64::try_from(r.request).ok() != Some(pending) {
             return ctx.outbox.push(fault(format!(
                 "stale reply for agent {} (request {}, pending {})",
                 id.0, r.request, pending
@@ -323,25 +421,62 @@ impl Step<'_> {
         }
 
         let back_to_idle = |me: &Self, ctx: &mut Ctx, kind: &str, body: &str| {
+            me.clear_pending_approval(ctx, id);
             me.remember(ctx, id, kind, body);
             ctx.graph.set(id, v.pending, Value::Int(0));
             me.set_state(ctx, id, AgentState::Idle);
         };
         match (state, r.verb) {
             (AgentState::Thinking, Verb::Say) => {
-                self.act(ctx, id, pending, Decision::Say(r.payload))
+                self.act(ctx, id, pending, r.call_id, Decision::Say(r.payload))
             }
             (AgentState::Thinking, Verb::Call) => {
-                let (tool, args) = match r.payload.split_once(' ') {
-                    Some((t, a)) => (t.to_string(), a.to_string()),
-                    None => (r.payload.clone(), String::new()),
-                };
-                self.act(ctx, id, pending, Decision::Call { tool, args })
+                let (t, a) = Reply::parse_call_payload(&r.payload);
+                self.act(
+                    ctx,
+                    id,
+                    pending,
+                    r.call_id,
+                    Decision::Call {
+                        tool: t.to_string(),
+                        args: a.to_string(),
+                    },
+                )
             }
             (AgentState::Thinking, Verb::Done) => {
-                self.act(ctx, id, pending, Decision::Done(r.payload))
+                self.act(ctx, id, pending, r.call_id, Decision::Done(r.payload))
             }
-            (_, Verb::Fail) => self.act(ctx, id, pending, Decision::Fail(r.payload)),
+            (AgentState::WaitingApproval, Verb::Approve) => {
+                let tool = text(&*ctx.graph, id, v.pending_tool).unwrap_or_default();
+                let args = text(&*ctx.graph, id, v.pending_args).unwrap_or_default();
+                let call_id = text(&*ctx.graph, id, v.pending_call_id)
+                    .filter(|s| !s.is_empty())
+                    .or(r.call_id);
+                self.clear_pending_approval(ctx, id);
+                self.dispatch_tool_call(ctx, id, pending, tool, args, call_id);
+            }
+            (AgentState::WaitingApproval, Verb::Deny) => {
+                let tool = text(&*ctx.graph, id, v.pending_tool).unwrap_or_default();
+                self.clear_pending_approval(ctx, id);
+                let note = if r.payload.is_empty() {
+                    tool.clone()
+                } else {
+                    format!("{tool}: {}", r.payload)
+                };
+                self.remember(ctx, id, "denied", &note);
+                ctx.graph.set(id, v.pending, Value::Int(0));
+                ctx.outbox.push(domain(
+                    v.ev_approval_denied,
+                    Some(id),
+                    vec![
+                        (v.request, Value::Int(pending)),
+                        (v.tool, Value::Text(tool)),
+                        (v.reason, Value::Text(r.payload)),
+                    ],
+                ));
+                self.set_state(ctx, id, AgentState::Idle);
+            }
+            (_, Verb::Fail) => self.act(ctx, id, pending, r.call_id, Decision::Fail(r.payload)),
             (AgentState::Acting, Verb::Observe) => back_to_idle(self, ctx, "observe", &r.payload),
             (AgentState::Acting, Verb::ToolError) => {
                 back_to_idle(self, ctx, "tool_error", &r.payload)
@@ -361,7 +496,7 @@ impl Step<'_> {
             return;
         };
         match state {
-            AgentState::Done | AgentState::Failed => {}
+            AgentState::Done | AgentState::Failed | AgentState::WaitingApproval => {}
             AgentState::Thinking | AgentState::Acting => {
                 if int(&*ctx.graph, id, v.remaining).unwrap_or(0) <= 0 {
                     self.finish(ctx, id, AgentState::Failed, "timeout");
@@ -385,7 +520,7 @@ impl Step<'_> {
                         ctx.graph.set(id, v.pending, Value::Int(request));
                         let view = agent_view(&*ctx.graph, v, id);
                         let decision = scripted.decide(&view, ctx.rng);
-                        self.act(ctx, id, request, decision);
+                        self.act(ctx, id, request, None, decision);
                     }
                     None => self.finish(ctx, id, AgentState::Failed, "invalid_policy"),
                 }

@@ -71,3 +71,54 @@ fn reply_to_event_uses_fixed_source_independent_of_any_vocab_prefix() {
         other => panic!("se esperaba ingress Raw, llegó {other:?}"),
     }
 }
+
+#[test]
+fn reply_v2_codec_round_trips_call_id_and_special_characters() {
+    let reply = Reply::call_structured(
+        ConceptId(5),
+        12,
+        "fs_write",
+        "{\"path\":\"a b.rs\",\"body\":\"line1\\nline2\\t\"}",
+    )
+    .with_call_id("call:1\talpha");
+
+    let bytes = reply.to_bytes();
+    assert!(bytes.starts_with(b"v2\t"));
+    assert_eq!(Reply::from_bytes(&bytes), Ok(reply));
+}
+
+#[test]
+fn reply_v2_rejects_malformed_headers_and_lengths() {
+    assert_eq!(Reply::from_bytes(b"v2\t1\t2\tsay"), Err("malformed reply".into()));
+    assert_eq!(
+        Reply::from_bytes(b"v2\t1\t2\tsay\tnonlen:abc\thi"),
+        Err("malformed reply".into())
+    );
+    assert_eq!(
+        Reply::from_bytes(b"v2\t1\t2\tsay\t99:short\thi"),
+        Err("malformed reply".into())
+    );
+    assert_eq!(
+        Reply::from_bytes(b"v2\t1\t2\tsay\t3:abcXhi"),
+        Err("malformed reply".into())
+    );
+}
+
+#[test]
+fn reply_parse_call_payload_handles_structured_and_legacy() {
+    let structured = Reply::call_structured(
+        ConceptId(1),
+        1,
+        "fs_edit",
+        "  leading space\nand\tnewlines",
+    );
+    assert_eq!(
+        Reply::parse_call_payload(&structured.payload),
+        ("fs_edit", "  leading space\nand\tnewlines")
+    );
+    assert_eq!(
+        Reply::parse_call_payload("search foo bar"),
+        ("search", "foo bar")
+    );
+    assert_eq!(Reply::parse_call_payload("ping"), ("ping", ""));
+}

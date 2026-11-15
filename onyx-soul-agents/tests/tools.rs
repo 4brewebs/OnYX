@@ -725,3 +725,42 @@ fn factories_do_not_include_the_tool_system() {
         "ToolSystem lo aporta la app, no el loader"
     );
 }
+
+#[test]
+fn structured_call_and_call_id_propagate_across_runtime_and_tools() {
+    let mut w = Integrated::new();
+    let id = w.spawn(&AgentSpec::new("alice", "g").with_tools(["search"]));
+    let reply = Reply::call_structured(id, 1, "search", "  line1\nline2").with_call_id("cid-42");
+
+    let out = w.run(vec![reply.to_event()]);
+    assert_eq!(
+        tool_calls(&w.v, &out),
+        [(id, "search".into(), "  line1\nline2".into())]
+    );
+    let ev_call = out
+        .iter()
+        .find(|e| matches!(e, OnyxEvent::Domain(d) if d.kind == w.v.ev_tool_call))
+        .expect("ev_tool_call esperado");
+    if let OnyxEvent::Domain(d) = ev_call {
+        assert_eq!(
+            payload(d, w.v.call_id),
+            Some(&Value::Text("cid-42".into()))
+        );
+    }
+
+    let out = w.run(vec![ev_call.clone()]);
+    let ev_res = out
+        .iter()
+        .find(|e| matches!(e, OnyxEvent::Domain(d) if d.kind == w.v.ev_tool_result))
+        .expect("ev_tool_result esperado");
+    if let OnyxEvent::Domain(d) = ev_res {
+        assert_eq!(
+            payload(d, w.v.call_id),
+            Some(&Value::Text("cid-42".into()))
+        );
+        assert_eq!(
+            payload(d, w.v.text),
+            Some(&Value::Text("search:1:  line1\nline2".into()))
+        );
+    }
+}

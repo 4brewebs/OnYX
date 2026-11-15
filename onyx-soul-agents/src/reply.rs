@@ -27,6 +27,10 @@ pub enum Verb {
     Done,
     /// Terminar con error. Payload: motivo.
     Fail,
+    /// Aprobar la herramienta pendiente en `WaitingApproval`.
+    Approve,
+    /// Denegar la herramienta pendiente en `WaitingApproval`. Payload: motivo opcional.
+    Deny,
 }
 
 impl Verb {
@@ -38,6 +42,8 @@ impl Verb {
             Self::ToolError => "tool_error",
             Self::Done => "done",
             Self::Fail => "fail",
+            Self::Approve => "approve",
+            Self::Deny => "deny",
         }
     }
 
@@ -49,6 +55,8 @@ impl Verb {
             "tool_error" => Self::ToolError,
             "done" => Self::Done,
             "fail" => Self::Fail,
+            "approve" => Self::Approve,
+            "deny" => Self::Deny,
             _ => return None,
         })
     }
@@ -62,6 +70,8 @@ pub struct Reply {
     pub request: u64,
     pub verb: Verb,
     pub payload: String,
+    /// Identificador opcional de correlación para llamadas a herramientas (v2).
+    pub call_id: Option<String>,
 }
 
 impl Reply {
@@ -71,7 +81,13 @@ impl Reply {
             request,
             verb,
             payload: payload.into(),
+            call_id: None,
         }
+    }
+
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = Some(call_id.into());
+        self
     }
 
     pub fn say(agent: ConceptId, request: u64, text: impl Into<String>) -> Self {
@@ -82,8 +98,43 @@ impl Reply {
         Self::new(agent, request, Verb::Call, tool_and_args)
     }
 
+    /// Llamada a herramienta con separación sin ambigüedad (`\0`), segura para
+    /// argumentos multi-línea, JSON o rutas con espacios.
+    pub fn call_structured(
+        agent: ConceptId,
+        request: u64,
+        tool: impl Into<String>,
+        args: impl Into<String>,
+    ) -> Self {
+        let tool = tool.into();
+        let args = args.into();
+        let payload = if args.is_empty() {
+            tool
+        } else {
+            format!("{tool}\0{args}")
+        };
+        Self::new(agent, request, Verb::Call, payload)
+    }
+
+    /// Extrae `(tool, args)` de un payload de `Verb::Call`.
+    /// Prioriza el separador estructurado `\0` y cae al primer espacio `' '`
+    /// por compatibilidad con el formato simple.
+    pub fn parse_call_payload(payload: &str) -> (&str, &str) {
+        if let Some((t, a)) = payload.split_once('\0') {
+            (t, a)
+        } else if let Some((t, a)) = payload.split_once(' ') {
+            (t, a)
+        } else {
+            (payload, "")
+        }
+    }
+
     pub fn observe(agent: ConceptId, request: u64, text: impl Into<String>) -> Self {
         Self::new(agent, request, Verb::Observe, text)
+    }
+
+    pub fn tool_error(agent: ConceptId, request: u64, error: impl Into<String>) -> Self {
+        Self::new(agent, request, Verb::ToolError, error)
     }
 
     pub fn done(agent: ConceptId, request: u64, result: impl Into<String>) -> Self {
@@ -92,6 +143,14 @@ impl Reply {
 
     pub fn fail(agent: ConceptId, request: u64, reason: impl Into<String>) -> Self {
         Self::new(agent, request, Verb::Fail, reason)
+    }
+
+    pub fn approve(agent: ConceptId, request: u64) -> Self {
+        Self::new(agent, request, Verb::Approve, "")
+    }
+
+    pub fn deny(agent: ConceptId, request: u64, reason: impl Into<String>) -> Self {
+        Self::new(agent, request, Verb::Deny, reason)
     }
 
     /// Convierte una `Decision` en la respuesta equivalente.
@@ -112,21 +171,59 @@ impl Reply {
         }
     }
 
-    /// Formato: `agent \t request \t verb \t payload` en UTF-8. El payload es
-    /// el resto de la línea y puede contener tabuladores.
+    /// Formato v1: `agent \t request \t verb \t payload` en UTF-8.
+    /// Formato v2 (cuando hay `call_id`): `v2 \t agent \t request \t verb \t len:call_id \t payload`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        format!(
-            "{}\t{}\t{}\t{}",
-            self.agent.0,
-            self.request,
-            self.verb.as_str(),
-            self.payload
-        )
-        .into_bytes()
+        match &self.call_id {
+            None => format!(
+                "{}\t{}\t{}\t{}",
+                self.agent.0,
+                self.request,
+                self.verb.as_str(),
+                self.payload
+            )
+            .into_bytes(),
+            Some(cid) => format!(
+                "v2\t{}\t{}\t{}\t{}:{}\t{}",
+                self.agent.0,
+                self.request,
+                self.verb.as_str(),
+                cid.len(),
+                cid,
+                self.payload
+            )
+            .into_bytes(),
+        }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let s = std::str::from_utf8(bytes).map_err(|_| "reply is not UTF-8".to_string())?;
+        if let Some(rest) = s.strip_prefix("v2\t") {
+            let mut parts = rest.splitn(4, '\t');
+            let agent = parts.next().and_then(|p| p.parse::<u64>().ok());
+            let request = parts.next().and_then(|p| p.parse::<u64>().ok());
+            let verb = parts.next().and_then(Verb::parse);
+            let tail = parts.next();
+            let (Some(a), Some(r), Some(v), Some(tail)) = (agent, request, verb, tail) else {
+                return Err("malformed reply".to_string());
+            };
+            let Some((len_str, after_colon)) = tail.split_once(':') else {
+                return Err("malformed reply".to_string());
+            };
+            let Ok(cid_len) = len_str.parse::<usize>() else {
+                return Err("malformed reply".to_string());
+            };
+            if after_colon.len() <= cid_len
+                || !after_colon.is_char_boundary(cid_len)
+                || after_colon.as_bytes()[cid_len] != b'\t'
+            {
+                return Err("malformed reply".to_string());
+            }
+            let call_id = &after_colon[..cid_len];
+            let payload = &after_colon[cid_len + 1..];
+            return Ok(Self::new(ConceptId(a), r, v, payload).with_call_id(call_id));
+        }
+
         let mut parts = s.splitn(4, '\t');
         let agent = parts.next().and_then(|p| p.parse::<u64>().ok());
         let request = parts.next().and_then(|p| p.parse::<u64>().ok());
