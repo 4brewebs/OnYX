@@ -176,6 +176,11 @@ impl AgentSpawner {
             _ => Vec::new(),
         };
 
+        let birth = match self.reserve(ctx, v) {
+            Ok(b) => b,
+            Err(e) => return self.reject(ctx, v, d, e.reason()),
+        };
+
         let id = ctx.graph.create();
         // Las propiedades de la app van primero: las del framework las pisan.
         for (key, value) in &d.data {

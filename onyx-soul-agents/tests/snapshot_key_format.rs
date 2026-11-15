@@ -34,7 +34,11 @@ impl Sandbox {
         fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Option<Vec<u8>>)>) {
             for e in fs::read_dir(dir).unwrap().flatten() {
                 let p = e.path();
-                let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                let rel = p
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 if p.is_dir() {
                     out.push((rel, None));
                     walk(base, &p, out);

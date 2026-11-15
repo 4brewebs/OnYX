@@ -10,10 +10,10 @@ use std::sync::atomic::Ordering;
 
 use gemini::{DEFAULT_GEMINI_MODEL, GeminiResponder};
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AttrRegistry, Ctx, EventBus,
-    GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, PlatformDriver,
-    RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Vocab, pending_approvals,
-    spawn_event,
+    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AttrRegistry, Ctx,
+    EventBus, GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem,
+    PlatformDriver, RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Value, Vocab,
+    pending_approvals, spawn_event,
 };
 use onyx_workspace::{WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools};
 use tui::TuiDriver;
@@ -240,6 +240,23 @@ fn prompt_approval(tool: &str, args: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+fn all_live_waiting_approval(graph: &dyn GraphView, v: &Vocab) -> bool {
+    let mut any_live = false;
+    for id in graph.query(&[v.state]) {
+        if let Some(Value::Text(s)) = graph.get(id, v.state) {
+            if let Some(state) = AgentState::parse(&s) {
+                if !state.is_terminal() {
+                    any_live = true;
+                    if state != AgentState::WaitingApproval {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    any_live
+}
+
 fn make_spec(goal: &str, auto_approve: bool) -> AgentSpec {
     let mut spec = AgentSpec::new("openonyx", goal)
         .with_tools(WorkspaceTools::all_tool_names().iter().copied());
@@ -326,6 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
 
             let tui = TuiDriver::new(host.vocab())?;
+            let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(tui);
             let mut driver = RecordingBridge::new(
@@ -334,11 +352,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .wrapping(ws_bridge);
 
+            tui_handle.render(host.graph());
+            let mut needs_follow_up_tick = false;
             while !quit.load(Ordering::Relaxed) {
-                if save_snapshots {
-                    host.request_snapshot(&host.ticks().to_string());
+                let queued = tui_handle.has_queued_events();
+                let waiting_human = all_live_waiting_approval(host.graph(), &host.vocab());
+                let can_advance = !host.is_settled() && !waiting_human;
+                if can_advance || queued || needs_follow_up_tick {
+                    let was_settled = host.is_settled();
+                    if save_snapshots {
+                        host.request_snapshot(&host.ticks().to_string());
+                    }
+                    host.step(&mut driver);
+                    // Un `IngressEvent::Command` tarda 1 tick en convertirse en
+                    // `spawn_event` (por `CommandSpawnerSystem`) y otro en crear
+                    // el agente en el grafo (por `AgentSpawner`).
+                    needs_follow_up_tick = queued;
+                    if !was_settled && host.is_settled() {
+                        if let Some(path) = &cli.save_transcript {
+                            let _ = fs::write(path, driver.transcript().to_bytes());
+                        }
+                    }
+                } else {
+                    tui_handle.pump_idle(host.graph());
                 }
-                host.step(&mut driver);
             }
             if let Some(path) = cli.save_transcript {
                 fs::write(path, driver.transcript().to_bytes())?;
@@ -367,7 +404,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host.request_snapshot(&host.ticks().to_string());
                 }
                 host.step(&mut driver);
-                if driver.remaining() == 0 && host.is_settled() {
+                if driver.remaining() == 0
+                    && (host.is_settled() || all_live_waiting_approval(host.graph(), &host.vocab()))
+                {
                     break;
                 }
             }
@@ -487,4 +526,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_spawner_spawns_agent_on_follow_up_tick() {
+        let mut host = AgentHost::builder(1)
+            .config(AgentConfig {
+                default_max_steps: 32,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            })
+            .system(Box::new(CommandSpawnerSystem::new(false)))
+            .build()
+            .unwrap();
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("hola".into())));
+        host.step(&mut HeadlessDriver::new());
+        assert!(host.agents().is_empty(), "tick 0 only emits spawn_event");
+
+        host.step(&mut HeadlessDriver::new());
+        assert_eq!(host.agents().len(), 1, "tick 1 must spawn the agent");
+        let id = host.agents()[0];
+        assert_eq!(
+            host.agent_state(id),
+            Some(onyx_soul_agents::AgentState::Thinking)
+        );
+        assert!(!all_live_waiting_approval(host.graph(), &host.vocab()));
+
+        let req = onyx_soul_agents::pending_requests(host.graph(), &host.vocab())[0].request;
+        host.push(Reply::call(id, req, "shell_exec {\"command\":\"echo hi\"}").to_event());
+        host.step(&mut HeadlessDriver::new());
+        assert_eq!(host.agent_state(id), Some(AgentState::WaitingApproval));
+        assert!(all_live_waiting_approval(host.graph(), &host.vocab()));
+    }
 }

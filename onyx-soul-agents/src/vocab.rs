@@ -218,6 +218,11 @@ impl Vocab {
             self.mem_count,
             self.tools_csv,
             self.approval_tools_csv,
+            self.tool_name,
+            self.mem_seq,
+            self.mem_kind,
+            self.mem_text,
+            self.mem_tick,
         ]
         .contains(&attr)
             || self.operations.is_reserved(attr)

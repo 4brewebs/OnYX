@@ -181,7 +181,7 @@ impl HostBuilder {
             loader.load_app(&mut registry, &factories, &[blueprint], &self.stage_name)?;
 
         if self.memory.is_some() || self.scripted.is_some() || self.approval.is_some() {
-            let mut runtime = AgentRuntime::new(self.config.clone());
+            let mut runtime = AgentRuntime::new(config.clone());
             if let Some(m) = self.memory {
                 runtime = runtime.with_memory(m);
             }

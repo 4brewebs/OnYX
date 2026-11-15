@@ -6,6 +6,8 @@
 .vscode/
 *.swp
 /snapshots/
+/snaps*/
+*.tr
 
 # Crates WIP excluidos del workspace: al compilarlos por separado
 # Cargo genera su propio lockfile y target/.

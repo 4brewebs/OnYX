@@ -1,8 +1,10 @@
 //! Adaptador TUI interactivo (`ratatui` + `crossterm`) para `openOnyx`.
 //! Vive fuera de `onyx-core` y `onyx-soul-agents` para mantener los souls con 0 dependencias.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::{self, Stdout};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -13,8 +15,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use onyx_soul_agents::{
-    ConceptId, EventBus, GraphView, IngressEvent, Key, KeyCode, Mods, OnyxEvent, PlatformDriver,
-    Reply, SurfaceBinding, Vocab, pending_approvals,
+    ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, Reply, SurfaceBinding,
+    Vocab, pending_approvals,
 };
 use ratatui::{
     Terminal,
@@ -25,7 +27,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-pub struct TuiDriver {
+struct TuiInner {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     vocab: Vocab,
     input: String,
@@ -33,6 +35,35 @@ pub struct TuiDriver {
     active_approval: Option<(ConceptId, u64, String, String)>,
     seen_approvals: BTreeSet<(u64, u64)>,
     quit: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub struct TuiHandle {
+    inner: Rc<RefCell<TuiInner>>,
+}
+
+impl TuiHandle {
+    pub fn has_queued_events(&self) -> bool {
+        !self.inner.borrow().queued.is_empty()
+    }
+
+    pub fn render(&self, graph: &dyn GraphView) {
+        self.inner.borrow_mut().render(graph);
+    }
+
+    /// Lee entrada de teclado/resize cuando el cerebro está en reposo (`is_settled()`),
+    /// redibujando la UI sin avanzar `host.ticks()`.
+    pub fn pump_idle(&self, graph: &dyn GraphView) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.poll_crossterm() && inner.queued.is_empty() && !inner.quit.load(Ordering::Relaxed)
+        {
+            inner.render(graph);
+        }
+    }
+}
+
+pub struct TuiDriver {
+    inner: Rc<RefCell<TuiInner>>,
 }
 
 impl TuiDriver {
@@ -43,29 +74,101 @@ impl TuiDriver {
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
-            terminal,
-            vocab,
-            input: String::new(),
-            queued: Vec::new(),
-            active_approval: None,
-            seen_approvals: BTreeSet::new(),
-            quit: Arc::new(AtomicBool::new(false)),
+            inner: Rc::new(RefCell::new(TuiInner {
+                terminal,
+                vocab,
+                input: String::new(),
+                queued: Vec::new(),
+                active_approval: None,
+                seen_approvals: BTreeSet::new(),
+                quit: Arc::new(AtomicBool::new(false)),
+            })),
         })
     }
 
-    pub fn quit_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.quit)
+    pub fn handle(&self) -> TuiHandle {
+        TuiHandle {
+            inner: Rc::clone(&self.inner),
+        }
     }
 
+    pub fn quit_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.inner.borrow().quit)
+    }
+}
+
+impl TuiInner {
     fn shutdown_inner(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
         Ok(())
     }
+
+    /// Devuelve `true` si hubo algún evento de UI o cerebro.
+    fn poll_crossterm(&mut self) -> bool {
+        if !event::poll(Duration::from_millis(16)).unwrap_or(false) {
+            return false;
+        }
+        match event::read() {
+            Ok(Event::Resize(w, h)) => {
+                self.queued.push(OnyxEvent::Ingress(IngressEvent::Resize {
+                    w: u32::from(w),
+                    h: u32::from(h),
+                }));
+                true
+            }
+            Ok(Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind,
+                ..
+            })) => {
+                if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    return false;
+                }
+                let is_ctrl_c = modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
+                if is_ctrl_c || matches!(code, CtKeyCode::Esc) {
+                    self.quit.store(true, Ordering::Relaxed);
+                } else if let Some((agent, req, _, _)) = self.active_approval.clone() {
+                    match code {
+                        CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
+                            self.queued.push(Reply::approve(agent, req).to_event());
+                            self.active_approval = None;
+                        }
+                        CtKeyCode::Char('n') | CtKeyCode::Char('N') => {
+                            self.queued
+                                .push(Reply::deny(agent, req, "denied by user in TUI").to_event());
+                            self.active_approval = None;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match code {
+                        CtKeyCode::Char(c) => self.input.push(c),
+                        CtKeyCode::Backspace => {
+                            self.input.pop();
+                        }
+                        CtKeyCode::Enter => {
+                            let cmd = self.input.trim().to_string();
+                            self.input.clear();
+                            if !cmd.is_empty() {
+                                self.queued
+                                    .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
-impl Drop for TuiDriver {
+impl Drop for TuiInner {
     fn drop(&mut self) {
         let _ = self.shutdown_inner();
     }
@@ -73,68 +176,22 @@ impl Drop for TuiDriver {
 
 impl PlatformDriver for TuiDriver {
     fn poll(&mut self, bus: &mut dyn EventBus) {
-        for ev in self.queued.drain(..) {
-            bus.push(ev);
+        let mut inner = self.inner.borrow_mut();
+        if inner.queued.is_empty() {
+            inner.poll_crossterm();
         }
-
-        if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-            match event::read() {
-                Ok(Event::Resize(w, h)) => {
-                    bus.push(OnyxEvent::Ingress(IngressEvent::Resize {
-                        w: u32::from(w),
-                        h: u32::from(h),
-                    }));
-                }
-                Ok(Event::Key(KeyEvent {
-                    code,
-                    modifiers,
-                    kind,
-                    ..
-                })) => {
-                    if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                        return;
-                    }
-                    let is_ctrl_c = modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
-                    if is_ctrl_c || matches!(code, CtKeyCode::Esc) {
-                        self.quit.store(true, Ordering::Relaxed);
-                    } else if let Some((agent, req, _, _)) = self.active_approval.clone() {
-                        match code {
-                            CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
-                                bus.push(Reply::approve(agent, req).to_event());
-                                self.active_approval = None;
-                            }
-                            CtKeyCode::Char('n') | CtKeyCode::Char('N') => {
-                                bus.push(Reply::deny(agent, req, "denied by user in TUI").to_event());
-                                self.active_approval = None;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match code {
-                            CtKeyCode::Char(c) => self.input.push(c),
-                            CtKeyCode::Backspace => {
-                                self.input.pop();
-                            }
-                            CtKeyCode::Enter => {
-                                let cmd = self.input.trim().to_string();
-                                self.input.clear();
-                                if !cmd.is_empty() {
-                                    bus.push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    let key = translate_key(code, modifiers);
-                    bus.push(OnyxEvent::Ingress(IngressEvent::Key(key)));
-                }
-                _ => {}
-            }
+        for ev in inner.queued.drain(..) {
+            bus.push(ev);
         }
     }
 
     fn present(&mut self, graph: &dyn GraphView, _surfaces: &[SurfaceBinding]) {
+        self.inner.borrow_mut().render(graph);
+    }
+}
+
+impl TuiInner {
+    fn render(&mut self, graph: &dyn GraphView) {
         let approvals = pending_approvals(graph, &self.vocab);
         if self.active_approval.is_none() {
             for a in &approvals {
@@ -167,26 +224,12 @@ impl PlatformDriver for TuiDriver {
                     "tool_error" | "denied" => Color::Red,
                     _ => Color::Cyan,
                 };
-                log_lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("[{kind}] "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text),
-                ]));
+                push_multiline_entry(&mut log_lines, &kind, color, &text);
             }
 
             if let Some(res) = prop_text(graph, *id, self.vocab.result) {
                 if !res.is_empty() {
-                    log_lines.push(Line::from(vec![
-                        Span::styled(
-                            "[result] ",
-                            Style::default()
-                                .fg(Color::LightGreen)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(res),
-                    ]));
+                    push_multiline_entry(&mut log_lines, "result", Color::LightGreen, &res);
                 }
             }
         }
@@ -243,38 +286,22 @@ impl PlatformDriver for TuiDriver {
     }
 }
 
+fn push_multiline_entry(out: &mut Vec<Line<'static>>, label: &str, color: Color, text: &str) {
+    let prefix_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let mut lines = text.split('\n');
+    let first = lines.next().unwrap_or("");
+    out.push(Line::from(vec![
+        Span::styled(format!("[{label}] "), prefix_style),
+        Span::raw(first.to_string()),
+    ]));
+    for line in lines {
+        out.push(Line::from(Span::raw(format!("  {line}"))));
+    }
+}
+
 fn prop_text(g: &dyn GraphView, id: ConceptId, attr: onyx_soul_agents::Attr) -> Option<String> {
     match g.get(id, attr) {
         Some(onyx_soul_agents::Value::Text(s)) => Some(s),
         _ => None,
     }
-}
-
-fn translate_key(code: CtKeyCode, modifiers: KeyModifiers) -> Key {
-    let mut mods = Mods::default();
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        mods.0 |= Mods::SHIFT;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        mods.0 |= Mods::CTRL;
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        mods.0 |= Mods::ALT;
-    }
-
-    let code = match code {
-        CtKeyCode::Char(c) => KeyCode::Char(c),
-        CtKeyCode::Enter => KeyCode::Enter,
-        CtKeyCode::Esc => KeyCode::Esc,
-        CtKeyCode::Tab => KeyCode::Tab,
-        CtKeyCode::Backspace => KeyCode::Backspace,
-        CtKeyCode::Up => KeyCode::Up,
-        CtKeyCode::Down => KeyCode::Down,
-        CtKeyCode::Left => KeyCode::Left,
-        CtKeyCode::Right => KeyCode::Right,
-        CtKeyCode::F(n) => KeyCode::F(n),
-        _ => KeyCode::Char('?'),
-    };
-
-    Key { code, mods }
 }
