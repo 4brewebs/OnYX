@@ -25,6 +25,15 @@
 //!    agente que volvió a `Idle` en la fase 1 puede abrir la siguiente
 //!    petición en este mismo tick.
 //!
+//! Prioridad entre agentes que tocan el mismo nodo en un tick: no hay
+//! paralelismo ni fusión, cada paso ve lo que escribieron los anteriores.
+//! En la fase 1 manda el orden de llegada del inbox y en la fase 2 el
+//! orden ascendente de id. Por eso, si dos agentes escriben el mismo
+//! atributo, queda el valor del último procesado (en la fase 2, el de id
+//! mayor); si compiten por algo que el primero ya ocupó, el segundo lo
+//! encuentra ocupado (en la fase 2, gana el de id menor). Es determinista,
+//! no equitativo; cambiar esta regla cambia los fingerprints.
+//!
 //! Una decisión externa se proyecta como estado: un agente `Thinking` con su
 //! `pending` es la petición. El [`crate::RecordingBridge`] (o el
 //! [`crate::AgentDriver`]) la lee en `present` (solo `GraphView`) y responde

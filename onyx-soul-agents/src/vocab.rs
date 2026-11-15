@@ -11,6 +11,8 @@
 use onyx_core::{Attr, AttrRegistry};
 
 use crate::config::DEFAULT_PREFIX;
+use crate::operation::OperationLog;
+use crate::root::RootSchema;
 
 /// Estado de ejecución de un agente. Vive en el grafo como `Text`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -105,6 +107,12 @@ pub struct Vocab {
     pub ev_approval_denied: Attr,
     pub ev_finished: Attr,
     pub ev_failed: Attr,
+    /// Asks the spawner to create the execution root ([`crate::begin_event`]).
+    pub ev_begin: Attr,
+    /// Root created; `subject` is the root concept.
+    pub ev_begun: Attr,
+    /// Begin refused; `reason` carries [`crate::RootError::reason`].
+    pub ev_begin_rejected: Attr,
 
     // Claves de `DomainEvent::data`.
     pub request: Attr,
@@ -115,6 +123,10 @@ pub struct Vocab {
     pub reason: Attr,
     /// `Bool` en `ev.tool_result`: `false` si la herramienta falló.
     pub ok: Attr,
+    /// Independent tool-operation schema under the same vocabulary prefix.
+    pub operations: OperationLog,
+    /// Execution root and agent identity under fixed names, not under the prefix.
+    pub root: RootSchema,
 }
 
 impl Vocab {
@@ -165,6 +177,9 @@ impl Vocab {
             ev_approval_denied: a("ev.approval_denied"),
             ev_finished: a("ev.finished"),
             ev_failed: a("ev.failed"),
+            ev_begin: a("ev.begin_execution"),
+            ev_begun: a("ev.execution_begun"),
+            ev_begin_rejected: a("ev.execution_rejected"),
 
             request: a("request"),
             call_id: a("call_id"),
@@ -173,11 +188,17 @@ impl Vocab {
             text: a("text"),
             reason: a("reason"),
             ok: a("ok"),
+            operations: OperationLog::resolve_with(attrs, prefix),
+            root: RootSchema::resolve(attrs),
         }
     }
 
-    /// Atributos que gestiona el framework. Una propiedad extra de la app con
-    /// uno de estos nombres se ignora: la app no puede falsear el estado.
+    /// Atributos que gestiona este vocabulario: los del agente, los de
+    /// herramientas y memoria (un agente no puede hacerse pasar por ellas),
+    /// los diez campos de operación de su prefijo y los ocho atributos fijos de
+    /// raíz e identidad (`onyx.agents.*`). Se ignoran al copiar extras en las
+    /// dos vías de spawn; no bloquea otros prefijos ni las escrituras directas
+    /// de `Graph`.
     pub fn is_reserved(&self, attr: Attr) -> bool {
         [
             self.name,
@@ -199,5 +220,7 @@ impl Vocab {
             self.approval_tools_csv,
         ]
         .contains(&attr)
+            || self.operations.is_reserved(attr)
+            || self.root.is_reserved(attr)
     }
 }

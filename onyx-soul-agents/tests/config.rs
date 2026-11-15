@@ -27,6 +27,7 @@ fn to_params_roundtrips() {
         default_max_steps: 5,
         default_timeout_ticks: 2,
         memory_keep_last: 7,
+        execution: None,
     };
     assert_eq!(AgentConfig::from_params(&c.to_params()).unwrap(), c);
 }

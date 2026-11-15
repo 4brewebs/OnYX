@@ -10,6 +10,8 @@ use crate::graph::{AttrRegistry, Graph, GraphView, OnyxError, Value};
 /// Agrupa las capacidades disponibles durante `run`.
 pub struct Ctx<'a> {
     /// Estado del cerebro. Lectura y escritura.
+    /// Cada escritura es visible en el acto para este sistema y para los
+    /// que se ejecuten después en el mismo tick; no hay buffer ni fusión.
     pub graph: &'a mut dyn Graph,
     /// Eventos llegados en este tick.
     pub inbox: &'a [OnyxEvent],

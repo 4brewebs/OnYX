@@ -95,7 +95,18 @@ impl AgentGraph {
         Self::default()
     }
 
-    /// Helper de dominio. No forma parte del contrato `Graph`.
+    /// Helper de dominio para el modo heredado, con `AgentConfig::execution`
+    /// en `None`. No forma parte del contrato `Graph`.
+    ///
+    /// Crea un agente con nombre, objetivo, estado `idle` y cero pasos.
+    /// No escribe la raíz de ejecución ni la identidad lógica del agente
+    /// (`onyx.agents.agent.execution` y `onyx.agents.agent.birth`).
+    ///
+    /// Si el grafo tiene raíz de ejecución, el agente creado queda sin
+    /// nacimiento y el grafo deja de ser válido para el modo operativo.
+    /// `execution_root` devuelve `RootError::MissingBirth`, y `AgentSpawner`
+    /// rechaza los spawns siguientes con el motivo `missing_birth`. En un
+    /// grafo con raíz, crea los agentes con el evento `ev.spawn`.
     pub fn spawn_agent(&mut self, vocab: &Vocab, name: &str, goal: &str) -> ConceptId {
         let id = self.create();
         self.set(id, vocab.name, Value::Text(name.into()));
@@ -329,5 +340,92 @@ impl Graph for AgentGraph {
             high_water: self.high_water.max(source.high_water),
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod incoming_index_tests {
+    //! The incoming index is not observable through the public API, so stale
+    //! entries (left by `unrelate` or by `destroy` on its targets) only show up
+    //! here: after every operation each node's index must equal a fresh
+    //! `rebuild_incoming` over the same `props` and `links`.
+    use super::*;
+
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    type Index = BTreeMap<u64, (BTreeSet<(u64, u32)>, BTreeSet<(u64, u32)>)>;
+
+    fn actual(g: &AgentGraph) -> Index {
+        g.nodes
+            .iter()
+            .map(|(&id, n)| (id, (n.incoming_props.clone(), n.incoming_links.clone())))
+            .collect()
+    }
+
+    fn expected(g: &AgentGraph) -> Index {
+        let mut copy: BTreeMap<u64, Node> = g
+            .nodes
+            .iter()
+            .map(|(&id, n)| {
+                let node = Node {
+                    props: n.props.clone(),
+                    links: n.links.clone(),
+                    ..Node::default()
+                };
+                (id, node)
+            })
+            .collect();
+        rebuild_incoming(&mut copy);
+        copy.into_iter()
+            .map(|(id, n)| (id, (n.incoming_props, n.incoming_links)))
+            .collect()
+    }
+
+    #[test]
+    fn incoming_index_never_holds_stale_entries() {
+        for seed in 0..200u64 {
+            let mut rng = SplitMix64(seed);
+            let mut g = AgentGraph::new();
+            let attrs = [g.attr("p"), g.attr("q"), g.attr("r")];
+            let mut ids: Vec<ConceptId> = Vec::new();
+            for step in 0..300 {
+                if ids.is_empty() || rng.below(6) == 0 {
+                    ids.push(g.create());
+                    continue;
+                }
+                let a = ids[rng.below(ids.len())];
+                let b = ids[rng.below(ids.len())];
+                let attr = attrs[rng.below(attrs.len())];
+                match rng.below(7) {
+                    0 => g.destroy(a),
+                    1 | 2 => g.set(a, attr, Value::Concept(b)),
+                    3 => g.set(a, attr, Value::Int(step)),
+                    4 => g.relate(a, attr, b),
+                    5 => g.unrelate(a, attr, b),
+                    _ => {
+                        let bytes = g.export();
+                        let mut fresh = AgentGraph::new();
+                        fresh.attr("r");
+                        fresh.attr("q");
+                        fresh.attr("p");
+                        fresh.import(&bytes).expect("own snapshot");
+                        g = fresh;
+                    }
+                }
+                assert_eq!(actual(&g), expected(&g), "seed {seed}, step {step}");
+            }
+        }
     }
 }

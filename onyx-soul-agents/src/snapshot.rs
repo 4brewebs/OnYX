@@ -2,11 +2,20 @@
 //!
 //! Keeps one snapshot per tick so the application can rewind.
 //! Reuses the file format of `FileSnapshotStore` but adds an index.
+//!
+//! [`SnapshotStore`] keys that parse as `u64` are ticks (`"3"` and `"003"`
+//! both mean `tick-3.bin`). Any other key is a free key: a single relative
+//! file name inside the store directory. Free keys with a separator, `.`,
+//! `..`, an absolute path or a prefix, and free keys equal to a canonical
+//! tick file name (`tick-3.bin`), are rejected with `OnyxError::Format`
+//! before touching the file system. Existing files are never deleted or
+//! renamed. This bounds the key to the directory by name only; it does not
+//! guard against links placed inside the directory, nor promise durability.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use onyx_core::{OnyxError, SnapshotStore};
 
@@ -56,6 +65,36 @@ impl AgentSnapshotStore {
     }
 }
 
+/// Tick of a canonical tick file name: `tick-12.bin`, not `tick-012.bin`.
+fn tick_of(name: &str) -> Option<u64> {
+    let tick: u64 = name
+        .strip_prefix("tick-")?
+        .strip_suffix(".bin")?
+        .parse()
+        .ok()?;
+    (name == format!("tick-{tick}.bin")).then_some(tick)
+}
+
+/// Path of a free key, or why it is not one.
+fn free_path(dir: &Path, key: &str) -> Result<PathBuf, OnyxError> {
+    let mut parts = Path::new(key).components();
+    let single = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(name)), None) if name == key
+    );
+    if !single {
+        return Err(OnyxError::Format(format!(
+            "snapshot key {key:?} must be a single relative file name"
+        )));
+    }
+    if tick_of(key).is_some() {
+        return Err(OnyxError::Format(format!(
+            "snapshot key {key:?} is reserved for a numeric tick"
+        )));
+    }
+    Ok(dir.join(key))
+}
+
 fn index_existing_ticks(dir: &Path) -> BTreeMap<u64, PathBuf> {
     let mut index = BTreeMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -66,20 +105,10 @@ fn index_existing_ticks(dir: &Path) -> BTreeMap<u64, PathBuf> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some(tick_str) = name
-            .strip_prefix("tick-")
-            .and_then(|rest| rest.strip_suffix(".bin"))
-        else {
-            continue;
-        };
-        let Ok(tick) = tick_str.parse::<u64>() else {
-            continue;
-        };
         // `tick-012.bin` no es el nombre que escribe `path_for(12)`.
-        if name != format!("tick-{tick}.bin") {
-            continue;
+        if let Some(tick) = tick_of(name) {
+            index.insert(tick, path);
         }
-        index.insert(tick, path);
     }
     index
 }
@@ -90,7 +119,7 @@ impl SnapshotStore for AgentSnapshotStore {
         if let Ok(tick) = key.parse::<u64>() {
             self.save_tick(tick, bytes)
         } else {
-            let path = self.dir.join(key);
+            let path = free_path(&self.dir, key)?;
             let mut f = File::create(&path).map_err(|e| OnyxError::Io(e.to_string()))?;
             f.write_all(bytes)
                 .map_err(|e| OnyxError::Io(e.to_string()))?;
@@ -102,7 +131,7 @@ impl SnapshotStore for AgentSnapshotStore {
         if let Ok(tick) = key.parse::<u64>() {
             self.load_tick(tick)
         } else {
-            let path = self.dir.join(key);
+            let path = free_path(&self.dir, key)?;
             let mut f = File::open(&path).map_err(|e| OnyxError::Io(e.to_string()))?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)
