@@ -7,13 +7,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use gemini::{AsyncGeminiResponder, DEFAULT_GEMINI_MODEL, GeminiResponder};
+use gemini::{AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder};
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AttrRegistry, Ctx, EventBus,
-    GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, PlatformDriver,
-    RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Value, Vocab,
+    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AgentView, AttrRegistry,
+    Ctx, EventBus, GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem,
+    PlatformDriver, RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Value, Vocab,
     pending_approvals, spawn_event,
 };
 use onyx_workspace::{
@@ -249,13 +249,19 @@ fn prompt_approval(tool: &str, args: &str) -> bool {
 }
 
 fn all_live_waiting_approval(graph: &dyn GraphView, v: &Vocab) -> bool {
+    all_live_agents_blocked(graph, v, 0)
+}
+
+fn all_live_agents_blocked(graph: &dyn GraphView, v: &Vocab, llm_in_flight: usize) -> bool {
     let mut any_live = false;
     for id in graph.query(&[v.state]) {
         if let Some(Value::Text(s)) = graph.get(id, v.state) {
             if let Some(state) = AgentState::parse(&s) {
                 if !state.is_terminal() {
                     any_live = true;
-                    if state != AgentState::WaitingApproval {
+                    let blocked = state == AgentState::WaitingApproval
+                        || (state == AgentState::Thinking && llm_in_flight > 0);
+                    if !blocked {
                         return false;
                     }
                 }
@@ -379,9 +385,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Mode::Chat => {
             let checkpoints = PendingCheckpoints::default();
+            let chat_config = AgentConfig {
+                default_timeout_ticks: 512,
+                ..config
+            };
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
-                config,
+                chat_config,
                 cli.snapshot_dir.as_ref(),
                 Some(Box::new(CommandSpawnerSystem::new(cli.auto_approve))),
                 Some(checkpoints.clone()),
@@ -401,20 +411,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .require_read_before_edit(true)
                 .wrapping(tui);
             let llm_in_flight = Arc::new(AtomicUsize::new(0));
-            let mut driver = RecordingBridge::new(
+            let gemini_ready = Arc::new(AtomicBool::new(false));
+            let async_gemini = AsyncGeminiDriver::new(
                 host.vocab(),
-                AsyncGeminiResponder::new(api_key, model, Arc::clone(&llm_in_flight)),
+                api_key,
+                model,
+                Arc::clone(&llm_in_flight),
+                Arc::clone(&gemini_ready),
             )
             .wrapping(ws_bridge);
+            let mut driver =
+                RecordingBridge::new(host.vocab(), |_: &AgentView| None).wrapping(async_gemini);
 
             tui_handle.render(host.graph());
             let mut needs_follow_up_tick = false;
             while !quit.load(Ordering::Relaxed) {
-                let queued = tui_handle.has_queued_events();
-                let waiting_human = all_live_waiting_approval(host.graph(), &host.vocab());
-                let waiting_llm = llm_in_flight.load(Ordering::Acquire) > 0;
-                let can_advance = !host.is_settled() && !waiting_human && !waiting_llm;
-                if can_advance || queued || needs_follow_up_tick {
+                let ui_queued = tui_handle.has_queued_events();
+                let llm_ready = gemini_ready.load(Ordering::Acquire);
+                let all_blocked = all_live_agents_blocked(
+                    host.graph(),
+                    &host.vocab(),
+                    llm_in_flight.load(Ordering::Acquire),
+                );
+                let can_advance = !host.is_settled() && !all_blocked;
+                if can_advance || ui_queued || llm_ready || needs_follow_up_tick {
                     let was_settled = host.is_settled();
                     if save_snapshots {
                         host.request_snapshot(&host.ticks().to_string());
@@ -423,7 +443,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Un `IngressEvent::Command` tarda 1 tick en convertirse en
                     // `spawn_event` (por `CommandSpawnerSystem`) y otro en crear
                     // el agente en el grafo (por `AgentSpawner`).
-                    needs_follow_up_tick = queued;
+                    needs_follow_up_tick = ui_queued;
                     if !was_settled && host.is_settled() {
                         if let Some(path) = &cli.save_transcript {
                             let _ = fs::write(path, driver.transcript().to_bytes());

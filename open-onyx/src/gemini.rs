@@ -1,15 +1,63 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
+use onyx_soul_agents::{
+    AgentView, ConceptId, EventBus, GraphView, PlatformDriver, Reply, Responder, SurfaceBinding,
+    Vocab, pending_requests,
+};
 use onyx_workspace::WorkspaceTools;
 use serde_json::{Value as JsonValue, json};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 
 type SignatureMap = Arc<Mutex<HashMap<(u64, usize), JsonValue>>>;
+type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
+
+#[derive(Clone, Default)]
+struct GeminiSharedState {
+    thought_signatures: SignatureMap,
+    pending_calls: PendingCallQueue,
+}
+
+struct QueuedToolCall {
+    name: String,
+    args: String,
+}
+
+fn next_queued_call(pending_calls: &PendingCallQueue, req: &AgentView) -> Option<Reply> {
+    let mut guard = pending_calls.lock().ok()?;
+    if matches!(
+        req.memory.last().map(|(k, _)| k.as_str()),
+        Some("tool_error" | "denied")
+    ) {
+        guard.remove(&req.agent.0);
+        return None;
+    }
+    let queue = guard.get_mut(&req.agent.0)?;
+    let (name, args) = queue.pop_front()?;
+    if queue.is_empty() {
+        guard.remove(&req.agent.0);
+    }
+    Some(Reply::call_structured(req.agent, req.request, name, args))
+}
+
+fn push_queued_calls(
+    pending_calls: &PendingCallQueue,
+    agent: ConceptId,
+    calls: impl IntoIterator<Item = QueuedToolCall>,
+) {
+    if let Ok(mut guard) = pending_calls.lock() {
+        let queue = guard.entry(agent.0).or_default();
+        for c in calls {
+            queue.push_back((c.name, c.args));
+        }
+        if queue.is_empty() {
+            guard.remove(&agent.0);
+        }
+    }
+}
 
 struct InFlightGuard(Arc<AtomicUsize>);
 
@@ -112,7 +160,7 @@ fn build_request_body(
     let mut body = json!({
         "systemInstruction": {
             "parts": [{
-                "text": "You are openOnyx, a precise software engineering agent. Use the workspace tools to inspect files before editing, keep changes minimal, and summarize your final answer clearly when done."
+                "text": "You are openOnyx, a precise software engineering agent. Use the workspace tools to inspect files before editing, prefer calling one tool at a time, keep changes minimal, and summarize your final answer clearly when done."
             }]
         },
         "contents": contents
@@ -129,7 +177,7 @@ fn parse_gemini_response(
     agent: ConceptId,
     request: u64,
     call_index: usize,
-    thought_signatures: &SignatureMap,
+    shared: &GeminiSharedState,
 ) -> Reply {
     let parts = json["candidates"][0]["content"]["parts"]
         .as_array()
@@ -143,26 +191,27 @@ fn parse_gemini_response(
         }
     }
 
-    if function_calls.len() > 1 {
-        return Reply::fail(
-            agent,
-            request,
-            format!(
-                "gemini returned {} simultaneous functionCall parts; only single tool calls are supported",
-                function_calls.len()
-            ),
-        );
-    }
-
-    if let Some((part, fc)) = function_calls.into_iter().next() {
-        if let Some(sig) = part.get("thoughtSignature") {
-            if let Ok(mut guard) = thought_signatures.lock() {
-                guard.insert((agent.0, call_index), sig.clone());
+    if !function_calls.is_empty() {
+        let mut parsed = Vec::with_capacity(function_calls.len());
+        let mut batch_sig: Option<JsonValue> = None;
+        for (offset, (part, fc)) in function_calls.into_iter().enumerate() {
+            if let Some(sig) = part.get("thoughtSignature") {
+                batch_sig = Some(sig.clone());
             }
+            if let Some(ref sig) = batch_sig {
+                if let Ok(mut guard) = shared.thought_signatures.lock() {
+                    guard.insert((agent.0, call_index + offset), sig.clone());
+                }
+            }
+            let name = fc["name"].as_str().unwrap_or_default().to_string();
+            let args = serde_json::to_string(&fc["args"]).unwrap_or_else(|_| "{}".to_string());
+            parsed.push(QueuedToolCall { name, args });
         }
-        let name = fc["name"].as_str().unwrap_or_default();
-        let args = serde_json::to_string(&fc["args"]).unwrap_or_else(|_| "{}".to_string());
-        return Reply::call_structured(agent, request, name, args);
+
+        let mut iter = parsed.into_iter();
+        let first = iter.next().expect("non-empty function_calls");
+        push_queued_calls(&shared.pending_calls, agent, iter);
+        return Reply::call_structured(agent, request, first.name, first.args);
     }
 
     let text: String = parts
@@ -197,7 +246,7 @@ fn execute_gemini_http(
     agent: ConceptId,
     request: u64,
     call_index: usize,
-    thought_signatures: &SignatureMap,
+    shared: &GeminiSharedState,
 ) -> Reply {
     let resp = match ureq::post(url)
         .set("x-goog-api-key", api_key)
@@ -227,14 +276,14 @@ fn execute_gemini_http(
         }
     };
 
-    parse_gemini_response(&json, agent, request, call_index, thought_signatures)
+    parse_gemini_response(&json, agent, request, call_index, shared)
 }
 
 /// Adaptador síncrono para Google AI Studio (Gemini `generateContent` REST API).
 pub struct GeminiResponder {
     api_key: String,
     model: String,
-    thought_signatures: SignatureMap,
+    shared: GeminiSharedState,
 }
 
 impl GeminiResponder {
@@ -242,19 +291,23 @@ impl GeminiResponder {
         Self {
             api_key: api_key.into(),
             model: model.into(),
-            thought_signatures: Arc::new(Mutex::new(HashMap::new())),
+            shared: GeminiSharedState::default(),
         }
     }
 }
 
 impl Responder for GeminiResponder {
     fn respond(&mut self, req: &AgentView) -> Option<Reply> {
+        if let Some(queued_reply) = next_queued_call(&self.shared.pending_calls, req) {
+            return Some(queued_reply);
+        }
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
             self.model
         );
         let body = {
             let sigs = self
+                .shared
                 .thought_signatures
                 .lock()
                 .map(|g| g.clone())
@@ -269,71 +322,84 @@ impl Responder for GeminiResponder {
             req.agent,
             req.request,
             call_index,
-            &self.thought_signatures,
+            &self.shared,
         ))
     }
 }
 
-/// Adaptador asíncrono no bloqueante para la TUI de `Mode::Chat`.
-pub struct AsyncGeminiResponder {
+/// Driver asíncrono no bloqueante para la TUI de `Mode::Chat`.
+///
+/// Despacha peticiones HTTP en `present()` y entrega los `Reply` recibidos en `poll()`,
+/// de modo que `RecordingBridge` pueda grabarlos vía `RecordingBus` sin violar el
+/// contrato de disparo único de `Responder::respond`.
+pub struct AsyncGeminiDriver {
+    vocab: Vocab,
     api_key: String,
     model: String,
-    thought_signatures: SignatureMap,
-    in_flight: HashSet<(u64, u64)>,
+    shared: GeminiSharedState,
+    dispatched: HashSet<(u64, u64)>,
     in_flight_count: Arc<AtomicUsize>,
-    rx: mpsc::Receiver<((u64, u64), Reply)>,
-    tx: mpsc::Sender<((u64, u64), Reply)>,
-    ready: HashMap<(u64, u64), Reply>,
+    has_ready: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Reply>,
+    tx: mpsc::Sender<Reply>,
+    inner: Option<Box<dyn PlatformDriver>>,
 }
 
-impl AsyncGeminiResponder {
+impl AsyncGeminiDriver {
     pub fn new(
+        vocab: Vocab,
         api_key: impl Into<String>,
         model: impl Into<String>,
         in_flight_count: Arc<AtomicUsize>,
+        has_ready: Arc<AtomicBool>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
+            vocab,
             api_key: api_key.into(),
             model: model.into(),
-            thought_signatures: Arc::new(Mutex::new(HashMap::new())),
-            in_flight: HashSet::new(),
+            shared: GeminiSharedState::default(),
+            dispatched: HashSet::new(),
             in_flight_count,
+            has_ready,
             rx,
             tx,
-            ready: HashMap::new(),
+            inner: None,
         }
     }
 
-    fn respond_with<F>(&mut self, req: &AgentView, spawn_fn: F) -> Option<Reply>
+    pub fn wrapping(mut self, inner: impl PlatformDriver + 'static) -> Self {
+        self.inner = Some(Box::new(inner));
+        self
+    }
+
+    fn dispatch_with<F>(&mut self, req: &AgentView, spawn_fn: F)
     where
         F: FnOnce(
-            (u64, u64),
             String,
             String,
             JsonValue,
             ConceptId,
             u64,
             usize,
-            SignatureMap,
+            GeminiSharedState,
             InFlightGuard,
-            mpsc::Sender<((u64, u64), Reply)>,
+            Arc<AtomicBool>,
+            mpsc::Sender<Reply>,
         ),
     {
-        while let Ok((k, r)) = self.rx.try_recv() {
-            self.in_flight.remove(&k);
-            self.ready.insert(k, r);
-        }
-
         let key = (req.agent.0, req.request);
-        if let Some(reply) = self.ready.remove(&key) {
-            return Some(reply);
-        }
-        if self.in_flight.contains(&key) {
-            return None;
+        if !self.dispatched.insert(key) {
+            return;
         }
 
-        self.in_flight.insert(key);
+        if let Some(queued_reply) = next_queued_call(&self.shared.pending_calls, req) {
+            if self.tx.send(queued_reply).is_ok() {
+                self.has_ready.store(true, Ordering::Release);
+            }
+            return;
+        }
+
         self.in_flight_count.fetch_add(1, Ordering::Release);
         let guard = InFlightGuard(Arc::clone(&self.in_flight_count));
         let url = format!(
@@ -342,6 +408,7 @@ impl AsyncGeminiResponder {
         );
         let body = {
             let sigs = self
+                .shared
                 .thought_signatures
                 .lock()
                 .map(|g| g.clone())
@@ -351,41 +418,72 @@ impl AsyncGeminiResponder {
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
 
         spawn_fn(
-            key,
             url,
             self.api_key.clone(),
             body,
             req.agent,
             req.request,
             call_index,
-            Arc::clone(&self.thought_signatures),
+            self.shared.clone(),
             guard,
+            Arc::clone(&self.has_ready),
             self.tx.clone(),
         );
-        None
     }
 }
 
-impl Responder for AsyncGeminiResponder {
-    fn respond(&mut self, req: &AgentView) -> Option<Reply> {
-        self.respond_with(
-            req,
-            |key, url, api_key, body, agent, request, call_index, sigs, guard, tx| {
-                thread::spawn(move || {
-                    let _guard = guard;
-                    let reply = execute_gemini_http(
-                        &url, &api_key, body, agent, request, call_index, &sigs,
-                    );
-                    let _ = tx.send((key, reply));
-                });
-            },
-        )
+impl PlatformDriver for AsyncGeminiDriver {
+    fn poll(&mut self, bus: &mut dyn EventBus) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.poll(bus);
+        }
+        self.has_ready.store(false, Ordering::Release);
+        while let Ok(reply) = self.rx.try_recv() {
+            bus.push(reply.to_event());
+        }
+    }
+
+    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.present(graph, surfaces);
+        }
+        for req in pending_requests(graph, &self.vocab) {
+            self.dispatch_with(
+                &req,
+                |url, api_key, body, agent, request, call_index, shared, guard, ready_flag, tx| {
+                    thread::spawn(move || {
+                        let _guard = guard;
+                        let reply = execute_gemini_http(
+                            &url, &api_key, body, agent, request, call_index, &shared,
+                        );
+                        if tx.send(reply).is_ok() {
+                            ready_flag.store(true, Ordering::Release);
+                        }
+                    });
+                },
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onyx_soul_agents::{AgentGraph, OnyxEvent};
+
+    struct VecBus(Vec<OnyxEvent>);
+
+    impl EventBus for VecBus {
+        fn push(&mut self, event: OnyxEvent) {
+            self.0.push(event);
+        }
+        fn drain(&mut self) -> Vec<OnyxEvent> {
+            std::mem::take(&mut self.0)
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
 
     fn dummy_agent_view(agent_id: u64, request: u64) -> AgentView {
         AgentView {
@@ -401,63 +499,150 @@ mod tests {
     }
 
     #[test]
-    fn async_responder_defers_and_delivers_via_channel() {
+    fn async_driver_dispatches_once_and_delivers_on_poll() {
+        let mut graph = AgentGraph::new();
+        let vocab = Vocab::resolve(&mut graph);
         let in_flight = Arc::new(AtomicUsize::new(0));
-        let mut responder =
-            AsyncGeminiResponder::new("fake-key", DEFAULT_GEMINI_MODEL, Arc::clone(&in_flight));
+        let has_ready = Arc::new(AtomicBool::new(false));
+        let mut driver = AsyncGeminiDriver::new(
+            vocab,
+            "fake-key",
+            DEFAULT_GEMINI_MODEL,
+            Arc::clone(&in_flight),
+            Arc::clone(&has_ready),
+        );
         let req = dummy_agent_view(7, 42);
 
         let mut captured_tx = None;
         let mut captured_guard = None;
-        let first = responder.respond_with(
+        let mut captured_ready = None;
+        driver.dispatch_with(
             &req,
-            |_key, _url, _key_str, _body, _agent, _request, _idx, _sigs, guard, tx| {
+            |_url, _key_str, _body, _agent, _request, _idx, _shared, guard, ready_flag, tx| {
                 captured_guard = Some(guard);
+                captured_ready = Some(ready_flag);
                 captured_tx = Some(tx);
             },
         );
-        assert!(first.is_none());
         assert_eq!(in_flight.load(Ordering::Acquire), 1);
+        assert!(!has_ready.load(Ordering::Acquire));
 
-        // While worker is still running, a repeated poll returns None and does not spawn again.
+        // Repeated dispatch for the same (agent, request) is ignored.
         let mut spawned_again = false;
-        let second = responder.respond_with(&req, |_, _, _, _, _, _, _, _, _, _| {
+        driver.dispatch_with(&req, |_, _, _, _, _, _, _, _, _, _| {
             spawned_again = true;
         });
-        assert!(second.is_none());
         assert!(!spawned_again);
         assert_eq!(in_flight.load(Ordering::Acquire), 1);
 
-        // Simulate worker finishing: send reply then drop guard.
+        // Simulate worker finishing: send reply, mark ready, then drop guard.
         captured_tx
             .unwrap()
-            .send(((7, 42), Reply::done(ConceptId(7), 42, "all good")))
+            .send(Reply::done(ConceptId(7), 42, "all good"))
             .unwrap();
+        captured_ready.unwrap().store(true, Ordering::Release);
         drop(captured_guard);
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        assert!(has_ready.load(Ordering::Acquire));
 
-        let third = responder.respond_with(&req, |_, _, _, _, _, _, _, _, _, _| {
-            panic!("should not spawn when reply is ready");
-        });
-        assert!(third.is_some());
-        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        let mut bus = VecBus(Vec::new());
+        driver.poll(&mut bus);
+        assert_eq!(bus.0.len(), 1);
+        assert!(!has_ready.load(Ordering::Acquire));
     }
 
     #[test]
-    fn multi_function_call_is_rejected_explicitly() {
-        let sigs = Arc::new(Mutex::new(HashMap::new()));
+    fn multi_function_call_queues_and_dispatches_sequentially() {
+        let shared = GeminiSharedState::default();
         let json = json!({
             "candidates": [{
                 "content": {
                     "parts": [
-                        { "functionCall": { "name": "fs_read", "args": { "path": "a.rs" } } },
-                        { "functionCall": { "name": "fs_read", "args": { "path": "b.rs" } } }
+                        {
+                            "functionCall": { "name": "fs_read", "args": { "path": "a.rs" } },
+                            "thoughtSignature": "sig-0"
+                        },
+                        {
+                            "functionCall": { "name": "fs_read", "args": { "path": "b.rs" } },
+                            "thoughtSignature": "sig-1"
+                        }
                     ]
                 }
             }]
         });
-        let reply = parse_gemini_response(&json, ConceptId(1), 1, 0, &sigs);
-        let debug = format!("{reply:?}");
-        assert!(debug.contains("simultaneous functionCall"), "{debug}");
+
+        let first = parse_gemini_response(&json, ConceptId(1), 10, 0, &shared);
+        let first_dbg = format!("{first:?}");
+        assert!(first_dbg.contains("a.rs"), "{first_dbg}");
+
+        let mut req2 = dummy_agent_view(1, 11);
+        req2.memory = vec![
+            ("call".to_string(), r#"fs_read {"path":"a.rs"}"#.to_string()),
+            ("observe".to_string(), "ok".to_string()),
+        ];
+        let second = next_queued_call(&shared.pending_calls, &req2).expect("second call queued");
+        let second_dbg = format!("{second:?}");
+        assert!(second_dbg.contains("b.rs"), "{second_dbg}");
+
+        let mut req3 = dummy_agent_view(1, 12);
+        req3.memory = vec![
+            ("call".to_string(), r#"fs_read {"path":"a.rs"}"#.to_string()),
+            ("observe".to_string(), "ok".to_string()),
+            ("call".to_string(), r#"fs_read {"path":"b.rs"}"#.to_string()),
+            ("observe".to_string(), "ok".to_string()),
+        ];
+        assert!(next_queued_call(&shared.pending_calls, &req3).is_none());
+        let sig_guard = shared.thought_signatures.lock().unwrap();
+        assert_eq!(sig_guard.get(&(1, 0)), Some(&json!("sig-0")));
+        assert_eq!(sig_guard.get(&(1, 1)), Some(&json!("sig-1")));
+    }
+
+    #[test]
+    fn queued_calls_are_cleared_after_tool_error_or_denial() {
+        let shared = GeminiSharedState::default();
+        push_queued_calls(
+            &shared.pending_calls,
+            ConceptId(2),
+            [QueuedToolCall {
+                name: "fs_write".to_string(),
+                args: r#"{"path":"x.rs","content":"hi"}"#.to_string(),
+            }],
+        );
+
+        let mut denied_req = dummy_agent_view(2, 5);
+        denied_req.memory = vec![
+            ("call".to_string(), "shell_exec {}".to_string()),
+            ("denied".to_string(), "user declined".to_string()),
+        ];
+        assert!(next_queued_call(&shared.pending_calls, &denied_req).is_none());
+
+        // Even if memory is later clean, the aborted batch must remain empty.
+        let clean_req = dummy_agent_view(2, 6);
+        assert!(next_queued_call(&shared.pending_calls, &clean_req).is_none());
+    }
+
+    #[test]
+    fn batch_thought_signature_is_inherited_by_subsequent_parallel_calls() {
+        let shared = GeminiSharedState::default();
+        let json = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": { "name": "fs_list", "args": {} },
+                            "thoughtSignature": "sig-batch"
+                        },
+                        {
+                            "functionCall": { "name": "fs_read", "args": { "path": "Cargo.toml" } }
+                        }
+                    ]
+                }
+            }]
+        });
+
+        let _ = parse_gemini_response(&json, ConceptId(1), 1, 0, &shared);
+        let sig_guard = shared.thought_signatures.lock().unwrap();
+        assert_eq!(sig_guard.get(&(1, 0)), Some(&json!("sig-batch")));
+        assert_eq!(sig_guard.get(&(1, 1)), Some(&json!("sig-batch")));
     }
 }

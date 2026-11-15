@@ -2,7 +2,7 @@
 
 **CLI and TUI coding agent harness powered by OnYX (`onyx-soul-agents` + `onyx-workspace`).**
 
-`openonyx` connects an external LLM responder (`GeminiResponder` / `AsyncGeminiResponder` via Google AI Studio REST API) and an interactive terminal UI (`TuiDriver` via `ratatui` + `crossterm`) to OnYX's deterministic `AgentHost` runtime, with full transcript recording, per-tick graph snapshots, inspection, and Git-reconciled time-travel rewind.
+`openonyx` connects an external LLM responder (`GeminiResponder` / `AsyncGeminiDriver` via Google AI Studio REST API) and an interactive terminal UI (`TuiDriver` via `ratatui` + `crossterm`) to OnYX's deterministic `AgentHost` runtime, with full transcript recording, per-tick graph snapshots, inspection, and Git-reconciled time-travel rewind.
 
 ## Environment Variables
 
@@ -61,12 +61,12 @@ cargo run -p open-onyx -- rewind snaps 2 --transcript session.tr
 
 ## Architecture
 
-- [`main.rs`](src/main.rs): CLI parsing, `CommandSpawnerSystem`, `CliApprovalDriver`, `all_live_waiting_approval`, `WorkspaceLedgerSystem` + `PendingCheckpoints` wiring, and `run` / `chat` / `replay` / `inspect` / `rewind` execution loops:
-  - `chat` only advances `host.step()` when agents are active (`!is_settled()`, not blocked on `WaitingApproval`, and not waiting on an in-flight `AsyncGeminiResponder` request) or when UI events (`Enter` command, `y`/`n` approval) are queued, avoiding idle/approval/LLM-wait tick bloat while keeping the TUI responsive.
+- [`main.rs`](src/main.rs): CLI parsing, `CommandSpawnerSystem`, `CliApprovalDriver`, `all_live_agents_blocked` / `all_live_waiting_approval`, `WorkspaceLedgerSystem` + `PendingCheckpoints` wiring, and `run` / `chat` / `replay` / `inspect` / `rewind` execution loops:
+  - `chat` only advances `host.step()` when at least one live agent can advance (`!is_settled()` and `!all_live_agents_blocked(...)`), when a background `AsyncGeminiDriver` reply is ready (`has_ready`), or when UI events (`Enter` command, `y`/`n` approval) are queued, avoiding idle/approval/LLM-wait tick bloat while keeping the TUI responsive.
   - `--save-transcript` flushes after each settled turn in `chat` as well as on exit.
   - `replay` stops cleanly when `ReplayBridge` is exhausted and all live agents are settled or in `WaitingApproval`.
   - `rewind` queries `effects_after_tick` from the latest snapshot, restores the working tree via `restore_git_tree_checkpoint` to the first pre-effect `tree_sha` (or prints the reconciliation plan with `--dry-run`), and resumes from tick `N`.
-- [`gemini.rs`](src/gemini.rs): `GeminiResponder` (sync, for `run`/`rewind`) and `AsyncGeminiResponder` (non-blocking background worker + `InFlightGuard` RAII counter, for `chat`) implementing `Responder`, passing the API key via `x-goog-api-key` header, rejecting simultaneous multi-`functionCall` turns explicitly, and preserving `thoughtSignature` across thinking turns.
+- [`gemini.rs`](src/gemini.rs): `GeminiResponder` (sync `Responder`, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking `PlatformDriver` background worker + `has_ready` + `InFlightGuard` RAII counter, wrapped by `RecordingBridge` for `chat`), passing the API key via `x-goog-api-key` header, queueing simultaneous multi-`functionCall` turns sequentially per tick (clearing queued calls automatically on `tool_error`/`denied` so Gemini can replan), and propagating `thoughtSignature` across parallel call batches and thinking turns.
 - [`tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`pump_idle`, `has_queued_events`, multiline entry rendering) implementing `PlatformDriver` with `ratatui` and `crossterm`. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` remain dependency-free.
 
 ## Roadmap / TODO (Not Yet Implemented)
