@@ -229,12 +229,18 @@ impl WorkspaceTools {
             if self.policy.is_ignored(&path) {
                 continue;
             }
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             let rel = path
                 .strip_prefix(&self.policy.root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if path.is_dir() {
+            if meta.is_dir() {
                 out.push(format!("{rel}/"));
                 if depth < max_depth {
                     self.walk_list(&path, depth + 1, max_depth, out);
@@ -263,20 +269,29 @@ impl WorkspaceTools {
         let path = self.policy.resolve_existing(&args.path)?;
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
-        let count = content.matches(&args.old_text).count();
-        if count == 0 {
-            return Err(format!("old_text not found in `{}`", args.path));
+
+        let exact_count = content.matches(&args.old_text).count();
+        if exact_count == 1 {
+            let updated = content.replacen(&args.old_text, &args.new_text, 1);
+            fs::write(&path, updated.as_bytes())
+                .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
+            return Ok(format!("edited `{}` (1 replacement)", args.path));
         }
-        if count > 1 {
+        if exact_count > 1 {
             return Err(format!(
-                "old_text matched {count} times in `{}`; provide more context",
+                "old_text matched {exact_count} times in `{}`; provide more context",
                 args.path
             ));
         }
-        let updated = content.replacen(&args.old_text, &args.new_text, 1);
+
+        let updated = replace_line_trimmed_unique(&content, &args.old_text, &args.new_text)
+            .map_err(|reason| format!("in `{}`: {reason}", args.path))?;
         fs::write(&path, updated.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
-        Ok(format!("edited `{}` (1 replacement)", args.path))
+        Ok(format!(
+            "edited `{}` (1 line-trimmed replacement)",
+            args.path
+        ))
     }
 
     fn code_search(&self, args: CodeSearchArgs) -> Result<String, String> {
@@ -302,10 +317,13 @@ impl WorkspaceTools {
         if hits.len() >= max_results || self.policy.is_ignored(path) {
             return;
         }
-        if path.is_file() {
-            let Ok(meta) = fs::metadata(path) else {
-                return;
-            };
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if meta.is_file() {
             if meta.len() > 1024 * 1024 {
                 return;
             }
@@ -355,10 +373,17 @@ impl WorkspaceTools {
         cmd.current_dir(&self.policy.root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn shell command: {e}"))?;
+        let out_handle = read_pipe_capped(child.stdout.take(), self.policy.max_output_bytes);
+        let err_handle = read_pipe_capped(child.stderr.take(), self.policy.max_output_bytes);
         let deadline = Instant::now() + self.policy.command_timeout;
 
         let status = loop {
@@ -366,8 +391,26 @@ impl WorkspaceTools {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if Instant::now() >= deadline {
+                        #[cfg(windows)]
+                        {
+                            let _ = Command::new("taskkill")
+                                .args(["/F", "/T", "/PID", &child.id().to_string()])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
+                        }
+                        #[cfg(unix)]
+                        {
+                            let _ = Command::new("kill")
+                                .args(["-9", &format!("-{}", child.id())])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
+                        let _ = out_handle.join();
+                        let _ = err_handle.join();
                         return Err(format!(
                             "command timed out after {:?}",
                             self.policy.command_timeout
@@ -379,18 +422,8 @@ impl WorkspaceTools {
             }
         };
 
-        let mut stdout = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            stdout = String::from_utf8_lossy(&buf).into_owned();
-        }
-        let mut stderr = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            let mut buf = Vec::new();
-            let _ = err.read_to_end(&mut buf);
-            stderr = String::from_utf8_lossy(&buf).into_owned();
-        }
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
 
         let combined = format!(
             "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
@@ -400,6 +433,31 @@ impl WorkspaceTools {
         );
         Ok(truncate_utf8(&combined, self.policy.max_output_bytes))
     }
+}
+
+fn read_pipe_capped<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    cap: usize,
+) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let Some(mut reader) = pipe else {
+            return String::new();
+        };
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if collected.len() < cap {
+                        let take = (cap - collected.len()).min(n);
+                        collected.extend_from_slice(&chunk[..take]);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&collected).into_owned()
+    })
 }
 
 fn truncate_utf8(s: &str, max_bytes: usize) -> String {
@@ -449,4 +507,66 @@ struct CodeSearchArgs {
 #[derive(Deserialize)]
 struct ShellExecArgs {
     command: String,
+}
+
+fn replace_line_trimmed_unique(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Result<String, String> {
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    if old_lines.is_empty() {
+        return Err("old_text cannot be empty".to_string());
+    }
+
+    let mut line_spans: Vec<(usize, usize, &str)> = Vec::new();
+    let mut offset = 0usize;
+    for chunk in content.split_inclusive('\n') {
+        let trimmed_line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let trimmed_line = trimmed_line.strip_suffix('\r').unwrap_or(trimmed_line);
+        line_spans.push((offset, offset + chunk.len(), trimmed_line));
+        offset += chunk.len();
+    }
+    if offset < content.len() {
+        let tail = &content[offset..];
+        line_spans.push((offset, content.len(), tail));
+    }
+
+    let window_len = old_lines.len();
+    if window_len > line_spans.len() {
+        return Err("old_text not found".to_string());
+    }
+
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for start in 0..=(line_spans.len() - window_len) {
+        let matched =
+            (0..window_len).all(|i| line_spans[start + i].2.trim() == old_lines[i].trim());
+        if matched {
+            let byte_start = line_spans[start].0;
+            let byte_end = line_spans[start + window_len - 1].1;
+            matches.push((byte_start, byte_end));
+        }
+    }
+
+    match matches.len() {
+        0 => Err("old_text not found".to_string()),
+        1 => {
+            let (byte_start, byte_end) = matches[0];
+            let mut out = String::with_capacity(content.len() + new_text.len());
+            out.push_str(&content[..byte_start]);
+            out.push_str(new_text);
+            if content[..byte_end].ends_with('\n') && !new_text.ends_with('\n') {
+                if content[..byte_end].ends_with("\r\n") {
+                    out.push_str("\r\n");
+                } else {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&content[byte_end..]);
+            Ok(out)
+        }
+        n => Err(format!(
+            "old_text matched {n} times (line-trimmed); provide more context"
+        )),
+    }
 }

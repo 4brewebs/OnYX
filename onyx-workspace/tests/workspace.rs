@@ -5,7 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use onyx_soul_agents::{
     AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply,
 };
-use onyx_workspace::{WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools};
+use onyx_workspace::{
+    WorkspaceLedgerSystem, WorkspaceMode, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
+    WorkspaceVocab, capture_git_tree_checkpoint, effects_after_tick, is_file_read,
+    restore_git_tree_checkpoint,
+};
 
 struct TempDir(PathBuf);
 
@@ -159,4 +163,246 @@ fn recorded_workspace_session_replays_identically_without_touching_disk() {
     let mut replay_driver = ReplayBridge::new(transcript).wrapping(HeadlessDriver::new());
     assert!(replayed.run_until_settled(&mut replay_driver, 16));
     assert_eq!(replayed.fingerprint(), expected_fp);
+}
+
+#[test]
+fn plan_mode_blocks_mutating_tools_without_touching_disk() {
+    let dir = TempDir::new("plan-mode");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let spec = AgentSpec::new("planner", "try writing in plan mode")
+        .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+    let mut host = AgentHost::builder(1)
+        .system(Box::new(WorkspaceLedgerSystem::new()))
+        .build()
+        .unwrap();
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_mode(WorkspaceMode::Plan)
+        .wrapping(HeadlessDriver::new());
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        if let Some((_, err)) = req.memory.iter().find(|(k, _)| k == "tool_error") {
+            Some(Reply::done(req.agent, req.request, err.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"blocked.txt","content":"nope"}"#,
+            ))
+        }
+    })
+    .wrapping(ws_bridge);
+
+    assert!(host.run_until_settled(&mut driver, 16));
+    assert!(!dir.0.join("blocked.txt").exists());
+    let id = host.agents()[0];
+    let result = host.result(id).unwrap();
+    assert!(result.contains("blocked by workspace mode"), "{result}");
+}
+
+#[test]
+fn require_read_before_edit_and_ledger_records_file_and_effects() {
+    let dir = TempDir::new("read-before-edit");
+    fs::write(dir.0.join("note.txt"), "before\n").unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let spec = AgentSpec::new("editor", "edit note.txt")
+        .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+    let mut host = AgentHost::builder(7)
+        .system(Box::new(WorkspaceLedgerSystem::new()))
+        .build()
+        .unwrap();
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_workspace_vocab(ws_vocab)
+        .require_read_before_edit(true)
+        .wrapping(HeadlessDriver::new());
+
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        let has_err = req.memory.iter().any(|(k, _)| k == "tool_error");
+        let obs_count = req.memory.iter().filter(|(k, _)| k == "observe").count();
+        if obs_count >= 2 {
+            Some(Reply::done(req.agent, req.request, "edited"))
+        } else if obs_count == 1 {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_edit",
+                r#"{"path":"note.txt","old_text":"before","new_text":"after"}"#,
+            ))
+        } else if has_err {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_read",
+                r#"{"path":"note.txt"}"#,
+            ))
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_edit",
+                r#"{"path":"note.txt","old_text":"before","new_text":"after"}"#,
+            ))
+        }
+    })
+    .wrapping(ws_bridge);
+
+    assert!(host.run_until_settled(&mut driver, 24));
+    assert_eq!(
+        fs::read_to_string(dir.0.join("note.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(is_file_read(host.graph(), &ws_vocab, "note.txt"));
+
+    let effects = effects_after_tick(host.graph(), &ws_vocab, 0);
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].tool, "fs_edit");
+    assert_eq!(effects[0].target, "note.txt");
+    assert_eq!(effects[0].reversibility, "auto_reversible");
+}
+
+#[test]
+fn shell_exec_drains_large_output_without_deadlock() {
+    let dir = TempDir::new("pipe-drain");
+    let mut policy = WorkspacePolicy::new(&dir.0).unwrap();
+    policy.max_output_bytes = 4096;
+    let tools = WorkspaceTools::new(policy);
+
+    let cmd = if cfg!(windows) {
+        r#"{"command":"$s = 'A' * 4096; 1..80 | ForEach-Object { [Console]::Out.WriteLine($s); [Console]::Error.WriteLine($s) }"}"#
+    } else {
+        r#"{"command":"i=0; while [ $i -lt 2000 ]; do echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB >&2; i=$((i+1)); done"}"#
+    };
+
+    let out = tools.execute("shell_exec", cmd).unwrap();
+    assert!(out.contains("exit_code: 0"), "{out}");
+    assert!(out.len() <= 4096 + 64, "output len was {}", out.len());
+}
+
+#[test]
+fn walk_list_and_search_ignore_external_symlinks() {
+    let dir = TempDir::new("symlink-root");
+    let outside = TempDir::new("symlink-outside");
+    fs::write(dir.0.join("inside.txt"), "needle inside\n").unwrap();
+    fs::write(outside.0.join("secret.txt"), "needle outside\n").unwrap();
+
+    let link_path = dir.0.join("escape_link");
+    #[cfg(unix)]
+    let link_res = std::os::unix::fs::symlink(&outside.0, &link_path);
+    #[cfg(windows)]
+    let link_res = std::os::windows::fs::symlink_dir(&outside.0, &link_path);
+
+    // En Windows sin privilegios de desarrollador/admin puede devolver ERROR_PRIVILEGE_NOT_HELD (1314).
+    if let Err(e) = link_res {
+        if e.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("unexpected symlink error: {e}");
+    }
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let listed = tools.execute("fs_list", r#"{"max_depth":3}"#).unwrap();
+    assert!(listed.contains("inside.txt"), "{listed}");
+    assert!(!listed.contains("secret.txt"), "{listed}");
+    assert!(!listed.contains("escape_link"), "{listed}");
+
+    let searched = tools
+        .execute("code_search", r#"{"pattern":"needle"}"#)
+        .unwrap();
+    assert!(searched.contains("inside.txt"), "{searched}");
+    assert!(!searched.contains("secret.txt"), "{searched}");
+}
+
+#[test]
+fn fs_edit_line_trimmed_fallback() {
+    let dir = TempDir::new("edit_trimmed");
+    let file = dir.0.join("sample.rs");
+    fs::write(
+        &file,
+        "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n",
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // 2-space indentation in old_text vs 4-space in file should succeed via line-trimmed fallback.
+    let edited = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"sample.rs","old_text":"  let x = 1;\n  let y = 2;","new_text":"    let x = 10;\n    let y = 20;"}"#,
+        )
+        .unwrap();
+    assert!(edited.contains("edited"), "{edited}");
+    let updated = fs::read_to_string(&file).unwrap();
+    assert!(updated.contains("let x = 10;"), "{updated}");
+    assert!(updated.contains("let y = 20;"), "{updated}");
+
+    // Duplicate trimmed blocks must be rejected.
+    fs::write(
+        &file,
+        "fn a() {\n    let z = 1;\n}\nfn b() {\n  let z = 1;\n}\n",
+    )
+    .unwrap();
+    let err = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"sample.rs","old_text":"let z = 1;","new_text":"let z = 2;"}"#,
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("2 times") || err.contains("2 matches") || err.contains("unique"),
+        "{err}"
+    );
+}
+
+#[test]
+fn git_tree_checkpoint_captures_and_restores_working_tree() {
+    let dir = TempDir::new("git_ckpt");
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir.0)
+            .output()
+            .expect("git must be available");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run_git(&["init"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["config", "user.email", "test@example.com"]);
+    run_git(&["config", "core.autocrlf", "false"]);
+
+    let file = dir.0.join("tracked.txt");
+    fs::write(&file, "original\n").unwrap();
+    run_git(&["add", "tracked.txt"]);
+    run_git(&["commit", "-m", "init"]);
+
+    // Modify tracked.txt before capturing checkpoint to verify dirty tree is captured in tree_sha.
+    fs::write(&file, "before-edit\n").unwrap();
+    let (head_sha, tree_sha) = capture_git_tree_checkpoint(&dir.0).unwrap();
+    assert!(!head_sha.is_empty());
+    assert!(!tree_sha.is_empty());
+
+    // Mutate file after checkpoint, then restore.
+    fs::write(&file, "after-edit\n").unwrap();
+    restore_git_tree_checkpoint(&dir.0, &tree_sha).unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "before-edit\n");
 }

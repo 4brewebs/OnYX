@@ -24,7 +24,7 @@ jobs:
           rustc --version
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --all-targets --locked
-      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --release --locked
       - name: Comprobar documentación
