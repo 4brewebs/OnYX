@@ -166,9 +166,14 @@ impl AgentSpawner {
                 .collect(),
             _ => Vec::new(),
         };
-        let birth = match self.reserve(ctx, v) {
-            Ok(birth) => birth,
-            Err(e) => return self.reject(ctx, v, d, e.reason()),
+        let approval_tools: Vec<String> = match data(d, v.approval_tools_csv) {
+            Some(Value::Text(csv)) => csv
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
         };
 
         let id = ctx.graph.create();
@@ -200,6 +205,9 @@ impl AgentSpawner {
         for tool in &tool_names {
             let tool_id = find_or_create_tool(ctx.graph, v, tool);
             ctx.graph.relate(id, v.rel_tool, tool_id);
+            if approval_tools.iter().any(|a| a == tool) {
+                ctx.graph.relate(id, v.rel_approval_tool, tool_id);
+            }
         }
 
         if let Some(parent) = d.subject {

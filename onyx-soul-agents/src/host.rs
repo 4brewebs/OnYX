@@ -20,11 +20,12 @@ use onyx_core::{
     PlatformDriver, SnapshotStore, SurfaceBinding, SystemEvent, SystemSpec, Value, tick,
 };
 
+use crate::bridge::pending_approvals;
 use crate::bus::AgentBus;
 use crate::config::AgentConfig;
 use crate::graph::AgentGraph;
 use crate::loader::RustLoader;
-use crate::policy::{AgentView, MemoryPolicy, ScriptedPolicy, agent_view};
+use crate::policy::{AgentView, ApprovalPolicy, MemoryPolicy, ScriptedPolicy, agent_view};
 use crate::registry::{InMemorySystemRegistry, SystemFactory};
 use crate::root::{ExecutionRoot, RootError, begin_event, execution_root};
 use crate::runtime::{AgentRuntime, RUNTIME_NAME};
@@ -73,6 +74,7 @@ pub struct HostBuilder {
     tools: Vec<Box<dyn ToolExecutor>>,
     memory: Option<Box<dyn MemoryPolicy>>,
     scripted: Option<Box<dyn ScriptedPolicy>>,
+    approval: Option<Box<dyn ApprovalPolicy>>,
     store: Option<Box<dyn SnapshotStore>>,
     systems: Vec<Box<dyn OnyxSystem>>,
 }
@@ -88,6 +90,7 @@ impl HostBuilder {
             tools: Vec::new(),
             memory: None,
             scripted: None,
+            approval: None,
             store: None,
             systems: Vec::new(),
         }
@@ -137,6 +140,11 @@ impl HostBuilder {
         self
     }
 
+    pub fn approval(mut self, approval: Box<dyn ApprovalPolicy>) -> Self {
+        self.approval = Some(approval);
+        self
+    }
+
     pub fn store(mut self, store: Box<dyn SnapshotStore>) -> Self {
         self.store = Some(store);
         self
@@ -172,13 +180,16 @@ impl HostBuilder {
         let mut systems =
             loader.load_app(&mut registry, &factories, &[blueprint], &self.stage_name)?;
 
-        if self.memory.is_some() || self.scripted.is_some() {
-            let mut runtime = AgentRuntime::new(config.clone());
+        if self.memory.is_some() || self.scripted.is_some() || self.approval.is_some() {
+            let mut runtime = AgentRuntime::new(self.config.clone());
             if let Some(m) = self.memory {
                 runtime = runtime.with_memory(m);
             }
             if let Some(s) = self.scripted {
                 runtime = runtime.with_scripted(s);
+            }
+            if let Some(a) = self.approval {
+                runtime = runtime.with_approval(a);
             }
             let slot = systems
                 .iter()
@@ -358,6 +369,10 @@ impl AgentHost {
 
     pub fn view(&self, id: ConceptId) -> AgentView {
         agent_view(&self.graph, &self.vocab, id)
+    }
+
+    pub fn pending_approvals(&self) -> Vec<AgentView> {
+        pending_approvals(&self.graph, &self.vocab)
     }
 
     pub fn result(&self, id: ConceptId) -> Option<String> {

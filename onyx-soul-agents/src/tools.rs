@@ -33,6 +33,7 @@ pub const TOOLS_NAME: &str = "agent_tools";
 pub struct ToolCall {
     pub agent: ConceptId,
     pub request: i64,
+    pub call_id: Option<String>,
     pub tool: String,
     pub args: String,
 }
@@ -115,12 +116,17 @@ impl OnyxSystem for ToolSystem {
                 Some(Value::Text(a)) => a.clone(),
                 _ => String::new(),
             };
+            let call_id = match data(d, v.call_id) {
+                Some(Value::Text(c)) => Some(c.clone()),
+                _ => None,
+            };
             let Some(exec) = self.tools.iter_mut().find(|t| t.name() == tool.as_str()) else {
                 continue;
             };
             let call = ToolCall {
                 agent,
                 request: *request,
+                call_id: call_id.clone(),
                 tool: tool.clone(),
                 args,
             };
@@ -137,15 +143,16 @@ impl OnyxSystem for ToolSystem {
                 Ok(text) => (true, text),
                 Err(e) => (false, e),
             };
-            ctx.outbox.push(domain(
-                v.ev_tool_result,
-                Some(agent),
-                vec![
-                    (v.request, Value::Int(*request)),
-                    (v.text, Value::Text(body)),
-                    (v.ok, Value::Bool(ok)),
-                ],
-            ));
+            let mut result_data = vec![
+                (v.request, Value::Int(*request)),
+                (v.text, Value::Text(body)),
+                (v.ok, Value::Bool(ok)),
+            ];
+            if let Some(cid) = call_id {
+                result_data.push((v.call_id, Value::Text(cid)));
+            }
+            ctx.outbox
+                .push(domain(v.ev_tool_result, Some(agent), result_data));
         }
     }
 }

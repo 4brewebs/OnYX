@@ -193,19 +193,16 @@ fn reserved_attrs_are_exactly_the_framework_properties() {
         v.steps,
         v.max_steps,
         v.pending,
+        v.pending_tool,
+        v.pending_args,
+        v.pending_call_id,
         v.remaining,
         v.timeout,
         v.born,
         v.result,
         v.mem_count,
         v.tools_csv,
-        // Atributos de concepto herramienta y de entrada de memoria: un extra
-        // con ellos haría pasar al agente por herramienta o por memoria.
-        v.tool_name,
-        v.mem_seq,
-        v.mem_kind,
-        v.mem_text,
-        v.mem_tick,
+        v.approval_tools_csv,
     ] {
         assert!(v.is_reserved(attr), "{attr:?} debe estar reservado");
     }
@@ -216,7 +213,7 @@ fn reserved_attrs_are_exactly_the_framework_properties() {
 #[test]
 fn agent_state_text_roundtrips_and_only_done_failed_are_terminal() {
     use AgentState::*;
-    for s in [Idle, Thinking, Acting, Done, Failed] {
+    for s in [Idle, Thinking, WaitingApproval, Acting, Done, Failed] {
         assert_eq!(AgentState::parse(s.as_str()), Some(s));
         assert_eq!(s.is_terminal(), matches!(s, Done | Failed), "{s:?}");
     }

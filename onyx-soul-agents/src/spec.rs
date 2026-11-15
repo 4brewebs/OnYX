@@ -39,6 +39,8 @@ pub struct AgentSpec {
     pub policy: Policy,
     /// Nombres de herramienta. No pueden contener comas.
     pub tools: Vec<String>,
+    /// Subconjunto de `tools` que requiere aprobación humana (`WaitingApproval`).
+    pub approval_tools: Vec<String>,
     /// Presupuesto de decisiones. `None` usa `AgentConfig::default_max_steps`.
     pub max_steps: Option<i64>,
     /// Ticks de espera. `None` usa `AgentConfig::default_timeout_ticks`.
@@ -55,6 +57,7 @@ impl AgentSpec {
             goal: goal.into(),
             policy: Policy::External,
             tools: Vec::new(),
+            approval_tools: Vec::new(),
             max_steps: None,
             timeout_ticks: None,
             extra: Vec::new(),
@@ -72,6 +75,16 @@ impl AgentSpec {
         S: Into<String>,
     {
         self.tools = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Marca qué herramientas requieren aprobación humana antes de ejecutarse.
+    pub fn with_approval_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.approval_tools = tools.into_iter().map(Into::into).collect();
         self
     }
 
@@ -107,6 +120,12 @@ pub fn spawn_event(vocab: &Vocab, spec: &AgentSpec, parent: Option<ConceptId>) -
         (vocab.policy, Value::Text(spec.policy.as_str().into())),
         (vocab.tools_csv, Value::Text(spec.tools.join(","))),
     ];
+    if !spec.approval_tools.is_empty() {
+        data.push((
+            vocab.approval_tools_csv,
+            Value::Text(spec.approval_tools.join(",")),
+        ));
+    }
     if let Some(n) = spec.max_steps {
         data.push((vocab.max_steps, Value::Int(n)));
     }

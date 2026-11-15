@@ -21,6 +21,8 @@ pub enum AgentState {
     Idle,
     /// Espera una decisión externa (la petición está proyectada en el grafo).
     Thinking,
+    /// Espera aprobación humana antes de ejecutar una herramienta sensible.
+    WaitingApproval,
     /// Espera el resultado de una herramienta.
     Acting,
     /// Terminó con éxito. Estado terminal.
@@ -34,6 +36,7 @@ impl AgentState {
         match self {
             Self::Idle => "idle",
             Self::Thinking => "thinking",
+            Self::WaitingApproval => "waiting_approval",
             Self::Acting => "acting",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -44,6 +47,7 @@ impl AgentState {
         Some(match s {
             "idle" => Self::Idle,
             "thinking" => Self::Thinking,
+            "waiting_approval" => Self::WaitingApproval,
             "acting" => Self::Acting,
             "done" => Self::Done,
             "failed" => Self::Failed,
@@ -67,6 +71,9 @@ pub struct Vocab {
     pub steps: Attr,
     pub max_steps: Attr,
     pub pending: Attr,
+    pub pending_tool: Attr,
+    pub pending_args: Attr,
+    pub pending_call_id: Attr,
     pub remaining: Attr,
     pub timeout: Attr,
     pub born: Attr,
@@ -74,9 +81,12 @@ pub struct Vocab {
     pub mem_count: Attr,
     /// Solo viaja en el evento de spawn: nombres de herramienta separados por coma.
     pub tools_csv: Attr,
+    /// Solo viaja en el evento de spawn: herramientas que requieren aprobación humana.
+    pub approval_tools_csv: Attr,
 
     // Relaciones salientes del agente.
     pub rel_tool: Attr,
+    pub rel_approval_tool: Attr,
     pub rel_memory: Attr,
     pub rel_parent: Attr,
 
@@ -93,6 +103,8 @@ pub struct Vocab {
     pub ev_rejected: Attr,
     pub ev_tool_call: Attr,
     pub ev_tool_result: Attr,
+    pub ev_approval_requested: Attr,
+    pub ev_approval_denied: Attr,
     pub ev_finished: Attr,
     pub ev_failed: Attr,
     /// Asks the spawner to create the execution root ([`crate::begin_event`]).
@@ -104,6 +116,7 @@ pub struct Vocab {
 
     // Claves de `DomainEvent::data`.
     pub request: Attr,
+    pub call_id: Attr,
     pub tool: Attr,
     pub args: Attr,
     pub text: Attr,
@@ -133,14 +146,19 @@ impl Vocab {
             steps: a("steps"),
             max_steps: a("max_steps"),
             pending: a("pending"),
+            pending_tool: a("pending_tool"),
+            pending_args: a("pending_args"),
+            pending_call_id: a("pending_call_id"),
             remaining: a("remaining"),
             timeout: a("timeout"),
             born: a("born"),
             result: a("result"),
             mem_count: a("mem_count"),
             tools_csv: a("tools_csv"),
+            approval_tools_csv: a("approval_tools_csv"),
 
             rel_tool: a("has_tool"),
+            rel_approval_tool: a("requires_approval"),
             rel_memory: a("has_memory"),
             rel_parent: a("parent"),
 
@@ -155,6 +173,8 @@ impl Vocab {
             ev_rejected: a("ev.spawn_rejected"),
             ev_tool_call: a("ev.tool_call"),
             ev_tool_result: a("ev.tool_result"),
+            ev_approval_requested: a("ev.approval_requested"),
+            ev_approval_denied: a("ev.approval_denied"),
             ev_finished: a("ev.finished"),
             ev_failed: a("ev.failed"),
             ev_begin: a("ev.begin_execution"),
@@ -162,6 +182,7 @@ impl Vocab {
             ev_begin_rejected: a("ev.execution_rejected"),
 
             request: a("request"),
+            call_id: a("call_id"),
             tool: a("tool"),
             args: a("args"),
             text: a("text"),
@@ -187,17 +208,16 @@ impl Vocab {
             self.steps,
             self.max_steps,
             self.pending,
+            self.pending_tool,
+            self.pending_args,
+            self.pending_call_id,
             self.remaining,
             self.timeout,
             self.born,
             self.result,
             self.mem_count,
             self.tools_csv,
-            self.tool_name,
-            self.mem_seq,
-            self.mem_kind,
-            self.mem_text,
-            self.mem_tick,
+            self.approval_tools_csv,
         ]
         .contains(&attr)
             || self.operations.is_reserved(attr)
