@@ -2,25 +2,29 @@
 
 **Agent harness soul for OnYX.**
 
-Implements the core ports for deterministic multi-agent applications:
+Implements the core ports for deterministic multi-agent applications and coding harnesses without any external dependencies (`onyx-core` only):
 
-- `AgentGraph` — in-memory EAV graph with agent helpers
-- `AgentSnapshotStore` — tick-indexed snapshots (rewind to any tick)
-- `AgentBus` — in-memory bus
-- `RecordingBridge` / `ReplayBridge` — external decider with record/replay, `wrapping` and `starting_at`
+- `AgentGraph` — in-memory EAV graph with agent helpers (`spawn`, tools, memory, approvals)
+- `AgentSnapshotStore` — tick-indexed snapshots (inspect and rewind to any tick)
+- `AgentBus` — in-memory FIFO event bus
+- `RecordingBridge` / `ReplayBridge` — external decider & driver wrapper (`wrapping`, `starting_at`) producing deterministic `Transcript`s (`ONYXTR1` / `ONYXTR2`, capturing both `Reply` events and `IngressEvent::Command`)
 - `HeadlessDriver` / `HeadlessHandle` — inspect surfaces and counts, including after `wrapping`
-- `AgentHost` — mounts graph, bus, store, systems and the tick loop
+- `AgentHost` / `HostBuilder` — mounts graph, bus, store, systems, and the `tick` loop
 - `AgentSpawner` + `AgentRuntime` — systems that only speak `OnyxEvent`
-- `ToolSystem` / `ToolExecutor` — deterministic in-brain tools
+- `ToolSystem` / `ToolExecutor` — deterministic in-brain tools (`ToolCall`, `ToolCtx`)
+- **External tool calls & human-in-the-loop approvals**:
+  - `AgentState::WaitingApproval` and `ApprovalPolicy` (`AgentSpec::with_approval_tools`, `PendingApproval`, `pending_approvals`)
+  - Structured calls via `Reply::call_structured` (`call_id`) and `pending_tool_calls`
+  - Approval verbs `Verb::Approve` / `Verb::Deny` (`Reply::approve`, `Reply::deny`)
 
 The application decides stages, systems, tools, and policies.
 This soul closes the framework so the app can be written against it.
 
-`AgentDriver` remains for the older request/reply tests. New apps should use the bridge (and `AgentHost` if they do not want to wire `tick` themselves).
+`AgentDriver` remains for the older request/reply tests. New apps should use `RecordingBridge` / `ReplayBridge` (and `AgentHost` if they do not want to wire `tick` themselves).
 
 ## Usage
 
-The full tour — a `ToolExecutor`, `step_with` with a surface, a snapshot after `say`, a second host, `set_tick` and `ReplayBridge::starting_at` — lives in the `onyx-example-agents` crate.
+The full tour — a `ToolExecutor`, `step_with` with a surface, a snapshot after `say`, a second host, `set_tick` and `ReplayBridge::starting_at` — lives in the `onyx-example-agents` crate. For a full coding harness with workspace tools, approvals, TUI, and snapshot rewind, see `onyx-workspace` and `open-onyx`.
 
 ```rust
 use onyx_soul_agents::{
@@ -31,7 +35,11 @@ use onyx_soul_agents::{
 let mut host = AgentHost::builder(1)
     .tool(Box::new(Search))
     .build()?;
-host.spawn(&AgentSpec::new("alice", "research topic A").with_tools(["search"]));
+host.spawn(
+    &AgentSpec::new("alice", "research topic A")
+        .with_tools(["search"])
+        .with_approval_tools(["search"]),
+);
 
 let view = host.attr("view.main");
 let surfaces = [SurfaceBinding {

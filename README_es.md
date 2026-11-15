@@ -7,9 +7,13 @@ OnYX separa un núcleo de contratos, pequeño y sin dependencias, de las almas q
 > **Estado: v0, en diseño activo.** El contrato público aún no está cerrado y cambiará de forma rompedora. No lo uses donde un fallo tenga consecuencias. Este README separa lo que existe hoy de lo que solo está diseñado.
 
 ```
-onyx-core   = contratos + tick + RNG determinista            · 0 dependencias
-onyx-soul   = implementaciones por defecto de esos contratos · 0 dependencias externas
-adaptadores = TUI, WASM, TOML, Redis, Kafka...               · (aún no existen)
+onyx-core           = contratos + tick + RNG determinista             · 0 dependencias
+onyx-soul           = implementaciones por defecto de esos contratos  · 0 dependencias externas
+onyx-soul-agents    = soul para harnesses multi-agente deterministas  · 0 dependencias externas
+onyx-workspace      = herramientas de código y sandbox de workspace   · usa onyx-soul-agents
+open-onyx           = harness CLI/TUI (Gemini + ratatui + replay)     · usa onyx-soul-agents + onyx-workspace
+onyx-example-app    = REPL mínimo sobre onyx-soul                     · usa onyx-soul
+onyx-example-agents = recorrido completo sobre onyx-soul-agents       · usa onyx-soul-agents
 ```
 
 ## Estado al 7 de noviembre de 2026
@@ -147,6 +151,13 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 
 - Casos genéricos que reciben fábricas, sin exigir `Default`. La feature está apagada por defecto y no añade dependencias. `onyx-soul` la activa solo en `[dev-dependencies]`.
 - API pública de verificación, fuera de la estabilidad de v0: sus casos pueden crecer o endurecerse entre versiones. Ocho grafos defectuosos de prueba demuestran que detecta reutilización de IDs, consultas desordenadas, creación implícita desde `set` e importación no atómica, incluidas fugas que solo alteran nombres o el contador, además de referencias Concept y relaciones entrantes que `destroy` no limpia. Cada caso pasa primero con el defecto desactivado.
+
+**`onyx-soul-agents`**, **`onyx-workspace`** y **`open-onyx`**
+
+- [`onyx-soul-agents`](onyx-soul-agents/README.md): soul sin dependencias externas especializado en harnesses multi-agente deterministas (`AgentGraph`, `AgentSnapshotStore`, `AgentHost`, `RecordingBridge`/`ReplayBridge`, `AgentState::WaitingApproval`, `ApprovalPolicy` y llamadas estructuradas con `call_id`).
+- [`onyx-workspace`](onyx-workspace/README.md): herramientas de código (`fs_read`, `fs_list`, `fs_write`, `fs_edit`, `code_search`, `shell_exec`) bajo `WorkspacePolicy` y `WorkspaceToolBridge` para grabación y replay determinista sin tocar disco.
+- [`open-onyx`](open-onyx/README.md): binario `openonyx` con modos `run`, `chat` (TUI con `ratatui`/`crossterm`), `replay`, `inspect` y `rewind`, conectado a Gemini (`GeminiResponder`).
+- `onyx-example-app` y `onyx-example-agents`: aplicaciones de ejemplo sobre `onyx-soul` y `onyx-soul-agents`.
 
 Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. `WorldGraph` pasa los casos genéricos de consultas, referencias, destrucción, remapeo de atributos y continuidad tras restaurar, además de pruebas privadas de rechazo atómico de snapshots inválidos. Las mutaciones de bytes no se presuponen inválidas: solo si `import` devuelve `Err` se exige conservación del observable y de una sonda de estado privado suministrada por el soul, que cubre registro completo y contador. La suite no exige igualdad de snapshots entre instancias. Esto no demuestra todavía intercambio con una segunda implementación de grafo ni recuperación completa del runtime. También se prueban RNG, tick, bus y capacidades de los puertos. La idempotencia de `init` se comprueba con una fábrica de sistemas consumidores de prueba, no para cualquier sistema externo. `cargo tree --workspace` permite comprobar que no hay dependencias externas. Para ejecutar solo los controles defectuosos: `cargo test -p onyx-core --features conformance --test conformance_probes`.
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use onyx_soul_agents::{
-    AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, Reply,
+    AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply,
 };
 use onyx_workspace::{WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools};
 
@@ -110,4 +110,49 @@ fn workspace_tool_bridge_executes_tools_end_to_end_with_agent_host() {
     assert!(host.run_until_settled(&mut driver, 16));
     let id = host.agents()[0];
     assert_eq!(host.result(id).as_deref(), Some("1: hola mundo\n"));
+}
+
+#[test]
+fn recorded_workspace_session_replays_identically_without_touching_disk() {
+    let dir = TempDir::new("replay");
+    fs::write(dir.0.join("data.txt"), "valor determinista\n").unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let spec = AgentSpec::new("coder", "read data.txt")
+        .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+
+    let mut recorded = AgentHost::builder(42).build().unwrap();
+    recorded.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(recorded.vocab(), tools).wrapping(HeadlessDriver::new());
+    let mut rec_driver = RecordingBridge::new(recorded.vocab(), |req: &AgentView| {
+        if let Some((_, text)) = req.memory.iter().find(|(k, _)| k == "observe") {
+            Some(Reply::done(req.agent, req.request, text.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_read",
+                r#"{"path":"data.txt"}"#,
+            ))
+        }
+    })
+    .wrapping(ws_bridge);
+
+    assert!(recorded.run_until_settled(&mut rec_driver, 16));
+    let expected_fp = recorded.fingerprint();
+    let transcript = rec_driver.transcript().clone();
+
+    // Eliminamos el directorio temporal: el replay NO debe tocar el disco ni el LLM.
+    drop(dir);
+
+    let mut replayed = AgentHost::builder(42).build().unwrap();
+    replayed.spawn(&spec);
+    let mut replay_driver = ReplayBridge::new(transcript).wrapping(HeadlessDriver::new());
+    assert!(replayed.run_until_settled(&mut replay_driver, 16));
+    assert_eq!(replayed.fingerprint(), expected_fp);
 }
