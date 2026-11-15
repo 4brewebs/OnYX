@@ -742,10 +742,7 @@ fn structured_call_and_call_id_propagate_across_runtime_and_tools() {
         .find(|e| matches!(e, OnyxEvent::Domain(d) if d.kind == w.v.ev_tool_call))
         .expect("ev_tool_call esperado");
     if let OnyxEvent::Domain(d) = ev_call {
-        assert_eq!(
-            payload(d, w.v.call_id),
-            Some(&Value::Text("cid-42".into()))
-        );
+        assert_eq!(payload(d, w.v.call_id), Some(&Value::Text("cid-42".into())));
     }
 
     let out = w.run(vec![ev_call.clone()]);
@@ -754,10 +751,7 @@ fn structured_call_and_call_id_propagate_across_runtime_and_tools() {
         .find(|e| matches!(e, OnyxEvent::Domain(d) if d.kind == w.v.ev_tool_result))
         .expect("ev_tool_result esperado");
     if let OnyxEvent::Domain(d) = ev_res {
-        assert_eq!(
-            payload(d, w.v.call_id),
-            Some(&Value::Text("cid-42".into()))
-        );
+        assert_eq!(payload(d, w.v.call_id), Some(&Value::Text("cid-42".into())));
         assert_eq!(
             payload(d, w.v.text),
             Some(&Value::Text("search:1:  line1\nline2".into()))

@@ -45,8 +45,8 @@ pub mod vocab;
 mod util;
 
 pub use bridge::{
-    Logged, LoggedCommand, RecordingBridge, ReplayBridge, Responder, Transcript,
-    pending_approvals, pending_requests, pending_tool_calls,
+    Logged, LoggedCommand, RecordingBridge, ReplayBridge, Responder, Transcript, pending_approvals,
+    pending_requests, pending_tool_calls,
 };
 pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};

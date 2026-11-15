@@ -70,12 +70,14 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 - `onyx-example-app`: minimal REPL that loads systems/stages, restores/saves snapshots, and processes `agree`, `status`, `exit`
 - `onyx-example-agents`: end-to-end tour of `AgentHost`, `RecordingBridge`, `AgentSnapshotStore`, and `ReplayBridge::starting_at`
 
-## What does NOT exist yet
+## What does NOT exist yet (Roadmap / TODO)
 
 - WASM drivers
 - Stage change at runtime
 - TOML / config loaders
-- Unified recovery bundle (snapshot + RNG seed + transcript in one artifact)
+- Unified recovery bundle (snapshot + tick `n` + RNG seed + `Transcript` in one validated artifact)
+- Async background LLM worker in `open-onyx` TUI (currently `GeminiResponder` blocks synchronously during `present`)
+- Configurable `shell_exec` timeout and subagent delegation tool in `open-onyx`
 - Multi-soul interoperability tests
 
 ## Quick start

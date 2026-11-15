@@ -34,7 +34,9 @@ impl WorkspacePolicy {
         path.components().any(|c| {
             if let Component::Normal(name) = c {
                 let s = name.to_string_lossy();
-                self.ignored_dirs.iter().any(|ignored| ignored == s.as_ref())
+                self.ignored_dirs
+                    .iter()
+                    .any(|ignored| ignored == s.as_ref())
             } else {
                 false
             }

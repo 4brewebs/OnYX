@@ -74,3 +74,8 @@ let _seen = monitor.last_surfaces();
 ```
 
 `Search` in this snippet is a `ToolExecutor`. `pending_requests` only lists agents in `Thinking`, so the bridge does not ask the decider while the agent is `Acting`. After a `tool_error`, the runtime returns the agent to `Idle` and opens a new request; this snippet answers it with `Reply::fail`. Returning `None` leaves that request unanswered and the agent fails by timeout. The example crate has a complete, runnable success path.
+
+## Roadmap / TODO (Not Yet Implemented)
+
+- **Unified recovery unit**: bundle `AgentGraph` snapshot, tick `n`, RNG seed, execution root, and `Transcript` with divergence validation so restore + replay cannot drift silently.
+- **Parent/child orchestration helpers**: `WaitingChildren` / join-style coordination on top of `rel_parent` for structured multi-agent delegation.

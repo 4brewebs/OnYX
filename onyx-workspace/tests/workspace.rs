@@ -54,7 +54,10 @@ fn workspace_tools_write_read_edit_search_and_list() {
     assert!(w.contains("wrote"));
 
     let r = tools
-        .execute("fs_read", r#"{"path":"src/lib.rs","start_line":2,"end_line":2}"#)
+        .execute(
+            "fs_read",
+            r#"{"path":"src/lib.rs","start_line":2,"end_line":2}"#,
+        )
         .unwrap();
     assert_eq!(r, "2: fn two() {}\n");
 
@@ -126,7 +129,8 @@ fn recorded_workspace_session_replays_identically_without_touching_disk() {
     let mut recorded = AgentHost::builder(42).build().unwrap();
     recorded.spawn(&spec);
 
-    let ws_bridge = WorkspaceToolBridge::new(recorded.vocab(), tools).wrapping(HeadlessDriver::new());
+    let ws_bridge =
+        WorkspaceToolBridge::new(recorded.vocab(), tools).wrapping(HeadlessDriver::new());
     let mut rec_driver = RecordingBridge::new(recorded.vocab(), |req: &AgentView| {
         if let Some((_, text)) = req.memory.iter().find(|(k, _)| k == "observe") {
             Some(Reply::done(req.agent, req.request, text.clone()))

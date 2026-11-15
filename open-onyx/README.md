@@ -60,6 +60,16 @@ cargo run -p open-onyx -- rewind snaps 2 --transcript session.tr
 
 ## Architecture
 
-- [`main.rs`](src/main.rs): CLI parsing, `CommandSpawnerSystem`, `CliApprovalDriver`, and `run` / `chat` / `replay` / `inspect` / `rewind` execution loops.
-- [`gemini.rs`](src/gemini.rs): `GeminiResponder` implementing `Responder`, including `functionCall` / `functionResponse` formatting and `thoughtSignature` preservation across thinking turns.
-- [`tui.rs`](src/tui.rs): `TuiDriver` implementing `PlatformDriver` with `ratatui` and `crossterm`. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` remain dependency-free.
+- [`main.rs`](src/main.rs): CLI parsing, `CommandSpawnerSystem`, `CliApprovalDriver`, `all_live_waiting_approval`, and `run` / `chat` / `replay` / `inspect` / `rewind` execution loops:
+  - `chat` only advances `host.step()` when agents are active (`!is_settled()` and not blocked on `WaitingApproval`) or when UI events (`Enter` command, `y`/`n` approval) are queued, avoiding idle/approval tick bloat.
+  - `--save-transcript` flushes after each settled turn in `chat` as well as on exit.
+  - `replay` stops cleanly when `ReplayBridge` is exhausted and all live agents are settled or in `WaitingApproval`.
+- [`gemini.rs`](src/gemini.rs): synchronous `GeminiResponder` implementing `Responder`, including `functionCall` / `functionResponse` formatting and `thoughtSignature` preservation across thinking turns.
+- [`tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`pump_idle`, `has_queued_events`, multiline entry rendering) implementing `PlatformDriver` with `ratatui` and `crossterm`. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` remain dependency-free.
+
+## Roadmap / TODO (Not Yet Implemented)
+
+- **Async Gemini worker in TUI**: `GeminiResponder::respond` currently blocks synchronously during `present`; moving HTTP calls to a background worker thread will keep the TUI responsive (and allow `Esc` cancellation) while an agent is `Thinking`.
+- **Unified recovery bundle**: bundle graph snapshot, tick `n`, RNG seed, and `Transcript` into a single validated checkpoint artifact for `rewind` and `resume`.
+- **Configurable `shell_exec` timeout**: expose `--command-timeout` / per-call timeout overrides (currently fixed at `30s` in `WorkspacePolicy`).
+- **Subagent delegation tool**: expose a `spawn_agent` tool in `open-onyx` so the main agent can delegate subtasks to child agents via `onyx-soul-agents`'s `parent` links.

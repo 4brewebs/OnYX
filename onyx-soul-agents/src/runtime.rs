@@ -307,8 +307,10 @@ impl Step<'_> {
 
     fn clear_pending_approval(&self, ctx: &mut Ctx, id: ConceptId) {
         let v = &self.v;
-        ctx.graph.set(id, v.pending_tool, Value::Text(String::new()));
-        ctx.graph.set(id, v.pending_args, Value::Text(String::new()));
+        ctx.graph
+            .set(id, v.pending_tool, Value::Text(String::new()));
+        ctx.graph
+            .set(id, v.pending_args, Value::Text(String::new()));
         ctx.graph
             .set(id, v.pending_call_id, Value::Text(String::new()));
     }
@@ -344,7 +346,8 @@ impl Step<'_> {
         if let Some(cid) = call_id {
             event_data.push((v.call_id, Value::Text(cid)));
         }
-        ctx.outbox.push(domain(v.ev_tool_call, Some(id), event_data));
+        ctx.outbox
+            .push(domain(v.ev_tool_call, Some(id), event_data));
         self.enter_wait(ctx, id, AgentState::Acting);
     }
 
@@ -375,9 +378,11 @@ impl Step<'_> {
             Decision::Call { tool, args } => {
                 if self.has_tool(ctx, id, &tool) {
                     let needs_approval = self.tool_requires_approval(ctx, id, &tool)
-                        || self
-                            .approval
-                            .requires_approval(&agent_view(&*ctx.graph, v, id), &tool, &args);
+                        || self.approval.requires_approval(
+                            &agent_view(&*ctx.graph, v, id),
+                            &tool,
+                            &args,
+                        );
                     if needs_approval {
                         ctx.graph.set(id, v.pending_tool, Value::Text(tool.clone()));
                         ctx.graph.set(id, v.pending_args, Value::Text(args.clone()));

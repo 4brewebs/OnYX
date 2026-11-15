@@ -53,7 +53,10 @@ pub fn pending_approvals(view: &dyn GraphView, v: &Vocab) -> Vec<AgentView> {
 }
 
 /// Llamadas a herramientas en ejecución externa (`AgentState::Acting`), en orden de id.
-pub fn pending_tool_calls(view: &dyn GraphView, v: &Vocab) -> Vec<(onyx_core::ConceptId, u64, PendingApproval)> {
+pub fn pending_tool_calls(
+    view: &dyn GraphView,
+    v: &Vocab,
+) -> Vec<(onyx_core::ConceptId, u64, PendingApproval)> {
     view.query(&[v.state, v.pending])
         .into_iter()
         .filter(|id| {
@@ -67,7 +70,15 @@ pub fn pending_tool_calls(view: &dyn GraphView, v: &Vocab) -> Vec<(onyx_core::Co
             let tool = text(view, id, v.pending_tool).filter(|s| !s.is_empty())?;
             let args = text(view, id, v.pending_args).unwrap_or_default();
             let call_id = text(view, id, v.pending_call_id).filter(|s| !s.is_empty());
-            Some((id, request, PendingApproval { tool, args, call_id }))
+            Some((
+                id,
+                request,
+                PendingApproval {
+                    tool,
+                    args,
+                    call_id,
+                },
+            ))
         })
         .collect()
 }
@@ -403,7 +414,9 @@ impl PlatformDriver for ReplayBridge {
             if cmd.poll != self.polls {
                 break;
             }
-            bus.push(OnyxEvent::Ingress(IngressEvent::Command(cmd.command.clone())));
+            bus.push(OnyxEvent::Ingress(IngressEvent::Command(
+                cmd.command.clone(),
+            )));
             self.cmd_cursor += 1;
         }
         while let Some(entry) = self.transcript.get(self.cursor) {

@@ -858,12 +858,7 @@ fn approval_gated_tool_waits_for_approve_without_timing_out() {
 fn denying_pending_approval_returns_agent_to_idle_with_reason() {
     struct GateDangerous;
     impl onyx_soul_agents::ApprovalPolicy for GateDangerous {
-        fn requires_approval(
-            &self,
-            _view: &AgentView,
-            tool: &str,
-            args: &str,
-        ) -> bool {
+        fn requires_approval(&self, _view: &AgentView, tool: &str, args: &str) -> bool {
             tool == "shell" && args.contains("rm")
         }
     }

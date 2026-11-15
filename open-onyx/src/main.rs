@@ -10,9 +10,9 @@ use std::sync::atomic::Ordering;
 
 use gemini::{DEFAULT_GEMINI_MODEL, GeminiResponder};
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AttrRegistry, Ctx,
-    EventBus, GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem,
-    PlatformDriver, RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Value, Vocab,
+    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AttrRegistry, Ctx, EventBus,
+    GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, PlatformDriver,
+    RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Value, Vocab,
     pending_approvals, spawn_event,
 };
 use onyx_workspace::{WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools};
@@ -295,18 +295,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut host = builder.build()?;
             let api_key = env::var("GEMINI_API_KEY")
                 .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
-            let model = env::var("ONYX_GEMINI_MODEL")
-                .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+            let model =
+                env::var("ONYX_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
 
             host.spawn(&make_spec(&goal, cli.auto_approve));
 
             let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(cli_driver);
-            let mut driver = RecordingBridge::new(
-                host.vocab(),
-                GeminiResponder::new(api_key, model),
-            )
-            .wrapping(ws_bridge);
+            let mut driver =
+                RecordingBridge::new(host.vocab(), GeminiResponder::new(api_key, model))
+                    .wrapping(ws_bridge);
 
             for _ in 0..256 {
                 if save_snapshots {
@@ -339,18 +337,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut host = builder.build()?;
             let api_key = env::var("GEMINI_API_KEY")
                 .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
-            let model = env::var("ONYX_GEMINI_MODEL")
-                .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+            let model =
+                env::var("ONYX_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
 
             let tui = TuiDriver::new(host.vocab())?;
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(tui);
-            let mut driver = RecordingBridge::new(
-                host.vocab(),
-                GeminiResponder::new(api_key, model),
-            )
-            .wrapping(ws_bridge);
+            let mut driver =
+                RecordingBridge::new(host.vocab(), GeminiResponder::new(api_key, model))
+                    .wrapping(ws_bridge);
 
             tui_handle.render(host.graph());
             let mut needs_follow_up_tick = false;
@@ -497,14 +493,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let model = env::var("ONYX_GEMINI_MODEL")
                     .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
                 let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
-                let ws_bridge =
-                    WorkspaceToolBridge::new(host.vocab(), tools).wrapping(cli_driver);
-                let mut driver = RecordingBridge::new(
-                    host.vocab(),
-                    GeminiResponder::new(api_key, model),
-                )
-                .starting_at(next_tick)
-                .wrapping(ws_bridge);
+                let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(cli_driver);
+                let mut driver =
+                    RecordingBridge::new(host.vocab(), GeminiResponder::new(api_key, model))
+                        .starting_at(next_tick)
+                        .wrapping(ws_bridge);
 
                 for _ in 0..256 {
                     host.step(&mut driver);

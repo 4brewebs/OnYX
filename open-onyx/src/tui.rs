@@ -254,11 +254,17 @@ impl TuiInner {
             );
             f.render_widget(header, chunks[0]);
 
-            let scroll = log_lines.len().saturating_sub(chunks[1].height.saturating_sub(2) as usize);
+            let scroll = log_lines
+                .len()
+                .saturating_sub(chunks[1].height.saturating_sub(2) as usize);
             let body = Paragraph::new(log_lines)
                 .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
                 .wrap(Wrap { trim: false })
-                .block(Block::default().title(" Memory & Trace ").borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .title(" Memory & Trace ")
+                        .borders(Borders::ALL),
+                );
             f.render_widget(body, chunks[1]);
 
             let (bottom_title, bottom_text, border_color) = match &approval_snapshot {

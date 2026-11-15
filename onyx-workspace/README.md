@@ -22,3 +22,8 @@ Provides sandboxed filesystem, search, and shell capabilities that plug directly
   - Implements `PlatformDriver` and wraps an inner driver (e.g., `HeadlessDriver`, `CliApprovalDriver`, or `TuiDriver`).
   - Watches `pending_tool_calls` for `AgentState::Acting` agents, executes the matching `WorkspaceTools` action, and pushes `Reply::observe` or `Reply::tool_error` back into the `EventBus`.
   - Designed to sit inside `RecordingBridge::wrapping(...)` so tool observations are recorded into the `Transcript` and replayed deterministically without touching disk.
+
+## Roadmap / TODO (Not Yet Implemented)
+
+- **Configurable `shell_exec` timeout**: `WorkspacePolicy::command_timeout` currently defaults to `30s`; add per-call or policy-level overrides for long-running builds/test suites.
+- **Streaming / cancellation for `shell_exec`**: allow incremental output capture and cancellation hooks from external adapters without blocking the brain.

@@ -142,11 +142,23 @@ impl Responder for GeminiResponder {
                     format!("gemini HTTP {code}: {err_body}"),
                 ));
             }
-            Err(e) => return Some(Reply::fail(req.agent, req.request, format!("gemini error: {e}"))),
+            Err(e) => {
+                return Some(Reply::fail(
+                    req.agent,
+                    req.request,
+                    format!("gemini error: {e}"),
+                ));
+            }
         };
         let json: JsonValue = match resp.into_json() {
             Ok(v) => v,
-            Err(e) => return Some(Reply::fail(req.agent, req.request, format!("gemini json error: {e}"))),
+            Err(e) => {
+                return Some(Reply::fail(
+                    req.agent,
+                    req.request,
+                    format!("gemini json error: {e}"),
+                ));
+            }
         };
 
         let parts = json["candidates"][0]["content"]["parts"]

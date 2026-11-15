@@ -151,8 +151,8 @@ impl WorkspaceTools {
                 self.fs_list(args)
             }
             "fs_write" => {
-                let args: FsWriteArgs = serde_json::from_str(raw)
-                    .map_err(|e| format!("invalid fs_write args: {e}"))?;
+                let args: FsWriteArgs =
+                    serde_json::from_str(raw).map_err(|e| format!("invalid fs_write args: {e}"))?;
                 self.fs_write(args)
             }
             "fs_edit" => {
@@ -176,14 +176,16 @@ impl WorkspaceTools {
 
     fn fs_read(&self, args: FsReadArgs) -> Result<String, String> {
         let path = self.policy.resolve_existing(&args.path)?;
-        let content =
-            fs::read_to_string(&path).map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
         let start = args.start_line.unwrap_or(1).max(1);
         let end = args.end_line.unwrap_or(total).min(total);
         if start > total && total > 0 {
-            return Ok(format!("(file has {total} lines; start_line {start} is past EOF)"));
+            return Ok(format!(
+                "(file has {total} lines; start_line {start} is past EOF)"
+            ));
         }
         let mut out = String::new();
         for (idx, line) in lines
@@ -208,7 +210,10 @@ impl WorkspaceTools {
         let mut entries = Vec::new();
         self.walk_list(&start, 0, max_depth, &mut entries);
         entries.sort();
-        Ok(truncate_utf8(&entries.join("\n"), self.policy.max_output_bytes))
+        Ok(truncate_utf8(
+            &entries.join("\n"),
+            self.policy.max_output_bytes,
+        ))
     }
 
     fn walk_list(&self, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<String>) {
@@ -243,8 +248,7 @@ impl WorkspaceTools {
     fn fs_write(&self, args: FsWriteArgs) -> Result<String, String> {
         let path = self.policy.resolve_for_write(&args.path)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create parent dir: {e}"))?;
+            fs::create_dir_all(parent).map_err(|e| format!("failed to create parent dir: {e}"))?;
         }
         fs::write(&path, args.content.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
@@ -257,8 +261,8 @@ impl WorkspaceTools {
 
     fn fs_edit(&self, args: FsEditArgs) -> Result<String, String> {
         let path = self.policy.resolve_existing(&args.path)?;
-        let content =
-            fs::read_to_string(&path).map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
         let count = content.matches(&args.old_text).count();
         if count == 0 {
             return Err(format!("old_text not found in `{}`", args.path));
@@ -287,7 +291,10 @@ impl WorkspaceTools {
         if hits.is_empty() {
             Ok("no matches".to_string())
         } else {
-            Ok(truncate_utf8(&hits.join("\n"), self.policy.max_output_bytes))
+            Ok(truncate_utf8(
+                &hits.join("\n"),
+                self.policy.max_output_bytes,
+            ))
         }
     }
 

@@ -188,11 +188,12 @@ El siguiente diseño propuesto, cuando se retome el contrato de core, es `System
 
 Marcado **TOIMPLEMENT** o **TODO** cuando ya hay un comentario en el código. No son capacidades actuales.
 
-- **TOIMPLEMENT.** TR2 y herramientas externas. Hoy un `ToolExecutor` solo puede tocar el grafo y `DetRng`. Una herramienta sin ejecutor se deja para que otro sistema o un driver responda con `ev.tool_result` o un `Reply` de observación; si nadie responde, el agente acaba por timeout. La transcripción TR1 graba las `Reply` del decisor, no un protocolo completo de resultados externos. El diseño propuesto para TR2 graba la petición completa de la herramienta (nombre, argumentos e identificador) y el replay falla de forma clara si esa grabación diverge. Tras un restore, la entrega es al menos una vez. El identificador de la llamada se persiste en el grafo como clave de idempotencia; el receptor o el host evitan duplicar el efecto asociado a esa clave. No se promete una entrega exactamente una vez.
-- **TOIMPLEMENT.** Drivers TUI y WASM. El REPL de ejemplo no sustituye a un driver de terminal.
+- **TOIMPLEMENT.** Validación estricta de divergencia en TR2 y entrega con idempotencia completa tras restore. Hoy ya existen `ONYXTR2` (comandos + `Reply` v2 con `call_id`), `AgentState::WaitingApproval` y herramientas externas en `onyx-workspace` (`WorkspaceToolBridge`), pero el replay aún no falla explícitamente si divergen los argumentos de una petición respecto a la transcripción ni empaqueta la unidad completa de recuperación junto con el snapshot.
+- **TOIMPLEMENT.** Drivers WASM (el driver TUI interactivo ya existe en `open-onyx` mediante `TuiDriver` sobre `ratatui` y `crossterm`, manteniendo `onyx-core` y los souls con 0 dependencias).
+- **TOIMPLEMENT.** Worker asíncrono en segundo plano para `GeminiResponder` en `TuiDriver` (`open-onyx`): hoy la petición HTTP bloquea síncronamente durante `present`.
+- **TOIMPLEMENT.** Timeout configurable para `shell_exec` en `onyx-workspace` / `open-onyx` (hoy `WorkspacePolicy::command_timeout` fija `30s` por defecto) y herramienta de delegación a subagentes (`spawn_agent` / `WaitingChildren`).
 - **TOIMPLEMENT.** Cargadores de blueprints desde TOML u otros formatos externos. `RustLoader` solo registra blueprints en código.
 - **TOIMPLEMENT.** Pruebas de interoperabilidad que monten los mismos sistemas y el mismo blueprint sobre dos souls con la misma semántica y comparen resultados observables.
-- **TOIMPLEMENT.** Flujos de CI en el repositorio. Hoy no hay directorio `.github` ni toolchain file que los defina.
 - **TODO** en `RustLoader` de ambos souls: `SystemSpec::persistent` y `StageBlueprint::entities` se ignoran. Afectan a la semántica del cambio de stage y del snapshot, y conviene acordarlos en el contrato antes de implementarlos.
 - No se ha ejecutado el agotamiento real del registro de atributos `u32`. La implementación usa una conversión comprobada antes de añadir un nombre.
 
