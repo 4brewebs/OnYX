@@ -19,11 +19,11 @@
 
 use std::collections::BTreeSet;
 
-use onyx_core::{EventBus, GraphView, PlatformDriver, SurfaceBinding};
+use onyx_core::{EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, SurfaceBinding};
 
-use crate::policy::{AgentView, agent_view};
-use crate::reply::Reply;
-use crate::util::text;
+use crate::policy::{AgentView, PendingApproval, agent_view};
+use crate::reply::{REPLY_SOURCE, Reply};
+use crate::util::{int, text};
 use crate::vocab::{AgentState, Vocab};
 
 /// Peticiones pendientes: agentes en `Thinking`, en orden de id.
@@ -36,6 +36,39 @@ pub fn pending_requests(view: &dyn GraphView, v: &Vocab) -> Vec<AgentView> {
         })
         .map(|id| agent_view(view, v, id))
         .filter(|a| a.request > 0)
+        .collect()
+}
+
+/// Aprobaciones humanas pendientes: agentes en `WaitingApproval`, en orden de id.
+pub fn pending_approvals(view: &dyn GraphView, v: &Vocab) -> Vec<AgentView> {
+    view.query(&[v.state, v.pending])
+        .into_iter()
+        .filter(|id| {
+            text(view, *id, v.state).and_then(|s| AgentState::parse(&s))
+                == Some(AgentState::WaitingApproval)
+        })
+        .map(|id| agent_view(view, v, id))
+        .filter(|a| a.request > 0 && a.pending_approval.is_some())
+        .collect()
+}
+
+/// Llamadas a herramientas en ejecución externa (`AgentState::Acting`), en orden de id.
+pub fn pending_tool_calls(view: &dyn GraphView, v: &Vocab) -> Vec<(onyx_core::ConceptId, u64, PendingApproval)> {
+    view.query(&[v.state, v.pending])
+        .into_iter()
+        .filter(|id| {
+            text(view, *id, v.state).and_then(|s| AgentState::parse(&s)) == Some(AgentState::Acting)
+        })
+        .filter_map(|id| {
+            let request = int(view, id, v.pending).and_then(|i| u64::try_from(i).ok())?;
+            if request == 0 {
+                return None;
+            }
+            let tool = text(view, id, v.pending_tool).filter(|s| !s.is_empty())?;
+            let args = text(view, id, v.pending_args).unwrap_or_default();
+            let call_id = text(view, id, v.pending_call_id).filter(|s| !s.is_empty());
+            Some((id, request, PendingApproval { tool, args, call_id }))
+        })
         .collect()
 }
 
@@ -64,33 +97,114 @@ pub struct Logged {
     pub reply: Reply,
 }
 
+/// Comando de usuario (`IngressEvent::Command`) grabado con su `poll`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoggedCommand {
+    pub poll: u64,
+    pub command: String,
+}
+
 /// Transcripción de una ejecución: lo único que hace falta para reproducirla
 /// además del estado inicial y la semilla.
 ///
-/// Formato binario propio: `ONYXTR1\n`, luego por entrada `poll: u64 LE`,
-/// `len: u32 LE` y los bytes de `Reply::to_bytes`. Sin suma de comprobación.
+/// Soporta `ONYXTR1\n` (solo respuestas) y `ONYXTR2\n` (respuestas + comandos).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Transcript {
     pub entries: Vec<Logged>,
+    pub commands: Vec<LoggedCommand>,
 }
 
-const MAGIC: &[u8] = b"ONYXTR1\n";
+const MAGIC_V1: &[u8] = b"ONYXTR1\n";
+const MAGIC_V2: &[u8] = b"ONYXTR2\n";
 
 impl Transcript {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = MAGIC.to_vec();
-        for e in &self.entries {
-            let body = e.reply.to_bytes();
-            let len = u32::try_from(body.len()).expect("reply exceeds 4 GiB");
-            out.extend_from_slice(&e.poll.to_le_bytes());
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&body);
+        if self.commands.is_empty() {
+            let mut out = MAGIC_V1.to_vec();
+            for e in &self.entries {
+                let body = e.reply.to_bytes();
+                let len = u32::try_from(body.len()).expect("reply exceeds 4 GiB");
+                out.extend_from_slice(&e.poll.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&body);
+            }
+            return out;
+        }
+
+        let mut out = MAGIC_V2.to_vec();
+        let mut ei = 0usize;
+        let mut ci = 0usize;
+        while ei < self.entries.len() || ci < self.commands.len() {
+            let take_cmd = match (self.entries.get(ei), self.commands.get(ci)) {
+                (Some(e), Some(c)) => c.poll <= e.poll,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if take_cmd {
+                let c = &self.commands[ci];
+                let body = c.command.as_bytes();
+                let len = u32::try_from(body.len()).expect("command exceeds 4 GiB");
+                out.push(1);
+                out.extend_from_slice(&c.poll.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(body);
+                ci += 1;
+            } else {
+                let e = &self.entries[ei];
+                let body = e.reply.to_bytes();
+                let len = u32::try_from(body.len()).expect("reply exceeds 4 GiB");
+                out.push(0);
+                out.extend_from_slice(&e.poll.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&body);
+                ei += 1;
+            }
         }
         out
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let mut rest = bytes.strip_prefix(MAGIC).ok_or("not a transcript")?;
+        if let Some(mut rest) = bytes.strip_prefix(MAGIC_V2) {
+            let mut entries = Vec::new();
+            let mut commands = Vec::new();
+            let mut last_poll = 0u64;
+            while !rest.is_empty() {
+                if rest.len() < 13 {
+                    return Err("truncated transcript".into());
+                }
+                let tag = rest[0];
+                let poll = u64::from_le_bytes(rest[1..9].try_into().unwrap());
+                let len = usize::try_from(u32::from_le_bytes(rest[9..13].try_into().unwrap()))
+                    .expect("usize fits a u32 length");
+                rest = &rest[13..];
+                if rest.len() < len {
+                    return Err("truncated transcript".into());
+                }
+                if poll < last_poll {
+                    return Err("transcript out of order".into());
+                }
+                last_poll = poll;
+                match tag {
+                    0 => entries.push(Logged {
+                        poll,
+                        reply: Reply::from_bytes(&rest[..len])?,
+                    }),
+                    1 => {
+                        let cmd = std::str::from_utf8(&rest[..len])
+                            .map_err(|_| "command is not UTF-8".to_string())?;
+                        commands.push(LoggedCommand {
+                            poll,
+                            command: cmd.to_string(),
+                        });
+                    }
+                    _ => return Err("unknown transcript record tag".into()),
+                }
+                rest = &rest[len..];
+            }
+            return Ok(Self { entries, commands });
+        }
+
+        let mut rest = bytes.strip_prefix(MAGIC_V1).ok_or("not a transcript")?;
         let mut entries = Vec::new();
         let mut last_poll = 0u64;
         while !rest.is_empty() {
@@ -114,7 +228,10 @@ impl Transcript {
             });
             rest = &rest[len..];
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            commands: Vec::new(),
+        })
     }
 }
 
@@ -160,10 +277,54 @@ impl<R: Responder> RecordingBridge<R> {
     }
 }
 
+struct RecordingBus<'a> {
+    inner: &'a mut dyn EventBus,
+    poll: u64,
+    entries: &'a mut Vec<Logged>,
+    commands: &'a mut Vec<LoggedCommand>,
+}
+
+impl EventBus for RecordingBus<'_> {
+    fn push(&mut self, event: OnyxEvent) {
+        match &event {
+            OnyxEvent::Ingress(IngressEvent::Raw { source, bytes }) if source == REPLY_SOURCE => {
+                if let Ok(reply) = Reply::from_bytes(bytes) {
+                    self.entries.push(Logged {
+                        poll: self.poll,
+                        reply,
+                    });
+                }
+            }
+            OnyxEvent::Ingress(IngressEvent::Command(cmd)) => {
+                self.commands.push(LoggedCommand {
+                    poll: self.poll,
+                    command: cmd.clone(),
+                });
+            }
+            _ => {}
+        }
+        self.inner.push(event);
+    }
+
+    fn drain(&mut self) -> Vec<OnyxEvent> {
+        self.inner.drain()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
 impl<R: Responder> PlatformDriver for RecordingBridge<R> {
     fn poll(&mut self, bus: &mut dyn EventBus) {
         if let Some(inner) = self.inner.as_mut() {
-            inner.poll(bus);
+            let mut rec = RecordingBus {
+                inner: bus,
+                poll: self.polls,
+                entries: &mut self.transcript.entries,
+                commands: &mut self.transcript.commands,
+            };
+            inner.poll(&mut rec);
         }
         for reply in self.queued.drain(..) {
             bus.push(reply.to_event());
@@ -192,8 +353,10 @@ impl<R: Responder> PlatformDriver for RecordingBridge<R> {
 
 pub struct ReplayBridge {
     transcript: Vec<Logged>,
+    commands: Vec<LoggedCommand>,
     inner: Option<Box<dyn PlatformDriver>>,
     cursor: usize,
+    cmd_cursor: usize,
     polls: u64,
 }
 
@@ -201,8 +364,10 @@ impl ReplayBridge {
     pub fn new(transcript: Transcript) -> Self {
         Self {
             transcript: transcript.entries,
+            commands: transcript.commands,
             inner: None,
             cursor: 0,
+            cmd_cursor: 0,
             polls: 0,
         }
     }
@@ -219,12 +384,13 @@ impl ReplayBridge {
     pub fn starting_at(mut self, poll: u64) -> Self {
         self.polls = poll;
         self.cursor = self.transcript.partition_point(|entry| entry.poll < poll);
+        self.cmd_cursor = self.commands.partition_point(|cmd| cmd.poll < poll);
         self
     }
 
-    /// Cuántas respuestas grabadas quedan sin reinyectar.
+    /// Cuántas entradas grabadas (respuestas y comandos) quedan sin reinyectar.
     pub fn remaining(&self) -> usize {
-        self.transcript.len() - self.cursor
+        (self.transcript.len() - self.cursor) + (self.commands.len() - self.cmd_cursor)
     }
 }
 
@@ -232,6 +398,13 @@ impl PlatformDriver for ReplayBridge {
     fn poll(&mut self, bus: &mut dyn EventBus) {
         if let Some(inner) = self.inner.as_mut() {
             inner.poll(bus);
+        }
+        while let Some(cmd) = self.commands.get(self.cmd_cursor) {
+            if cmd.poll != self.polls {
+                break;
+            }
+            bus.push(OnyxEvent::Ingress(IngressEvent::Command(cmd.command.clone())));
+            self.cmd_cursor += 1;
         }
         while let Some(entry) = self.transcript.get(self.cursor) {
             if entry.poll != self.polls {

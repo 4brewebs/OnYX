@@ -4,6 +4,8 @@ members = [
     "onyx-core",
     "onyx-soul",
     "onyx-soul-agents",
+    "onyx-workspace",
+    "open-onyx",
     "onyx-example-app",
     "onyx-example-agents",
 ]

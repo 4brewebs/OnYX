@@ -10,7 +10,7 @@
 use onyx_core::{ConceptId, DetRng, GraphView, Value};
 
 use crate::util::{int, text};
-use crate::vocab::Vocab;
+use crate::vocab::{AgentState, Vocab};
 
 /// Una anotación de la memoria de un agente.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +52,14 @@ impl MemoryPolicy for DefaultMemory {
     }
 }
 
+/// Llamada a herramienta en espera de aprobación humana (`AgentState::WaitingApproval`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApproval {
+    pub tool: String,
+    pub args: String,
+    pub call_id: Option<String>,
+}
+
 /// Lo que un agente ve de sí mismo: el estado del grafo en el instante de decidir.
 /// También es el contenido de una petición a un decisor externo.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +72,8 @@ pub struct AgentView {
     pub tools: Vec<String>,
     /// Memoria cronológica: `(kind, text)`.
     pub memory: Vec<(String, String)>,
+    /// Herramienta pendiente de aprobación humana, si el agente está en `WaitingApproval`.
+    pub pending_approval: Option<PendingApproval>,
     /// Todas las propiedades del agente por nombre, también las de la app.
     pub props: Vec<(String, Value)>,
 }
@@ -85,6 +95,17 @@ pub(crate) fn agent_view<G: GraphView + ?Sized>(g: &G, v: &Vocab, id: ConceptId)
             )
         })
         .collect();
+    let pending_approval = if text(g, id, v.state).and_then(|s| AgentState::parse(&s))
+        == Some(AgentState::WaitingApproval)
+    {
+        text(g, id, v.pending_tool).map(|tool| PendingApproval {
+            tool,
+            args: text(g, id, v.pending_args).unwrap_or_default(),
+            call_id: text(g, id, v.pending_call_id).filter(|s| !s.is_empty()),
+        })
+    } else {
+        None
+    };
     AgentView {
         agent: id,
         request: int(g, id, v.pending)
@@ -94,6 +115,7 @@ pub(crate) fn agent_view<G: GraphView + ?Sized>(g: &G, v: &Vocab, id: ConceptId)
         goal: text(g, id, v.goal).unwrap_or_default(),
         tools,
         memory,
+        pending_approval,
         props: g.props(id),
     }
 }
@@ -134,5 +156,22 @@ impl ScriptedPolicy for UniformTool {
             tool: view.tools[pick].clone(),
             args: String::new(),
         }
+    }
+}
+
+/// Política dinámica de aprobación humana para llamadas a herramientas.
+/// Se combina con `AgentSpec::approval_tools`: si cualquiera exige aprobación,
+/// el agente entra en `AgentState::WaitingApproval`.
+pub trait ApprovalPolicy {
+    fn requires_approval(&self, view: &AgentView, tool: &str, args: &str) -> bool;
+}
+
+/// Por defecto: no exige aprobación adicional (solo las marcadas en `AgentSpec`).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NeverApprove;
+
+impl ApprovalPolicy for NeverApprove {
+    fn requires_approval(&self, _view: &AgentView, _tool: &str, _args: &str) -> bool {
+        false
     }
 }

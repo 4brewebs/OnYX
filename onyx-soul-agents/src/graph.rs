@@ -95,7 +95,18 @@ impl AgentGraph {
         Self::default()
     }
 
-    /// Helper de dominio. No forma parte del contrato `Graph`.
+    /// Helper de dominio para el modo heredado, con `AgentConfig::execution`
+    /// en `None`. No forma parte del contrato `Graph`.
+    ///
+    /// Crea un agente con nombre, objetivo, estado `idle` y cero pasos.
+    /// No escribe la raíz de ejecución ni la identidad lógica del agente
+    /// (`onyx.agents.agent.execution` y `onyx.agents.agent.birth`).
+    ///
+    /// Si el grafo tiene raíz de ejecución, el agente creado queda sin
+    /// nacimiento y el grafo deja de ser válido para el modo operativo.
+    /// `execution_root` devuelve `RootError::MissingBirth`, y `AgentSpawner`
+    /// rechaza los spawns siguientes con el motivo `missing_birth`. En un
+    /// grafo con raíz, crea los agentes con el evento `ev.spawn`.
     pub fn spawn_agent(&mut self, vocab: &Vocab, name: &str, goal: &str) -> ConceptId {
         let id = self.create();
         self.set(id, vocab.name, Value::Text(name.into()));

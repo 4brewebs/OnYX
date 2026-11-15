@@ -363,6 +363,7 @@ fn transcript_codec_round_trips_and_rejects_corruption() {
                 reply: Reply::done(ConceptId(2), 2, "fin\n"),
             },
         ],
+        commands: Vec::new(),
     };
     let bytes = t.to_bytes();
     assert_eq!(Transcript::from_bytes(&bytes).unwrap(), t);
@@ -394,8 +395,20 @@ fn transcript_codec_round_trips_and_rejects_corruption() {
     assert!(Transcript::from_bytes(&huge).is_err());
     let swapped = Transcript {
         entries: vec![t.entries[2].clone(), t.entries[0].clone()],
+        commands: Vec::new(),
     };
     assert!(Transcript::from_bytes(&swapped.to_bytes()).is_err());
+
+    let v2 = Transcript {
+        entries: t.entries.clone(),
+        commands: vec![onyx_soul_agents::LoggedCommand {
+            poll: 0,
+            command: "spawn goal".into(),
+        }],
+    };
+    let v2_bytes = v2.to_bytes();
+    assert!(v2_bytes.starts_with(b"ONYXTR2\n"));
+    assert_eq!(Transcript::from_bytes(&v2_bytes).unwrap(), v2);
 }
 
 #[test]
@@ -418,6 +431,7 @@ fn replay_starting_at_skips_earlier_replies() {
                 reply: same_poll.clone(),
             },
         ],
+        commands: Vec::new(),
     };
 
     let fresh = ReplayBridge::new(transcript.clone());

@@ -2,12 +2,23 @@
 
 Agent-oriented soul for OnYX. It implements the core ports and does not depend on `onyx-soul`.
 
-The application decides stages, systems, tools, and policies. This soul closes the framework so the app can be written against it and depend only on this crate. Core contracts the app needs are reexported at the crate root.
+Implements the core ports for deterministic multi-agent applications and coding harnesses without any external dependencies (`onyx-core` only):
 
-## What exists today
+- `AgentGraph` — in-memory EAV graph with agent helpers (`spawn`, tools, memory, approvals)
+- `AgentSnapshotStore` — tick-indexed snapshots (inspect and rewind to any tick)
+- `AgentBus` — in-memory FIFO event bus
+- `RecordingBridge` / `ReplayBridge` — external decider & driver wrapper (`wrapping`, `starting_at`) producing deterministic `Transcript`s (`ONYXTR1` / `ONYXTR2`, capturing both `Reply` events and `IngressEvent::Command`)
+- `HeadlessDriver` / `HeadlessHandle` — inspect surfaces and counts, including after `wrapping`
+- `AgentHost` / `HostBuilder` — mounts graph, bus, store, systems, and the `tick` loop
+- `AgentSpawner` + `AgentRuntime` — systems that only speak `OnyxEvent`
+- `ToolSystem` / `ToolExecutor` — deterministic in-brain tools (`ToolCall`, `ToolCtx`)
+- **External tool calls & human-in-the-loop approvals**:
+  - `AgentState::WaitingApproval` and `ApprovalPolicy` (`AgentSpec::with_approval_tools`, `PendingApproval`, `pending_approvals`)
+  - Structured calls via `Reply::call_structured` (`call_id`) and `pending_tool_calls`
+  - Approval verbs `Verb::Approve` / `Verb::Deny` (`Reply::approve`, `Reply::deny`)
 
 - `AgentGraph`: in-memory EAV graph with agent helpers, a private incoming-edge index, and surgical `destroy`. Its snapshot format is private to this soul, with no checksum and no migrations. The index is not serialized; import rebuilds it after remapping attributes.
-- `AgentSnapshotStore`: stores graph bytes under a tick key (`tick-{n}.bin`) or a free-form key, so an app can reload a previous graph. The store does not save `n`, the seed, the bus, or system states.
+- `AgentSnapshotStore`: stores graph bytes under a tick key (`tick-{n}.bin`) or a free key, so an app can reload a previous graph. A key that parses as `u64` is a tick (`3`, `003`, and `+3` all mean `tick-3.bin`). A free key must be a single relative file name inside the store directory and must not be a canonical tick file name such as `tick-3.bin`; other keys are rejected with `OnyxError::Format`. The store does not save `n`, the seed, the bus, or system states.
 - `AgentBus`: in-memory bus.
 - `RecordingBridge` and `ReplayBridge`: external decider with record and replay. The transcript format is TR1 (`ONYXTR1`), with no checksum. Both expose `wrapping` (chain another `PlatformDriver`) and `starting_at` (align the poll cursor after a restore, without rewriting the transcript).
 - `HeadlessDriver` and `HeadlessHandle`: inspect surfaces and counts, including after `wrapping`.
@@ -15,25 +26,11 @@ The application decides stages, systems, tools, and policies. This soul closes t
 - `AgentSpawner` and `AgentRuntime`: systems that only speak `OnyxEvent`.
 - `ToolSystem` and `ToolExecutor`: deterministic in-brain tools. An executor may touch only the graph and `DetRng`.
 
-`AgentDriver` remains for the older request and reply tests. New apps should use the bridge, and `AgentHost` if they do not want to wire `tick` themselves.
-
-## Recovery today
-
-`request_snapshot` and `request_restore` are served at the end of the next tick, like any other control event. The graph snapshot does not include in-flight events (values the outbox returns to the bus). The caller keeps those events. After restore, to match an uninterrupted run, push them back with `AgentHost::push`. The recovery tests do that on every cut from tick 0 through 28 of a 30-tick run. Without that re-injection, only a quiet cut (empty outbox) matches, which is what the quiet-cut control and `onyx-example-agents` check.
-
-`request_restore` does not realign the host counter. `ticks` is the `n` of the next `step`. After a restore, call `set_tick` so that `tick` and `DetRng` see the intended `n`. Pair that with `ReplayBridge::starting_at` (or `RecordingBridge::starting_at`) on the same poll offset. Compare `fingerprint()` and contract events, not snapshot bytes.
-
-This is implemented and covered by host and recovery tests, and by `onyx-example-agents`. It is not the complete `TickState` recovery unit proposed in the root [README_es.md](../README_es.md).
-
-## Designed or not yet implemented
-
-- **TOIMPLEMENT.** TR2 and external tools. A tool name with no `ToolExecutor` is left for another system or a driver to answer (`ev.tool_result` or an observe `Reply`). If nobody answers, the agent times out. TR1 records decider replies. The proposed TR2 design records the full tool request (tool, arguments, and id). Replay fails clearly if that record diverges. After a restore, delivery is at least once. The call id is persisted in the graph as an idempotency key, and the receiver or the host uses that key to avoid duplicating the effect. This is not a promise of exactly-once delivery.
-- **TODO** in `RustLoader`: `SystemSpec::persistent` and `StageBlueprint::entities` are ignored. Runtime stage change (`LoadStage`) is proposed design, not implemented.
-- TUI and WASM drivers are not part of this crate.
+`AgentDriver` remains for the older request/reply tests. New apps should use `RecordingBridge` / `ReplayBridge` (and `AgentHost` if they do not want to wire `tick` themselves).
 
 ## Usage
 
-The full tour, a `ToolExecutor`, `step_with` with a surface, a snapshot after `say`, a second host, `set_tick`, and `ReplayBridge::starting_at`, lives in the [`onyx-example-agents`](../onyx-example-agents/README.md) crate.
+The full tour — a `ToolExecutor`, `step_with` with a surface, a snapshot after `say`, a second host, `set_tick` and `ReplayBridge::starting_at` — lives in the `onyx-example-agents` crate. For a full coding harness with workspace tools, approvals, TUI, and snapshot rewind, see `onyx-workspace` and `open-onyx`.
 
 ```rust
 use onyx_soul_agents::{
@@ -44,7 +41,11 @@ use onyx_soul_agents::{
 let mut host = AgentHost::builder(1)
     .tool(Box::new(Search))
     .build()?;
-host.spawn(&AgentSpec::new("alice", "research topic A").with_tools(["search"]));
+host.spawn(
+    &AgentSpec::new("alice", "research topic A")
+        .with_tools(["search"])
+        .with_approval_tools(["search"]),
+);
 
 let view = host.attr("view.main");
 let surfaces = [SurfaceBinding {

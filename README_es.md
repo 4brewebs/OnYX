@@ -6,7 +6,25 @@ OnYX separa un núcleo de contratos, pequeño y sin dependencias, de las almas q
 
 **Estado: v0, en diseño activo.** El contrato público aún no está cerrado y cambiará de forma rompedora. No lo uses donde un fallo tenga consecuencias. Este README separa lo que existe y está comprobado de lo que es diseño propuesto o queda pendiente de implementar.
 
-El resumen en inglés está en [README.md](README.md).
+```
+onyx-core           = contratos + tick + RNG determinista             · 0 dependencias
+onyx-soul           = implementaciones por defecto de esos contratos  · 0 dependencias externas
+onyx-soul-agents    = soul para harnesses multi-agente deterministas  · 0 dependencias externas
+onyx-workspace      = herramientas de código y sandbox de workspace   · usa onyx-soul-agents
+open-onyx           = harness CLI/TUI (Gemini + ratatui + replay)     · usa onyx-soul-agents + onyx-workspace
+onyx-example-app    = REPL mínimo sobre onyx-soul                     · usa onyx-soul
+onyx-example-agents = recorrido completo sobre onyx-soul-agents       · usa onyx-soul-agents
+```
+
+## Estado al 7 de noviembre de 2026
+
+La última modificación de código de este cierre es `c22927e`.
+Esta actualización del README no cambia los contratos ni la implementación.
+El workspace contiene solo `onyx-core` y `onyx-soul`, sin dependencias externas.
+
+### Verificación del cierre
+
+Comprobado con Rust 1.85.1 y edición 2024:
 
 ```
 onyx-core           = contratos, tick y RNG determinista         · 0 dependencias
@@ -99,7 +117,14 @@ Segunda alma, desacoplada de `onyx-soul`, para aplicaciones multiagente determin
 
 El snapshot del grafo está implementado en ambos souls. El formato es privado de cada alma, no incorpora suma de comprobación y no define migraciones. Una captura incompatible se rechaza y no se borra. Una alteración que siga describiendo un grafo válido puede aceptarse.
 
-Esa captura no incluye el bus, los eventos en vuelo, el contador `n`, la semilla ni los estados de los sistemas. Los eventos que el outbox devuelve al bus para el tick siguiente no forman parte del snapshot: los conserva el llamador. `AgentHost` lo documenta en `request_restore`.
+**`onyx-soul-agents`**, **`onyx-workspace`** y **`open-onyx`**
+
+- [`onyx-soul-agents`](onyx-soul-agents/README.md): soul sin dependencias externas especializado en harnesses multi-agente deterministas (`AgentGraph`, `AgentSnapshotStore`, `AgentHost`, `RecordingBridge`/`ReplayBridge`, `AgentState::WaitingApproval`, `ApprovalPolicy` y llamadas estructuradas con `call_id`).
+- [`onyx-workspace`](onyx-workspace/README.md): herramientas de código (`fs_read`, `fs_list`, `fs_write`, `fs_edit`, `code_search`, `shell_exec`) bajo `WorkspacePolicy` y `WorkspaceToolBridge` para grabación y replay determinista sin tocar disco.
+- [`open-onyx`](open-onyx/README.md): binario `openonyx` con modos `run`, `chat` (TUI con `ratatui`/`crossterm`), `replay`, `inspect` y `rewind`, conectado a Gemini (`GeminiResponder`).
+- `onyx-example-app` y `onyx-example-agents`: aplicaciones de ejemplo sobre `onyx-soul` y `onyx-soul-agents`.
+
+Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. `WorldGraph` pasa los casos genéricos de consultas, referencias, destrucción, remapeo de atributos y continuidad tras restaurar, además de pruebas privadas de rechazo atómico de snapshots inválidos. Las mutaciones de bytes no se presuponen inválidas: solo si `import` devuelve `Err` se exige conservación del observable y de una sonda de estado privado suministrada por el soul, que cubre registro completo y contador. La suite no exige igualdad de snapshots entre instancias. Esto no demuestra todavía intercambio con una segunda implementación de grafo ni recuperación completa del runtime. También se prueban RNG, tick, bus y capacidades de los puertos. La idempotencia de `init` se comprueba con una fábrica de sistemas consumidores de prueba, no para cualquier sistema externo. `cargo tree --workspace` permite comprobar que no hay dependencias externas. Para ejecutar solo los controles defectuosos: `cargo test -p onyx-core --features conformance --test conformance_probes`.
 
 Tras una importación correcta, `tick` reaplica el protocolo `init` y `on_restore` descrito más arriba. El llamador tiene que aportar de nuevo `n` y la semilla. En `AgentHost`, `ticks` es el `n` del próximo `step`; un restore no lo realinea. Hay que llamar a `set_tick` para que el siguiente `step` entregue ese `n` a `tick` y a `DetRng`. Los puentes TR1 exponen `starting_at` para alinear la transcripción con ese próximo `poll`. Para que continuar equivalga a no interrumpir tras un corte con outbox no vacío, el llamador tiene que reinyectar esos eventos.
 

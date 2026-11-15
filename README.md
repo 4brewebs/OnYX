@@ -12,11 +12,13 @@ Do not use it where a failure has consequences.
 The full project description, including proposed design that is not yet code, is in Spanish in [README_es.md](README_es.md).
 
 ```
-onyx-core           = contracts, tick, deterministic RNG     · no dependencies
-onyx-soul           = default implementations of those ports · no external dependencies
-onyx-soul-agents    = agent-oriented soul, same core ports   · no external dependencies
-onyx-example-app    = minimal REPL on onyx-soul              · depends only on that soul
-onyx-example-agents = host, tool, snapshot, and replay demo  · depends only on onyx-soul-agents
+onyx-core           = contracts + tick + deterministic RNG            · 0 dependencies
+onyx-soul           = default implementations of those contracts      · 0 external dependencies
+onyx-soul-agents    = deterministic multi-agent harness soul          · 0 external dependencies
+onyx-workspace      = sandboxed coding tools + bridge                 · uses onyx-soul-agents
+open-onyx           = CLI/TUI coding agent harness (Gemini + ratatui) · uses onyx-soul-agents + onyx-workspace
+onyx-example-app    = minimal REPL that exercises onyx-soul           · uses onyx-soul
+onyx-example-agents = deterministic multi-agent tour                  · uses onyx-soul-agents
 ```
 
 ## Workspace
@@ -40,49 +42,48 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 `tick` does not use `BlueprintLoader` or `SystemRegistry`. Those ports exist so a soul or an app can load stages. There is no `Supervisor` type in core. System states live in a slice the caller passes into `tick`.
 
 ### `onyx-soul`
-
-- `WorldGraph`, an in-memory EAV graph with a private incoming-edge index and surgical `destroy`
-- `FileSnapshotStore` (private graph bytes on disk, standard library only)
-- `HeadlessDriver` and `PromptDriver` (`TuiDriver` is not compiled)
-- `InMemoryBus`, `InMemorySystemRegistry`, `RustLoader` with `load_app`, and `Supervisor`
-
-The WorldGraph design and its limits are in [docs/world-graph.md](docs/world-graph.md). They are not obligations on other souls.
+- `WorldGraph` (in-memory EAV)
+- `FileSnapshotStore` (private binary format, 0 deps)
+- `HeadlessDriver`
+- `InMemoryBus`
+- `InMemorySystemRegistry`
+- `RustLoader` with `load_app` helper
+- `Supervisor`
 
 ### `onyx-soul-agents`
+- `AgentGraph`, `AgentSnapshotStore` (tick-indexed snapshots & rewind), `AgentBus`, `AgentHost`
+- `AgentSpawner`, `AgentRuntime`, `ToolSystem` / `ToolExecutor`
+- `RecordingBridge` / `ReplayBridge` (`ONYXTR1` / `ONYXTR2` transcripts), `HeadlessDriver`
+- `AgentState::WaitingApproval`, `ApprovalPolicy`, structured tool calls (`Reply::call_structured`)
 
-A second soul, specialized for deterministic multi-agent apps, documented in [onyx-soul-agents/README.md](onyx-soul-agents/README.md). It does not depend on `onyx-soul`. It includes `AgentGraph` (same observable graph contract, its own private snapshot format), `AgentHost`, the TR1 record and replay bridges, `HeadlessDriver` with a handle that survives `wrapping`, in-brain `ToolExecutor` tools, and `AgentSnapshotStore`.
+### `onyx-workspace`
+- `WorkspacePolicy` (canonicalized root sandbox, ignored dirs, I/O and timeout limits)
+- `WorkspaceTools` (`fs_read`, `fs_list`, `fs_write`, `fs_edit`, `code_search`, `shell_exec`)
+- `WorkspaceToolBridge` (`PlatformDriver` adapter for `RecordingBridge` / `ReplayBridge`)
 
-### Examples
+### `open-onyx` (`openonyx`)
+- CLI & TUI coding agent harness (`run`, `chat`, `replay`, `inspect`, `rewind`)
+- `GeminiResponder` (Google AI Studio REST API) & `TuiDriver` (`ratatui` + `crossterm`)
+- Per-tick graph snapshots (`--snapshot-dir`), transcript saving, and time-travel rewind
 
-- `onyx-example-app` loads a boot stage, runs a small REPL (`agree`, `status`, `exit`), and saves or restores the graph through `FileSnapshotStore`.
-- `onyx-example-agents` walks one agent through the host, a deterministic tool, a snapshot, `set_tick`, and replay. See [onyx-example-agents/README.md](onyx-example-agents/README.md).
+### `onyx-example-app` & `onyx-example-agents`
+- `onyx-example-app`: minimal REPL that loads systems/stages, restores/saves snapshots, and processes `agree`, `status`, `exit`
+- `onyx-example-agents`: end-to-end tour of `AgentHost`, `RecordingBridge`, `AgentSnapshotStore`, and `ReplayBridge::starting_at`
 
-## Recovery today
+## What does NOT exist yet
 
-Graph snapshots are implemented. The format is private to each soul, has no checksum, and has no migration scheme. An incompatible capture is rejected and left untouched. A snapshot of the graph does not include the bus, in-flight events, the tick counter `n`, the seed, or system states. The events the outbox returns to the bus for the next tick stay with the caller.
-
-After a successful import, `tick` re-runs `init` on every system and calls `on_restore` only on `Active` systems whose `init` succeeded. `AgentHost::request_restore` does not realign `n`. After restore, the caller uses `set_tick` so the next `step` presents the intended `n` to `tick` and `DetRng`. `RecordingBridge` and `ReplayBridge` expose `starting_at` to align the TR1 transcript with that next poll. To continue like an uninterrupted run after a cut that left events in the outbox, the caller must also re-inject those events.
-
-Within one compatible configuration, the recovery tests of both souls cut every tick from 0 through 28 of a 30-tick run and re-inject the pending outbox (`Reinsert` in `onyx-soul`, `AgentHost::push` in `onyx-soul-agents`), then set the next `n` (`set_tick` in `AgentHost`) and continue. They compare the observable graph (and, in the agents soul, `fingerprint`) and the contract events, not snapshot bytes. Without that re-injection, the match holds only for a quiet cut, when the outbox is empty. A dedicated control in each recovery suite checks that case, and `onyx-example-agents` snapshots after `say`, with no in-flight tool event. That is not the complete recovery unit described as proposed design in [README_es.md](README_es.md).
-
-## Designed, not implemented
-
-These items are proposed design or explicit implementation gaps, not current capabilities. The Spanish README keeps the full specifications.
-
-- `SystemTable`, `TickOutcome`, and a `Shutdown` policy in core
-- `TickState` (next `n`, seed, and system states) and a recovery unit that captures the graph, `TickState`, and compatible stage, configuration, and system order at the same tick frontier
-- Runtime stage change (`LoadStage`); `RustLoader` still ignores `SystemSpec::persistent` and `StageBlueprint::entities` (TODO in both souls)
-- TR2 and external tools whose results must be recorded and replayed (TOIMPLEMENT). In-brain deterministic `ToolExecutor` tools are implemented. TR1 records decider `Reply` values, not a complete external-tool protocol.
-- Real TUI and WASM drivers, and TOML blueprint loaders
-- Interoperability tests that swap two soul implementations under the same systems and blueprint
-- CI workflows (none are in the tree)
-
-v0 does not offer bounded latency or a tick that allocates nothing. Changing the soul is not enough to obtain those properties.
+- WASM drivers
+- Stage change at runtime
+- TOML / config loaders
+- Unified recovery bundle (snapshot + RNG seed + transcript in one artifact)
+- Multi-soul interoperability tests
 
 ## Quick start
 
 ```bash
 cargo run -p onyx-example-app
+cargo run -p onyx-example-agents
+cargo run -p open-onyx -- --help
 ```
 
 ```text

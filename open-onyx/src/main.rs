@@ -1,0 +1,490 @@
+mod gemini;
+mod tui;
+
+use std::collections::BTreeSet;
+use std::env;
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+
+use gemini::{DEFAULT_GEMINI_MODEL, GeminiResponder};
+use onyx_soul_agents::{
+    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AttrRegistry, Ctx, EventBus,
+    GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, PlatformDriver,
+    RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Vocab, pending_approvals,
+    spawn_event,
+};
+use onyx_workspace::{WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools};
+use tui::TuiDriver;
+
+struct CliArgs {
+    mode: Mode,
+    workspace: PathBuf,
+    auto_approve: bool,
+    save_transcript: Option<PathBuf>,
+    snapshot_dir: Option<PathBuf>,
+}
+
+enum Mode {
+    Run(String),
+    Chat,
+    Replay(PathBuf),
+    Inspect {
+        dir: PathBuf,
+        tick: Option<u64>,
+    },
+    Rewind {
+        dir: PathBuf,
+        tick: u64,
+        transcript: Option<PathBuf>,
+    },
+}
+
+/// Sistema determinista que convierte `IngressEvent::Command(goal)` de la TUI en
+/// un `spawn_event` dentro del bucle `tick()`.
+struct CommandSpawnerSystem {
+    vocab: Option<Vocab>,
+    auto_approve: bool,
+    counter: usize,
+}
+
+impl CommandSpawnerSystem {
+    fn new(auto_approve: bool) -> Self {
+        Self {
+            vocab: None,
+            auto_approve,
+            counter: 0,
+        }
+    }
+}
+
+impl OnyxSystem for CommandSpawnerSystem {
+    fn name(&self) -> &str {
+        "openonyx_command_spawner"
+    }
+
+    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        self.vocab = Some(Vocab::resolve(attrs));
+        Ok(())
+    }
+
+    fn run(&mut self, ctx: &mut Ctx) {
+        let Some(v) = self.vocab else { return };
+        for event in ctx.inbox {
+            if let OnyxEvent::Ingress(IngressEvent::Command(goal)) = event {
+                self.counter += 1;
+                let mut spec = AgentSpec::new(format!("openonyx-{}", self.counter), goal.clone())
+                    .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+                if !self.auto_approve {
+                    spec = spec.with_approval_tools(
+                        WorkspaceTools::approval_required_names().iter().copied(),
+                    );
+                }
+                ctx.outbox.push(spawn_event(&v, &spec, None));
+            }
+        }
+    }
+}
+
+/// Driver CLI para aprobaciones en modo `run`: se envuelve dentro de
+/// `RecordingBridge` para que `Approve`/`Deny` queden grabados en `Transcript`.
+struct CliApprovalDriver {
+    vocab: Vocab,
+    inner: Box<dyn PlatformDriver>,
+    seen: BTreeSet<(u64, u64)>,
+    queued: Vec<Reply>,
+}
+
+impl CliApprovalDriver {
+    fn new(vocab: Vocab, inner: impl PlatformDriver + 'static) -> Self {
+        Self {
+            vocab,
+            inner: Box::new(inner),
+            seen: BTreeSet::new(),
+            queued: Vec::new(),
+        }
+    }
+}
+
+impl PlatformDriver for CliApprovalDriver {
+    fn poll(&mut self, bus: &mut dyn EventBus) {
+        self.inner.poll(bus);
+        for reply in self.queued.drain(..) {
+            bus.push(reply.to_event());
+        }
+    }
+
+    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        self.inner.present(graph, surfaces);
+        for view in pending_approvals(graph, &self.vocab) {
+            if !self.seen.insert((view.agent.0, view.request)) {
+                continue;
+            }
+            if let Some(pending) = &view.pending_approval {
+                let reply = if prompt_approval(&pending.tool, &pending.args) {
+                    Reply::approve(view.agent, view.request)
+                } else {
+                    Reply::deny(view.agent, view.request, "denied by user")
+                };
+                self.queued.push(reply);
+            }
+        }
+    }
+}
+
+fn parse_args() -> Result<CliArgs, String> {
+    let mut args = env::args().skip(1);
+    let Some(cmd) = args.next() else {
+        return Err(usage());
+    };
+    let mut workspace = env::current_dir().map_err(|e| e.to_string())?;
+    let mut auto_approve = false;
+    let mut save_transcript = None;
+    let mut snapshot_dir = None;
+    let mut tick_opt: Option<u64> = None;
+    let mut transcript_opt: Option<PathBuf> = None;
+    let mut positional = Vec::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" | "-w" => {
+                let p = args.next().ok_or("--workspace requires a path")?;
+                workspace = PathBuf::from(p);
+            }
+            "--auto-approve" => auto_approve = true,
+            "--save-transcript" => {
+                let p = args.next().ok_or("--save-transcript requires a path")?;
+                save_transcript = Some(PathBuf::from(p));
+            }
+            "--snapshot-dir" => {
+                let p = args.next().ok_or("--snapshot-dir requires a path")?;
+                snapshot_dir = Some(PathBuf::from(p));
+            }
+            "--tick" => {
+                let t = args.next().ok_or("--tick requires a number")?;
+                tick_opt = Some(t.parse::<u64>().map_err(|_| "--tick must be a u64")?);
+            }
+            "--transcript" => {
+                let p = args.next().ok_or("--transcript requires a path")?;
+                transcript_opt = Some(PathBuf::from(p));
+            }
+            "--help" | "-h" => return Err(usage()),
+            _ => positional.push(arg),
+        }
+    }
+
+    let mode = match cmd.as_str() {
+        "run" => {
+            if positional.is_empty() {
+                return Err("run requires a <goal>".to_string());
+            }
+            Mode::Run(positional.join(" "))
+        }
+        "chat" => Mode::Chat,
+        "replay" => {
+            let p = positional
+                .into_iter()
+                .next()
+                .ok_or("replay requires <transcript>")?;
+            Mode::Replay(PathBuf::from(p))
+        }
+        "inspect" => {
+            let dir = positional
+                .into_iter()
+                .next()
+                .ok_or("inspect requires <snapshot_dir>")?;
+            Mode::Inspect {
+                dir: PathBuf::from(dir),
+                tick: tick_opt,
+            }
+        }
+        "rewind" => {
+            let mut it = positional.into_iter();
+            let dir = it.next().ok_or("rewind requires <snapshot_dir> <tick>")?;
+            let tick_str = it.next().ok_or("rewind requires <tick>")?;
+            let tick = tick_str
+                .parse::<u64>()
+                .map_err(|_| "rewind <tick> must be a u64")?;
+            Mode::Rewind {
+                dir: PathBuf::from(dir),
+                tick,
+                transcript: transcript_opt,
+            }
+        }
+        _ => return Err(usage()),
+    };
+
+    Ok(CliArgs {
+        mode,
+        workspace,
+        auto_approve,
+        save_transcript,
+        snapshot_dir,
+    })
+}
+
+fn usage() -> String {
+    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve]".to_string()
+}
+
+fn prompt_approval(tool: &str, args: &str) -> bool {
+    println!("\n[openOnyx] Approval required for `{tool}`:");
+    println!("  args: {args}");
+    print!("Approve? [y/N]: ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn make_spec(goal: &str, auto_approve: bool) -> AgentSpec {
+    let mut spec = AgentSpec::new("openonyx", goal)
+        .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+    if !auto_approve {
+        spec = spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
+    }
+    spec
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = match parse_args() {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+
+    let policy = WorkspacePolicy::new(&cli.workspace)?;
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 32,
+        default_timeout_ticks: 64,
+        ..AgentConfig::default()
+    };
+
+    let save_snapshots = cli.snapshot_dir.is_some();
+
+    match cli.mode {
+        Mode::Run(goal) => {
+            let mut builder = AgentHost::builder(1).config(config);
+            if let Some(dir) = &cli.snapshot_dir {
+                builder = builder.store(Box::new(AgentSnapshotStore::new(dir)));
+            }
+            let mut host = builder.build()?;
+            let api_key = env::var("GEMINI_API_KEY")
+                .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
+            let model = env::var("ONYX_GEMINI_MODEL")
+                .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+
+            host.spawn(&make_spec(&goal, cli.auto_approve));
+
+            let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
+            let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(cli_driver);
+            let mut driver = RecordingBridge::new(
+                host.vocab(),
+                GeminiResponder::new(api_key, model),
+            )
+            .wrapping(ws_bridge);
+
+            for _ in 0..256 {
+                if save_snapshots {
+                    host.request_snapshot(&host.ticks().to_string());
+                }
+                host.step(&mut driver);
+                if host.is_settled() {
+                    break;
+                }
+            }
+
+            if let Some(path) = cli.save_transcript {
+                fs::write(path, driver.transcript().to_bytes())?;
+            }
+            if let Some(id) = host.agents().first().copied() {
+                println!(
+                    "\n[openOnyx] state={:?} result:\n{}",
+                    host.agent_state(id),
+                    host.result(id).unwrap_or_default()
+                );
+            }
+        }
+        Mode::Chat => {
+            let mut builder = AgentHost::builder(1)
+                .config(config)
+                .system(Box::new(CommandSpawnerSystem::new(cli.auto_approve)));
+            if let Some(dir) = &cli.snapshot_dir {
+                builder = builder.store(Box::new(AgentSnapshotStore::new(dir)));
+            }
+            let mut host = builder.build()?;
+            let api_key = env::var("GEMINI_API_KEY")
+                .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
+            let model = env::var("ONYX_GEMINI_MODEL")
+                .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+
+            let tui = TuiDriver::new(host.vocab())?;
+            let quit = tui.quit_flag();
+            let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(tui);
+            let mut driver = RecordingBridge::new(
+                host.vocab(),
+                GeminiResponder::new(api_key, model),
+            )
+            .wrapping(ws_bridge);
+
+            while !quit.load(Ordering::Relaxed) {
+                if save_snapshots {
+                    host.request_snapshot(&host.ticks().to_string());
+                }
+                host.step(&mut driver);
+            }
+            if let Some(path) = cli.save_transcript {
+                fs::write(path, driver.transcript().to_bytes())?;
+            }
+        }
+        Mode::Replay(path) => {
+            let bytes = fs::read(path)?;
+            let transcript = Transcript::from_bytes(&bytes).map_err(|e| format!("{e}"))?;
+            let has_commands = !transcript.commands.is_empty();
+
+            let mut builder = AgentHost::builder(1)
+                .config(config)
+                .system(Box::new(CommandSpawnerSystem::new(cli.auto_approve)));
+            if let Some(dir) = &cli.snapshot_dir {
+                builder = builder.store(Box::new(AgentSnapshotStore::new(dir)));
+            }
+            let mut host = builder.build()?;
+            if !has_commands {
+                host.spawn(&make_spec("replay", cli.auto_approve));
+            }
+
+            // Replay determinista puro: NO toca disco ni llama a Gemini.
+            let mut driver = ReplayBridge::new(transcript).wrapping(HeadlessDriver::new());
+            for _ in 0..4096 {
+                if save_snapshots {
+                    host.request_snapshot(&host.ticks().to_string());
+                }
+                host.step(&mut driver);
+                if driver.remaining() == 0 && host.is_settled() {
+                    break;
+                }
+            }
+
+            for id in host.agents() {
+                println!(
+                    "\n[openOnyx replay] agent={} state={:?} result:\n{}",
+                    id.0,
+                    host.agent_state(id),
+                    host.result(id).unwrap_or_default()
+                );
+            }
+        }
+        Mode::Inspect { dir, tick } => {
+            let store = AgentSnapshotStore::new(&dir);
+            let target_tick = match tick {
+                Some(t) => t,
+                None => store
+                    .latest_tick()
+                    .ok_or("no snapshots found in directory")?,
+            };
+            let mut host = AgentHost::builder(1)
+                .config(config)
+                .store(Box::new(store))
+                .build()?;
+            host.request_restore(&target_tick.to_string());
+            host.step(&mut HeadlessDriver::new());
+
+            println!("=== openOnyx Graph Snapshot @ tick {target_tick} ===");
+            let concepts = host.graph().query(&[]);
+            println!("Total concepts: {}", concepts.len());
+            for id in host.agents() {
+                let view = host.view(id);
+                println!(
+                    "\nAgent {} (`{}`) state={:?} req={}",
+                    id.0,
+                    view.name,
+                    host.agent_state(id),
+                    view.request
+                );
+                println!("  goal: {}", view.goal);
+                println!("  tools: {:?}", view.tools);
+                println!("  memory ({} entries):", view.memory.len());
+                for (k, body) in &view.memory {
+                    let preview: String = body.chars().take(120).collect();
+                    println!("    - [{k}] {preview}");
+                }
+                if let Some(p) = &view.pending_approval {
+                    println!("  pending_approval: {} {}", p.tool, p.args);
+                }
+                if let Some(res) = host.result(id) {
+                    println!("  result: {res}");
+                }
+            }
+        }
+        Mode::Rewind {
+            dir,
+            tick,
+            transcript,
+        } => {
+            let store = AgentSnapshotStore::new(&dir);
+            let mut host = AgentHost::builder(1)
+                .config(config)
+                .system(Box::new(CommandSpawnerSystem::new(cli.auto_approve)))
+                .store(Box::new(store))
+                .build()?;
+            host.request_restore(&tick.to_string());
+            host.step(&mut HeadlessDriver::new());
+
+            let next_tick = tick.saturating_add(1);
+            host.set_tick(next_tick);
+
+            if let Some(tr_path) = transcript {
+                let bytes = fs::read(tr_path)?;
+                let tr = Transcript::from_bytes(&bytes).map_err(|e| format!("{e}"))?;
+                let mut driver = ReplayBridge::new(tr)
+                    .starting_at(next_tick)
+                    .wrapping(HeadlessDriver::new());
+                for _ in 0..4096 {
+                    host.step(&mut driver);
+                    if driver.remaining() == 0 && host.is_settled() {
+                        break;
+                    }
+                }
+            } else {
+                let api_key = env::var("GEMINI_API_KEY")
+                    .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
+                let model = env::var("ONYX_GEMINI_MODEL")
+                    .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+                let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
+                let ws_bridge =
+                    WorkspaceToolBridge::new(host.vocab(), tools).wrapping(cli_driver);
+                let mut driver = RecordingBridge::new(
+                    host.vocab(),
+                    GeminiResponder::new(api_key, model),
+                )
+                .starting_at(next_tick)
+                .wrapping(ws_bridge);
+
+                for _ in 0..256 {
+                    host.step(&mut driver);
+                    if host.is_settled() {
+                        break;
+                    }
+                }
+            }
+
+            for id in host.agents() {
+                println!(
+                    "\n[openOnyx rewind@{tick}] agent={} state={:?} result:\n{}",
+                    id.0,
+                    host.agent_state(id),
+                    host.result(id).unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
