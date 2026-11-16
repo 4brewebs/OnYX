@@ -2,6 +2,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(feature = "scent")]
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,11 +25,17 @@ pub struct ToolSchema {
 #[derive(Clone, Debug)]
 pub struct WorkspaceTools {
     policy: WorkspacePolicy,
+    #[cfg(feature = "scent")]
+    scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
 }
 
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            #[cfg(feature = "scent")]
+            scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
+        }
     }
 
     pub fn policy(&self) -> &WorkspacePolicy {
@@ -35,14 +43,30 @@ impl WorkspaceTools {
     }
 
     pub fn all_tool_names() -> &'static [&'static str] {
-        &[
-            "fs_read",
-            "fs_list",
-            "fs_write",
-            "fs_edit",
-            "code_search",
-            "shell_exec",
-        ]
+        #[cfg(feature = "scent")]
+        {
+            &[
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "code_search",
+                "shell_exec",
+                "scent_outline",
+                "scent_impact",
+            ]
+        }
+        #[cfg(not(feature = "scent"))]
+        {
+            &[
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "code_search",
+                "shell_exec",
+            ]
+        }
     }
 
     pub fn approval_required_names() -> &'static [&'static str] {
@@ -50,7 +74,7 @@ impl WorkspaceTools {
     }
 
     pub fn schemas() -> Vec<ToolSchema> {
-        vec![
+        let mut out = vec![
             ToolSchema {
                 name: "fs_read",
                 description: "Read a UTF-8 file from the workspace, optionally by 1-based inclusive line range.",
@@ -130,7 +154,40 @@ impl WorkspaceTools {
                 }),
                 requires_approval: true,
             },
-        ]
+        ];
+        #[cfg(feature = "scent")]
+        {
+            out.push(ToolSchema {
+                name: "scent_outline",
+                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, or Java files.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "path": { "type": "STRING", "description": "Optional relative file or directory inside the workspace (defaults to '.')." },
+                        "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public symbols." },
+                        "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 120)." }
+                    }
+                }),
+                requires_approval: false,
+            });
+            out.push(ToolSchema {
+                name: "scent_impact",
+                description: "Trace semantic AST call impact around a target symbol as ranked @TOON v1 tuples (epicenter, callers, callees, line ranges).",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": { "type": "STRING", "description": "Symbol name, Type::method, or file::symbol to analyze." },
+                        "max_hops": { "type": "INTEGER", "description": "Optional diffusion hop radius (1..=6, default 3)." },
+                        "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 120)." }
+                    },
+                    "required": ["target"]
+                }),
+                requires_approval: false,
+            });
+        }
+        out
     }
 
     pub fn execute(&self, tool: &str, args_json: &str) -> Result<String, String> {
@@ -169,6 +226,18 @@ impl WorkspaceTools {
                 let args: ShellExecArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid shell_exec args: {e}"))?;
                 self.shell_exec(args)
+            }
+            #[cfg(feature = "scent")]
+            "scent_outline" => {
+                let args: ScentOutlineArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid scent_outline args: {e}"))?;
+                self.scent_outline(args)
+            }
+            #[cfg(feature = "scent")]
+            "scent_impact" => {
+                let args: ScentImpactArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid scent_impact args: {e}"))?;
+                self.scent_impact(args)
             }
             _ => Err(format!("unknown workspace tool `{tool}`")),
         }
@@ -433,6 +502,55 @@ impl WorkspaceTools {
         );
         Ok(truncate_utf8(&combined, self.policy.max_output_bytes))
     }
+
+    #[cfg(feature = "scent")]
+    fn scent_outline(&self, args: ScentOutlineArgs) -> Result<String, String> {
+        let base = args.path.as_deref().unwrap_or(".");
+        let resolved = self.policy.resolve_existing(base)?;
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_target(&self.policy.root, Some(&resolved))
+            .map_err(|e| e.to_string())?;
+        let opts = onyx_scent::ToonPageOptions {
+            cursor: args.cursor.unwrap_or(0),
+            max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            public_only: args.public_only.unwrap_or(false),
+            ..onyx_scent::ToonPageOptions::default()
+        };
+        Ok(truncate_utf8(
+            &idx.outline_toon(opts),
+            self.policy.max_output_bytes,
+        ))
+    }
+
+    #[cfg(feature = "scent")]
+    fn scent_impact(&self, args: ScentImpactArgs) -> Result<String, String> {
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_workspace(&self.policy.root)
+            .map_err(|e| e.to_string())?;
+        let hops = args.max_hops.unwrap_or(3).clamp(1, 6);
+        let opts = onyx_scent::ToonPageOptions {
+            cursor: args.cursor.unwrap_or(0),
+            max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            ..onyx_scent::ToonPageOptions::default()
+        };
+        let toon = idx
+            .impact_toon(
+                &args.target,
+                &onyx_scent::DistillerConfig {
+                    iterations: hops,
+                    ..onyx_scent::DistillerConfig::default()
+                },
+                opts,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(truncate_utf8(&toon, self.policy.max_output_bytes))
+    }
 }
 
 fn read_pipe_capped<R: Read + Send + 'static>(
@@ -507,6 +625,24 @@ struct CodeSearchArgs {
 #[derive(Deserialize)]
 struct ShellExecArgs {
     command: String,
+}
+
+#[cfg(feature = "scent")]
+#[derive(Deserialize)]
+struct ScentOutlineArgs {
+    path: Option<String>,
+    public_only: Option<bool>,
+    cursor: Option<usize>,
+    max_rows: Option<usize>,
+}
+
+#[cfg(feature = "scent")]
+#[derive(Deserialize)]
+struct ScentImpactArgs {
+    target: String,
+    max_hops: Option<u8>,
+    cursor: Option<usize>,
+    max_rows: Option<usize>,
 }
 
 fn replace_line_trimmed_unique(

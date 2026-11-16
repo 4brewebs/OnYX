@@ -27,6 +27,7 @@ struct CliArgs {
     workspace: PathBuf,
     auto_approve: bool,
     dry_run: bool,
+    max_steps: Option<i64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
 }
@@ -139,13 +140,17 @@ impl PlatformDriver for CliApprovalDriver {
 }
 
 fn parse_args() -> Result<CliArgs, String> {
-    let mut args = env::args().skip(1);
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, String> {
     let Some(cmd) = args.next() else {
         return Err(usage());
     };
     let mut workspace = env::current_dir().map_err(|e| e.to_string())?;
     let mut auto_approve = false;
     let mut dry_run = false;
+    let mut max_steps: Option<i64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
     let mut tick_opt: Option<u64> = None;
@@ -160,6 +165,18 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             "--auto-approve" => auto_approve = true,
             "--dry-run" => dry_run = true,
+            "--max-steps" => {
+                let s = args
+                    .next()
+                    .ok_or("--max-steps requires a positive integer")?;
+                let parsed = s
+                    .parse::<i64>()
+                    .map_err(|_| "--max-steps must be a positive integer")?;
+                if parsed <= 0 {
+                    return Err("--max-steps must be > 0".to_string());
+                }
+                max_steps = Some(parsed);
+            }
             "--save-transcript" => {
                 let p = args.next().ok_or("--save-transcript requires a path")?;
                 save_transcript = Some(PathBuf::from(p));
@@ -227,13 +244,14 @@ fn parse_args() -> Result<CliArgs, String> {
         workspace,
         auto_approve,
         dry_run,
+        max_steps,
         save_transcript,
         snapshot_dir,
     })
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]".to_string()
 }
 
 fn prompt_approval(tool: &str, args: &str) -> bool {
@@ -327,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tools = WorkspaceTools::new(policy);
 
     let config = AgentConfig {
-        default_max_steps: 32,
+        default_max_steps: cli.max_steps.unwrap_or(32),
         default_timeout_ticks: 64,
         ..AgentConfig::default()
     };
@@ -386,6 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Chat => {
             let checkpoints = PendingCheckpoints::default();
             let chat_config = AgentConfig {
+                default_max_steps: cli.max_steps.unwrap_or(128),
                 default_timeout_ticks: 512,
                 ..config
             };
@@ -742,5 +761,21 @@ mod tests {
         assert_eq!(orphaned[0].reversibility, "auto_reversible");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_args_supports_max_steps_and_rejects_non_positive() {
+        let parsed = parse_args_from(
+            ["chat", "--max-steps", "96"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(parsed.max_steps, Some(96));
+
+        let err = parse_args_from(["chat", "--max-steps", "0"].into_iter().map(str::to_string))
+            .err()
+            .expect("0 max-steps must be rejected");
+        assert!(err.contains("--max-steps"), "{err}");
     }
 }

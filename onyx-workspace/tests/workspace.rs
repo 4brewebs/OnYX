@@ -406,3 +406,41 @@ fn git_tree_checkpoint_captures_and_restores_working_tree() {
     restore_git_tree_checkpoint(&dir.0, &tree_sha).unwrap();
     assert_eq!(fs::read_to_string(&file).unwrap(), "before-edit\n");
 }
+
+#[cfg(feature = "scent")]
+#[test]
+fn scent_tools_emit_toon_outline_and_impact_respecting_policy() {
+    let dir = TempDir::new("scent_tools");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::write(
+        dir.0.join("src/lib.rs"),
+        "pub fn entry() -> i32 { leaf() }\nfn leaf() -> i32 { 1 }\n",
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    assert!(WorkspaceTools::all_tool_names().contains(&"scent_outline"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"scent_impact"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"scent_outline"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"scent_impact"));
+
+    let outline = tools.execute("scent_outline", r#"{"path":"src"}"#).unwrap();
+    assert!(outline.starts_with("@TOON v1"), "{outline}");
+    assert!(outline.contains("src/lib.rs::entry"), "{outline}");
+
+    let impact = tools
+        .execute("scent_impact", r#"{"target":"leaf","max_hops":2}"#)
+        .unwrap();
+    assert!(impact.starts_with("@TOON v1"), "{impact}");
+    assert!(impact.contains("src/lib.rs::entry"), "{impact}");
+
+    let traversal_err = tools
+        .execute("scent_outline", r#"{"path":"../outside"}"#)
+        .unwrap_err();
+    assert!(
+        traversal_err.contains("outside") || traversal_err.contains("failed"),
+        "{traversal_err}"
+    );
+}

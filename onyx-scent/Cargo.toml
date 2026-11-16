@@ -1,0 +1,24 @@
+[package]
+name = "onyx-scent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Deterministic AST indexer, thermal impact distiller, and TOON serializer for OnYX harnesses."
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+cli = ["dep:clap"]
+
+[dependencies]
+blake3 = "1.5"
+clap = { version = "4.5", features = ["derive"], optional = true }
+tree-sitter = "0.20"
+tree-sitter-java = "0.20"
+tree-sitter-python = "0.20"
+tree-sitter-rust = "0.20"
+
+[[bin]]
+name = "scent"
+path = "src/bin/scent.rs"
+required-features = ["cli"]

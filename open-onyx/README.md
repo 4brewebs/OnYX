@@ -12,8 +12,8 @@
 ## Usage
 
 ```text
-openonyx chat [--workspace <dir>] [--auto-approve] [--save-transcript <file>] [--snapshot-dir <dir>]
-openonyx run <goal> [--workspace <dir>] [--auto-approve] [--save-transcript <file>] [--snapshot-dir <dir>]
+openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]
+openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]
 openonyx inspect <snapshot_dir> [--tick <n>]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]

@@ -16,6 +16,7 @@ Provides sandboxed filesystem, search, and shell capabilities that plug directly
   - `fs_write` — create or overwrite a UTF-8 file *(requires approval by default)*.
   - `fs_edit` — unique exact replacement (with line-trimmed fallback for whitespace/indentation) in a UTF-8 file *(requires approval by default)*.
   - `code_search` — search for a pattern across workspace files (ignoring symlinks and ignored directories).
+  - `scent_outline` / `scent_impact` *(optional `feature = "scent"`)* — read-only AST outline and semantic call-impact tools backed by `onyx-scent` (`blake3` incremental cache + `@TOON v1` paginated output), validated through `WorkspacePolicy` without requiring human approval or creating mutating `SideEffectLedger` entries.
   - `shell_exec` — execute a shell command inside `root` with timeout, full process-tree cleanup, concurrent stdout/stderr draining, and output limits *(requires approval by default; `WorkspacePolicy` restricts filesystem tool paths, whereas `shell_exec` runs host OS processes under explicit approval)*.
   - `WorkspaceTools::schemas()` exports JSON parameter schemas suitable for LLM function calling.
 - `WorkspaceMode` & `WorkspaceLedgerSystem` (`state.rs`):
