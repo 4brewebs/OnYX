@@ -381,8 +381,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tools = WorkspaceTools::new(policy);
 
     let config = AgentConfig {
-        default_max_steps: cli.max_steps.unwrap_or(32),
-        default_timeout_ticks: 64,
+        default_max_steps: cli.max_steps.unwrap_or(64),
+        default_timeout_ticks: 128,
         ..AgentConfig::default()
     };
 

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::lang::{ParsedFile, parse_source};
+use crate::lang::{ParsedFile, RawCall, RawTypeRef, parse_source};
 use crate::ontology::{Edge, Entity, RelationKind, ScentArena, ScentError, SupportedLang};
 
 const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
@@ -47,30 +47,40 @@ impl WorkspaceIndex {
             message: e.to_string(),
         })?;
 
-        let start_dir = match scope {
+        let raw_start = match scope {
             Some(p) if p.is_absolute() => p.to_path_buf(),
             Some(p) => canon_root.join(p),
             None => canon_root.clone(),
         };
 
-        let meta = fs::symlink_metadata(&start_dir).map_err(|e| ScentError::Io {
-            path: start_dir.display().to_string(),
+        let meta = fs::symlink_metadata(&raw_start).map_err(|e| ScentError::Io {
+            path: raw_start.display().to_string(),
             message: e.to_string(),
         })?;
         if meta.file_type().is_symlink() {
             return Err(ScentError::Io {
-                path: start_dir.display().to_string(),
+                path: raw_start.display().to_string(),
                 message: "symlink targets are ignored by policy".to_string(),
+            });
+        }
+        let canon_start = raw_start.canonicalize().map_err(|e| ScentError::Io {
+            path: raw_start.display().to_string(),
+            message: e.to_string(),
+        })?;
+        if !canon_start.starts_with(&canon_root) {
+            return Err(ScentError::Io {
+                path: raw_start.display().to_string(),
+                message: "scope path escapes workspace root".to_string(),
             });
         }
 
         let mut discovered = BTreeSet::new();
         if meta.is_file() {
-            if let Some((rel, lang)) = supported_rel_file(&canon_root, &start_dir)? {
+            if let Some((rel, lang)) = supported_rel_file(&canon_root, &canon_start)? {
                 discovered.insert((rel, lang));
             }
         } else if meta.is_dir() {
-            collect_files_sorted(&canon_root, &start_dir, &mut discovered)?;
+            collect_files_sorted(&canon_root, &canon_start, &mut discovered)?;
         }
 
         let mut stats = IndexStats {
@@ -123,7 +133,15 @@ impl WorkspaceIndex {
         let mut by_short: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut by_type_member: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
         let mut by_file_short: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
-        let mut file_local_map: Vec<(String, Vec<usize>, Vec<crate::lang::RawCall>)> = Vec::new();
+        struct FileLocalEntries {
+            rel_path: String,
+            local_to_global: Vec<usize>,
+            raw_calls: Vec<RawCall>,
+            raw_type_refs: Vec<RawTypeRef>,
+        }
+
+        let mut types_by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut file_local_map: Vec<FileLocalEntries> = Vec::new();
 
         for rel_path in active_paths {
             let Some(parsed) = self.cache.get(rel_path) else {
@@ -155,6 +173,7 @@ impl WorkspaceIndex {
                     kind: ent.kind,
                     signature: ent.signature.clone(),
                     is_public: ent.is_public,
+                    is_test: ent.is_test,
                     start_line: ent.start_line,
                     end_line: ent.end_line,
                 });
@@ -167,37 +186,83 @@ impl WorkspaceIndex {
                         .or_default()
                         .push(id);
                     if let Some(owner) = &ent.owner_type {
+                        let type_short = owner.rsplit("::").next().unwrap_or(owner).to_string();
                         by_type_member
-                            .entry((owner.clone(), ent.short_name.clone()))
+                            .entry((type_short, ent.short_name.clone()))
                             .or_default()
                             .push(id);
                     }
+                } else {
+                    types_by_name
+                        .entry(ent.short_name.clone())
+                        .or_default()
+                        .push(id);
                 }
             }
 
-            file_local_map.push((rel_path.clone(), local_to_global, parsed.raw_calls.clone()));
+            file_local_map.push(FileLocalEntries {
+                rel_path: rel_path.clone(),
+                local_to_global,
+                raw_calls: parsed.raw_calls.clone(),
+                raw_type_refs: parsed.raw_type_refs.clone(),
+            });
         }
 
         let mut unique_edges: BTreeSet<(usize, usize, RelationKind)> = BTreeSet::new();
 
-        for (rel_path, local_to_global, raw_calls) in file_local_map {
+        for FileLocalEntries {
+            rel_path,
+            local_to_global,
+            raw_calls,
+            raw_type_refs,
+        } in file_local_map
+        {
             for call in raw_calls {
                 let Some(&caller_id) = local_to_global.get(call.caller_entity_idx) else {
                     continue;
                 };
 
-                let candidates: Option<&Vec<usize>> = if let Some(qual) = &call.qualifier {
-                    if qual == "self" || qual == "Self" {
+                let candidates: Option<&Vec<usize>> = if call.is_method_call {
+                    if let Some(qual) = &call.qualifier {
+                        if matches!(qual.as_str(), "self" | "Self" | "cls") {
+                            self.arena.nodes[caller_id]
+                                .owner_type
+                                .as_ref()
+                                .and_then(|owner| {
+                                    let type_short =
+                                        owner.rsplit("::").next().unwrap_or(owner).to_string();
+                                    by_type_member.get(&(type_short, call.callee_name.clone()))
+                                })
+                                .or_else(|| {
+                                    by_file_short.get(&(rel_path.clone(), call.callee_name.clone()))
+                                })
+                        } else {
+                            by_type_member.get(&(qual.clone(), call.callee_name.clone()))
+                        }
+                    } else {
+                        // Sin calificador en llamada de método (ej. `vec.push`, `x.parse`):
+                        // limitar al mismo archivo y <= 2 coincidencias para evitar falsos positivos globales.
+                        by_file_short
+                            .get(&(rel_path.clone(), call.callee_name.clone()))
+                            .filter(|v| v.len() <= 2)
+                    }
+                } else if let Some(qual) = &call.qualifier {
+                    if matches!(qual.as_str(), "self" | "Self" | "cls") {
                         self.arena.nodes[caller_id]
                             .owner_type
                             .as_ref()
                             .and_then(|owner| {
-                                by_type_member.get(&(owner.clone(), call.callee_name.clone()))
+                                let type_short =
+                                    owner.rsplit("::").next().unwrap_or(owner).to_string();
+                                by_type_member.get(&(type_short, call.callee_name.clone()))
                             })
                             .or_else(|| by_file_short.get(&(rel_path.clone(), call.callee_name)))
                     } else {
                         by_type_member
                             .get(&(qual.clone(), call.callee_name.clone()))
+                            .or_else(|| {
+                                by_file_short.get(&(rel_path.clone(), call.callee_name.clone()))
+                            })
                             .or_else(|| by_short.get(&call.callee_name))
                     }
                 } else {
@@ -219,6 +284,25 @@ impl WorkspaceIndex {
                     }
                     unique_edges.insert((caller_id, target_id, RelationKind::Calls));
                     unique_edges.insert((target_id, caller_id, RelationKind::CalledBy));
+                }
+            }
+
+            for tref in raw_type_refs {
+                let Some(&src_id) = local_to_global.get(tref.source_entity_idx) else {
+                    continue;
+                };
+                let Some(targets) = types_by_name.get(&tref.target_type) else {
+                    continue;
+                };
+                if targets.len() > MAX_MULTI_TARGET_MATCHES {
+                    continue;
+                }
+                for &target_id in targets {
+                    if src_id == target_id {
+                        continue;
+                    }
+                    unique_edges.insert((src_id, target_id, tref.kind));
+                    unique_edges.insert((target_id, src_id, RelationKind::UsedByType));
                 }
             }
         }
