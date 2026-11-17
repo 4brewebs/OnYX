@@ -12,11 +12,12 @@
 ## Usage
 
 ```text
-openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]
-openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]
+openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]
+openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]
 openonyx inspect <snapshot_dir> [--tick <n>]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]
+openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
 ```
 
 ### Examples
@@ -61,16 +62,15 @@ cargo run -p open-onyx -- rewind snaps 2 --transcript session.tr
 
 ## Architecture
 
-- [`main.rs`](src/main.rs): CLI parsing, `CommandSpawnerSystem`, `CliApprovalDriver`, `all_live_agents_blocked` / `all_live_waiting_approval`, `WorkspaceLedgerSystem` + `PendingCheckpoints` wiring, and `run` / `chat` / `replay` / `inspect` / `rewind` execution loops:
+- [`main.rs`](src/main.rs): CLI parsing, `CommandSpawnerSystem`, `CliApprovalDriver`, `all_live_agents_blocked` / `all_live_waiting_approval`, `SubagentSystem` (`WaitingChildren` + `spawn_agent`), `WorkspaceLedgerSystem` + `PendingCheckpoints` wiring, and `run` / `chat` / `replay` / `inspect` / `rewind` / `doctor` execution loops:
   - `chat` only advances `host.step()` when at least one live agent can advance (`!is_settled()` and `!all_live_agents_blocked(...)`), when a background `AsyncGeminiDriver` reply is ready (`has_ready`), or when UI events (`Enter` command, `y`/`n` approval) are queued, avoiding idle/approval/LLM-wait tick bloat while keeping the TUI responsive.
   - `--save-transcript` flushes after each settled turn in `chat` as well as on exit.
   - `replay` stops cleanly when `ReplayBridge` is exhausted and all live agents are settled or in `WaitingApproval`.
   - `rewind` queries `effects_after_tick` from the latest snapshot, restores the working tree via `restore_git_tree_checkpoint` to the first pre-effect `tree_sha` (or prints the reconciliation plan with `--dry-run`), and resumes from tick `N`.
-- [`gemini.rs`](src/gemini.rs): `GeminiResponder` (sync `Responder`, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking `PlatformDriver` background worker + `has_ready` + `InFlightGuard` RAII counter, wrapped by `RecordingBridge` for `chat`), passing the API key via `x-goog-api-key` header, queueing simultaneous multi-`functionCall` turns sequentially per tick (clearing queued calls automatically on `tool_error`/`denied` so Gemini can replan), and propagating `thoughtSignature` across parallel call batches and thinking turns.
+  - `doctor` audits Git worktree health, stray `.tr` / `snaps*` artifacts, `ONYXAG` snapshots, `ONYXTR1`/`ONYXTR2` transcripts, and `SideEffectLedger` `tree_sha` objects in Git.
+- [`gemini.rs`](src/gemini.rs): `GeminiResponder` (sync `Responder`, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking `PlatformDriver` background worker + `has_ready` + `InFlightGuard` RAII counter, wrapped by `RecordingBridge` for `chat`), passing the API key via `x-goog-api-key` header, projecting *as-of* `superseded` file reads and enforcing `ContextBudget` (prioritizing errors, denials, and `@TOON v1` outputs), queueing simultaneous multi-`functionCall` turns sequentially per tick (clearing queued calls automatically on `tool_error`/`denied` so Gemini can replan), and propagating `thoughtSignature` across parallel call batches and thinking turns.
 - [`tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`pump_idle`, `has_queued_events`, multiline entry rendering) implementing `PlatformDriver` with `ratatui` and `crossterm`. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` remain dependency-free.
 
 ## Roadmap / TODO (Not Yet Implemented)
 
 - **Unified recovery bundle**: bundle graph snapshot, tick `n`, RNG seed, and `Transcript` into a single validated checkpoint artifact for `rewind` and `resume`.
-- **Configurable `shell_exec` timeout**: expose `--command-timeout` / per-call timeout overrides (currently fixed at `30s` in `WorkspacePolicy`).
-- **Subagent delegation tool**: expose a `spawn_agent` tool in `open-onyx` so the main agent can delegate subtasks to child agents via `onyx-soul-agents`'s `parent` links.

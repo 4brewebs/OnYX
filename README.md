@@ -68,9 +68,9 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 - `WorkspaceMode` (`Plan`, `Build`, `Explore`), `WorkspaceLedgerSystem` (EAV `File` & `ExternalEffect` ledger, `effects_after_tick`), lightweight Git tree checkpoints (`capture_git_tree_checkpoint` / `restore_git_tree_checkpoint`), and `WorkspaceToolBridge`
 
 ### `open-onyx` (`openonyx`)
-- CLI & TUI coding agent harness (`run`, `chat`, `replay`, `inspect`, `rewind [--dry-run]`, `--max-steps <n>`)
-- `GeminiResponder` (sync, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking background HTTP worker + `has_ready` / `InFlightGuard` RAII + sequential multi-`functionCall` batch queueing with `thoughtSignature` inheritance, for `chat`)
-- `TuiDriver` (`ratatui` + `crossterm`), per-tick graph snapshots (`--snapshot-dir`), transcript saving, and Git-reconciled time-travel rewind
+- CLI & TUI coding agent harness (`run`, `chat`, `replay`, `inspect`, `rewind [--dry-run]`, `doctor`, `--max-steps <n>`, `--shell-timeout <secs>`)
+- `GeminiResponder` (sync, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking background HTTP worker + `has_ready` / `InFlightGuard` RAII + *as-of* `supersede` & `ContextBudget` projection + sequential multi-`functionCall` batch queueing with `thoughtSignature` inheritance, for `chat`)
+- `SubagentSystem` (`AgentState::WaitingChildren` + `spawn_agent` child delegation), `WorkspaceTools` with `recall_seen` (`@TOON v1` deduplication) & `scrub_secrets`, `TuiDriver` (`ratatui` + `crossterm`), per-tick graph snapshots, and Git-reconciled time-travel rewind
 
 ### `onyx-example-app` & `onyx-example-agents`
 - `onyx-example-app`: minimal REPL that loads systems/stages, restores/saves snapshots, and processes `agree`, `status`, `exit`
@@ -82,7 +82,6 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 - Stage change at runtime
 - TOML / config loaders
 - Unified recovery bundle (snapshot + tick `n` + RNG seed + `Transcript` in one validated artifact)
-- Configurable `shell_exec` timeout and subagent delegation tool in `open-onyx`
 - Multi-soul interoperability tests
 
 ## Quick start

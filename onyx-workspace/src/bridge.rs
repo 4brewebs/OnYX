@@ -6,8 +6,8 @@ use onyx_soul_agents::{
 use serde_json::Value as JsonValue;
 
 use crate::state::{
-    PendingCheckpoints, WorkspaceMode, WorkspaceVocab, capture_git_tree_checkpoint, is_file_read,
-    normalize_rel_path,
+    PendingCheckpoints, WorkspaceMode, WorkspaceVocab, capture_git_tree_checkpoint, file_read_tick,
+    is_file_read, normalize_rel_path,
 };
 use crate::tools::WorkspaceTools;
 
@@ -117,6 +117,9 @@ impl PlatformDriver for WorkspaceToolBridge {
             inner.present(graph, surfaces);
         }
         for (agent, request, pending) in pending_tool_calls(graph, &self.vocab) {
+            if pending.tool == "spawn_agent" {
+                continue;
+            }
             if !self.dispatched.insert((agent.0, request)) {
                 continue;
             }
@@ -142,7 +145,18 @@ impl PlatformDriver for WorkspaceToolBridge {
                             }
                         }
                     }
-                    self.tools.execute(&pending.tool, &pending.args)
+                    let tick_hint = if pending.tool == "fs_read" {
+                        self.ws_vocab.as_ref().and_then(|wv| {
+                            let parsed: JsonValue =
+                                serde_json::from_str(&pending.args).unwrap_or(JsonValue::Null);
+                            let path = parsed.get("path").and_then(|v| v.as_str())?;
+                            file_read_tick(graph, wv, path).and_then(|t| u64::try_from(t).ok())
+                        })
+                    } else {
+                        None
+                    };
+                    self.tools
+                        .execute_with_tick(&pending.tool, &pending.args, tick_hint)
                 }
                 Err(reason) => Err(reason),
             };

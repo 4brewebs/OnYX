@@ -444,3 +444,56 @@ fn scent_tools_emit_toon_outline_and_impact_respecting_policy() {
         "{traversal_err}"
     );
 }
+
+#[test]
+fn fs_read_deduplicates_unchanged_reads_and_invalidates_after_edit() {
+    let dir = TempDir::new("recall_seen");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "line1\nline2\nline3\n").unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let first = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(10))
+        .unwrap();
+    assert!(first.contains("1: line1"), "{first}");
+
+    let second = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(10))
+        .unwrap();
+    assert!(second.starts_with("@TOON v1"), "{second}");
+    assert!(second.contains("unchanged_since_tick:10"), "{second}");
+
+    // Mutate via fs_edit: invalidates seen_reads cache so the next read returns full lines again.
+    tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"notes.txt","old_text":"line2","new_text":"line2-updated"}"#,
+        )
+        .unwrap();
+
+    let third = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(12))
+        .unwrap();
+    assert!(third.contains("2: line2-updated"), "{third}");
+}
+
+#[test]
+fn shell_exec_scrubs_credentials_and_honors_custom_timeout() {
+    let dir = TempDir::new("scrub");
+    let policy = WorkspacePolicy::new(&dir.0)
+        .unwrap()
+        .with_command_timeout(std::time::Duration::from_secs(15));
+    assert_eq!(policy.command_timeout, std::time::Duration::from_secs(15));
+
+    let redacted = onyx_workspace::tools::scrub_secrets(
+        "Authorization: Bearer super_secret_token_999 and AIzaSyA12345678901234567890",
+    );
+    assert!(!redacted.contains("super_secret_token_999"), "{redacted}");
+    assert!(
+        !redacted.contains("AIzaSyA12345678901234567890"),
+        "{redacted}"
+    );
+    assert!(redacted.contains("[REDACTED]"), "{redacted}");
+}

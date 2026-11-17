@@ -11,6 +11,20 @@ use onyx_workspace::WorkspaceTools;
 use serde_json::{Value as JsonValue, json};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
+pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 96 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub max_memory_bytes: usize,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
+        }
+    }
+}
 
 type SignatureMap = Arc<Mutex<HashMap<(u64, usize), JsonValue>>>;
 type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
@@ -67,24 +81,108 @@ impl Drop for InFlightGuard {
     }
 }
 
+fn normalize_tool_path(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("./")
+        .trim_start_matches(".\\")
+        .replace('\\', "/")
+}
+
+fn extract_call_path(args_json: &str) -> Option<String> {
+    let parsed: JsonValue = serde_json::from_str(args_json).ok()?;
+    parsed
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(normalize_tool_path)
+}
+
+fn find_superseded_reads(memory: &[(String, String)]) -> HashMap<usize, String> {
+    let mut read_observe_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut superseded: HashMap<usize, String> = HashMap::new();
+    let mut last_call: Option<(String, Option<String>)> = None;
+
+    for (idx, (kind, text)) in memory.iter().enumerate() {
+        match kind.as_str() {
+            "call" => {
+                let (tool, args) = match text.split_once(' ') {
+                    Some((t, a)) => (t, a),
+                    None => (text.as_str(), "{}"),
+                };
+                last_call = Some((tool.to_string(), extract_call_path(args)));
+            }
+            "observe" => {
+                if let Some((tool, Some(path))) = last_call.take() {
+                    if tool == "fs_read" {
+                        read_observe_indices.entry(path).or_default().push(idx);
+                    } else if matches!(tool.as_str(), "fs_write" | "fs_edit") {
+                        if let Some(indices) = read_observe_indices.remove(&path) {
+                            for old_idx in indices {
+                                superseded.insert(old_idx, path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            "tool_error" | "denied" => {
+                last_call = None;
+            }
+            _ => {}
+        }
+    }
+    superseded
+}
+
 fn build_request_body(
     req: &AgentView,
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
 ) -> JsonValue {
-    let mut contents = Vec::new();
-    contents.push(json!({
-        "role": "user",
-        "parts": [{ "text": format!("Goal: {}", req.goal) }]
-    }));
+    build_request_body_with_budget(req, thought_signatures, ContextBudget::default())
+}
+
+fn build_request_body_with_budget(
+    req: &AgentView,
+    thought_signatures: &HashMap<(u64, usize), JsonValue>,
+    budget: ContextBudget,
+) -> JsonValue {
+    struct ProjectedEntry {
+        msg: JsonValue,
+        tool_name: String,
+        bytes: usize,
+        is_observe: bool,
+        is_toon: bool,
+        is_superseded: bool,
+    }
+
+    let superseded = find_superseded_reads(&req.memory);
+    let mut entries: Vec<ProjectedEntry> = Vec::with_capacity(req.memory.len() + 1);
+    let goal_text = format!("Goal: {}", req.goal);
+    entries.push(ProjectedEntry {
+        bytes: goal_text.len(),
+        msg: json!({
+            "role": "user",
+            "parts": [{ "text": goal_text }]
+        }),
+        tool_name: String::new(),
+        is_observe: false,
+        is_toon: false,
+        is_superseded: false,
+    });
 
     let mut last_tool: Option<String> = None;
     let mut call_index = 0usize;
-    for (kind, text) in &req.memory {
+    for (mem_idx, (kind, text)) in req.memory.iter().enumerate() {
         match kind.as_str() {
-            "say" => contents.push(json!({
-                "role": "model",
-                "parts": [{ "text": text }]
-            })),
+            "say" => entries.push(ProjectedEntry {
+                bytes: text.len(),
+                msg: json!({
+                    "role": "model",
+                    "parts": [{ "text": text }]
+                }),
+                tool_name: String::new(),
+                is_observe: false,
+                is_toon: false,
+                is_superseded: false,
+            }),
             "call" => {
                 let (tool, args) = match text.split_once(' ') {
                     Some((t, a)) => (t, a),
@@ -100,52 +198,138 @@ fn build_request_body(
                     part["thoughtSignature"] = sig.clone();
                 }
                 call_index += 1;
-                contents.push(json!({
-                    "role": "model",
-                    "parts": [part]
-                }));
+                entries.push(ProjectedEntry {
+                    bytes: tool.len() + args.len(),
+                    msg: json!({
+                        "role": "model",
+                        "parts": [part]
+                    }),
+                    tool_name: tool.to_string(),
+                    is_observe: false,
+                    is_toon: false,
+                    is_superseded: false,
+                });
             }
             "observe" => {
                 let name = last_tool.take().unwrap_or_else(|| "tool".to_string());
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": name,
-                            "response": { "result": text }
-                        }
-                    }]
-                }));
+                if let Some(sup_path) = superseded.get(&mem_idx) {
+                    let marker = format!(
+                        "[superseded: prior fs_read of `{sup_path}` was invalidated by a subsequent edit]"
+                    );
+                    entries.push(ProjectedEntry {
+                        bytes: marker.len(),
+                        msg: json!({
+                            "role": "user",
+                            "parts": [{
+                                "functionResponse": {
+                                    "name": name,
+                                    "response": { "result": marker }
+                                }
+                            }]
+                        }),
+                        tool_name: name,
+                        is_observe: true,
+                        is_toon: false,
+                        is_superseded: true,
+                    });
+                } else {
+                    let is_toon = text.trim_start().starts_with("@TOON v1");
+                    entries.push(ProjectedEntry {
+                        bytes: text.len(),
+                        msg: json!({
+                            "role": "user",
+                            "parts": [{
+                                "functionResponse": {
+                                    "name": name,
+                                    "response": { "result": text }
+                                }
+                            }]
+                        }),
+                        tool_name: name,
+                        is_observe: true,
+                        is_toon,
+                        is_superseded: false,
+                    });
+                }
             }
             "tool_error" => {
                 let name = last_tool.take().unwrap_or_else(|| "tool".to_string());
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": name,
-                            "response": { "error": text }
-                        }
-                    }]
-                }));
+                entries.push(ProjectedEntry {
+                    bytes: text.len(),
+                    msg: json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": name,
+                                "response": { "error": text }
+                            }
+                        }]
+                    }),
+                    tool_name: name,
+                    is_observe: false,
+                    is_toon: false,
+                    is_superseded: false,
+                });
             }
             "denied" => {
                 let name = last_tool.take().unwrap_or_else(|| "tool".to_string());
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": name,
-                            "response": { "error": format!("Tool call denied: {text}. Adjust your plan.") }
-                        }
-                    }]
-                }));
+                let msg_text = format!("Tool call denied: {text}. Adjust your plan.");
+                entries.push(ProjectedEntry {
+                    bytes: msg_text.len(),
+                    msg: json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": name,
+                                "response": { "error": msg_text }
+                            }
+                        }]
+                    }),
+                    tool_name: name,
+                    is_observe: false,
+                    is_toon: false,
+                    is_superseded: false,
+                });
             }
             _ => {}
         }
     }
 
-    let declarations: Vec<JsonValue> = WorkspaceTools::schemas()
+    let mut total_bytes: usize = entries.iter().map(|e| e.bytes).sum();
+    let keep_tail_from = entries.len().saturating_sub(4);
+    if total_bytes > budget.max_memory_bytes {
+        // Pase 1 del presupuesto: compactar observaciones no-TOON antiguas antes de tocar TOON.
+        for pass_toon in [false, true] {
+            for entry in entries.iter_mut().take(keep_tail_from) {
+                if total_bytes <= budget.max_memory_bytes {
+                    break;
+                }
+                if !entry.is_observe || entry.is_superseded || entry.is_toon != pass_toon {
+                    continue;
+                }
+                let marker = format!(
+                    "[trimmed by ContextBudget: prior `{}` output ({} bytes) omitted]",
+                    entry.tool_name, entry.bytes
+                );
+                if marker.len() < entry.bytes {
+                    total_bytes = total_bytes - entry.bytes + marker.len();
+                    entry.bytes = marker.len();
+                    entry.msg = json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": entry.tool_name,
+                                "response": { "result": marker }
+                            }
+                        }]
+                    });
+                }
+            }
+        }
+    }
+
+    let contents: Vec<JsonValue> = entries.into_iter().map(|e| e.msg).collect();
+    let declarations: Vec<JsonValue> = WorkspaceTools::schemas_with_subagents(true)
         .into_iter()
         .filter(|s| req.tools.iter().any(|t| t == s.name))
         .map(|s| {
@@ -160,7 +344,7 @@ fn build_request_body(
     let mut body = json!({
         "systemInstruction": {
             "parts": [{
-                "text": "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Read files before editing them, prefer calling one tool at a time, keep changes minimal, and summarize your final answer clearly when done."
+                "text": "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, prefer calling one tool at a time, keep changes minimal, and summarize your final answer clearly when done."
             }]
         },
         "contents": contents
@@ -644,5 +828,78 @@ mod tests {
         let sig_guard = shared.thought_signatures.lock().unwrap();
         assert_eq!(sig_guard.get(&(1, 0)), Some(&json!("sig-batch")));
         assert_eq!(sig_guard.get(&(1, 1)), Some(&json!("sig-batch")));
+    }
+
+    #[test]
+    fn build_request_body_supersedes_prior_reads_after_edit() {
+        let mut req = dummy_agent_view(1, 3);
+        req.memory = vec![
+            (
+                "call".to_string(),
+                r#"fs_read {"path":"./src/lib.rs"}"#.to_string(),
+            ),
+            (
+                "observe".to_string(),
+                "OLD_STALE_CONTENT_SHOULD_BE_SUPERSEDED".to_string(),
+            ),
+            (
+                "call".to_string(),
+                r#"fs_edit {"path":"src/lib.rs","old_text":"a","new_text":"b"}"#.to_string(),
+            ),
+            (
+                "observe".to_string(),
+                "edited `src/lib.rs` (1 replacement)".to_string(),
+            ),
+        ];
+
+        let body = build_request_body(&req, &HashMap::new());
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("OLD_STALE_CONTENT_SHOULD_BE_SUPERSEDED"),
+            "{serialized}"
+        );
+        assert!(serialized.contains("superseded"), "{serialized}");
+    }
+
+    #[test]
+    fn build_request_body_respects_context_budget_preserving_errors_and_toon() {
+        let mut req = dummy_agent_view(1, 5);
+        req.memory = vec![
+            (
+                "call".to_string(),
+                r#"fs_read {"path":"huge.rs"}"#.to_string(),
+            ),
+            ("observe".to_string(), "X".repeat(600)),
+            (
+                "call".to_string(),
+                r#"scent_impact {"target":"foo"}"#.to_string(),
+            ),
+            (
+                "observe".to_string(),
+                "@TOON v1\n# cols: subject | predicate | object | meta\nfoo | epicenter | src/a.rs::foo | temp_bp:10000\n# total: 1\n"
+                    .to_string(),
+            ),
+            (
+                "call".to_string(),
+                r#"shell_exec {"command":"cargo test"}"#.to_string(),
+            ),
+            ("tool_error".to_string(), "RECENT_ERROR_KEEP".to_string()),
+        ];
+
+        let body = build_request_body_with_budget(
+            &req,
+            &HashMap::new(),
+            ContextBudget {
+                max_memory_bytes: 350,
+            },
+        );
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(!serialized.contains(&"X".repeat(200)), "{serialized}");
+        assert!(
+            serialized.contains("trimmed by ContextBudget"),
+            "{serialized}"
+        );
+        assert!(serialized.contains("@TOON v1"), "{serialized}");
+        assert!(serialized.contains("RECENT_ERROR_KEEP"), "{serialized}");
     }
 }

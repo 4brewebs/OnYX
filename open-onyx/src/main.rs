@@ -5,16 +5,18 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use gemini::{AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder};
 use onyx_soul_agents::{
     AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AgentView, AttrRegistry,
     Ctx, EventBus, GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem,
-    PlatformDriver, RecordingBridge, ReplayBridge, Reply, SurfaceBinding, Transcript, Value, Vocab,
-    pending_approvals, spawn_event,
+    PlatformDriver, RecordingBridge, ReplayBridge, Reply, SnapshotStore, SubagentSystem,
+    SurfaceBinding, Transcript, Value, Vocab, pending_approvals, spawn_event,
 };
 use onyx_workspace::{
     PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceMode, WorkspacePolicy, WorkspaceToolBridge,
@@ -28,6 +30,7 @@ struct CliArgs {
     auto_approve: bool,
     dry_run: bool,
     max_steps: Option<i64>,
+    shell_timeout_secs: Option<u64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
 }
@@ -43,6 +46,10 @@ enum Mode {
     Rewind {
         dir: PathBuf,
         tick: u64,
+        transcript: Option<PathBuf>,
+    },
+    Doctor {
+        snapshot_dir: Option<PathBuf>,
         transcript: Option<PathBuf>,
     },
 }
@@ -151,6 +158,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut auto_approve = false;
     let mut dry_run = false;
     let mut max_steps: Option<i64> = None;
+    let mut shell_timeout_secs: Option<u64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
     let mut tick_opt: Option<u64> = None;
@@ -176,6 +184,18 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--max-steps must be > 0".to_string());
                 }
                 max_steps = Some(parsed);
+            }
+            "--shell-timeout" => {
+                let s = args
+                    .next()
+                    .ok_or("--shell-timeout requires seconds as a positive integer")?;
+                let parsed = s
+                    .parse::<u64>()
+                    .map_err(|_| "--shell-timeout must be a positive integer")?;
+                if parsed == 0 {
+                    return Err("--shell-timeout must be > 0".to_string());
+                }
+                shell_timeout_secs = Some(parsed);
             }
             "--save-transcript" => {
                 let p = args.next().ok_or("--save-transcript requires a path")?;
@@ -236,6 +256,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 transcript: transcript_opt,
             }
         }
+        "doctor" => Mode::Doctor {
+            snapshot_dir: snapshot_dir
+                .clone()
+                .or_else(|| positional.into_iter().next().map(PathBuf::from)),
+            transcript: transcript_opt,
+        },
         _ => return Err(usage()),
     };
 
@@ -245,13 +271,14 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         auto_approve,
         dry_run,
         max_steps,
+        shell_timeout_secs,
         save_transcript,
         snapshot_dir,
     })
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]".to_string()
 }
 
 fn prompt_approval(tool: &str, args: &str) -> bool {
@@ -277,8 +304,10 @@ fn all_live_agents_blocked(graph: &dyn GraphView, v: &Vocab, llm_in_flight: usiz
             if let Some(state) = AgentState::parse(&s) {
                 if !state.is_terminal() {
                     any_live = true;
-                    let blocked = state == AgentState::WaitingApproval
-                        || (state == AgentState::Thinking && llm_in_flight > 0);
+                    let blocked = matches!(
+                        state,
+                        AgentState::WaitingApproval | AgentState::WaitingChildren
+                    ) || (state == AgentState::Thinking && llm_in_flight > 0);
                     if !blocked {
                         return false;
                     }
@@ -310,7 +339,8 @@ fn build_host_with_checkpoints(
         ledger = ledger.with_checkpoints(cp);
     }
     let mut builder = AgentHost::builder(seed)
-        .config(config)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
         .system(Box::new(ledger));
     if let Some(sys) = extra_system {
         builder = builder.system(sys);
@@ -324,8 +354,11 @@ fn build_host_with_checkpoints(
 }
 
 fn make_spec(goal: &str, auto_approve: bool) -> AgentSpec {
-    let mut spec = AgentSpec::new("openonyx", goal)
-        .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+    let mut spec = AgentSpec::new("openonyx", goal).with_tools(
+        WorkspaceTools::all_tool_names_with_subagents()
+            .iter()
+            .copied(),
+    );
     if !auto_approve {
         spec = spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
     }
@@ -341,7 +374,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let policy = WorkspacePolicy::new(&cli.workspace)?;
+    let mut policy = WorkspacePolicy::new(&cli.workspace)?;
+    if let Some(secs) = cli.shell_timeout_secs {
+        policy = policy.with_command_timeout(Duration::from_secs(secs));
+    }
     let tools = WorkspaceTools::new(policy);
 
     let config = AgentConfig {
@@ -674,9 +710,214 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        Mode::Doctor {
+            snapshot_dir,
+            transcript,
+        } => {
+            let report = run_doctor(&cli.workspace, snapshot_dir.as_ref(), transcript.as_ref());
+            report.print();
+            if !report.errors.is_empty() {
+                return Err(format!("doctor detected {} error(s)", report.errors.len()).into());
+            }
+        }
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct DoctorReport {
+    checks: Vec<String>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+impl DoctorReport {
+    fn print(&self) {
+        println!("=== [openOnyx doctor] ===");
+        for item in &self.checks {
+            println!("  [OK]   {item}");
+        }
+        for warn in &self.warnings {
+            println!("  [WARN] {warn}");
+        }
+        for err in &self.errors {
+            println!("  [ERR]  {err}");
+        }
+    }
+}
+
+fn run_doctor(
+    workspace: &Path,
+    snapshot_dir: Option<&PathBuf>,
+    transcript: Option<&PathBuf>,
+) -> DoctorReport {
+    let mut report = DoctorReport::default();
+
+    let git_ok = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(workspace)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if git_ok {
+        report
+            .checks
+            .push(format!("git worktree valid at {}", workspace.display()));
+    } else {
+        report.warnings.push(format!(
+            "workspace `{}` is not a git worktree",
+            workspace.display()
+        ));
+    }
+
+    if let Ok(entries) = fs::read_dir(workspace) {
+        let mut temp_artifacts = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tr") || (name.starts_with("snaps") && entry.path().is_dir()) {
+                temp_artifacts.push(name);
+            }
+        }
+        temp_artifacts.sort();
+        if temp_artifacts.is_empty() {
+            report
+                .checks
+                .push("no stray *.tr or snaps* artifacts in workspace root".to_string());
+        } else {
+            report.warnings.push(format!(
+                "temporary artifacts in workspace root: {}",
+                temp_artifacts.join(", ")
+            ));
+        }
+    }
+
+    if let Some(tr_path) = transcript {
+        match fs::read(tr_path) {
+            Err(e) => report.errors.push(format!(
+                "failed to read transcript `{}`: {e}",
+                tr_path.display()
+            )),
+            Ok(bytes) => {
+                if !bytes.starts_with(b"ONYXTR2") && !bytes.starts_with(b"ONYXTR1") {
+                    report.errors.push(format!(
+                        "transcript `{}` missing ONYXTR1/ONYXTR2 header",
+                        tr_path.display()
+                    ));
+                }
+                match Transcript::from_bytes(&bytes) {
+                    Ok(tr) => report.checks.push(format!(
+                        "transcript `{}` valid ({} entries, {} commands)",
+                        tr_path.display(),
+                        tr.entries.len(),
+                        tr.commands.len()
+                    )),
+                    Err(e) => report.errors.push(format!(
+                        "transcript `{}` parse error: {e}",
+                        tr_path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    if let Some(dir) = snapshot_dir {
+        let store = AgentSnapshotStore::new(dir);
+        match fs::read_dir(dir) {
+            Err(e) => report
+                .errors
+                .push(format!("cannot read snapshot dir `{}`: {e}", dir.display())),
+            Ok(entries) => {
+                let mut ticks = Vec::new();
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if let Some(stem) = name
+                        .strip_prefix("tick-")
+                        .and_then(|s| s.strip_suffix(".bin"))
+                    {
+                        if let Ok(t) = stem.parse::<u64>() {
+                            ticks.push(t);
+                        }
+                    }
+                }
+                ticks.sort();
+                if ticks.is_empty() {
+                    report.warnings.push(format!(
+                        "no tick-*.bin snapshots found in `{}`",
+                        dir.display()
+                    ));
+                } else {
+                    let mut bad_snaps = 0usize;
+                    for &t in &ticks {
+                        let key = t.to_string();
+                        match store.load(&key) {
+                            Ok(bytes) if bytes.starts_with(b"ONYXAG") => {}
+                            Ok(_) => {
+                                bad_snaps += 1;
+                                report
+                                    .errors
+                                    .push(format!("snapshot tick-{t}.bin missing ONYXAG header"));
+                            }
+                            Err(e) => {
+                                bad_snaps += 1;
+                                report
+                                    .errors
+                                    .push(format!("snapshot tick-{t}.bin load error: {e}"));
+                            }
+                        }
+                    }
+                    if bad_snaps == 0 {
+                        report.checks.push(format!(
+                            "all {} snapshots in `{}` carry ONYXAG headers and load cleanly",
+                            ticks.len(),
+                            dir.display()
+                        ));
+                    }
+                    if let Some(&latest) = ticks.last() {
+                        match build_host(1, AgentConfig::default(), Some(dir), None) {
+                            Ok((mut host, ws_vocab)) => {
+                                host.request_restore(&latest.to_string());
+                                host.step(&mut HeadlessDriver::new());
+                                let effects = effects_after_tick(host.graph(), &ws_vocab, 0);
+                                let mut checked_shas = 0usize;
+                                for eff in effects {
+                                    if let Some(sha) = eff.tree_sha {
+                                        checked_shas += 1;
+                                        if git_ok {
+                                            let is_tree = Command::new("git")
+                                                .args(["cat-file", "-t", &sha])
+                                                .current_dir(workspace)
+                                                .output()
+                                                .map(|o| {
+                                                    o.status.success()
+                                                        && String::from_utf8_lossy(&o.stdout).trim()
+                                                            == "tree"
+                                                })
+                                                .unwrap_or(false);
+                                            if !is_tree {
+                                                report.errors.push(format!(
+                                                    "ledger tree_sha `{sha}` (tick {}) missing in git object database",
+                                                    eff.tick
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                report.checks.push(format!(
+                                    "verified {checked_shas} ledger tree checkpoint(s) at tick {latest}"
+                                ));
+                            }
+                            Err(e) => report
+                                .errors
+                                .push(format!("failed to inspect snapshot ledger: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    report
 }
 
 #[cfg(test)]
@@ -777,5 +1018,52 @@ mod tests {
             .err()
             .expect("0 max-steps must be rejected");
         assert!(err.contains("--max-steps"), "{err}");
+
+        let parsed_timeout = parse_args_from(
+            ["chat", "--shell-timeout", "45"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(parsed_timeout.shell_timeout_secs, Some(45));
+    }
+
+    #[test]
+    fn doctor_validates_snapshots_transcript_and_flags_bad_headers() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-doctor-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let snap_dir = dir.join("snaps_test");
+        fs::create_dir_all(&snap_dir).unwrap();
+
+        let (mut host, _) = build_host(1, AgentConfig::default(), Some(&snap_dir), None).unwrap();
+        host.spawn(&make_spec("check doctor", true));
+        host.request_snapshot("0");
+        host.step(&mut HeadlessDriver::new());
+
+        let tr_path = dir.join("ok.tr");
+        let rec = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            Some(Reply::done(req.agent, req.request, "done"))
+        })
+        .wrapping(HeadlessDriver::new());
+        fs::write(&tr_path, rec.transcript().to_bytes()).unwrap();
+
+        let report = run_doctor(&dir, Some(&snap_dir), Some(&tr_path));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ok.tr") && w.contains("snaps_test")),
+            "{:?}",
+            report.warnings
+        );
+
+        let bad_tr = dir.join("bad.tr");
+        fs::write(&bad_tr, b"NOT_A_TRANSCRIPT").unwrap();
+        let bad_report = run_doctor(&dir, Some(&snap_dir), Some(&bad_tr));
+        assert!(!bad_report.errors.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
