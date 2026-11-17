@@ -23,6 +23,8 @@ pub enum AgentState {
     Thinking,
     /// Espera aprobación humana antes de ejecutar una herramienta sensible.
     WaitingApproval,
+    /// Espera la resolución determinista de uno o más subagentes hijos.
+    WaitingChildren,
     /// Espera el resultado de una herramienta.
     Acting,
     /// Terminó con éxito. Estado terminal.
@@ -37,6 +39,7 @@ impl AgentState {
             Self::Idle => "idle",
             Self::Thinking => "thinking",
             Self::WaitingApproval => "waiting_approval",
+            Self::WaitingChildren => "waiting_children",
             Self::Acting => "acting",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -48,6 +51,7 @@ impl AgentState {
             "idle" => Self::Idle,
             "thinking" => Self::Thinking,
             "waiting_approval" => Self::WaitingApproval,
+            "waiting_children" => Self::WaitingChildren,
             "acting" => Self::Acting,
             "done" => Self::Done,
             "failed" => Self::Failed,

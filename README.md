@@ -15,7 +15,8 @@ The full project description, including proposed design that is not yet code, is
 onyx-core           = contracts + tick + deterministic RNG            · 0 dependencies
 onyx-soul           = default implementations of those contracts      · 0 external dependencies
 onyx-soul-agents    = deterministic multi-agent harness soul          · 0 external dependencies
-onyx-workspace      = sandboxed coding tools + bridge                 · uses onyx-soul-agents
+onyx-scent          = AST distiller + blake3 cache + @TOON v1         · optional cli feature
+onyx-workspace      = sandboxed coding tools + bridge                 · uses onyx-soul-agents (+ optional onyx-scent)
 open-onyx           = CLI/TUI coding agent harness (Gemini + ratatui) · uses onyx-soul-agents + onyx-workspace
 onyx-example-app    = minimal REPL that exercises onyx-soul           · uses onyx-soul
 onyx-example-agents = deterministic multi-agent tour                  · uses onyx-soul-agents
@@ -56,15 +57,20 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 - `RecordingBridge` / `ReplayBridge` (`ONYXTR1` / `ONYXTR2` transcripts), `HeadlessDriver`
 - `AgentState::WaitingApproval`, `ApprovalPolicy`, structured tool calls (`Reply::call_structured`)
 
+### `onyx-scent`
+- Deterministic multi-language (`Rust`, `Python`, `Java`) `tree-sitter` AST indexer with `blake3` incremental cache
+- Integer-only (`0..=10_000` bp) Max-Heat impact diffusion (`distill_heat`) and `@TOON v1` paginated encoder/decoder (`outline_toon`, `impact_toon`)
+- Pure library by default (`clap` gated behind `feature = "cli"`)
+
 ### `onyx-workspace`
 - `WorkspacePolicy` (canonicalized root sandbox, symlink-safe traversal, ignored dirs, I/O and process-tree timeout limits)
-- `WorkspaceTools` (`fs_read`, `fs_list`, `fs_write`, `fs_edit` with line-trimmed fallback, `code_search`, `shell_exec`)
+- `WorkspaceTools` (`fs_read`, `fs_list`, `fs_write`, `fs_edit` with line-trimmed fallback, `code_search`, `shell_exec`, plus read-only `scent_outline` & `scent_impact` under `feature = "scent"`)
 - `WorkspaceMode` (`Plan`, `Build`, `Explore`), `WorkspaceLedgerSystem` (EAV `File` & `ExternalEffect` ledger, `effects_after_tick`), lightweight Git tree checkpoints (`capture_git_tree_checkpoint` / `restore_git_tree_checkpoint`), and `WorkspaceToolBridge`
 
 ### `open-onyx` (`openonyx`)
-- CLI & TUI coding agent harness (`run`, `chat`, `replay`, `inspect`, `rewind [--dry-run]`)
-- `GeminiResponder` (sync, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking background HTTP worker + `has_ready` / `InFlightGuard` RAII + sequential multi-`functionCall` batch queueing with `thoughtSignature` inheritance, for `chat`)
-- `TuiDriver` (`ratatui` + `crossterm`), per-tick graph snapshots (`--snapshot-dir`), transcript saving, and Git-reconciled time-travel rewind
+- CLI & TUI coding agent harness (`run`, `chat`, `replay`, `inspect`, `rewind [--dry-run]`, `doctor`, `--max-steps <n>`, `--shell-timeout <secs>`)
+- `GeminiResponder` (sync, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking background HTTP worker + `has_ready` / `InFlightGuard` RAII + *as-of* `supersede` & `ContextBudget` projection + sequential multi-`functionCall` batch queueing with `thoughtSignature` inheritance, for `chat`)
+- `SubagentSystem` (`AgentState::WaitingChildren` + `spawn_agent` child delegation), `WorkspaceTools` with `recall_seen` (`@TOON v1` deduplication) & `scrub_secrets`, `TuiDriver` (`ratatui` + `crossterm`), per-tick graph snapshots, and Git-reconciled time-travel rewind
 
 ### `onyx-example-app` & `onyx-example-agents`
 - `onyx-example-app`: minimal REPL that loads systems/stages, restores/saves snapshots, and processes `agree`, `status`, `exit`
@@ -76,7 +82,6 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 - Stage change at runtime
 - TOML / config loaders
 - Unified recovery bundle (snapshot + tick `n` + RNG seed + `Transcript` in one validated artifact)
-- Configurable `shell_exec` timeout and subagent delegation tool in `open-onyx`
 - Multi-soul interoperability tests
 
 ## Quick start

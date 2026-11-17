@@ -53,6 +53,7 @@ pub struct WorkspaceVocab {
     pub file_path: Attr,
     pub file_read_tick: Attr,
     pub file_dirty: Attr,
+    pub file_hash: Attr,
     pub effect_tick: Attr,
     pub effect_agent: Attr,
     pub effect_tool: Attr,
@@ -73,6 +74,7 @@ impl WorkspaceVocab {
             file_path: reg("ws.file.path"),
             file_read_tick: reg("ws.file.read_tick"),
             file_dirty: reg("ws.file.dirty"),
+            file_hash: reg("ws.file.hash"),
             effect_tick: reg("ws.effect.tick"),
             effect_agent: reg("ws.effect.agent"),
             effect_tool: reg("ws.effect.tool"),
@@ -173,15 +175,22 @@ pub fn restore_git_tree_checkpoint(root: &Path, tree_sha: &str) -> Result<(), St
 
 /// Consulta en el grafo si un archivo relativo ya fue leído en la sesión.
 pub fn is_file_read(graph: &dyn GraphView, ws: &WorkspaceVocab, rel_path: &str) -> bool {
+    file_read_tick(graph, ws, rel_path).is_some()
+}
+
+/// Devuelve el tick más reciente de lectura registrada para `rel_path`, si existe.
+pub fn file_read_tick(graph: &dyn GraphView, ws: &WorkspaceVocab, rel_path: &str) -> Option<i64> {
     let norm = normalize_rel_path(rel_path);
     for id in graph.query(&[ws.file_path, ws.file_read_tick]) {
         if let Some(Value::Text(p)) = graph.get(id, ws.file_path) {
             if p == norm {
-                return true;
+                if let Some(Value::Int(t)) = graph.get(id, ws.file_read_tick) {
+                    return Some(t);
+                }
             }
         }
     }
-    false
+    None
 }
 
 /// Devuelve todos los efectos externos registrados después de `after_tick`

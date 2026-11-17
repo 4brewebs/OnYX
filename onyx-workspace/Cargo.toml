@@ -6,7 +6,12 @@ rust-version = "1.85"
 description = "Workspace capabilities (filesystem, search, edit, shell) with sandbox policy for OnYX agent harnesses."
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+scent = ["dep:onyx-scent"]
+
 [dependencies]
+onyx-scent = { path = "../onyx-scent", optional = true }
 onyx-soul-agents = { path = "../onyx-soul-agents" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

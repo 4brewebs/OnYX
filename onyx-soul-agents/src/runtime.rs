@@ -228,7 +228,12 @@ impl Step<'_> {
     fn is_expecting_reply(&self, ctx: &Ctx, id: ConceptId) -> bool {
         matches!(
             self.state_of(ctx, id),
-            Some(AgentState::Thinking | AgentState::WaitingApproval | AgentState::Acting)
+            Some(
+                AgentState::Thinking
+                    | AgentState::WaitingApproval
+                    | AgentState::WaitingChildren
+                    | AgentState::Acting
+            )
         )
     }
 
@@ -491,8 +496,10 @@ impl Step<'_> {
                 self.set_state(ctx, id, AgentState::Idle);
             }
             (_, Verb::Fail) => self.act(ctx, id, pending, r.call_id, Decision::Fail(r.payload)),
-            (AgentState::Acting, Verb::Observe) => back_to_idle(self, ctx, "observe", &r.payload),
-            (AgentState::Acting, Verb::ToolError) => {
+            (AgentState::Acting | AgentState::WaitingChildren, Verb::Observe) => {
+                back_to_idle(self, ctx, "observe", &r.payload)
+            }
+            (AgentState::Acting | AgentState::WaitingChildren, Verb::ToolError) => {
                 back_to_idle(self, ctx, "tool_error", &r.payload)
             }
             (state, verb) => ctx.outbox.push(fault(format!(
@@ -510,7 +517,10 @@ impl Step<'_> {
             return;
         };
         match state {
-            AgentState::Done | AgentState::Failed | AgentState::WaitingApproval => {}
+            AgentState::Done
+            | AgentState::Failed
+            | AgentState::WaitingApproval
+            | AgentState::WaitingChildren => {}
             AgentState::Thinking | AgentState::Acting => {
                 if int(&*ctx.graph, id, v.remaining).unwrap_or(0) <= 0 {
                     self.finish(ctx, id, AgentState::Failed, "timeout");

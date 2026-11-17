@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,15 +22,27 @@ pub struct ToolSchema {
     pub requires_approval: bool,
 }
 
+type SeenReadsMap = Arc<Mutex<BTreeMap<(String, usize, usize), (String, u64)>>>;
+
 /// Ejecutor de herramientas de código sujeto a `WorkspacePolicy`.
 #[derive(Clone, Debug)]
 pub struct WorkspaceTools {
     policy: WorkspacePolicy,
+    seen_reads: SeenReadsMap,
+    read_seq: Arc<AtomicU64>,
+    #[cfg(feature = "scent")]
+    scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
 }
 
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            seen_reads: Arc::new(Mutex::new(BTreeMap::new())),
+            read_seq: Arc::new(AtomicU64::new(1)),
+            #[cfg(feature = "scent")]
+            scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
+        }
     }
 
     pub fn policy(&self) -> &WorkspacePolicy {
@@ -35,22 +50,91 @@ impl WorkspaceTools {
     }
 
     pub fn all_tool_names() -> &'static [&'static str] {
-        &[
-            "fs_read",
-            "fs_list",
-            "fs_write",
-            "fs_edit",
-            "code_search",
-            "shell_exec",
-        ]
+        #[cfg(feature = "scent")]
+        {
+            &[
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "code_search",
+                "shell_exec",
+                "scent_outline",
+                "scent_impact",
+            ]
+        }
+        #[cfg(not(feature = "scent"))]
+        {
+            &[
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "code_search",
+                "shell_exec",
+            ]
+        }
+    }
+
+    pub fn all_tool_names_with_subagents() -> &'static [&'static str] {
+        #[cfg(feature = "scent")]
+        {
+            &[
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "code_search",
+                "shell_exec",
+                "scent_outline",
+                "scent_impact",
+                "spawn_agent",
+            ]
+        }
+        #[cfg(not(feature = "scent"))]
+        {
+            &[
+                "fs_read",
+                "fs_list",
+                "fs_write",
+                "fs_edit",
+                "code_search",
+                "shell_exec",
+                "spawn_agent",
+            ]
+        }
     }
 
     pub fn approval_required_names() -> &'static [&'static str] {
         &["fs_write", "fs_edit", "shell_exec"]
     }
 
+    pub fn subagent_schema() -> ToolSchema {
+        ToolSchema {
+            name: "spawn_agent",
+            description: "Delegate a scoped subtask to a child subagent and suspend until the child completes.",
+            parameters: json!({
+                "type": "OBJECT",
+                "properties": {
+                    "name": { "type": "STRING", "description": "Optional short label for the subagent." },
+                    "goal": { "type": "STRING", "description": "Clear, bounded goal for the child subagent." }
+                },
+                "required": ["goal"]
+            }),
+            requires_approval: false,
+        }
+    }
+
+    pub fn schemas_with_subagents(include_subagents: bool) -> Vec<ToolSchema> {
+        let mut out = Self::schemas();
+        if include_subagents {
+            out.push(Self::subagent_schema());
+        }
+        out
+    }
+
     pub fn schemas() -> Vec<ToolSchema> {
-        vec![
+        let mut out = vec![
             ToolSchema {
                 name: "fs_read",
                 description: "Read a UTF-8 file from the workspace, optionally by 1-based inclusive line range.",
@@ -130,10 +214,52 @@ impl WorkspaceTools {
                 }),
                 requires_approval: true,
             },
-        ]
+        ];
+        #[cfg(feature = "scent")]
+        {
+            out.push(ToolSchema {
+                name: "scent_outline",
+                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, or Java files.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "path": { "type": "STRING", "description": "Optional relative file or directory inside the workspace (defaults to '.')." },
+                        "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public symbols." },
+                        "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 120)." }
+                    }
+                }),
+                requires_approval: false,
+            });
+            out.push(ToolSchema {
+                name: "scent_impact",
+                description: "Trace semantic AST call impact around a target symbol as ranked @TOON v1 tuples (epicenter, callers, callees, line ranges).",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": { "type": "STRING", "description": "Symbol name, Type::method, or file::symbol to analyze." },
+                        "max_hops": { "type": "INTEGER", "description": "Optional diffusion hop radius (1..=6, default 3)." },
+                        "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 120)." }
+                    },
+                    "required": ["target"]
+                }),
+                requires_approval: false,
+            });
+        }
+        out
     }
 
     pub fn execute(&self, tool: &str, args_json: &str) -> Result<String, String> {
+        self.execute_with_tick(tool, args_json, None)
+    }
+
+    pub fn execute_with_tick(
+        &self,
+        tool: &str,
+        args_json: &str,
+        tick_hint: Option<u64>,
+    ) -> Result<String, String> {
         let raw = if args_json.trim().is_empty() {
             "{}"
         } else {
@@ -143,7 +269,7 @@ impl WorkspaceTools {
             "fs_read" => {
                 let args: FsReadArgs =
                     serde_json::from_str(raw).map_err(|e| format!("invalid fs_read args: {e}"))?;
-                self.fs_read(args)
+                self.fs_read(args, tick_hint)
             }
             "fs_list" => {
                 let args: FsListArgs =
@@ -170,14 +296,32 @@ impl WorkspaceTools {
                     .map_err(|e| format!("invalid shell_exec args: {e}"))?;
                 self.shell_exec(args)
             }
+            #[cfg(feature = "scent")]
+            "scent_outline" => {
+                let args: ScentOutlineArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid scent_outline args: {e}"))?;
+                self.scent_outline(args)
+            }
+            #[cfg(feature = "scent")]
+            "scent_impact" => {
+                let args: ScentImpactArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid scent_impact args: {e}"))?;
+                self.scent_impact(args)
+            }
             _ => Err(format!("unknown workspace tool `{tool}`")),
         }
     }
 
-    fn fs_read(&self, args: FsReadArgs) -> Result<String, String> {
+    fn fs_read(&self, args: FsReadArgs, tick_hint: Option<u64>) -> Result<String, String> {
         let path = self.policy.resolve_existing(&args.path)?;
+        let rel = path
+            .strip_prefix(&self.policy.root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+        let digest = fnv1a_hex(content.as_bytes());
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
         let start = args.start_line.unwrap_or(1).max(1);
@@ -187,6 +331,22 @@ impl WorkspaceTools {
                 "(file has {total} lines; start_line {start} is past EOF)"
             ));
         }
+
+        let key = (rel.clone(), start, end);
+        if let Ok(mut guard) = self.seen_reads.lock() {
+            if let Some((prev_digest, prev_tick)) = guard.get(&key) {
+                if prev_digest == &digest {
+                    let tick_label = tick_hint.unwrap_or(*prev_tick);
+                    return Ok(format!(
+                        "@TOON v1\n# cols: subject | predicate | object | meta\n{rel} | unchanged_since_tick:{tick_label} | lines:{start}-{end} | digest:{digest}\n# total: 1\n"
+                    ));
+                }
+            }
+            let tick_val =
+                tick_hint.unwrap_or_else(|| self.read_seq.fetch_add(1, Ordering::Relaxed));
+            guard.insert(key, (digest, tick_val));
+        }
+
         let mut out = String::new();
         for (idx, line) in lines
             .iter()
@@ -201,6 +361,17 @@ impl WorkspaceTools {
             }
         }
         Ok(out)
+    }
+
+    fn invalidate_seen_file(&self, canonical_path: &Path) {
+        let rel = canonical_path
+            .strip_prefix(&self.policy.root)
+            .unwrap_or(canonical_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Ok(mut guard) = self.seen_reads.lock() {
+            guard.retain(|(p, _, _), _| p != &rel);
+        }
     }
 
     fn fs_list(&self, args: FsListArgs) -> Result<String, String> {
@@ -258,6 +429,7 @@ impl WorkspaceTools {
         }
         fs::write(&path, args.content.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
+        self.invalidate_seen_file(&path);
         Ok(format!(
             "wrote {} bytes to {}",
             args.content.len(),
@@ -275,6 +447,7 @@ impl WorkspaceTools {
             let updated = content.replacen(&args.old_text, &args.new_text, 1);
             fs::write(&path, updated.as_bytes())
                 .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
+            self.invalidate_seen_file(&path);
             return Ok(format!("edited `{}` (1 replacement)", args.path));
         }
         if exact_count > 1 {
@@ -288,6 +461,7 @@ impl WorkspaceTools {
             .map_err(|reason| format!("in `{}`: {reason}", args.path))?;
         fs::write(&path, updated.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
+        self.invalidate_seen_file(&path);
         Ok(format!(
             "edited `{}` (1 line-trimmed replacement)",
             args.path
@@ -425,13 +599,62 @@ impl WorkspaceTools {
         let stdout = out_handle.join().unwrap_or_default();
         let stderr = err_handle.join().unwrap_or_default();
 
-        let combined = format!(
+        let combined = scrub_secrets(&format!(
             "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
             status.code().unwrap_or(-1),
             stdout,
             stderr
-        );
+        ));
         Ok(truncate_utf8(&combined, self.policy.max_output_bytes))
+    }
+
+    #[cfg(feature = "scent")]
+    fn scent_outline(&self, args: ScentOutlineArgs) -> Result<String, String> {
+        let base = args.path.as_deref().unwrap_or(".");
+        let resolved = self.policy.resolve_existing(base)?;
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_target(&self.policy.root, Some(&resolved))
+            .map_err(|e| e.to_string())?;
+        let opts = onyx_scent::ToonPageOptions {
+            cursor: args.cursor.unwrap_or(0),
+            max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            public_only: args.public_only.unwrap_or(false),
+            ..onyx_scent::ToonPageOptions::default()
+        };
+        Ok(truncate_utf8(
+            &idx.outline_toon(opts),
+            self.policy.max_output_bytes,
+        ))
+    }
+
+    #[cfg(feature = "scent")]
+    fn scent_impact(&self, args: ScentImpactArgs) -> Result<String, String> {
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_workspace(&self.policy.root)
+            .map_err(|e| e.to_string())?;
+        let hops = args.max_hops.unwrap_or(3).clamp(1, 6);
+        let opts = onyx_scent::ToonPageOptions {
+            cursor: args.cursor.unwrap_or(0),
+            max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            ..onyx_scent::ToonPageOptions::default()
+        };
+        let toon = idx
+            .impact_toon(
+                &args.target,
+                &onyx_scent::DistillerConfig {
+                    iterations: hops,
+                    ..onyx_scent::DistillerConfig::default()
+                },
+                opts,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(truncate_utf8(&toon, self.policy.max_output_bytes))
     }
 }
 
@@ -509,6 +732,24 @@ struct ShellExecArgs {
     command: String,
 }
 
+#[cfg(feature = "scent")]
+#[derive(Deserialize)]
+struct ScentOutlineArgs {
+    path: Option<String>,
+    public_only: Option<bool>,
+    cursor: Option<usize>,
+    max_rows: Option<usize>,
+}
+
+#[cfg(feature = "scent")]
+#[derive(Deserialize)]
+struct ScentImpactArgs {
+    target: String,
+    max_hops: Option<u8>,
+    cursor: Option<usize>,
+    max_rows: Option<usize>,
+}
+
 fn replace_line_trimmed_unique(
     content: &str,
     old_text: &str,
@@ -569,4 +810,90 @@ fn replace_line_trimmed_unique(
             "old_text matched {n} times (line-trimmed); provide more context"
         )),
     }
+}
+
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Filtra secretos conocidos y valores de variables de entorno sensibles antes de
+/// exponer salidas de `shell_exec` al bus, transcripciones `.tr` o snapshots `.bin`.
+pub fn scrub_secrets(input: &str) -> String {
+    let mut out = input.to_string();
+
+    // 1. Valores reales presentes en variables de entorno sensibles (>= 8 chars).
+    for (k, v) in std::env::vars() {
+        if v.len() < 8 {
+            continue;
+        }
+        let upper = k.to_ascii_uppercase();
+        if upper.contains("KEY")
+            || upper.contains("TOKEN")
+            || upper.contains("SECRET")
+            || upper.contains("PASSWORD")
+            || upper.contains("CREDENTIAL")
+        {
+            out = out.replace(&v, "[REDACTED]");
+        }
+    }
+
+    // 2. Patrones comunes de tokens/claves literales en salida.
+    for prefix in ["AIza", "sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-"] {
+        out = redact_token_prefix(&out, prefix, 16);
+    }
+    out = redact_bearer_tokens(&out);
+    out
+}
+
+fn redact_token_prefix(input: &str, prefix: &str, min_tail: usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+    while let Some(rel) = input[idx..].find(prefix) {
+        let start = idx + rel;
+        out.push_str(&input[idx..start]);
+        let after_prefix = start + prefix.len();
+        let tail_len = input[after_prefix..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if tail_len >= min_tail {
+            out.push_str("[REDACTED]");
+            idx = after_prefix + tail_len;
+        } else {
+            out.push_str(prefix);
+            idx = after_prefix;
+        }
+    }
+    out.push_str(&input[idx..]);
+    out
+}
+
+fn redact_bearer_tokens(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+    while let Some(rel) = input[idx..].find("Bearer ") {
+        let start = idx + rel;
+        out.push_str(&input[idx..start]);
+        let token_start = start + "Bearer ".len();
+        let token_len = input[token_start..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if token_len >= 8 {
+            out.push_str("Bearer [REDACTED]");
+            idx = token_start + token_len;
+        } else {
+            out.push_str("Bearer ");
+            idx = token_start;
+        }
+    }
+    out.push_str(&input[idx..]);
+    out
 }

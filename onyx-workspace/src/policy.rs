@@ -30,6 +30,11 @@ impl WorkspacePolicy {
         })
     }
 
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
+    }
+
     pub fn is_ignored(&self, path: &Path) -> bool {
         path.components().any(|c| {
             if let Component::Normal(name) = c {
