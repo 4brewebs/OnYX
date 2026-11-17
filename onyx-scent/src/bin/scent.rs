@@ -21,7 +21,7 @@ enum Commands {
         path: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         cursor: usize,
-        #[arg(long, default_value_t = 120)]
+        #[arg(long, default_value_t = 250)]
         max_rows: usize,
         #[arg(long)]
         public_only: bool,
@@ -36,7 +36,7 @@ enum Commands {
         max_hops: u8,
         #[arg(long, default_value_t = 0)]
         cursor: usize,
-        #[arg(long, default_value_t = 120)]
+        #[arg(long, default_value_t = 250)]
         max_rows: usize,
     },
 }

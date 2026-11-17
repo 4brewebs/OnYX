@@ -225,8 +225,9 @@ impl WorkspaceTools {
                     "properties": {
                         "path": { "type": "STRING", "description": "Optional relative file or directory inside the workspace (defaults to '.')." },
                         "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public symbols." },
+                        "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test modules/functions (scope:test)." },
                         "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
-                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 120)." }
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 250)." }
                     }
                 }),
                 requires_approval: false,
@@ -239,8 +240,9 @@ impl WorkspaceTools {
                     "properties": {
                         "target": { "type": "STRING", "description": "Symbol name, Type::method, or file::symbol to analyze." },
                         "max_hops": { "type": "INTEGER", "description": "Optional diffusion hop radius (1..=6, default 3)." },
+                        "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test neighbors (scope:test)." },
                         "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
-                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 120)." }
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 250)." }
                     },
                     "required": ["target"]
                 }),
@@ -622,6 +624,7 @@ impl WorkspaceTools {
             cursor: args.cursor.unwrap_or(0),
             max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
             public_only: args.public_only.unwrap_or(false),
+            exclude_tests: args.exclude_tests.unwrap_or(false),
             ..onyx_scent::ToonPageOptions::default()
         };
         Ok(truncate_utf8(
@@ -642,6 +645,7 @@ impl WorkspaceTools {
         let opts = onyx_scent::ToonPageOptions {
             cursor: args.cursor.unwrap_or(0),
             max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            exclude_tests: args.exclude_tests.unwrap_or(false),
             ..onyx_scent::ToonPageOptions::default()
         };
         let toon = idx
@@ -737,6 +741,7 @@ struct ShellExecArgs {
 struct ScentOutlineArgs {
     path: Option<String>,
     public_only: Option<bool>,
+    exclude_tests: Option<bool>,
     cursor: Option<usize>,
     max_rows: Option<usize>,
 }
@@ -746,6 +751,7 @@ struct ScentOutlineArgs {
 struct ScentImpactArgs {
     target: String,
     max_hops: Option<u8>,
+    exclude_tests: Option<bool>,
     cursor: Option<usize>,
     max_rows: Option<usize>,
 }

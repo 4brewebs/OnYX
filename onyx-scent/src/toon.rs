@@ -3,8 +3,8 @@ use crate::index::WorkspaceIndex;
 use crate::ontology::ScentError;
 
 pub const TOON_HEADER: &str = "@TOON v1";
-pub const DEFAULT_MAX_ROWS: usize = 120;
-pub const DEFAULT_MAX_BYTES: usize = 12 * 1024;
+pub const DEFAULT_MAX_ROWS: usize = 250;
+pub const DEFAULT_MAX_BYTES: usize = 24 * 1024;
 
 /// A single decoded TOON row: `(subject, predicate, object, meta)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub struct ToonPageOptions {
     pub max_rows: usize,
     pub max_bytes: usize,
     pub public_only: bool,
+    pub exclude_tests: bool,
 }
 
 impl Default for ToonPageOptions {
@@ -31,6 +32,7 @@ impl Default for ToonPageOptions {
             max_rows: DEFAULT_MAX_ROWS,
             max_bytes: DEFAULT_MAX_BYTES,
             public_only: false,
+            exclude_tests: false,
         }
     }
 }
@@ -131,16 +133,18 @@ impl WorkspaceIndex {
             .nodes
             .iter()
             .filter(|n| !opts.public_only || n.is_public)
+            .filter(|n| !opts.exclude_tests || !n.is_test)
             .map(|n| ToonRow {
                 subject: n.qualified_name.clone(),
                 predicate: n.kind.as_str().to_string(),
                 object: n.signature.clone(),
                 meta: format!(
-                    "lang:{},lines:{}-{},vis:{}",
+                    "lang:{},lines:{}-{},vis:{},scope:{}",
                     n.lang.as_str(),
                     n.start_line,
                     n.end_line,
-                    if n.is_public { "pub" } else { "priv" }
+                    if n.is_public { "pub" } else { "priv" },
+                    if n.is_test { "test" } else { "src" }
                 ),
             })
             .collect();
@@ -149,7 +153,7 @@ impl WorkspaceIndex {
     }
 
     /// Runs deterministic thermal impact diffusion around `target` and encodes the ranked subgraph
-    /// as `@TOON v1` tuples (`target | epicenter/called_by/calls | neighbor | temp_bp:...,hop:...,lines:...`).
+    /// as `@TOON v1` tuples (`epicenter | relation | neighbor | temp_bp:...,hop:...,lines:...`).
     pub fn impact_toon(
         &self,
         target: &str,
@@ -171,20 +175,33 @@ impl WorkspaceIndex {
                 if opts.public_only && !node.is_public && hit.min_hop > 0 {
                     return None;
                 }
+                if opts.exclude_tests && node.is_test && hit.min_hop > 0 {
+                    return None;
+                }
+                let subject = if epicenters.len() > 1 {
+                    self.arena
+                        .nodes
+                        .get(hit.epicenter_id)
+                        .map_or_else(|| target.trim().to_string(), |e| e.qualified_name.clone())
+                } else {
+                    target.trim().to_string()
+                };
                 let predicate = match hit.dominant_relation {
                     None => "epicenter".to_string(),
                     Some(rel) => rel.as_str().to_string(),
                 };
                 Some(ToonRow {
-                    subject: target.trim().to_string(),
+                    subject,
                     predicate,
                     object: node.qualified_name.clone(),
                     meta: format!(
-                        "temp_bp:{},hop:{},lines:{}-{},sig:{}",
+                        "temp_bp:{},hop:{},lines:{}-{},vis:{},scope:{},sig:{}",
                         hit.temperature_bp,
                         hit.min_hop,
                         node.start_line,
                         node.end_line,
+                        if node.is_public { "pub" } else { "priv" },
+                        if node.is_test { "test" } else { "src" },
                         node.signature
                     ),
                 })

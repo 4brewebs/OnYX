@@ -194,6 +194,7 @@ public class App {
                 max_rows: 1,
                 max_bytes: DEFAULT_MAX_BYTES,
                 public_only: false,
+                exclude_tests: false,
             },
         );
         assert!(page1.contains("# page: next_cursor=1 total=2"), "{page1}");
@@ -207,10 +208,189 @@ public class App {
                 max_rows: 10,
                 max_bytes: DEFAULT_MAX_BYTES,
                 public_only: false,
+                exclude_tests: false,
             },
         );
         assert!(page2.contains("# total: 2"), "{page2}");
         let decoded2 = decode_toon(&page2).unwrap();
         assert_eq!(decoded2, vec![rows[1].clone()]);
+    }
+
+    #[test]
+    fn pub_trait_methods_inherit_public_visibility_and_trait_impact_works() {
+        let dir = TempDir::new("trait_impact");
+        fs::create_dir_all(dir.0.join("src")).unwrap();
+        fs::write(
+            dir.0.join("src/lib.rs"),
+            r#"
+pub trait EventBus {
+    fn push(&mut self, val: i32);
+    fn is_empty(&self) -> bool;
+}
+
+pub struct MemBus {
+    items: Vec<i32>,
+}
+
+pub enum BusMode {
+    Fifo,
+    Strict,
+}
+
+impl EventBus for MemBus {
+    fn push(&mut self, val: i32) {
+        self.items.push(val);
+    }
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+pub fn drive(bus: &mut dyn EventBus) -> bool {
+    bus.push(1);
+    bus.is_empty()
+}
+"#,
+        )
+        .unwrap();
+
+        let mut index = WorkspaceIndex::new();
+        index.index_workspace(&dir.0).unwrap();
+
+        let pub_outline = index.outline_toon(ToonPageOptions {
+            public_only: true,
+            ..ToonPageOptions::default()
+        });
+        assert!(
+            pub_outline.contains("src/lib.rs::EventBus::push"),
+            "{pub_outline}"
+        );
+        assert!(
+            pub_outline.contains("pub struct MemBus { items }"),
+            "{pub_outline}"
+        );
+        assert!(
+            pub_outline.contains("pub enum BusMode { Fifo, Strict }"),
+            "{pub_outline}"
+        );
+
+        let trait_impact = index
+            .impact_toon(
+                "EventBus",
+                &DistillerConfig::default(),
+                ToonPageOptions::default(),
+            )
+            .unwrap();
+        assert!(trait_impact.contains("used_by"), "{trait_impact}");
+        assert!(trait_impact.contains("src/lib.rs::drive"), "{trait_impact}");
+        assert!(
+            trait_impact.contains("src/lib.rs::MemBus::push"),
+            "{trait_impact}"
+        );
+    }
+
+    #[test]
+    fn nested_items_not_promoted_and_method_calls_avoid_cross_file_noise() {
+        let dir = TempDir::new("no_noise");
+        fs::create_dir_all(dir.0.join("src")).unwrap();
+        fs::write(
+            dir.0.join("src/a.rs"),
+            r#"
+pub fn caller() {
+    struct LocalEntry {
+        x: i32,
+    }
+    fn inner_helper() {}
+    let mut items = Vec::new();
+    items.push(LocalEntry { x: 1 });
+    inner_helper();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.0.join("src/b.rs"),
+            r#"
+pub struct OtherBus;
+impl OtherBus {
+    pub fn push(&mut self) {}
+}
+"#,
+        )
+        .unwrap();
+
+        let mut index = WorkspaceIndex::new();
+        index.index_workspace(&dir.0).unwrap();
+        let outline = index.outline_toon(ToonPageOptions::default());
+        assert!(!outline.contains("LocalEntry"), "{outline}");
+        assert!(!outline.contains("inner_helper"), "{outline}");
+
+        let impact = index
+            .impact_toon(
+                "caller",
+                &DistillerConfig::default(),
+                ToonPageOptions::default(),
+            )
+            .unwrap();
+        assert!(!impact.contains("OtherBus::push"), "{impact}");
+    }
+
+    #[test]
+    fn scope_tags_java_annotations_and_cycle_saturation_work() {
+        let dir = TempDir::new("cycles_java");
+        fs::write(
+            dir.0.join("mod.rs"),
+            r#"
+pub struct Attr(u32);
+pub fn ping() { pong(); }
+pub fn pong() { ping(); }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn check_ping() {
+        super::ping();
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.0.join("Runner.java"),
+            r#"
+public class Runner {
+    @Override
+    @SuppressWarnings("unchecked")
+    public void run() {}
+}
+"#,
+        )
+        .unwrap();
+
+        let mut index = WorkspaceIndex::new();
+        index.index_workspace(&dir.0).unwrap();
+
+        let src_only = index.outline_toon(ToonPageOptions {
+            public_only: true,
+            exclude_tests: true,
+            ..ToonPageOptions::default()
+        });
+        assert!(src_only.contains("pub struct Attr(u32)"), "{src_only}");
+        assert!(src_only.contains("Runner.java::Runner::run"), "{src_only}");
+        assert!(!src_only.contains("check_ping"), "{src_only}");
+
+        let all_outline = index.outline_toon(ToonPageOptions::default());
+        assert!(all_outline.contains("check_ping"), "{all_outline}");
+        assert!(all_outline.contains("scope:test"), "{all_outline}");
+
+        let impact = index
+            .impact_toon(
+                "ping",
+                &DistillerConfig::default(),
+                ToonPageOptions::default(),
+            )
+            .unwrap();
+        assert!(impact.contains("mod.rs::pong"), "{impact}");
+        assert!(impact.contains("temp_bp:10000"), "{impact}");
     }
 }

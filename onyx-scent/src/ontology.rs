@@ -88,6 +88,9 @@ impl EntityKind {
 pub enum RelationKind {
     Calls,
     CalledBy,
+    Implements,
+    UsesType,
+    UsedByType,
 }
 
 impl RelationKind {
@@ -96,6 +99,9 @@ impl RelationKind {
         match self {
             Self::Calls => 5_500,
             Self::CalledBy => 9_000,
+            Self::Implements => 8_500,
+            Self::UsesType => 6_500,
+            Self::UsedByType => 8_000,
         }
     }
 
@@ -103,6 +109,9 @@ impl RelationKind {
         match self {
             Self::Calls => "calls",
             Self::CalledBy => "called_by",
+            Self::Implements => "implements",
+            Self::UsesType => "uses_type",
+            Self::UsedByType => "used_by",
         }
     }
 }
@@ -119,6 +128,7 @@ pub struct Entity {
     pub kind: EntityKind,
     pub signature: String,
     pub is_public: bool,
+    pub is_test: bool,
     pub start_line: usize,
     pub end_line: usize,
 }

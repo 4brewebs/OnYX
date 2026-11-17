@@ -20,7 +20,7 @@ impl Default for DistillerConfig {
         Self {
             iterations: 3,
             decay_bp: 7_500,
-            threshold_bp: 2_500,
+            threshold_bp: 1_500,
         }
     }
 }
@@ -29,6 +29,8 @@ impl Default for DistillerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImpactHit {
     pub node_id: usize,
+    /// Origin epicenter node ID that seeded this hit.
+    pub epicenter_id: usize,
     /// Temperature in basis points (`0..=10_000`).
     pub temperature_bp: u16,
     /// Discrete shortest hop count from any epicenter (`0` = epicenter itself).
@@ -51,11 +53,13 @@ pub fn distill_heat(
     let mut temps = vec![0_u16; n];
     let mut hops: Vec<Option<u16>> = vec![None; n];
     let mut rels: Vec<Option<RelationKind>> = vec![None; n];
+    let mut origins: Vec<Option<usize>> = vec![None; n];
 
     for &id in epicenter_ids {
         if id < n {
             temps[id] = MAX_TEMPERATURE_BP;
             hops[id] = Some(0);
+            origins[id] = Some(id);
         }
     }
 
@@ -63,12 +67,18 @@ pub fn distill_heat(
         let mut next_temps = temps.clone();
         let mut next_hops = hops.clone();
         let mut next_rels = rels.clone();
+        let mut next_origins = origins.clone();
 
         for edge in &arena.edges {
             let src_temp = temps[edge.source_id];
             if src_temp == 0 {
                 continue;
             }
+            let hop = hops[edge.source_id].map_or(step, |h| h.saturating_add(1));
+            if next_hops[edge.target_id].is_none_or(|prev| hop < prev) {
+                next_hops[edge.target_id] = Some(hop);
+            }
+
             let propagated =
                 ((u64::from(src_temp) * u64::from(edge.weight_bp) * u64::from(config.decay_bp))
                     / 100_000_000)
@@ -76,15 +86,17 @@ pub fn distill_heat(
 
             if propagated > next_temps[edge.target_id] {
                 next_temps[edge.target_id] = propagated;
-                let hop = hops[edge.source_id].map_or(step, |h| h.saturating_add(1));
-                next_hops[edge.target_id] = Some(hop);
                 next_rels[edge.target_id] = Some(edge.kind);
+                if let Some(origin) = origins[edge.source_id] {
+                    next_origins[edge.target_id] = Some(origin);
+                }
             }
         }
 
         temps = next_temps;
         hops = next_hops;
         rels = next_rels;
+        origins = next_origins;
     }
 
     let mut hits = Vec::new();
@@ -96,6 +108,7 @@ pub fn distill_heat(
         if hop == 0 || temp >= config.threshold_bp {
             hits.push(ImpactHit {
                 node_id: id,
+                epicenter_id: origins[id].unwrap_or(epicenter_ids[0]),
                 temperature_bp: temp,
                 min_hop: hop,
                 dominant_relation: rels[id],
