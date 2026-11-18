@@ -9,7 +9,7 @@ If your reality is different, write your own soul: the contract is what matters.
 The public contract is not yet closed and will change in breaking ways.
 Do not use it where a failure has consequences.
 
-The full project description, including proposed design that is not yet code, is in Spanish in [README_es.md](README_es.md).
+The full project description, including proposed design that is not yet code, is in Spanish in [README_es.md](README_es.md). Contributor and agent rules are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```
 onyx-core           = contracts + tick + deterministic RNG            · 0 dependencies
@@ -69,18 +69,18 @@ Four behaviors are protocol hazards, not implementation bugs: a same-tick outbox
 
 ### `onyx-workspace`
 - `WorkspacePolicy` (canonicalized root sandbox, symlink-safe traversal, ignored dirs, I/O and process-tree timeout limits)
-- `WorkspaceTools` (`fs_read` with `recall_seen`, `fs_list`, `fs_write`, `fs_edit` with line-trimmed fallback, `code_search`, approval-free `git_status` & `git_diff`, `shell_exec` with secret scrubbing and cache invalidation, plus read-only `scent_outline` & `scent_impact` under `feature = "scent"`)
-- `preview_tool_diff` (pure unified diff preview for `fs_write`/`fs_edit`)
-- `WorkspaceMode` (`Plan`, `Build`, `Explore`), `WorkspaceModeHandle`, graph-backed `ws.mode`, `WorkspaceLedgerSystem` (EAV `File` & `ExternalEffect` ledger, `effects_after_tick`, `latest_undoable_effect`, `mark_latest_effect_undone`, `undone_effects`), Git tree checkpoints (`capture_git_tree_checkpoint` supporting unborn `HEAD`, `restore_git_tree_checkpoint` keeping `.git/index` clean), and `WorkspaceToolBridge` (inline `[checkpoint:<head>:<tree>]` tagging for deterministic `ReplayBridge` playback and live `/undo` materialization)
+- `WorkspaceTools` (`fs_read` with `recall_seen`, `fs_list`, `fs_write`, multi-hunk atomic `fs_edit` with line-trimmed fallback & relative re-indentation, `code_search`, approval-free `git_status` & `git_diff`, `load_skill` for on-demand `SKILL.md` / built-in guides, `plan_update`, `shell_exec` with secret scrubbing and cache invalidation, plus read-only `scent_outline` & `scent_impact` under `feature = "scent"` with `max_rows` clamped `1..=500` and `public_only`)
+- `preview_tool_diff` (pure single/multi-hunk unified diff preview for `fs_write`/`fs_edit`)
+- `WorkspaceMode` (`Plan`, `Build`, `Explore`), `WorkspaceModeHandle`, graph-backed `ws.mode` & `ws.plan.text`, `WorkspaceLedgerSystem` (EAV `File` & `ExternalEffect` ledger, `effects_after_tick`, `latest_undoable_effect`, `mark_latest_effect_undone`, `undone_effects`), Git tree checkpoints (`capture_git_tree_checkpoint` supporting unborn `HEAD`, `restore_git_tree_checkpoint` keeping `.git/index` clean), and `WorkspaceToolBridge` (inline `[checkpoint:<head>:<tree>]` tagging for deterministic `ReplayBridge` playback and live `/undo` materialization)
 
 ### `open-onyx` (`openonyx`)
 - Modular CLI & TUI coding agent harness:
   - [`main.rs`](open-onyx/src/main.rs) (`run`, `chat [--resume <dir>]`, `replay`, `inspect`, `rewind [--dry-run]`, `doctor`, `--max-steps <n>`, `--shell-timeout <secs>`)
   - [`command.rs`](open-onyx/src/command.rs) (pure deterministic `CommandSpawnerSystem` handling `/new`, `/mode`, `/undo`, `on_restore` mode sync, and multi-turn `continue_agent`)
-  - [`session.rs`](open-onyx/src/session.rs) (declared logical surfaces `SURFACE_STATUS`/`SURFACE_TRACE`/`SURFACE_APPROVAL` passed via `AgentHost::step_with`, `SessionDriver`, unified `run_session` + `StopPolicy`)
+  - [`session.rs`](open-onyx/src/session.rs) (declared logical surfaces `SURFACE_STATUS`/`SURFACE_TRACE`/`SURFACE_APPROVAL`/`SURFACE_PLAN` passed via `AgentHost::step_with`, `SessionDriver`, unified `run_session` + `StopPolicy`)
   - [`ops.rs`](open-onyx/src/ops.rs) (`inspect`, `rewind` ledger reconciliation, and `doctor`)
-- [`gemini.rs`](open-onyx/src/gemini.rs): `GeminiResponder` (sync), `AsyncGeminiDriver` (non-blocking background HTTP worker + `InFlightGuard`), `~/.onyx/{AGENTS,ONYX}.md` & `<workspace>/{AGENTS,ONYX}.md` instruction loading, *as-of* `supersede` & `ContextBudget`, sequential multi-`functionCall` queueing with `thoughtSignature` propagation, `"user"`/`"system"` turn mapping
-- [`tui.rs`](open-onyx/src/tui.rs): `TuiDriver` (`ratatui` + `crossterm`), `Tab` mode toggle (`[PLAN]`/`[BUILD]` emitted as recorded commands), and colored unified diff preview box on sensitive tool approvals (`y`/`n`)
+- [`gemini.rs`](open-onyx/src/gemini.rs): `GeminiResponder` (sync), `AsyncGeminiDriver` (non-blocking background HTTP worker + `InFlightGuard`), `~/.onyx/{AGENTS,ONYX}.md` & `<workspace>/{AGENTS,ONYX}.md` instruction loading + compact skill catalog (`discover_skills_summary`), *as-of* `supersede` & `ContextBudget`, sequential multi-`functionCall` queueing with `thoughtSignature` propagation, `"user"`/`"system"` turn mapping
+- [`tui.rs`](open-onyx/src/tui.rs): `TuiDriver` (`ratatui` + `crossterm`), full wrapped chat history scrolling (`Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`/`Ctrl+U`/`Ctrl+D`), optional `70%`/`30%` `Live Plan` split panel (`ws.plan.text` when width `>= 100`), `Tab` mode toggle (`[PLAN]`/`[BUILD]` emitted as recorded commands), and colored unified diff preview box on sensitive tool approvals (`y`/`n`)
 
 ### `onyx-example-app` & `onyx-example-agents`
 - `onyx-example-app`: minimal REPL that loads systems/stages, restores/saves snapshots, and processes `agree`, `status`, `exit`
