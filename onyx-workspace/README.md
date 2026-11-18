@@ -1,8 +1,8 @@
 # onyx-workspace
 
-**Workspace coding tools and path sandbox for harnesses built on `onyx-soul-agents`.**
+**Workspace coding tools, EAV side-effect ledger, mode policies, and Git tree checkpoints for harnesses built on `onyx-soul-agents`.**
 
-Provides sandboxed filesystem, search, and shell capabilities that plug directly into `onyx-soul-agents` as a `PlatformDriver` bridge, preserving deterministic `Transcript` recording and diskless replay.
+Provides sandboxed filesystem, Git inspection, AST outline/impact (`onyx-scent`), and shell execution capabilities that plug directly into `onyx-soul-agents` as a `PlatformDriver` bridge, keeping external I/O out of deterministic `OnyxSystem`s and preserving diskless `Transcript` replay.
 
 ## Components
 
@@ -11,23 +11,28 @@ Provides sandboxed filesystem, search, and shell capabilities that plug directly
   - Skips `ignored_dirs` by default (`.git`, `target`, `node_modules`).
   - Enforces default I/O limits (`max_read_bytes = 64 KiB`, `max_output_bytes = 32 KiB`, `command_timeout = 30s`, configurable via `WorkspacePolicy::with_command_timeout`).
 - `WorkspaceTools` & `ToolSchema`:
-  - `fs_read` — read UTF-8 files (optional 1-based `start_line` / `end_line` range), with `recall_seen` session deduplication (`@TOON v1` `unchanged_since_tick:<N>`) invalidated automatically on `fs_write`/`fs_edit`.
+  - `fs_read` — read UTF-8 files (optional 1-based `start_line` / `end_line` range), with `recall_seen` session deduplication (`@TOON v1` `unchanged_since_tick:<N>`) invalidated on `fs_write`, `fs_edit`, `shell_exec`, or `/undo` (`clear_seen_reads`).
   - `fs_list` — list directory entries up to `max_depth` (default `3`), ignoring symlinks and ignored directories.
   - `fs_write` — create or overwrite a UTF-8 file *(requires approval by default)*.
   - `fs_edit` — unique exact replacement (with line-trimmed fallback for whitespace/indentation) in a UTF-8 file *(requires approval by default)*.
   - `code_search` — search for a pattern across workspace files (ignoring symlinks and ignored directories).
-  - `scent_outline` / `scent_impact` *(optional `feature = "scent"`)* — read-only AST outline and semantic call-impact tools backed by `onyx-scent` (`blake3` incremental cache + `@TOON v1` paginated output), validated through `WorkspacePolicy` without requiring human approval or creating mutating `SideEffectLedger` entries.
-  - `shell_exec` — execute a shell command inside `root` with timeout, full process-tree cleanup, concurrent stdout/stderr draining, credential scrubbing (`scrub_secrets`), and output limits *(requires approval by default; `WorkspacePolicy` restricts filesystem tool paths, whereas `shell_exec` runs host OS processes under explicit approval)*.
-  - `WorkspaceTools::schemas()` / `schemas_with_subagents(true)` export JSON parameter schemas suitable for LLM function calling (including optional `spawn_agent` delegation schema).
-- `WorkspaceMode` & `WorkspaceLedgerSystem` (`state.rs`):
-  - Enforces workspace modes (`Plan`, `Build`, `Explore`) and optional `require_read_before_edit` policy.
-  - Tracks `File` nodes (`ws.file.path`, `ws.file.read_tick`, `ws.file.dirty`, `ws.file.write_count`) and the `SideEffectLedger` (`ExternalEffect` nodes with `ws.effect.*` reversibility and `effects_after_tick` query for two-phase `/rewind`).
-  - Captures lightweight Git working-tree checkpoints (`capture_git_tree_checkpoint` via temporary `GIT_INDEX_FILE` + `git add -A` + `git write-tree`, without touching `HEAD` or the user's staging area) and restores them via `restore_git_tree_checkpoint` (`git read-tree --reset -u <tree_sha>`).
-- `WorkspaceToolBridge`:
-  - Implements `PlatformDriver` and wraps an inner driver (e.g., `HeadlessDriver`, `CliApprovalDriver`, or `TuiDriver`).
-  - Enforces `WorkspaceMode`, `require_read_before_edit`, and pre-mutation `PendingCheckpoints` capture before executing `WorkspaceTools` actions and pushing `Reply::observe` or `Reply::tool_error` back into the `EventBus`.
-  - Designed to sit inside `RecordingBridge::wrapping(...)` so tool observations are recorded into the `Transcript` and replayed deterministically without touching disk.
+  - `git_status` — concise `git status --short --branch` inspection *(read-only, no approval required)*.
+  - `git_diff` — unified `git diff --no-color` inspection with optional relative `path` (passed strictly after `--`), `staged`, and `context_lines` *(read-only, no approval required)*.
+  - `scent_outline` / `scent_impact` *(optional `feature = "scent"`)* — read-only AST outline and semantic call-impact tools backed by `onyx-scent` (`blake3` incremental cache + `@TOON v1` paginated output with `public_only` and `exclude_tests`), validated through `WorkspacePolicy` *(no approval required)*.
+  - `shell_exec` — execute a shell command inside `root` with timeout, full process-tree cleanup, concurrent stdout/stderr draining, credential scrubbing (`scrub_secrets`), output limits, and automatic `clear_seen_reads()` *(requires approval by default)*.
+  - `preview_tool_diff(root, tool, args_json, max_lines)` — pure unified diff preview generator for `fs_write` / `fs_edit` reusing the same line-trimmed matching semantics.
+  - `WorkspaceTools::schemas()` / `schemas_with_subagents(true)` — export JSON parameter schemas for LLM function calling.
+- `WorkspaceMode`, `WorkspaceLedgerSystem` & Transactional Undo (`state.rs`):
+  - `WorkspaceMode` (`Plan`, `Build`, `Explore`), thread-safe `WorkspaceModeHandle`, and graph-backed `ws.mode` (`set_workspace_mode`, `graph_workspace_mode`).
+  - Tracks `File` nodes (`ws.file.path`, `ws.file.read_tick`, `ws.file.dirty`) and `ExternalEffect` nodes (`ws.effect.*`, `ws.effect.undone`, `effects_after_tick`, `latest_undoable_effect`, `mark_latest_effect_undone`, `undone_effects`).
+  - Lightweight Git checkpoints: `capture_git_tree_checkpoint` writes a temporary `GIT_INDEX_FILE` (`git add -A` + `git write-tree`, supporting repositories both with commits and with an unborn `HEAD`) without mutating `HEAD` or the user's staging area; `restore_git_tree_checkpoint` runs `git read-tree --reset -u <tree_sha>` and resets `.git/index` back to `HEAD` when `HEAD` exists so untracked files are restored cleanly without remaining staged.
+- `WorkspaceToolBridge` (`bridge.rs`):
+  - Implements `PlatformDriver` wrapping an inner driver (`HeadlessDriver`, `CliApprovalDriver`, or `TuiDriver`).
+  - Reads mode from graph (`ws.mode`, falling back to `WorkspaceModeHandle`) and enforces `require_read_before_edit`.
+  - Captures pre-mutation Git checkpoints for `fs_write`/`fs_edit`, records them in `PendingCheckpoints`, and embeds `[checkpoint:<head>:<tree>]` in `Reply::observe` so `WorkspaceLedgerSystem` reconstructs `ws.effect.tree_sha` deterministically even during diskless `ReplayBridge` playback.
+  - Materializes `undone_effects` in `present()` (avoiding double-execution on resumed graphs via `sync_existing_undos`), keeping `OnyxSystem`s free of disk/Git I/O.
 
 ## Roadmap / TODO (Not Yet Implemented)
 
+- **Multi-hunk atomic `fs_edit` & live `plan_update` state**: multi-hunk `edits` array with relative re-indentation and graph-stored plan steps (`ws.plan.text`).
 - **Streaming / cancellation for `shell_exec`**: allow incremental output capture and cancellation hooks from external adapters without blocking the brain.

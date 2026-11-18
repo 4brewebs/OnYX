@@ -6,8 +6,9 @@ use onyx_soul_agents::{
 use serde_json::Value as JsonValue;
 
 use crate::state::{
-    PendingCheckpoints, WorkspaceMode, WorkspaceVocab, capture_git_tree_checkpoint, file_read_tick,
-    is_file_read, normalize_rel_path,
+    PendingCheckpoints, WorkspaceMode, WorkspaceModeHandle, WorkspaceVocab,
+    capture_git_tree_checkpoint, file_read_tick, graph_workspace_mode, is_file_read,
+    normalize_rel_path, restore_git_tree_checkpoint, undone_effects,
 };
 use crate::tools::WorkspaceTools;
 
@@ -16,16 +17,20 @@ use crate::tools::WorkspaceTools;
 /// bajo `WorkspacePolicy` y devuelve `Reply::observe` / `Reply::tool_error` en el
 /// siguiente `poll`.
 ///
+/// También materializa en disco las intenciones de `/undo` marcadas en el grafo
+/// (`ws.effect.undone`) sin contaminar la reproducción determinista (`ReplayBridge`).
+///
 /// Puede envolver otro `PlatformDriver` (`TuiDriver`, `HeadlessDriver`, etc.).
 pub struct WorkspaceToolBridge {
     vocab: Vocab,
     ws_vocab: Option<WorkspaceVocab>,
-    mode: WorkspaceMode,
+    mode: WorkspaceModeHandle,
     require_read_before_edit: bool,
     checkpoints: Option<PendingCheckpoints>,
     tools: WorkspaceTools,
     inner: Option<Box<dyn PlatformDriver>>,
     dispatched: BTreeSet<(u64, u64)>,
+    applied_undos: BTreeSet<u64>,
     queued: Vec<Reply>,
 }
 
@@ -34,23 +39,47 @@ impl WorkspaceToolBridge {
         Self {
             vocab,
             ws_vocab: None,
-            mode: WorkspaceMode::Build,
+            mode: WorkspaceModeHandle::new(WorkspaceMode::Build),
             require_read_before_edit: false,
             checkpoints: None,
             tools,
             inner: None,
             dispatched: BTreeSet::new(),
+            applied_undos: BTreeSet::new(),
             queued: Vec::new(),
         }
     }
 
-    pub fn with_mode(mut self, mode: WorkspaceMode) -> Self {
+    pub fn with_mode(self, mode: WorkspaceMode) -> Self {
+        self.mode.set(mode);
+        self
+    }
+
+    pub fn with_mode_handle(mut self, mode: WorkspaceModeHandle) -> Self {
         self.mode = mode;
         self
     }
 
+    pub fn mode_handle(&self) -> WorkspaceModeHandle {
+        self.mode.clone()
+    }
+
     pub fn with_workspace_vocab(mut self, ws_vocab: WorkspaceVocab) -> Self {
         self.ws_vocab = Some(ws_vocab);
+        self
+    }
+
+    /// Pre-registra los `/undo` ya aplicados en un grafo restaurado para no
+    /// re-ejecutar `git read-tree` sobre efectos antiguos al reanudar sesión.
+    pub fn sync_existing_undos<G: GraphView + ?Sized>(mut self, graph: &G) -> Self {
+        if let Some(wv) = &self.ws_vocab {
+            for eff in undone_effects(graph, wv) {
+                self.applied_undos.insert(eff.id.0);
+            }
+            if let Some(mode) = graph_workspace_mode(graph, wv) {
+                self.mode.set(mode);
+            }
+        }
         self
     }
 
@@ -75,11 +104,16 @@ impl WorkspaceToolBridge {
         tool: &str,
         args_json: &str,
     ) -> Result<(), String> {
+        let current_mode = self
+            .ws_vocab
+            .as_ref()
+            .and_then(|wv| graph_workspace_mode(graph, wv))
+            .unwrap_or_else(|| self.mode.get());
         let is_mutating = matches!(tool, "fs_write" | "fs_edit" | "shell_exec");
-        if is_mutating && !self.mode.allows_mutation() {
+        if is_mutating && !current_mode.allows_mutation() {
             return Err(format!(
                 "blocked by workspace mode `{:?}`: `{tool}` is not permitted in read-only mode",
-                self.mode
+                current_mode
             ));
         }
 
@@ -113,6 +147,19 @@ impl PlatformDriver for WorkspaceToolBridge {
     }
 
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        if let Some(wv) = &self.ws_vocab {
+            if let Some(mode) = graph_workspace_mode(graph, wv) {
+                self.mode.set(mode);
+            }
+            for eff in undone_effects(graph, wv) {
+                if self.applied_undos.insert(eff.id.0) {
+                    if let Some(tree_sha) = eff.tree_sha.as_deref() {
+                        let _ = restore_git_tree_checkpoint(&self.tools.policy().root, tree_sha);
+                        self.tools.clear_seen_reads();
+                    }
+                }
+            }
+        }
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
@@ -125,26 +172,26 @@ impl PlatformDriver for WorkspaceToolBridge {
             }
             let outcome = match self.validate_policy(graph, &pending.tool, &pending.args) {
                 Ok(()) => {
-                    if matches!(pending.tool.as_str(), "fs_write" | "fs_edit") {
-                        if let Some(cp_map) = &self.checkpoints {
+                    let captured_ckpt = if matches!(pending.tool.as_str(), "fs_write" | "fs_edit") {
+                        let ckpt = capture_git_tree_checkpoint(&self.tools.policy().root);
+                        if let (Some((head, tree)), Some(cp_map)) = (&ckpt, &self.checkpoints) {
                             let parsed: JsonValue =
                                 serde_json::from_str(&pending.args).unwrap_or(JsonValue::Null);
                             let path = parsed
                                 .get("path")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown");
-                            if let Some((head, tree)) =
-                                capture_git_tree_checkpoint(&self.tools.policy().root)
-                            {
-                                if let Ok(mut guard) = cp_map.lock() {
-                                    guard.insert(
-                                        (agent.0, pending.tool.clone(), normalize_rel_path(path)),
-                                        (head, tree),
-                                    );
-                                }
+                            if let Ok(mut guard) = cp_map.lock() {
+                                guard.insert(
+                                    (agent.0, pending.tool.clone(), normalize_rel_path(path)),
+                                    (head.clone(), tree.clone()),
+                                );
                             }
                         }
-                    }
+                        ckpt
+                    } else {
+                        None
+                    };
                     let tick_hint = if pending.tool == "fs_read" {
                         self.ws_vocab.as_ref().and_then(|wv| {
                             let parsed: JsonValue =
@@ -157,6 +204,12 @@ impl PlatformDriver for WorkspaceToolBridge {
                     };
                     self.tools
                         .execute_with_tick(&pending.tool, &pending.args, tick_hint)
+                        .map(|mut out| {
+                            if let Some((head, tree)) = captured_ckpt {
+                                out.push_str(&format!(" [checkpoint:{head}:{tree}]"));
+                            }
+                            out
+                        })
                 }
                 Err(reason) => Err(reason),
             };

@@ -127,6 +127,118 @@ impl AgentGraph {
             .filter(|id| self.get(*id, vocab.state).is_some())
             .count()
     }
+
+    /// Delegado sobre [`append_agent_memory`] para este `AgentGraph`.
+    pub fn append_agent_memory(
+        &mut self,
+        vocab: &Vocab,
+        agent: ConceptId,
+        kind: &str,
+        body: &str,
+        tick: u64,
+    ) -> ConceptId {
+        append_agent_memory(self, vocab, agent, kind, body, tick)
+    }
+
+    /// Delegado sobre [`continue_agent`] para este `AgentGraph`.
+    pub fn continue_agent(
+        &mut self,
+        vocab: &Vocab,
+        agent: ConceptId,
+        user_prompt: &str,
+        extra_steps: i64,
+        tick: u64,
+    ) -> bool {
+        continue_agent(self, vocab, agent, user_prompt, extra_steps, tick)
+    }
+}
+
+/// Añade una entrada de memoria (`kind`, `body`) al agente manteniendo correlativos
+/// `vocab.mem_seq`, `vocab.mem_count` y `vocab.mem_tick`.
+///
+/// Si el agente está en `AgentState::Done` con `vocab.result` no vacío, vuelca primero
+/// ese resultado como `"say"` antes de añadir la nueva entrada (evitando que un
+/// mensaje `system` posterior quede oculto por un `result` previo en la UI).
+pub fn append_agent_memory<G: Graph + ?Sized>(
+    graph: &mut G,
+    vocab: &Vocab,
+    agent: ConceptId,
+    kind: &str,
+    body: &str,
+    tick: u64,
+) -> ConceptId {
+    if kind != "say" {
+        if let Some(Value::Text(s)) = graph.get(agent, vocab.state) {
+            if AgentState::parse(&s) == Some(AgentState::Done) {
+                if let Some(Value::Text(prev_res)) = graph.get(agent, vocab.result) {
+                    if !prev_res.is_empty() {
+                        graph.set(agent, vocab.result, Value::Text(String::new()));
+                        append_agent_memory(graph, vocab, agent, "say", &prev_res, tick);
+                    }
+                }
+            }
+        }
+    }
+    let next_seq = match graph.get(agent, vocab.mem_count) {
+        Some(Value::Int(n)) => n.saturating_add(1),
+        _ => 1,
+    };
+    let mem = graph.create();
+    graph.set(mem, vocab.mem_seq, Value::Int(next_seq));
+    graph.set(mem, vocab.mem_kind, Value::Text(kind.to_string()));
+    graph.set(mem, vocab.mem_text, Value::Text(body.to_string()));
+    graph.set(
+        mem,
+        vocab.mem_tick,
+        Value::Int(i64::try_from(tick).unwrap_or(i64::MAX)),
+    );
+    graph.relate(agent, vocab.rel_memory, mem);
+    graph.set(agent, vocab.mem_count, Value::Int(next_seq));
+    mem
+}
+
+/// Reactiva un agente en estado terminal (`Done` o `Failed`) para un nuevo turno de conversación:
+/// 1. Si `vocab.result` no está vacío y el estado era `Done`, vuelca `result` a `rel_memory` como `"say"`.
+/// 2. Anexa `user_prompt` a `rel_memory` como `"user"`.
+/// 3. Incrementa `vocab.max_steps = current_steps + extra_steps.max(1)` manteniendo `vocab.steps` monótono
+///    para que `request = steps + 1` nunca colisione con peticiones previas.
+/// 4. Limpia `vocab.result`, pone `vocab.pending = 0` y transiciona `vocab.state` a `AgentState::Idle`.
+pub fn continue_agent<G: Graph + ?Sized>(
+    graph: &mut G,
+    vocab: &Vocab,
+    agent: ConceptId,
+    user_prompt: &str,
+    extra_steps: i64,
+    tick: u64,
+) -> bool {
+    if !graph.exists(agent) {
+        return false;
+    }
+    let state = match graph.get(agent, vocab.state) {
+        Some(Value::Text(s)) => AgentState::parse(&s),
+        _ => None,
+    };
+    let Some(state) = state else {
+        return false;
+    };
+    if !state.is_terminal() {
+        return false;
+    }
+    append_agent_memory(graph, vocab, agent, "user", user_prompt, tick);
+    let current_steps = match graph.get(agent, vocab.steps) {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    let next_max = current_steps.saturating_add(extra_steps.max(1));
+    graph.set(agent, vocab.max_steps, Value::Int(next_max));
+    graph.set(agent, vocab.result, Value::Text(String::new()));
+    graph.set(agent, vocab.pending, Value::Int(0));
+    graph.set(
+        agent,
+        vocab.state,
+        Value::Text(AgentState::Idle.as_str().into()),
+    );
+    true
 }
 
 impl AttrRegistry for AgentGraph {
