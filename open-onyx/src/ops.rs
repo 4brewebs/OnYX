@@ -1,61 +1,370 @@
 //! Operaciones offline de diagnóstico e inspección (`inspect`, `rewind`, `doctor`).
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSnapshotStore, GraphView, HeadlessDriver, SnapshotStore,
-    Transcript,
+    AgentConfig, AgentGraph, Graph, GraphView, HeadlessDriver, Transcript, Value,
 };
-use onyx_workspace::{effects_after_tick, restore_git_tree_checkpoint};
+use onyx_workspace::{
+    RecordedEffect, all_recorded_effects, effects_after_tick, graph_workspace_mode,
+    graph_workspace_plan, is_effect_undone, restore_git_tree_checkpoint,
+};
+use serde::Serialize;
+use serde_json::json;
 
+use crate::pack::{PackSnapshotStore, SnapshotSource};
 use crate::session::build_host;
 
-pub fn run_inspect(
+#[derive(Serialize)]
+struct InspectGitCheckpointJson {
+    tree_sha: String,
+    head_sha: Option<String>,
+    tool: String,
+    target: String,
+}
+
+#[derive(Serialize)]
+struct InspectMilestoneJson {
+    tick: u64,
+    tag: String,
+    stored_bytes: u64,
+    raw_bytes: u64,
+    checksum_fnv1a: String,
+    source: &'static str,
+    git_checkpoint: Option<InspectGitCheckpointJson>,
+}
+
+#[derive(Serialize)]
+struct InspectMemoryJson {
+    kind: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct InspectPendingApprovalJson {
+    tool: String,
+    args: String,
+}
+
+#[derive(Serialize)]
+struct InspectAgentJson {
+    id: u64,
+    name: String,
+    state: Option<&'static str>,
+    request: u64,
+    goal: String,
+    tools: Vec<String>,
+    pending_approval: Option<InspectPendingApprovalJson>,
+    result: Option<String>,
+    memory: Vec<InspectMemoryJson>,
+}
+
+#[derive(Serialize)]
+struct InspectRecordedCheckpointJson {
+    concept_id: u64,
+    tick: u64,
+    agent: u64,
+    tool: String,
+    target: String,
+    reversibility: String,
+    summary: String,
+    head_sha: Option<String>,
+    tree_sha: Option<String>,
+    undone: bool,
+}
+
+#[derive(Serialize)]
+struct InspectLinkJson {
+    rel: String,
+    target: u64,
+}
+
+#[derive(Serialize)]
+struct InspectConceptJson {
+    id: u64,
+    props: BTreeMap<String, serde_json::Value>,
+    links: Vec<InspectLinkJson>,
+}
+
+#[derive(Serialize)]
+struct InspectSnapshotJson {
+    tick: u64,
+    tag: String,
+    raw_bytes: u64,
+    stored_bytes: u64,
+    checksum_fnv1a: String,
+    total_concepts: usize,
+    workspace_mode: Option<&'static str>,
+    live_plan: Option<String>,
+    agents: Vec<InspectAgentJson>,
+    checkpoints: Vec<InspectRecordedCheckpointJson>,
+    concepts: Vec<InspectConceptJson>,
+}
+
+pub fn render_inspect(
     dir: &Path,
     tick: Option<u64>,
+    list: bool,
+    json_output: bool,
     config: AgentConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let store = AgentSnapshotStore::new(dir);
+) -> Result<String, Box<dyn std::error::Error>> {
+    let store = PackSnapshotStore::new(dir);
+
+    if list {
+        return render_inspect_list(dir, &store, json_output, config);
+    }
+
     let target_tick = match tick {
-        Some(t) => t,
+        Some(t) => {
+            if !store.has_tick(t) {
+                return Err(format!(
+                    "snapshot for tick {t} not found in `{}` (available milestone ticks: {:?}; use --list)",
+                    dir.display(),
+                    store.ticks()
+                )
+                .into());
+            }
+            t
+        }
         None => store
             .latest_tick()
             .ok_or("no snapshots found in directory")?,
     };
-    let mut host = AgentHost::builder(1)
-        .config(config)
-        .store(Box::new(store))
-        .build()?;
+
+    let dir_buf = dir.to_path_buf();
+    let (mut host, ws_vocab) = build_host(1, config, Some(&dir_buf), None)?;
     host.request_restore(&target_tick.to_string());
     host.step(&mut HeadlessDriver::new());
 
-    println!("=== openOnyx Graph Snapshot @ tick {target_tick} ===");
+    let meta = store.get_meta(target_tick);
+    let tag = meta.map(|m| m.tag.as_str()).unwrap_or("unknown");
+
+    if json_output {
+        let concepts_ids = host.graph().query(&[]);
+        let agents = host
+            .agents()
+            .into_iter()
+            .map(|id| {
+                let view = host.view(id);
+                InspectAgentJson {
+                    id: id.0,
+                    name: view.name,
+                    state: host.agent_state(id).map(|s| s.as_str()),
+                    request: view.request,
+                    goal: view.goal,
+                    tools: view.tools,
+                    pending_approval: view.pending_approval.map(|p| InspectPendingApprovalJson {
+                        tool: p.tool,
+                        args: p.args,
+                    }),
+                    result: host.result(id),
+                    memory: view
+                        .memory
+                        .into_iter()
+                        .map(|(kind, text)| InspectMemoryJson { kind, text })
+                        .collect(),
+                }
+            })
+            .collect();
+
+        let checkpoints = all_recorded_effects(host.graph(), &ws_vocab)
+            .into_iter()
+            .map(|eff| {
+                let undone = is_effect_undone(host.graph(), &ws_vocab, eff.id);
+                InspectRecordedCheckpointJson {
+                    concept_id: eff.id.0,
+                    tick: eff.tick,
+                    agent: eff.agent,
+                    tool: eff.tool,
+                    target: eff.target,
+                    reversibility: eff.reversibility,
+                    summary: eff.summary,
+                    head_sha: eff.head_sha,
+                    tree_sha: eff.tree_sha,
+                    undone,
+                }
+            })
+            .collect();
+
+        let concepts = concepts_ids
+            .iter()
+            .map(|id| {
+                let mut props = BTreeMap::new();
+                for (name, val) in host.graph().props(*id) {
+                    let jv = match val {
+                        Value::Bool(b) => json!(b),
+                        Value::Int(i) => json!(i),
+                        Value::Float(f) => json!(f),
+                        Value::Text(s) => json!(s),
+                        Value::Concept(c) => json!({ "concept": c.0 }),
+                    };
+                    props.insert(name, jv);
+                }
+                let links = host
+                    .graph()
+                    .links(*id)
+                    .into_iter()
+                    .map(|(rel, to)| InspectLinkJson { rel, target: to.0 })
+                    .collect();
+                InspectConceptJson {
+                    id: id.0,
+                    props,
+                    links,
+                }
+            })
+            .collect();
+
+        let doc = InspectSnapshotJson {
+            tick: target_tick,
+            tag: tag.to_string(),
+            raw_bytes: meta.map(|m| m.raw_len).unwrap_or(0),
+            stored_bytes: meta.map(|m| m.stored_len).unwrap_or(0),
+            checksum_fnv1a: format!("{:016x}", meta.map(|m| m.checksum).unwrap_or(0)),
+            total_concepts: concepts_ids.len(),
+            workspace_mode: graph_workspace_mode(host.graph(), &ws_vocab).map(|m| m.as_label()),
+            live_plan: graph_workspace_plan(host.graph(), &ws_vocab),
+            agents,
+            checkpoints,
+            concepts,
+        };
+        return Ok(serde_json::to_string_pretty(&doc)?);
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== openOnyx Graph Snapshot @ tick {target_tick} [{tag}] ==="
+    );
     let concepts = host.graph().query(&[]);
-    println!("Total concepts: {}", concepts.len());
+    let _ = writeln!(out, "Total concepts: {}", concepts.len());
     for id in host.agents() {
         let view = host.view(id);
-        println!(
+        let _ = writeln!(
+            out,
             "\nAgent {} (`{}`) state={:?} req={}",
             id.0,
             view.name,
             host.agent_state(id),
             view.request
         );
-        println!("  goal: {}", view.goal);
-        println!("  tools: {:?}", view.tools);
-        println!("  memory ({} entries):", view.memory.len());
+        let _ = writeln!(out, "  goal: {}", view.goal);
+        let _ = writeln!(out, "  tools: {:?}", view.tools);
+        let _ = writeln!(out, "  memory ({} entries):", view.memory.len());
         for (k, body) in &view.memory {
             let preview: String = body.chars().take(120).collect();
-            println!("    - [{k}] {preview}");
+            let _ = writeln!(out, "    - [{k}] {preview}");
         }
         if let Some(p) = &view.pending_approval {
-            println!("  pending_approval: {} {}", p.tool, p.args);
+            let _ = writeln!(out, "  pending_approval: {} {}", p.tool, p.args);
         }
         if let Some(res) = host.result(id) {
-            println!("  result: {res}");
+            let _ = writeln!(out, "  result: {res}");
         }
+    }
+    Ok(out)
+}
+
+fn render_inspect_list(
+    dir: &Path,
+    store: &PackSnapshotStore,
+    json_output: bool,
+    config: AgentConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let entries = store.entries();
+    if entries.is_empty() {
+        return Err("no snapshots found in directory".into());
+    }
+
+    let dir_buf = dir.to_path_buf();
+    let latest = entries.last().expect("non-empty entries").tick;
+    let mut effects_by_tick: BTreeMap<u64, RecordedEffect> = BTreeMap::new();
+    if let Ok((mut probe_host, probe_ws_vocab)) = build_host(1, config, Some(&dir_buf), None) {
+        probe_host.request_restore(&latest.to_string());
+        probe_host.step(&mut HeadlessDriver::new());
+        for eff in all_recorded_effects(probe_host.graph(), &probe_ws_vocab) {
+            if eff.tree_sha.is_some() {
+                effects_by_tick.insert(eff.tick, eff);
+            }
+        }
+    }
+
+    if json_output {
+        let items: Vec<InspectMilestoneJson> = entries
+            .iter()
+            .map(|meta| {
+                let git_checkpoint = effects_by_tick.get(&meta.tick).and_then(|eff| {
+                    eff.tree_sha
+                        .as_ref()
+                        .map(|tree_sha| InspectGitCheckpointJson {
+                            tree_sha: tree_sha.clone(),
+                            head_sha: eff.head_sha.clone(),
+                            tool: eff.tool.clone(),
+                            target: eff.target.clone(),
+                        })
+                });
+                InspectMilestoneJson {
+                    tick: meta.tick,
+                    tag: meta.tag.clone(),
+                    stored_bytes: meta.stored_len,
+                    raw_bytes: meta.raw_len,
+                    checksum_fnv1a: format!("{:016x}", meta.checksum),
+                    source: match meta.source {
+                        SnapshotSource::PackFrame { .. } => "pack",
+                        SnapshotSource::LegacyBin(_) => "legacy_bin",
+                    },
+                    git_checkpoint,
+                }
+            })
+            .collect();
+        return Ok(serde_json::to_string_pretty(&items)?);
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== openOnyx Milestones in `{}` ({} snapshots) ===",
+        dir.display(),
+        entries.len()
+    );
+    let _ = writeln!(
+        out,
+        "  {:>4}  {:<22} {:>9}  {:>9}  {:<16}  GIT CHECKPOINT",
+        "TICK", "TAG", "STORED", "RAW", "CHECKSUM"
+    );
+    for meta in &entries {
+        let ckpt = effects_by_tick
+            .get(&meta.tick)
+            .and_then(|eff| {
+                eff.tree_sha.as_deref().map(|sha| {
+                    let short: String = sha.chars().take(12).collect();
+                    format!("{}:{} ({short})", eff.tool, eff.target)
+                })
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            out,
+            "  {:>4}  {:<22} {:>7} B  {:>7} B  {:016x}  {}",
+            meta.tick, meta.tag, meta.stored_len, meta.raw_len, meta.checksum, ckpt
+        );
+    }
+    Ok(out)
+}
+
+pub fn run_inspect(
+    dir: &Path,
+    tick: Option<u64>,
+    list: bool,
+    json: bool,
+    config: AgentConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rendered = render_inspect(dir, tick, list, json, config)?;
+    print!("{rendered}");
+    if !rendered.ends_with('\n') {
+        println!();
     }
     Ok(())
 }
@@ -68,7 +377,7 @@ pub fn reconcile_rewind_effects(
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir_buf = dir.to_path_buf();
-    let store = AgentSnapshotStore::new(dir);
+    let store = PackSnapshotStore::new(dir);
     let Some(latest) = store.latest_tick() else {
         return Ok(());
     };
@@ -209,95 +518,102 @@ pub fn run_doctor(
     }
 
     if let Some(dir) = snapshot_dir {
-        let store = AgentSnapshotStore::new(dir);
-        match fs::read_dir(dir) {
-            Err(e) => report
+        if let Err(e) = fs::read_dir(dir) {
+            report
                 .errors
-                .push(format!("cannot read snapshot dir `{}`: {e}", dir.display())),
-            Ok(entries) => {
-                let mut ticks = Vec::new();
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if let Some(stem) = name
-                        .strip_prefix("tick-")
-                        .and_then(|s| s.strip_suffix(".bin"))
-                    {
-                        if let Ok(t) = stem.parse::<u64>() {
-                            ticks.push(t);
+                .push(format!("cannot read snapshot dir `{}`: {e}", dir.display()));
+        } else {
+            let store = PackSnapshotStore::new(dir);
+            if let Some(err) = store.corruption_error() {
+                report.errors.push(err.to_string());
+            }
+            if store.truncated_tail_bytes() > 0 {
+                report.warnings.push(format!(
+                    "snapshots.onyxpack has {} truncated tail byte(s) from an interrupted write (earlier milestones intact)",
+                    store.truncated_tail_bytes()
+                ));
+            }
+            let entries = store.entries();
+            if entries.is_empty() {
+                report
+                    .warnings
+                    .push(format!("no snapshots found in `{}`", dir.display()));
+            } else {
+                let mut bad_snaps = 0usize;
+                for meta in &entries {
+                    match store.load_tick(meta.tick) {
+                        Ok(bytes) => {
+                            if !bytes.starts_with(b"ONYXAG") {
+                                bad_snaps += 1;
+                                report.errors.push(format!(
+                                    "snapshot tick {} [{}] missing ONYXAG header",
+                                    meta.tick, meta.tag
+                                ));
+                            } else {
+                                let mut probe = AgentGraph::new();
+                                if let Err(e) = probe.import(&bytes) {
+                                    bad_snaps += 1;
+                                    report.errors.push(format!(
+                                        "snapshot tick {} [{}] corrupt AgentGraph payload: {e}",
+                                        meta.tick, meta.tag
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            bad_snaps += 1;
+                            report.errors.push(format!(
+                                "snapshot tick {} [{}] load error: {e}",
+                                meta.tick, meta.tag
+                            ));
                         }
                     }
                 }
-                ticks.sort();
-                if ticks.is_empty() {
-                    report.warnings.push(format!(
-                        "no tick-*.bin snapshots found in `{}`",
+                if bad_snaps == 0 {
+                    report.checks.push(format!(
+                        "all {} snapshots in `{}` carry ONYXAG headers and load cleanly",
+                        entries.len(),
                         dir.display()
                     ));
-                } else {
-                    let mut bad_snaps = 0usize;
-                    for &t in &ticks {
-                        let key = t.to_string();
-                        match store.load(&key) {
-                            Ok(bytes) if bytes.starts_with(b"ONYXAG") => {}
-                            Ok(_) => {
-                                bad_snaps += 1;
-                                report
-                                    .errors
-                                    .push(format!("snapshot tick-{t}.bin missing ONYXAG header"));
-                            }
-                            Err(e) => {
-                                bad_snaps += 1;
-                                report
-                                    .errors
-                                    .push(format!("snapshot tick-{t}.bin load error: {e}"));
-                            }
-                        }
-                    }
-                    if bad_snaps == 0 {
-                        report.checks.push(format!(
-                            "all {} snapshots in `{}` carry ONYXAG headers and load cleanly",
-                            ticks.len(),
-                            dir.display()
-                        ));
-                    }
-                    if let Some(&latest) = ticks.last() {
-                        match build_host(1, AgentConfig::default(), Some(dir), None) {
-                            Ok((mut host, ws_vocab)) => {
-                                host.request_restore(&latest.to_string());
-                                host.step(&mut HeadlessDriver::new());
-                                let effects = effects_after_tick(host.graph(), &ws_vocab, 0);
-                                let mut checked_shas = 0usize;
-                                for eff in effects {
-                                    if let Some(sha) = eff.tree_sha {
-                                        checked_shas += 1;
-                                        if git_ok {
-                                            let is_tree = Command::new("git")
-                                                .args(["cat-file", "-t", &sha])
-                                                .current_dir(workspace)
-                                                .output()
-                                                .map(|o| {
-                                                    o.status.success()
-                                                        && String::from_utf8_lossy(&o.stdout).trim()
-                                                            == "tree"
-                                                })
-                                                .unwrap_or(false);
-                                            if !is_tree {
-                                                report.errors.push(format!(
-                                                    "ledger tree_sha `{sha}` (tick {}) missing in git object database",
-                                                    eff.tick
-                                                ));
-                                            }
+                }
+                if let Some(latest_meta) = entries.last() {
+                    let latest = latest_meta.tick;
+                    match build_host(1, AgentConfig::default(), Some(dir), None) {
+                        Ok((mut host, ws_vocab)) => {
+                            host.request_restore(&latest.to_string());
+                            host.step(&mut HeadlessDriver::new());
+                            let effects = effects_after_tick(host.graph(), &ws_vocab, 0);
+                            let mut checked_shas = 0usize;
+                            for eff in effects {
+                                if let Some(sha) = eff.tree_sha {
+                                    checked_shas += 1;
+                                    if git_ok {
+                                        let is_tree = Command::new("git")
+                                            .args(["cat-file", "-t", &sha])
+                                            .current_dir(workspace)
+                                            .output()
+                                            .map(|o| {
+                                                o.status.success()
+                                                    && String::from_utf8_lossy(&o.stdout).trim()
+                                                        == "tree"
+                                            })
+                                            .unwrap_or(false);
+                                        if !is_tree {
+                                            report.errors.push(format!(
+                                                "ledger tree_sha `{sha}` (tick {}) missing in git object database",
+                                                eff.tick
+                                            ));
                                         }
                                     }
                                 }
-                                report.checks.push(format!(
-                                    "verified {checked_shas} ledger tree checkpoint(s) at tick {latest}"
-                                ));
                             }
-                            Err(e) => report
-                                .errors
-                                .push(format!("failed to inspect snapshot ledger: {e}")),
+                            report.checks.push(format!(
+                                "verified {checked_shas} ledger tree checkpoint(s) at tick {latest}"
+                            ));
                         }
+                        Err(e) => report
+                            .errors
+                            .push(format!("failed to inspect snapshot ledger: {e}")),
                     }
                 }
             }

@@ -2,7 +2,7 @@
 
 **CLI and TUI coding agent harness powered by OnYX (`onyx-soul-agents` + `onyx-workspace`).**
 
-`openonyx` connects an external LLM responder (`GeminiResponder` / `AsyncGeminiDriver` via Google AI Studio REST API) and an interactive terminal UI (`TuiDriver` via `ratatui` + `crossterm`) to OnYX's deterministic `AgentHost` runtime, with multi-turn sessions, project instruction loading (`ONYX.md` / `AGENTS.md`), declared logical surfaces, `Plan`/`Build` mode toggling, transactional Git `/undo`, transcript recording (`ONYXTR1` / `ONYXTR2`), per-tick graph snapshots (`--resume`), and Git-reconciled time-travel `rewind`.
+`openonyx` connects an external LLM responder (`GeminiResponder` / `AsyncGeminiDriver` via Google AI Studio REST API) and an interactive terminal UI (`TuiDriver` via `ratatui` + `crossterm`) to OnYX's deterministic `AgentHost` runtime, with multi-turn sessions, project instruction loading (`ONYX.md` / `AGENTS.md`), declared logical surfaces, `Plan`/`Build` mode toggling, transactional Git `/undo`, transcript recording (`ONYXTR1` / `ONYXTR2`), milestone graph snapshots stored in compressed append-only `snapshots.onyxpack` (`--resume`), and Git-reconciled time-travel `rewind`.
 
 ## Environment Variables
 
@@ -21,59 +21,67 @@ Loaded files are filtered through `scrub_secrets`, combined with the compact on-
 ## Usage
 
 ```text
-openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>] [--resume <dir>]
-openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]
-openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]
-openonyx inspect <snapshot_dir> [--tick <n>]
+openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]
+openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
+openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
+openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]
 openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
 ```
 
 ### Examples
 
-Run a single goal and save both the transcript and per-tick graph snapshots:
+Run a single goal and save both the transcript (`--save-transcript` or `--record`) and milestone graph snapshots (`snapshots.onyxpack`):
 
 ```sh
-cargo run -p open-onyx -- run "summarize the workspace crates" --save-transcript session.tr --snapshot-dir snaps
+cargo run -p open-onyx -- run "summarize the workspace crates" --record session.tr --snapshot-dir snaps
 ```
 
 Start an interactive multi-turn TUI chat session:
 
 ```sh
-cargo run -p open-onyx -- chat --snapshot-dir snaps_chat --save-transcript chat.tr
+cargo run -p open-onyx -- chat --snapshot-dir snaps_chat --record chat.tr
 ```
 
-Resume an existing chat session from the latest `tick-*.bin` snapshot (automatically continues writing new snapshots into the same directory unless `--snapshot-dir` overrides it):
+Resume an existing chat session from the latest milestone snapshot in `snapshots.onyxpack` (with automatic fallback to legacy `tick-*.bin` files; continues writing new milestones into the same directory unless `--snapshot-dir` overrides it):
 
 ```sh
-cargo run -p open-onyx -- chat --resume snaps_chat --save-transcript chat_resumed.tr
+cargo run -p open-onyx -- chat --resume snaps_chat --record chat_resumed.tr
 ```
 
-Deterministically replay a saved transcript (no API key and no disk mutations) and write snapshots:
+Deterministically replay a saved transcript (no API key and no disk mutations) and write milestone snapshots:
 
 ```sh
 cargo run -p open-onyx -- replay chat.tr --snapshot-dir snaps_replay
 ```
 
-Inspect the EAV `AgentGraph` at the latest tick or at a specific tick:
+List recorded milestones (tick, milestone tag, compressed/raw size, FNV-1a checksum, Git tree checkpoint) or inspect any milestone graph as human-readable text or JSON:
 
 ```sh
+cargo run -p open-onyx -- inspect snaps_chat --list
+cargo run -p open-onyx -- inspect snaps_chat --list --json
 cargo run -p open-onyx -- inspect snaps_chat
-cargo run -p open-onyx -- inspect snaps_chat --tick 2
+cargo run -p open-onyx -- inspect snaps_chat --tick 4 --json
 ```
 
-Rewind to tick `2` from a snapshot directory (inspecting orphaned side effects and restoring the workspace Git tree checkpoint unless `--dry-run` is set) and resume deterministically from a transcript:
+Rewind to tick `4` (or the nearest prior milestone tick `<= N` automatically) from a snapshot directory, inspecting orphaned side effects and restoring the workspace Git tree checkpoint unless `--dry-run` is set, and resume deterministically from a transcript:
 
 ```sh
-cargo run -p open-onyx -- rewind snaps_chat 2 --dry-run
-cargo run -p open-onyx -- rewind snaps_chat 2 --transcript chat.tr
+cargo run -p open-onyx -- rewind snaps_chat 4 --dry-run
+cargo run -p open-onyx -- rewind snaps_chat 4 --transcript chat.tr
 ```
 
-Audit Git worktree health, stray artifacts, snapshots, transcript headers, and ledger `tree_sha` objects:
+Audit Git worktree health, stray artifacts, `snapshots.onyxpack` integrity (including FNV-1a checksums, `ONYXAG` payloads, and crash-truncated tail detection), legacy `tick-*.bin` snapshots, transcript headers, and ledger `tree_sha` objects:
 
 ```sh
 cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
 ```
+
+## Milestone Snapshots & `snapshots.onyxpack`
+
+When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapshots only at meaningful graph transitions (tagged as `init`, `spawn`, `approval:<tool>`, `tool:<tool>`, `tool_error:<tool>`, `cmd:/undo`, `cmd:/mode ...`, `cmd:/new`, `settled`, `failed`, `exit`, plus optional `--snapshot-every <n>` `periodic` frames) instead of dumping full uncompressed `tick-*.bin` files on idle or internal micro-ticks.
+
+`PackSnapshotStore` writes canonical `ONYXAG\x01\0` graph payloads into an append-only compressed container `<dir>/snapshots.onyxpack` (`ONYXPK1` frames with zlib compression, raw/stored lengths, and 64-bit FNV-1a checksums). Interrupted writes that leave a truncated tail frame are ignored safely on read and healed automatically on the next append, legacy `tick-*.bin` directories remain readable via transparent fallback, and `--max-snapshots <n>` is available as an opt-in retention bound (disabled by default so full session history stays rewindable).
 
 ## TUI Controls & Commands (`chat`)
 
@@ -91,10 +99,11 @@ cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
 
 `open-onyx` keeps external concurrency, HTTP, terminal I/O, and disk mutation strictly inside `PlatformDriver` adapters, while graph state transitions live in deterministic `OnyxSystem`s:
 
-- [`src/main.rs`](src/main.rs): CLI parsing (`CliArgs`, `Mode`, `parse_args_from`), driver stack composition, system registration (`SubagentSystem`, `WorkspaceLedgerSystem`, `CommandSpawnerSystem`), and delegation to `run_session` / `ops`.
+- [`src/main.rs`](src/main.rs): CLI parsing (`CliArgs`, `Mode`, `parse_args_from`), driver stack composition, system registration (`SubagentSystem`, `WorkspaceLedgerSystem`, `CommandSpawnerSystem`, `MilestoneSnapshotSystem`), and delegation to `run_session` / `ops`.
 - [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `/new`, `/mode`, `/undo` (`mark_latest_effect_undone`), `on_restore` mode sync, and multi-turn `continue_agent`.
-- [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`, `SURFACE_PLAN` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `build_host` / `build_host_with_checkpoints`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
-- [`src/ops.rs`](src/ops.rs): offline snapshot & ledger utilities (`run_inspect`, `reconcile_rewind_effects`, `run_doctor`).
+- [`src/pack.rs`](src/pack.rs): `PackSnapshotStore` (`SnapshotStore` implementation over append-only zlib-compressed `snapshots.onyxpack` with FNV-1a verification, truncated-tail crash tolerance, opt-in `--max-snapshots` compaction, and legacy `tick-*.bin` fallback) and `MilestoneSnapshotSystem` (deterministic `OnyxSystem` requesting snapshots on meaningful transitions and `--snapshot-every`).
+- [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`, `SURFACE_PLAN` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `build_host` / `build_host_with_options`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
+- [`src/ops.rs`](src/ops.rs): offline snapshot & ledger utilities (`render_inspect` / `run_inspect` with `--list` and `--json`, `reconcile_rewind_effects`, `run_doctor`).
 - [`src/gemini.rs`](src/gemini.rs): `GeminiResponder` (sync, for `run`/`rewind`), `AsyncGeminiDriver` (non-blocking background HTTP worker + `InFlightGuard`, wrapped by `RecordingBridge` for `chat`), `load_project_instructions` + on-demand skills catalog, *as-of* read `superseded` projection + `ContextBudget` pruning (preserving errors, denials, and `@TOON v1` outputs), sequential multi-`functionCall` queueing, `"user"`/`"system"` turn mapping, and `thoughtSignature` inheritance.
 - [`src/tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`ratatui` + `crossterm`) rendering header + `[PLAN]`/`[BUILD]` badge, wrapped history navigation (`visual_row_count` + `apply_scroll_key`), optional `70%`/`30%` `Live Plan` side panel (`ws.plan.text`), colored trace entries, and unified diff approval panel. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` retain 0 external dependencies.
 

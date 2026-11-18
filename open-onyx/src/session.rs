@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, EventBus, Graph, GraphView,
-    OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder, SubagentSystem,
+    AgentConfig, AgentHost, AgentSpec, AgentState, EventBus, Graph, GraphView, OnyxSystem,
+    PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder, SubagentSystem,
     SurfaceBinding, SurfaceId, Vocab, pending_approvals,
 };
 use onyx_workspace::{PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceTools, WorkspaceVocab};
 
+use crate::pack::{MilestoneSnapshotSystem, PackSnapshotStore};
 use crate::tui::TuiHandle;
 
 pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
@@ -85,6 +86,8 @@ pub struct SessionOptions {
     pub snapshot_dir: Option<PathBuf>,
     pub save_transcript: Option<PathBuf>,
     pub save_step_snapshots: bool,
+    pub snapshot_every: Option<u64>,
+    pub max_snapshots: Option<usize>,
 }
 
 pub enum StopPolicy {
@@ -112,22 +115,17 @@ pub fn run_session<D: SessionDriver>(
     match stop {
         StopPolicy::Settled { max_ticks } => {
             for _ in 0..max_ticks {
-                if opts.save_step_snapshots && opts.snapshot_dir.is_some() {
-                    host.request_snapshot(&host.ticks().to_string());
-                }
                 let surfaces = active_surfaces(host.graph(), &host.vocab());
                 host.step_with(driver, &surfaces);
                 if host.is_settled() {
                     break;
                 }
             }
+            save_latest_snapshot(opts, host);
             save_transcript_if_configured(opts, driver)?;
         }
         StopPolicy::ReplayExhausted { max_ticks } => {
             for _ in 0..max_ticks {
-                if opts.save_step_snapshots && opts.snapshot_dir.is_some() {
-                    host.request_snapshot(&host.ticks().to_string());
-                }
                 let surfaces = active_surfaces(host.graph(), &host.vocab());
                 host.step_with(driver, &surfaces);
                 if driver.replay_remaining() == Some(0)
@@ -136,6 +134,7 @@ pub fn run_session<D: SessionDriver>(
                     break;
                 }
             }
+            save_latest_snapshot(opts, host);
         }
         StopPolicy::Quit {
             quit,
@@ -157,9 +156,6 @@ pub fn run_session<D: SessionDriver>(
                 let can_advance = !host.is_settled() && !all_blocked;
                 if can_advance || ui_queued || ready || needs_follow_up_tick {
                     let was_settled = host.is_settled();
-                    if opts.save_step_snapshots && opts.snapshot_dir.is_some() {
-                        host.request_snapshot(&host.ticks().to_string());
-                    }
                     let surfaces = active_surfaces(host.graph(), &host.vocab());
                     host.step_with(driver, &surfaces);
                     stepped_in_session = true;
@@ -187,8 +183,12 @@ pub fn run_session<D: SessionDriver>(
 fn save_latest_snapshot(opts: &SessionOptions, host: &AgentHost) {
     if let Some(dir) = &opts.snapshot_dir {
         if host.ticks() > 0 {
-            let _ = AgentSnapshotStore::new(dir)
-                .save_tick(host.ticks().saturating_sub(1), &host.graph().export());
+            let mut store = PackSnapshotStore::new(dir).with_max_snapshots(opts.max_snapshots);
+            let _ = store.save_milestone(
+                host.ticks().saturating_sub(1),
+                "exit",
+                &host.graph().export(),
+            );
         }
     }
 }
@@ -310,6 +310,20 @@ pub fn build_host_with_checkpoints(
     extra_system: Option<Box<dyn OnyxSystem>>,
     checkpoints: Option<PendingCheckpoints>,
 ) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
+    let opts = SessionOptions {
+        snapshot_dir: snapshot_dir.cloned(),
+        ..SessionOptions::default()
+    };
+    build_host_with_options(seed, config, &opts, extra_system, checkpoints)
+}
+
+pub fn build_host_with_options(
+    seed: u64,
+    config: AgentConfig,
+    opts: &SessionOptions,
+    extra_system: Option<Box<dyn OnyxSystem>>,
+    checkpoints: Option<PendingCheckpoints>,
+) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
     let mut ledger = WorkspaceLedgerSystem::new();
     if let Some(cp) = checkpoints {
         ledger = ledger.with_checkpoints(cp);
@@ -321,8 +335,13 @@ pub fn build_host_with_checkpoints(
     if let Some(sys) = extra_system {
         builder = builder.system(sys);
     }
-    if let Some(dir) = snapshot_dir {
-        builder = builder.store(Box::new(AgentSnapshotStore::new(dir)));
+    if let Some(dir) = &opts.snapshot_dir {
+        if opts.save_step_snapshots {
+            builder = builder.system(Box::new(MilestoneSnapshotSystem::new(opts.snapshot_every)));
+        }
+        builder = builder.store(Box::new(
+            PackSnapshotStore::new(dir).with_max_snapshots(opts.max_snapshots),
+        ));
     }
     let mut host = builder.build()?;
     let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));

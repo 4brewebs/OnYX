@@ -213,7 +213,17 @@ pub fn capture_git_tree_checkpoint(root: &Path) -> Option<(String, String)> {
         std::env::temp_dir().join(format!("onyx_git_idx_{}_{nanos}_{seq}", std::process::id()));
 
     let add_ok = Command::new("git")
-        .args(["add", "-A"])
+        .args([
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude)*.onyxpack",
+            ":(exclude)*.onyxpack.tmp",
+            ":(exclude)tick-*.bin",
+            ":(exclude)*/tick-*.bin",
+            ":(exclude)*.tr",
+        ])
         .env("GIT_INDEX_FILE", &temp_index)
         .current_dir(root)
         .output()
@@ -346,17 +356,36 @@ pub fn effects_after_tick<G: GraphView + ?Sized>(
     ws: &WorkspaceVocab,
     after_tick: u64,
 ) -> Vec<RecordedEffect> {
+    let mut out = all_recorded_effects(graph, ws);
+    out.retain(|e| e.tick > after_tick);
+    out
+}
+
+/// Devuelve todos los efectos externos registrados en el ledger EAV ordenados por `(tick, id)`.
+pub fn all_recorded_effects<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Vec<RecordedEffect> {
     let mut out = Vec::new();
     for id in graph.query(&[ws.effect_tick, ws.effect_tool]) {
-        let Some(eff) = read_recorded_effect(graph, ws, id) else {
-            continue;
-        };
-        if eff.tick > after_tick {
+        if let Some(eff) = read_recorded_effect(graph, ws, id) {
             out.push(eff);
         }
     }
     out.sort_by_key(|e| (e.tick, e.id.0));
     out
+}
+
+/// Devuelve si el efecto indicado fue marcado como deshecho (`ws.effect.undone == true`).
+pub fn is_effect_undone<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+    effect_id: ConceptId,
+) -> bool {
+    matches!(
+        graph.get(effect_id, ws.effect_undone),
+        Some(Value::Bool(true))
+    )
 }
 
 /// Devuelve el último efecto con `tree_sha` que todavía no haya sido deshecho (`effect_undone != true`).
