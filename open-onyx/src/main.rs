@@ -318,7 +318,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gemini_env_and_instructions(&cli.workspace)?;
 
             let tui = TuiDriver::new(host.vocab())?
-                .with_workspace(cli.workspace.clone(), mode_handle.clone());
+                .with_workspace(cli.workspace.clone(), mode_handle.clone())
+                .with_workspace_vocab(ws_vocab);
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
@@ -485,7 +486,7 @@ mod tests {
 
     use onyx_soul_agents::{AgentHost, AgentState, IngressEvent, OnyxEvent, Reply};
     use onyx_workspace::{graph_workspace_mode, latest_undoable_effect};
-    use session::{SURFACE_APPROVAL, active_surfaces, all_live_waiting_approval};
+    use session::{SURFACE_APPROVAL, SURFACE_PLAN, active_surfaces, all_live_waiting_approval};
 
     use super::*;
 
@@ -526,6 +527,10 @@ mod tests {
             .find(|s| s.surface == SURFACE_APPROVAL)
             .expect("approval surface must be declared");
         assert!(approval_surface.focused);
+        assert!(
+            surfaces.iter().any(|s| s.surface == SURFACE_PLAN),
+            "plan surface must be declared"
+        );
     }
 
     #[test]

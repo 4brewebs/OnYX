@@ -19,7 +19,9 @@ use onyx_soul_agents::{
     ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, Reply, SurfaceBinding,
     Vocab, pending_approvals,
 };
-use onyx_workspace::{WorkspaceMode, WorkspaceModeHandle, preview_tool_diff};
+use onyx_workspace::{
+    WorkspaceMode, WorkspaceModeHandle, WorkspaceVocab, graph_workspace_plan, preview_tool_diff,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -32,6 +34,7 @@ use ratatui::{
 struct TuiInner {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     vocab: Vocab,
+    ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
     mode_handle: WorkspaceModeHandle,
     input: String,
@@ -39,6 +42,8 @@ struct TuiInner {
     active_approval: Option<(ConceptId, u64, String, String)>,
     approval_diff: Option<String>,
     seen_approvals: BTreeSet<(u64, u64)>,
+    scroll_from_bottom: usize,
+    last_viewport_height: usize,
     quit: Arc<AtomicBool>,
 }
 
@@ -82,6 +87,7 @@ impl TuiDriver {
             inner: Rc::new(RefCell::new(TuiInner {
                 terminal,
                 vocab,
+                ws_vocab: None,
                 workspace_root: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 input: String::new(),
@@ -89,6 +95,8 @@ impl TuiDriver {
                 active_approval: None,
                 approval_diff: None,
                 seen_approvals: BTreeSet::new(),
+                scroll_from_bottom: 0,
+                last_viewport_height: 20,
                 quit: Arc::new(AtomicBool::new(false)),
             })),
         })
@@ -99,6 +107,14 @@ impl TuiDriver {
             let mut inner = self.inner.borrow_mut();
             inner.workspace_root = Some(root);
             inner.mode_handle = mode_handle;
+        }
+        self
+    }
+
+    pub fn with_workspace_vocab(self, ws_vocab: WorkspaceVocab) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.ws_vocab = Some(ws_vocab);
         }
         self
     }
@@ -148,6 +164,13 @@ impl TuiInner {
                     && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
                 if is_ctrl_c || matches!(code, CtKeyCode::Esc) {
                     self.quit.store(true, Ordering::Relaxed);
+                } else if apply_scroll_key(
+                    &mut self.scroll_from_bottom,
+                    self.last_viewport_height,
+                    code,
+                    modifiers,
+                ) {
+                    return true;
                 } else if let Some((agent, req, _, _)) = self.active_approval.clone() {
                     match code {
                         CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
@@ -182,6 +205,7 @@ impl TuiInner {
                             let cmd = self.input.trim().to_string();
                             self.input.clear();
                             if !cmd.is_empty() {
+                                self.scroll_from_bottom = 0;
                                 self.queued
                                     .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
                             }
@@ -271,6 +295,10 @@ impl TuiInner {
         let input_snapshot = self.input.clone();
         let approval_snapshot = self.active_approval.clone();
         let diff_snapshot = self.approval_diff.clone();
+        let plan_snapshot = self
+            .ws_vocab
+            .as_ref()
+            .and_then(|wv| graph_workspace_plan(graph, wv));
         let mode_label = self.mode_handle.get().as_label();
         let header_title =
             format!(" openOnyx [{mode_label}] — Deterministic Harness (Esc/Ctrl+C to quit) ");
@@ -280,7 +308,10 @@ impl TuiInner {
             4
         };
 
-        let _ = self.terminal.draw(|f| {
+        let terminal = &mut self.terminal;
+        let scroll_from_bottom = &mut self.scroll_from_bottom;
+        let last_viewport_height = &mut self.last_viewport_height;
+        let _ = terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -294,18 +325,64 @@ impl TuiInner {
                 .block(Block::default().title(header_title).borders(Borders::ALL));
             f.render_widget(header, chunks[0]);
 
-            let scroll = log_lines
-                .len()
-                .saturating_sub(chunks[1].height.saturating_sub(2) as usize);
+            let (trace_area, plan_area) = match plan_snapshot.as_deref() {
+                Some(_) if f.area().width >= 100 => {
+                    let hsplit = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                        .split(chunks[1]);
+                    (hsplit[0], Some(hsplit[1]))
+                }
+                _ => (chunks[1], None),
+            };
+
+            let viewport_height = trace_area.height.saturating_sub(2) as usize;
+            *last_viewport_height = viewport_height.max(1);
+            let inner_width = trace_area.width.saturating_sub(2);
+            let total_rows = visual_row_count(&log_lines, inner_width);
+            let max_scroll = total_rows.saturating_sub(viewport_height);
+            *scroll_from_bottom = (*scroll_from_bottom).min(max_scroll);
+            let scroll_top = max_scroll.saturating_sub(*scroll_from_bottom);
+
+            let trace_title = if *scroll_from_bottom > 0 {
+                format!(
+                    " Memory & Trace [SCROLLED -{} lines | End to follow] ",
+                    *scroll_from_bottom
+                )
+            } else {
+                " Memory & Trace (Up/Down/PgUp/PgDn/Home/End) ".to_string()
+            };
+
             let body = Paragraph::new(log_lines)
-                .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+                .scroll((u16::try_from(scroll_top).unwrap_or(u16::MAX), 0))
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .title(" Memory & Trace ")
-                        .borders(Borders::ALL),
-                );
-            f.render_widget(body, chunks[1]);
+                .block(Block::default().title(trace_title).borders(Borders::ALL));
+            f.render_widget(body, trace_area);
+
+            if let (Some(p_area), Some(plan_text)) = (plan_area, plan_snapshot.as_deref()) {
+                let mut plan_lines: Vec<Line<'static>> = Vec::new();
+                for pline in plan_text.lines() {
+                    let trimmed = pline.trim_start();
+                    let style = if trimmed.starts_with("[x]") {
+                        Style::default().fg(Color::Green)
+                    } else if trimmed.starts_with("[>]") {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else if trimmed.starts_with("[ ]") {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    plan_lines.push(Line::from(Span::styled(pline.to_string(), style)));
+                }
+                let plan_widget = Paragraph::new(plan_lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().title(" Live Plan ").borders(Borders::ALL));
+                f.render_widget(plan_widget, p_area);
+            }
 
             let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
                 Some((_, _, tool, args)) => {
@@ -387,5 +464,165 @@ fn prop_text(g: &dyn GraphView, id: ConceptId, attr: onyx_soul_agents::Attr) -> 
     match g.get(id, attr) {
         Some(onyx_soul_agents::Value::Text(s)) => Some(s),
         _ => None,
+    }
+}
+
+pub(crate) fn apply_scroll_key(
+    scroll_from_bottom: &mut usize,
+    viewport_height: usize,
+    code: CtKeyCode,
+    modifiers: KeyModifiers,
+) -> bool {
+    let page = viewport_height.max(5);
+    match code {
+        CtKeyCode::Up => {
+            *scroll_from_bottom = scroll_from_bottom.saturating_add(3);
+            true
+        }
+        CtKeyCode::Down => {
+            *scroll_from_bottom = scroll_from_bottom.saturating_sub(3);
+            true
+        }
+        CtKeyCode::PageUp => {
+            *scroll_from_bottom = scroll_from_bottom.saturating_add(page);
+            true
+        }
+        CtKeyCode::PageDown => {
+            *scroll_from_bottom = scroll_from_bottom.saturating_sub(page);
+            true
+        }
+        CtKeyCode::Home => {
+            *scroll_from_bottom = usize::MAX / 2;
+            true
+        }
+        CtKeyCode::End => {
+            *scroll_from_bottom = 0;
+            true
+        }
+        CtKeyCode::Char('u' | 'U') if modifiers.contains(KeyModifiers::CONTROL) => {
+            *scroll_from_bottom = scroll_from_bottom.saturating_add(page);
+            true
+        }
+        CtKeyCode::Char('d' | 'D') if modifiers.contains(KeyModifiers::CONTROL) => {
+            *scroll_from_bottom = scroll_from_bottom.saturating_sub(page);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Calcula el número total de filas visuales que ocupan `lines` al envolver texto a `inner_width` columnas.
+pub(crate) fn visual_row_count(lines: &[Line<'_>], inner_width: u16) -> usize {
+    let w = usize::from(inner_width);
+    if w == 0 {
+        return lines.len();
+    }
+    let mut rows = 0usize;
+    for line in lines {
+        let line_width = line.width();
+        if line_width == 0 || line_width <= w {
+            rows += 1;
+            continue;
+        }
+        let mut flat = String::new();
+        for span in &line.spans {
+            flat.push_str(span.content.as_ref());
+        }
+        let mut current_rows = 1usize;
+        let mut col = 0usize;
+        let mut pending_space = 0usize;
+        for word in flat.split(' ') {
+            let word_w = Span::raw(word).width();
+            if word_w == 0 {
+                pending_space += 1;
+                continue;
+            }
+            if col > 0 && col + pending_space + word_w > w {
+                current_rows += 1;
+                col = 0;
+                pending_space = 0;
+            }
+            let start_col = col + pending_space;
+            if start_col + word_w > w {
+                let first_fit = w.saturating_sub(start_col);
+                let remaining = word_w - first_fit;
+                let extra = remaining.div_ceil(w);
+                current_rows += extra;
+                let mod_rem = remaining % w;
+                col = if mod_rem == 0 { w } else { mod_rem };
+            } else {
+                col = start_col + word_w;
+            }
+            pending_space = 1;
+        }
+        rows += current_rows;
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visual_row_count_accounts_for_word_wrapping_and_scroll_keys() {
+        let lines = vec![
+            Line::from(""),
+            Line::from("short"),
+            Line::from("hello world"),
+            Line::from("    hello"),
+            Line::from("abcdefghijklmno"),
+        ];
+        // width = 5:
+        // "" -> 1
+        // "short" (5) -> 1
+        // "hello world" -> "hello" (5) + wrap + "world" (5) -> 2
+        // "    hello" (4 spaces + 5 chars) -> 2
+        // "abcdefghijklmno" (15) -> 3
+        assert_eq!(visual_row_count(&lines, 5), 9);
+
+        let mut scroll = 0usize;
+        assert!(apply_scroll_key(
+            &mut scroll,
+            10,
+            CtKeyCode::Up,
+            KeyModifiers::NONE
+        ));
+        assert_eq!(scroll, 3);
+        assert!(apply_scroll_key(
+            &mut scroll,
+            10,
+            CtKeyCode::PageUp,
+            KeyModifiers::NONE
+        ));
+        assert_eq!(scroll, 13);
+        assert!(apply_scroll_key(
+            &mut scroll,
+            10,
+            CtKeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(scroll, 3);
+        assert!(apply_scroll_key(
+            &mut scroll,
+            10,
+            CtKeyCode::Down,
+            KeyModifiers::NONE
+        ));
+        assert_eq!(scroll, 0);
+        assert!(apply_scroll_key(
+            &mut scroll,
+            10,
+            CtKeyCode::Home,
+            KeyModifiers::NONE
+        ));
+        assert!(scroll > 100);
+        assert!(apply_scroll_key(
+            &mut scroll,
+            10,
+            CtKeyCode::End,
+            KeyModifiers::NONE
+        ));
+        assert_eq!(scroll, 0);
     }
 }

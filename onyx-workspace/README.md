@@ -14,13 +14,15 @@ Provides sandboxed filesystem, Git inspection, AST outline/impact (`onyx-scent`)
   - `fs_read` — read UTF-8 files (optional 1-based `start_line` / `end_line` range), with `recall_seen` session deduplication (`@TOON v1` `unchanged_since_tick:<N>`) invalidated on `fs_write`, `fs_edit`, `shell_exec`, or `/undo` (`clear_seen_reads`).
   - `fs_list` — list directory entries up to `max_depth` (default `3`), ignoring symlinks and ignored directories.
   - `fs_write` — create or overwrite a UTF-8 file *(requires approval by default)*.
-  - `fs_edit` — unique exact replacement (with line-trimmed fallback for whitespace/indentation) in a UTF-8 file *(requires approval by default)*.
+  - `fs_edit` — unique exact replacement (`old_text`/`new_text`) or atomic sequential multi-hunk `edits: [{ old_text, new_text }]` applied in memory before writing, with line-trimmed fallback and automatic relative indentation adjustment *(requires approval by default)*.
   - `code_search` — search for a pattern across workspace files (ignoring symlinks and ignored directories).
   - `git_status` — concise `git status --short --branch` inspection *(read-only, no approval required)*.
   - `git_diff` — unified `git diff --no-color` inspection with optional relative `path` (passed strictly after `--`), `staged`, and `context_lines` *(read-only, no approval required)*.
-  - `scent_outline` / `scent_impact` *(optional `feature = "scent"`)* — read-only AST outline and semantic call-impact tools backed by `onyx-scent` (`blake3` incremental cache + `@TOON v1` paginated output with `public_only` and `exclude_tests`), validated through `WorkspacePolicy` *(no approval required)*.
+  - `load_skill` — on-demand protocol/guide loader (`SKILL.md` / `*.md` from `<workspace>/.onyx/skills/`, `<workspace>/skills/`, `~/.onyx/skills/`, plus built-in `scent` and `rust` guides) paired with `discover_skills_summary` *(read-only, no approval required)*.
+  - `plan_update` — structured progress checklist (`[x]`, `[>]`, `[ ]` + optional `explanation`) persisted to the EAV graph via `ws.plan.text` (`set_workspace_plan`, `graph_workspace_plan`, `format_plan_steps`) *(no approval required)*.
+  - `scent_outline` / `scent_impact` *(optional `feature = "scent"`)* — read-only AST outline and semantic call-impact tools backed by `onyx-scent` (`blake3` incremental cache + `@TOON v1` paginated output with `public_only`, `exclude_tests`, and `max_rows` clamped `1..=500`), validated through `WorkspacePolicy` *(no approval required)*.
   - `shell_exec` — execute a shell command inside `root` with timeout, full process-tree cleanup, concurrent stdout/stderr draining, credential scrubbing (`scrub_secrets`), output limits, and automatic `clear_seen_reads()` *(requires approval by default)*.
-  - `preview_tool_diff(root, tool, args_json, max_lines)` — pure unified diff preview generator for `fs_write` / `fs_edit` reusing the same line-trimmed matching semantics.
+  - `preview_tool_diff(root, tool, args_json, max_lines)` — pure unified diff preview generator for single- and multi-hunk `fs_edit` / `fs_write` reusing line-trimmed matching and relative re-indentation.
   - `WorkspaceTools::schemas()` / `schemas_with_subagents(true)` — export JSON parameter schemas for LLM function calling.
 - `WorkspaceMode`, `WorkspaceLedgerSystem` & Transactional Undo (`state.rs`):
   - `WorkspaceMode` (`Plan`, `Build`, `Explore`), thread-safe `WorkspaceModeHandle`, and graph-backed `ws.mode` (`set_workspace_mode`, `graph_workspace_mode`).
@@ -34,5 +36,4 @@ Provides sandboxed filesystem, Git inspection, AST outline/impact (`onyx-scent`)
 
 ## Roadmap / TODO (Not Yet Implemented)
 
-- **Multi-hunk atomic `fs_edit` & live `plan_update` state**: multi-hunk `edits` array with relative re-indentation and graph-stored plan steps (`ws.plan.text`).
 - **Streaming / cancellation for `shell_exec`**: allow incremental output capture and cancellation hooks from external adapters without blocking the brain.

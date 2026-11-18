@@ -16,7 +16,7 @@ On startup (`run`, `chat`, and live `rewind`), `load_project_instructions` loads
 1. `~/.onyx/AGENTS.md` and `~/.onyx/ONYX.md`
 2. `<workspace>/AGENTS.md` and `<workspace>/ONYX.md`
 
-Loaded files are filtered through `scrub_secrets`, capped at `16 KiB` total, and appended to Gemini's `systemInstruction`.
+Loaded files are filtered through `scrub_secrets`, combined with the compact on-demand skills catalog (`discover_skills_summary`, scanning `.onyx/skills/`, `skills/`, `~/.onyx/skills/`, and built-ins `scent`/`rust`), capped at `16 KiB` total, and appended to Gemini's `systemInstruction`.
 
 ## Usage
 
@@ -77,9 +77,11 @@ cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
 
 ## TUI Controls & Commands (`chat`)
 
-- **Type + `Enter`**: submit an initial goal or follow-up prompt. Follow-up prompts reactivate the same root agent (`continue_agent`) with its full `rel_memory` preserved instead of spawning an amnesic agent.
+- **Type + `Enter`**: submit an initial goal or follow-up prompt. Follow-up prompts reactivate the same root agent (`continue_agent`) with its full `rel_memory` preserved instead of spawning an amnesic agent, and reset scroll position to auto-follow the bottom.
+- **`Up` / `Down` / `PageUp` / `PageDown` / `Home` / `End` / `Ctrl+U` / `Ctrl+D`**: scroll smoothly through the full wrapped chat & tool-call history (`Memory & Trace` pane), both while idle and while an approval prompt is open (`[SCROLLED -N lines | End to follow]`).
 - **`Tab`**: toggle between `[BUILD]` and `[PLAN]` modes by queuing `IngressEvent::Command("/mode plan" | "/mode build")`, persisting `ws.mode` in the EAV graph and recording the switch in `ONYXTR2` transcripts.
-- **`y` / `n`**: approve or deny pending mutating tools (`fs_write`, `fs_edit`, `shell_exec`) when `AgentState::WaitingApproval` is active. For `fs_write` / `fs_edit`, the approval box expands and renders a colored unified diff preview (`preview_tool_diff`).
+- **`y` / `n`**: approve or deny pending mutating tools (`fs_write`, `fs_edit`, `shell_exec`) when `AgentState::WaitingApproval` is active. For `fs_write` / multi-hunk `fs_edit`, the approval box expands and renders a colored unified diff preview (`preview_tool_diff`).
+- **Live Plan side panel**: when `plan_update` has recorded steps in `ws.plan.text` and terminal width `>= 100` columns, `TuiDriver` splits the main area (`70%` Memory & Trace / `30%` Live Plan) displaying `[x]`, `[>]`, and `[ ]` items live.
 - **`/undo`**: marks the latest reversible `fs_write`/`fs_edit` checkpoint (`ws.effect.undone`) inside `CommandSpawnerSystem`; `WorkspaceToolBridge::present` restores the Git tree checkpoint on disk (`restore_git_tree_checkpoint` + `clear_seen_reads()`), while `ReplayBridge` reproduces the graph state without touching disk.
 - **`/mode [plan|build|explore]`**: switch workspace mode explicitly via command.
 - **`/new` or `/new <goal>`**: instruct the next prompt to spawn a new root agent (or immediately spawn one with `<goal>`).
@@ -91,13 +93,12 @@ cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
 
 - [`src/main.rs`](src/main.rs): CLI parsing (`CliArgs`, `Mode`, `parse_args_from`), driver stack composition, system registration (`SubagentSystem`, `WorkspaceLedgerSystem`, `CommandSpawnerSystem`), and delegation to `run_session` / `ops`.
 - [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `/new`, `/mode`, `/undo` (`mark_latest_effect_undone`), `on_restore` mode sync, and multi-turn `continue_agent`.
-- [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `build_host` / `build_host_with_checkpoints`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
+- [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`, `SURFACE_PLAN` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `build_host` / `build_host_with_checkpoints`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
 - [`src/ops.rs`](src/ops.rs): offline snapshot & ledger utilities (`run_inspect`, `reconcile_rewind_effects`, `run_doctor`).
-- [`src/gemini.rs`](src/gemini.rs): `GeminiResponder` (sync, for `run`/`rewind`), `AsyncGeminiDriver` (non-blocking background HTTP worker + `InFlightGuard`, wrapped by `RecordingBridge` for `chat`), `load_project_instructions`, *as-of* read `superseded` projection + `ContextBudget` pruning (preserving errors, denials, and `@TOON v1` outputs), sequential multi-`functionCall` queueing, `"user"`/`"system"` turn mapping, and `thoughtSignature` inheritance.
-- [`src/tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`ratatui` + `crossterm`) rendering header + `[PLAN]`/`[BUILD]` badge, colored trace entries, and unified diff approval panel. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` retain 0 external dependencies.
+- [`src/gemini.rs`](src/gemini.rs): `GeminiResponder` (sync, for `run`/`rewind`), `AsyncGeminiDriver` (non-blocking background HTTP worker + `InFlightGuard`, wrapped by `RecordingBridge` for `chat`), `load_project_instructions` + on-demand skills catalog, *as-of* read `superseded` projection + `ContextBudget` pruning (preserving errors, denials, and `@TOON v1` outputs), sequential multi-`functionCall` queueing, `"user"`/`"system"` turn mapping, and `thoughtSignature` inheritance.
+- [`src/tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`ratatui` + `crossterm`) rendering header + `[PLAN]`/`[BUILD]` badge, wrapped history navigation (`visual_row_count` + `apply_scroll_key`), optional `70%`/`30%` `Live Plan` side panel (`ws.plan.text`), colored trace entries, and unified diff approval panel. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` retain 0 external dependencies.
 
 ## Roadmap / TODO (Not Yet Implemented)
 
-- **Multi-hunk `fs_edit` & live side-panel plan view**: atomic multi-hunk `fs_edit` with relative re-indentation and a `plan_update` tool projected in a split TUI pane.
 - **SSE streaming & OpenAI-compatible provider**: token streaming preview in `TuiDriver` and an optional OpenAI-compatible responder/driver.
 - **Unified recovery bundle**: bundle graph snapshot, tick `n`, RNG seed, and `Transcript` into a single validated checkpoint artifact for `rewind` and `resume`.

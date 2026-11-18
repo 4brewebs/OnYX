@@ -11,7 +11,7 @@ use onyx_soul_agents::{
     Vocab, pending_requests,
 };
 use onyx_workspace::WorkspaceTools;
-use onyx_workspace::tools::scrub_secrets;
+use onyx_workspace::tools::{discover_skills_summary, scrub_secrets};
 use serde_json::{Value as JsonValue, json};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
@@ -79,6 +79,17 @@ pub fn load_project_instructions(workspace_root: &Path) -> String {
             combined.push('\n');
         }
         combined.push_str(&section);
+    }
+
+    let skills_summary = discover_skills_summary(workspace_root);
+    if !skills_summary.is_empty()
+        && combined.len() + skills_summary.len() + 2 <= MAX_PROJECT_INSTRUCTIONS_BYTES
+    {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(skills_summary.trim_end());
+        combined.push('\n');
     }
     combined
 }
@@ -410,7 +421,7 @@ fn build_request_body_with_context(
         })
         .collect();
 
-    let base_instruction = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, and `git_diff` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, prefer calling one tool at a time, keep changes minimal, and summarize your final answer clearly when done.";
+    let base_instruction = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step work, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
     let system_text = if project_instructions.trim().is_empty() {
         base_instruction.to_string()
     } else {

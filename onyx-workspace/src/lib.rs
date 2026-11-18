@@ -10,7 +10,11 @@ pub use policy::WorkspacePolicy;
 pub use state::{
     EffectReversibility, PendingCheckpoints, RecordedEffect, WorkspaceLedgerSystem, WorkspaceMode,
     WorkspaceModeHandle, WorkspaceVocab, capture_git_tree_checkpoint, effects_after_tick,
-    graph_workspace_mode, is_file_read, latest_undoable_effect, mark_latest_effect_undone,
-    restore_git_tree_checkpoint, set_workspace_mode, undone_effects,
+    graph_workspace_mode, graph_workspace_plan, is_file_read, latest_undoable_effect,
+    mark_latest_effect_undone, restore_git_tree_checkpoint, set_workspace_mode, set_workspace_plan,
+    undone_effects,
 };
-pub use tools::{ToolSchema, WorkspaceTools, preview_tool_diff};
+pub use tools::{
+    FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,
+    format_plan_steps, preview_tool_diff,
+};
