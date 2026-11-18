@@ -19,9 +19,10 @@ use crate::tui::TuiHandle;
 pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
 pub const SURFACE_TRACE: SurfaceId = SurfaceId(2);
 pub const SURFACE_APPROVAL: SurfaceId = SurfaceId(3);
+pub const SURFACE_PLAN: SurfaceId = SurfaceId(4);
 
-/// Declara las tres superficies lógicas activas para un tick según el estado del grafo.
-pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding; 3] {
+/// Declara las cuatro superficies lógicas activas para un tick según el estado del grafo.
+pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding; 4] {
     let has_pending_approval = !pending_approvals(graph, vocab).is_empty();
     let any_active = graph.query(&[vocab.state]).into_iter().any(|id| {
         matches!(
@@ -46,6 +47,11 @@ pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding;
             surface: SURFACE_APPROVAL,
             view: vocab.pending_tool,
             focused: has_pending_approval,
+        },
+        SurfaceBinding {
+            surface: SURFACE_PLAN,
+            view: vocab.goal,
+            focused: false,
         },
     ]
 }

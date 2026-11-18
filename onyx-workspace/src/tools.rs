@@ -60,6 +60,8 @@ impl WorkspaceTools {
                 "code_search",
                 "git_status",
                 "git_diff",
+                "load_skill",
+                "plan_update",
                 "shell_exec",
                 "scent_outline",
                 "scent_impact",
@@ -75,6 +77,8 @@ impl WorkspaceTools {
                 "code_search",
                 "git_status",
                 "git_diff",
+                "load_skill",
+                "plan_update",
                 "shell_exec",
             ]
         }
@@ -91,6 +95,8 @@ impl WorkspaceTools {
                 "code_search",
                 "git_status",
                 "git_diff",
+                "load_skill",
+                "plan_update",
                 "shell_exec",
                 "scent_outline",
                 "scent_impact",
@@ -107,6 +113,8 @@ impl WorkspaceTools {
                 "code_search",
                 "git_status",
                 "git_diff",
+                "load_skill",
+                "plan_update",
                 "shell_exec",
                 "spawn_agent",
             ]
@@ -184,15 +192,27 @@ impl WorkspaceTools {
             },
             ToolSchema {
                 name: "fs_edit",
-                description: "Replace an exact unique substring in an existing file.",
+                description: "Replace one unique substring (`old_text`/`new_text`) or multiple sequential hunks atomically (`edits`) in an existing file.",
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
                         "path": { "type": "STRING", "description": "Relative path inside the workspace." },
-                        "old_text": { "type": "STRING", "description": "Exact text to replace (must occur once)." },
-                        "new_text": { "type": "STRING", "description": "Replacement text." }
+                        "old_text": { "type": "STRING", "description": "Exact text to replace (single-hunk mode)." },
+                        "new_text": { "type": "STRING", "description": "Replacement text (single-hunk mode)." },
+                        "edits": {
+                            "type": "ARRAY",
+                            "description": "Optional list of sequential `{ old_text, new_text }` hunks applied atomically in order.",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "old_text": { "type": "STRING", "description": "Exact text to replace." },
+                                    "new_text": { "type": "STRING", "description": "Replacement text." }
+                                },
+                                "required": ["old_text", "new_text"]
+                            }
+                        }
                     },
-                    "required": ["path", "old_text", "new_text"]
+                    "required": ["path"]
                 }),
                 requires_approval: true,
             },
@@ -233,6 +253,42 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
+                name: "load_skill",
+                description: "Load an on-demand protocol or stack guide (e.g. `scent`, `rust`, or workspace SKILL.md) without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": { "type": "STRING", "description": "Skill name to load." }
+                    },
+                    "required": ["name"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "plan_update",
+                description: "Publish or update a structured multi-step progress checklist (`[x]`, `[>]`, `[ ]`) rendered in the TUI without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "explanation": { "type": "STRING", "description": "Optional short summary of the current plan." },
+                        "steps": {
+                            "type": "ARRAY",
+                            "description": "Ordered plan items.",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "step": { "type": "STRING", "description": "Short task description." },
+                                    "status": { "type": "STRING", "description": "Status: `pending`, `in_progress`, or `completed`." }
+                                },
+                                "required": ["step", "status"]
+                            }
+                        }
+                    },
+                    "required": ["steps"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
                 name: "shell_exec",
                 description: "Execute a shell command in the workspace root directory.",
                 parameters: json!({
@@ -257,7 +313,7 @@ impl WorkspaceTools {
                         "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public symbols." },
                         "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test modules/functions (scope:test)." },
                         "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
-                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 250)." }
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (1..=500, default 250)." }
                     }
                 }),
                 requires_approval: false,
@@ -270,9 +326,10 @@ impl WorkspaceTools {
                     "properties": {
                         "target": { "type": "STRING", "description": "Symbol name, Type::method, or file::symbol to analyze." },
                         "max_hops": { "type": "INTEGER", "description": "Optional diffusion hop radius (1..=6, default 3)." },
+                        "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public neighbor symbols." },
                         "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test neighbors (scope:test)." },
                         "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
-                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (default 250)." }
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (1..=500, default 250)." }
                     },
                     "required": ["target"]
                 }),
@@ -329,6 +386,12 @@ impl WorkspaceTools {
                     serde_json::from_str(raw).map_err(|e| format!("invalid git_diff args: {e}"))?;
                 self.git_diff(args)
             }
+            "load_skill" => {
+                let args: LoadSkillArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid load_skill args: {e}"))?;
+                self.load_skill(args)
+            }
+            "plan_update" => self.plan_update(raw),
             "shell_exec" => {
                 let args: ShellExecArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid shell_exec args: {e}"))?;
@@ -482,34 +545,84 @@ impl WorkspaceTools {
     }
 
     fn fs_edit(&self, args: FsEditArgs) -> Result<String, String> {
+        let hunks = extract_edit_hunks(&args)?;
         let path = self.policy.resolve_existing(&args.path)?;
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
 
-        let exact_count = content.matches(&args.old_text).count();
-        if exact_count == 1 {
-            let updated = content.replacen(&args.old_text, &args.new_text, 1);
-            fs::write(&path, updated.as_bytes())
-                .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
-            self.invalidate_seen_file(&path);
-            return Ok(format!("edited `{}` (1 replacement)", args.path));
-        }
-        if exact_count > 1 {
-            return Err(format!(
-                "old_text matched {exact_count} times in `{}`; provide more context",
-                args.path
-            ));
+        let mut working = content;
+        let mut trimmed_count = 0usize;
+        for (idx, hunk) in hunks.iter().enumerate() {
+            let (updated, used_trimmed) =
+                apply_single_edit_in_memory(&working, &hunk.old_text, &hunk.new_text).map_err(
+                    |reason| {
+                        if hunks.len() > 1 {
+                            format!("in `{}` (hunk {}): {reason}", args.path, idx + 1)
+                        } else {
+                            format!("in `{}`: {reason}", args.path)
+                        }
+                    },
+                )?;
+            if used_trimmed {
+                trimmed_count += 1;
+            }
+            working = updated;
         }
 
-        let updated = replace_line_trimmed_unique(&content, &args.old_text, &args.new_text)
-            .map_err(|reason| format!("in `{}`: {reason}", args.path))?;
-        fs::write(&path, updated.as_bytes())
+        fs::write(&path, working.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
         self.invalidate_seen_file(&path);
-        Ok(format!(
-            "edited `{}` (1 line-trimmed replacement)",
-            args.path
+        if trimmed_count > 0 {
+            Ok(format!(
+                "edited `{}` ({} replacement(s), {} line-trimmed)",
+                args.path,
+                hunks.len(),
+                trimmed_count
+            ))
+        } else {
+            Ok(format!(
+                "edited `{}` ({} replacement(s))",
+                args.path,
+                hunks.len()
+            ))
+        }
+    }
+
+    fn load_skill(&self, args: LoadSkillArgs) -> Result<String, String> {
+        let name = args.name.trim();
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.contains('\0')
+        {
+            return Err(format!("invalid skill name `{name}`"));
+        }
+
+        for dir in skill_search_dirs(&self.policy.root) {
+            let folder_skill = dir.join(name).join("SKILL.md");
+            if let Ok(raw) = fs::read_to_string(&folder_skill) {
+                let cleaned = scrub_secrets(&raw);
+                return Ok(truncate_utf8(&cleaned, self.policy.max_read_bytes));
+            }
+            let flat_skill = dir.join(format!("{name}.md"));
+            if let Ok(raw) = fs::read_to_string(&flat_skill) {
+                let cleaned = scrub_secrets(&raw);
+                return Ok(truncate_utf8(&cleaned, self.policy.max_read_bytes));
+            }
+        }
+
+        if let Some(builtin) = builtin_skill_body(name) {
+            return Ok(builtin.to_string());
+        }
+
+        Err(format!(
+            "skill `{name}` not found (checked workspace `.onyx/skills`, `skills`, `~/.onyx/skills`, and built-ins `scent`, `rust`)"
         ))
+    }
+
+    fn plan_update(&self, raw_args: &str) -> Result<String, String> {
+        format_plan_steps(raw_args)
     }
 
     fn code_search(&self, args: CodeSearchArgs) -> Result<String, String> {
@@ -716,7 +829,10 @@ impl WorkspaceTools {
             .map_err(|e| e.to_string())?;
         let opts = onyx_scent::ToonPageOptions {
             cursor: args.cursor.unwrap_or(0),
-            max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            max_rows: args
+                .max_rows
+                .unwrap_or(onyx_scent::DEFAULT_MAX_ROWS)
+                .clamp(1, 500),
             public_only: args.public_only.unwrap_or(false),
             exclude_tests: args.exclude_tests.unwrap_or(false),
             ..onyx_scent::ToonPageOptions::default()
@@ -738,7 +854,11 @@ impl WorkspaceTools {
         let hops = args.max_hops.unwrap_or(3).clamp(1, 6);
         let opts = onyx_scent::ToonPageOptions {
             cursor: args.cursor.unwrap_or(0),
-            max_rows: args.max_rows.unwrap_or(onyx_scent::DEFAULT_MAX_ROWS),
+            max_rows: args
+                .max_rows
+                .unwrap_or(onyx_scent::DEFAULT_MAX_ROWS)
+                .clamp(1, 500),
+            public_only: args.public_only.unwrap_or(false),
             exclude_tests: args.exclude_tests.unwrap_or(false),
             ..onyx_scent::ToonPageOptions::default()
         };
@@ -811,11 +931,39 @@ struct FsWriteArgs {
     content: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct FsEditHunk {
+    pub old_text: String,
+    pub new_text: String,
+}
+
 #[derive(Deserialize)]
 struct FsEditArgs {
     path: String,
-    old_text: String,
-    new_text: String,
+    #[serde(default)]
+    old_text: Option<String>,
+    #[serde(default)]
+    new_text: Option<String>,
+    #[serde(default)]
+    edits: Option<Vec<FsEditHunk>>,
+}
+
+#[derive(Deserialize)]
+struct LoadSkillArgs {
+    name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PlanStepItem {
+    pub step: String,
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+struct PlanUpdateArgs {
+    #[serde(default)]
+    explanation: Option<String>,
+    steps: Vec<PlanStepItem>,
 }
 
 #[derive(Deserialize)]
@@ -855,9 +1003,194 @@ struct ScentOutlineArgs {
 struct ScentImpactArgs {
     target: String,
     max_hops: Option<u8>,
+    public_only: Option<bool>,
     exclude_tests: Option<bool>,
     cursor: Option<usize>,
     max_rows: Option<usize>,
+}
+
+fn extract_edit_hunks(args: &FsEditArgs) -> Result<Vec<FsEditHunk>, String> {
+    let mut hunks = Vec::new();
+    match (&args.old_text, &args.new_text) {
+        (Some(old_text), Some(new_text)) => hunks.push(FsEditHunk {
+            old_text: old_text.clone(),
+            new_text: new_text.clone(),
+        }),
+        (None, None) => {}
+        _ => {
+            return Err(
+                "fs_edit requires both `old_text` and `new_text`, or `edits` array".to_string(),
+            );
+        }
+    }
+    if let Some(extra) = &args.edits {
+        hunks.extend(extra.iter().cloned());
+    }
+    if hunks.is_empty() {
+        return Err(
+            "fs_edit requires at least one edit hunk (`old_text`/`new_text` or `edits`)"
+                .to_string(),
+        );
+    }
+    Ok(hunks)
+}
+
+fn apply_single_edit_in_memory(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Result<(String, bool), String> {
+    if old_text.is_empty() {
+        return Err("old_text cannot be empty".to_string());
+    }
+    let exact_count = content.matches(old_text).count();
+    if exact_count == 1 {
+        return Ok((content.replacen(old_text, new_text, 1), false));
+    }
+    if exact_count > 1 {
+        return Err(format!(
+            "old_text matched {exact_count} times; provide more context"
+        ));
+    }
+    let updated = replace_line_trimmed_unique(content, old_text, new_text)?;
+    Ok((updated, true))
+}
+
+/// Formatea un plan estructurado (`steps` con estados `completed`, `in_progress`, `pending`)
+/// como lista `[x]` / `[>]` / `[ ]` apta para persistirse en `ws.plan.text` y mostrarse en TUI.
+pub fn format_plan_steps(args_json: &str) -> Result<String, String> {
+    let raw = if args_json.trim().is_empty() {
+        "{}"
+    } else {
+        args_json
+    };
+    let args: PlanUpdateArgs =
+        serde_json::from_str(raw).map_err(|e| format!("invalid plan_update args: {e}"))?;
+    if args.steps.is_empty() {
+        return Err("plan_update requires at least one step".to_string());
+    }
+
+    let mut lines = Vec::new();
+    if let Some(expl) = args
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(expl.to_string());
+    }
+    for item in &args.steps {
+        let marker = match item.status.trim().to_ascii_lowercase().as_str() {
+            "completed" | "done" => "[x]",
+            "in_progress" | "active" => "[>]",
+            _ => "[ ]",
+        };
+        lines.push(format!("{marker} {}", item.step.trim()));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn skill_search_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        workspace_root.join(".onyx").join("skills"),
+        workspace_root.join("skills"),
+    ];
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        dirs.push(PathBuf::from(home).join(".onyx").join("skills"));
+    }
+    dirs
+}
+
+fn builtin_skill_body(name: &str) -> Option<&'static str> {
+    match name {
+        "scent" => Some(
+            "# Skill: Scent Two-Lens AST Navigation\n\
+1. Start broad with `scent_outline` (`exclude_tests: true` when mapping production architecture, `public_only: true` for public APIs, smaller `max_rows` like 80 if exploring large crates).\n\
+2. Paginate whenever `# page: next_cursor=<N>` appears before assuming you have seen all symbols.\n\
+3. Before modifying any shared type or function, run `scent_impact` (`max_hops: 2..=4`) to locate callers and callees by exact `<file>::<symbol>` names.\n\
+4. Read only the relevant line ranges returned by `lines:start-end` via `fs_read(path, start_line, end_line)`.",
+        ),
+        "rust" => Some(
+            "# Skill: OnYX Rust 1.85 Workspace Conventions\n\
+1. Keep `onyx-core`, `onyx-soul`, and `onyx-soul-agents` at ZERO external dependencies.\n\
+2. Maintain Rust 1.85.1 compatibility (no `&dyn Graph -> &dyn GraphView` trait upcasting; prefer `<G: GraphView + ?Sized>` or `<G: Graph + ?Sized>`).\n\
+3. Keep `OnyxSystem`s pure and deterministic (zero disk, network, or wall-clock I/O; isolate I/O in `PlatformDriver` adapters).\n\
+4. Verify edits with `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.",
+        ),
+        _ => None,
+    }
+}
+
+/// Descubre las skills disponibles (locales `SKILL.md`/`*.md` y embebidas) sin inflar `systemInstruction`.
+pub fn discover_skills_summary(workspace_root: &Path) -> String {
+    let mut entries: BTreeMap<String, String> = BTreeMap::new();
+    entries.insert(
+        "scent".to_string(),
+        "Two-lens AST navigation (`scent_outline` + `scent_impact` + bounded `fs_read`)"
+            .to_string(),
+    );
+    entries.insert(
+        "rust".to_string(),
+        "OnYX Rust 1.85 conventions, 0-dep core boundary, and verification checks".to_string(),
+    );
+
+    for dir in skill_search_dirs(workspace_root) {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let Some(name_os) = path.file_name() else {
+                continue;
+            };
+            let raw_name = name_os.to_string_lossy();
+            let skill_info = if path.is_dir() {
+                let skill_md = path.join("SKILL.md");
+                if skill_md.is_file() {
+                    Some((raw_name.into_owned(), skill_md))
+                } else {
+                    None
+                }
+            } else if path.is_file() && raw_name.ends_with(".md") {
+                Some((raw_name.trim_end_matches(".md").to_string(), path.clone()))
+            } else {
+                None
+            };
+            if let Some((name, file_path)) = skill_info {
+                let summary = fs::read_to_string(&file_path)
+                    .ok()
+                    .and_then(|txt| extract_skill_description(&txt))
+                    .unwrap_or_else(|| "Custom workspace skill".to_string());
+                entries.entry(name).or_insert(summary);
+            }
+        }
+    }
+
+    let mut out = String::from(
+        "Available on-demand skills (call `load_skill(name)` before specialized work):\n",
+    );
+    for (name, desc) in entries {
+        out.push_str(&format!("- `{name}`: {desc}\n"));
+    }
+    out
+}
+
+fn extract_skill_description(raw: &str) -> Option<String> {
+    for line in raw.lines().take(20) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("description:") {
+            let clean = rest.trim().trim_matches('"').trim_matches('\'');
+            if !clean.is_empty() {
+                return Some(scrub_secrets(clean));
+            }
+        } else if !trimmed.starts_with("name:") {
+            return Some(scrub_secrets(trimmed));
+        }
+    }
+    None
 }
 
 /// Genera un diff unificado compacto de vista previa antes de aprobar `fs_edit` o `fs_write`.
@@ -872,18 +1205,40 @@ pub fn preview_tool_diff(
     match tool {
         "fs_edit" => {
             let args: FsEditArgs = serde_json::from_str(args_json).ok()?;
+            let hunks = extract_edit_hunks(&args).ok()?;
             let resolved = policy.resolve_existing(&args.path).ok()?;
-            let content = fs::read_to_string(&resolved).ok()?;
-            let (byte_start, byte_end) = find_edit_span(&content, &args.old_text)?;
+            let mut current = fs::read_to_string(&resolved).ok()?;
             let rel = args.path.trim().replace('\\', "/");
-            Some(format_span_diff(
-                &rel,
-                &content,
-                byte_start,
-                byte_end,
-                &args.new_text,
-                cap,
-            ))
+
+            let mut all_lines: Vec<String> = Vec::new();
+            for (idx, hunk) in hunks.iter().enumerate() {
+                let (byte_start, byte_end, replacement_preview) =
+                    find_edit_span_and_replacement(&current, &hunk.old_text, &hunk.new_text)?;
+                let diff = format_span_diff(
+                    &rel,
+                    &current,
+                    byte_start,
+                    byte_end,
+                    &replacement_preview,
+                    usize::MAX,
+                );
+                for (lno, line) in diff.lines().enumerate() {
+                    if idx > 0 && lno < 2 && (line.starts_with("--- ") || line.starts_with("+++ "))
+                    {
+                        continue;
+                    }
+                    all_lines.push(line.to_string());
+                }
+                let (updated, _) =
+                    apply_single_edit_in_memory(&current, &hunk.old_text, &hunk.new_text).ok()?;
+                current = updated;
+            }
+            if all_lines.len() > cap {
+                let omitted = all_lines.len() - cap;
+                all_lines.truncate(cap);
+                all_lines.push(format!("... (+{omitted} more lines)"));
+            }
+            Some(all_lines.join("\n"))
         }
         "fs_write" => {
             let args: FsWriteArgs = serde_json::from_str(args_json).ok()?;
@@ -927,11 +1282,24 @@ fn format_span_diff(
     new_text: &str,
     max_lines: usize,
 ) -> String {
-    let prefix_lines: Vec<&str> = content[..byte_start].lines().collect();
-    let old_slice = &content[byte_start..byte_end];
-    let old_lines: Vec<&str> = old_slice.lines().collect();
-    let new_lines: Vec<&str> = new_text.lines().collect();
-    let suffix_lines: Vec<&str> = content[byte_end..].lines().collect();
+    let line_start = content[..byte_start].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = if byte_end > line_start && content[..byte_end].ends_with('\n') {
+        byte_end
+    } else {
+        content[byte_end..]
+            .find('\n')
+            .map_or(content.len(), |idx| byte_end + idx + 1)
+    };
+    let full_new = format!(
+        "{}{}{}",
+        &content[line_start..byte_start],
+        new_text,
+        &content[byte_end..line_end]
+    );
+    let prefix_lines: Vec<&str> = content[..line_start].lines().collect();
+    let old_lines: Vec<&str> = content[line_start..line_end].lines().collect();
+    let new_lines: Vec<&str> = full_new.lines().collect();
+    let suffix_lines: Vec<&str> = content[line_end..].lines().collect();
 
     let ctx_before_count = prefix_lines.len().min(2);
     let ctx_after_count = suffix_lines.len().min(2);
@@ -965,16 +1333,22 @@ fn format_span_diff(
     diff_lines.join("\n")
 }
 
-fn find_edit_span(content: &str, old_text: &str) -> Option<(usize, usize)> {
+fn find_edit_span_and_replacement(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Option<(usize, usize, String)> {
     let exact: Vec<(usize, &str)> = content.match_indices(old_text).collect();
     if exact.len() == 1 {
         let start = exact[0].0;
-        return Some((start, start + old_text.len()));
+        return Some((start, start + old_text.len(), new_text.to_string()));
     }
     if exact.len() > 1 {
         return None;
     }
-    find_line_trimmed_unique_span(content, old_text).ok()
+    let (byte_start, byte_end) = find_line_trimmed_unique_span(content, old_text).ok()?;
+    let adjusted = reindent_trimmed_replacement(&content[byte_start..byte_end], old_text, new_text);
+    Some((byte_start, byte_end, adjusted))
 }
 
 fn find_line_trimmed_unique_span(content: &str, old_text: &str) -> Result<(usize, usize), String> {
@@ -1021,16 +1395,67 @@ fn find_line_trimmed_unique_span(content: &str, old_text: &str) -> Result<(usize
     }
 }
 
+fn first_non_empty_indent(text: &str) -> &str {
+    for line in text.lines() {
+        if !line.trim().is_empty() {
+            let len = line
+                .bytes()
+                .take_while(|b| *b == b' ' || *b == b'\t')
+                .count();
+            return &line[..len];
+        }
+    }
+    ""
+}
+
+fn reindent_trimmed_replacement(matched_slice: &str, old_text: &str, new_text: &str) -> String {
+    let actual_indent = first_non_empty_indent(matched_slice);
+    let old_indent = first_non_empty_indent(old_text);
+    let new_indent = first_non_empty_indent(new_text);
+
+    if new_indent != old_indent || old_indent == actual_indent {
+        return new_text.to_string();
+    }
+
+    let mut out = String::with_capacity(new_text.len() + 16);
+    if let Some(delta) = actual_indent.strip_prefix(old_indent) {
+        for chunk in new_text.split_inclusive('\n') {
+            if chunk.trim().is_empty() {
+                out.push_str(chunk);
+            } else {
+                out.push_str(delta);
+                out.push_str(chunk);
+            }
+        }
+        return out;
+    }
+
+    if let Some(strip) = old_indent.strip_prefix(actual_indent) {
+        for chunk in new_text.split_inclusive('\n') {
+            if chunk.trim().is_empty() {
+                out.push_str(chunk);
+            } else {
+                out.push_str(chunk.strip_prefix(strip).unwrap_or(chunk));
+            }
+        }
+        return out;
+    }
+
+    new_text.to_string()
+}
+
 fn replace_line_trimmed_unique(
     content: &str,
     old_text: &str,
     new_text: &str,
 ) -> Result<String, String> {
     let (byte_start, byte_end) = find_line_trimmed_unique_span(content, old_text)?;
-    let mut out = String::with_capacity(content.len() + new_text.len());
+    let adjusted_new =
+        reindent_trimmed_replacement(&content[byte_start..byte_end], old_text, new_text);
+    let mut out = String::with_capacity(content.len() + adjusted_new.len());
     out.push_str(&content[..byte_start]);
-    out.push_str(new_text);
-    if content[..byte_end].ends_with('\n') && !new_text.ends_with('\n') {
+    out.push_str(&adjusted_new);
+    if content[..byte_end].ends_with('\n') && !adjusted_new.ends_with('\n') {
         if content[..byte_end].ends_with("\r\n") {
             out.push_str("\r\n");
         } else {

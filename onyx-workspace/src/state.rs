@@ -118,6 +118,7 @@ impl EffectReversibility {
 #[derive(Clone, Copy, Debug)]
 pub struct WorkspaceVocab {
     pub mode: Attr,
+    pub plan_text: Attr,
     pub file_path: Attr,
     pub file_read_tick: Attr,
     pub file_dirty: Attr,
@@ -141,6 +142,7 @@ impl WorkspaceVocab {
     pub fn resolve_with(mut reg: impl FnMut(&str) -> Attr) -> Self {
         Self {
             mode: reg("ws.mode"),
+            plan_text: reg("ws.plan.text"),
             file_path: reg("ws.file.path"),
             file_read_tick: reg("ws.file.read_tick"),
             file_dirty: reg("ws.file.dirty"),
@@ -407,6 +409,25 @@ pub fn graph_workspace_mode<G: GraphView + ?Sized>(
     prop_text(graph, id, ws.mode).and_then(|s| WorkspaceMode::parse(&s))
 }
 
+/// Persiste el plan activo (`ws.plan.text`) en el grafo EAV.
+pub fn set_workspace_plan<G: Graph + ?Sized>(graph: &mut G, ws: &WorkspaceVocab, plan_text: &str) {
+    let id = graph
+        .query(&[ws.plan_text])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| graph.create());
+    graph.set(id, ws.plan_text, Value::Text(plan_text.to_string()));
+}
+
+/// Lee el plan activo (`ws.plan.text`) persistido en el grafo EAV, si existe y no está vacío.
+pub fn graph_workspace_plan<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Option<String> {
+    let id = graph.query(&[ws.plan_text]).into_iter().next()?;
+    prop_text(graph, id, ws.plan_text).filter(|s| !s.trim().is_empty())
+}
+
 /// Marca en el grafo la intención determinista de deshacer el último efecto reversible,
 /// invalidando `file_dirty` sin ejecutar I/O en disco/git (el driver vivo lo materializa).
 pub fn mark_latest_effect_undone<G: Graph + ?Sized>(
@@ -635,6 +656,11 @@ fn record_tool_observation(
                     graph.set(eff, wv.effect_tree_sha, Value::Text(tree_sha));
                 }
             }
+        }
+        "plan_update" => {
+            let plan = crate::tools::format_plan_steps(obs.args_json)
+                .unwrap_or_else(|_| obs.obs_text.to_string());
+            set_workspace_plan(graph, wv, &plan);
         }
         "shell_exec" => {
             let cmd = parsed

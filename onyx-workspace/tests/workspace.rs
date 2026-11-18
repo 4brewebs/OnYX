@@ -8,8 +8,8 @@ use onyx_soul_agents::{
 use onyx_workspace::{
     PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
     WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, capture_git_tree_checkpoint,
-    effects_after_tick, is_file_read, latest_undoable_effect, preview_tool_diff,
-    restore_git_tree_checkpoint,
+    discover_skills_summary, effects_after_tick, graph_workspace_plan, is_file_read,
+    latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
 };
 
 struct TempDir(PathBuf);
@@ -699,4 +699,129 @@ fn git_tools_mode_handle_diff_preview_and_undoable_effect_work() {
     assert_eq!(eff.tool, "fs_edit");
     assert_eq!(eff.target, "src/lib.rs");
     assert!(eff.tree_sha.is_some());
+}
+
+#[test]
+fn multi_hunk_edit_reindentation_skills_and_plan_update_work() {
+    let dir = TempDir::new("iter2_features");
+    let src = dir.0.join("demo.rs");
+    fs::write(
+        &src,
+        "fn main() {\n    let a = 1;\n    let b = 2;\n    println!(\"{} {}\", a, b);\n}\n",
+    )
+    .unwrap();
+
+    // Custom workspace skill in `.onyx/skills/custom-stack/SKILL.md`
+    fs::create_dir_all(dir.0.join(".onyx/skills/custom-stack")).unwrap();
+    fs::write(
+        dir.0.join(".onyx/skills/custom-stack/SKILL.md"),
+        "---\ndescription: Custom test stack guide\n---\n# Custom Stack\nAlways validate schemas.\n",
+    )
+    .unwrap();
+
+    let summary = discover_skills_summary(&dir.0);
+    assert!(summary.contains("`scent`"), "{summary}");
+    assert!(
+        summary.contains("`custom-stack`: Custom test stack guide"),
+        "{summary}"
+    );
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // Relative re-indentation: 2-space old/new matched on 4-space block shifts result by +2 spaces.
+    tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"demo.rs","old_text":"  let a = 1;","new_text":"  let a = 100;"}"#,
+        )
+        .unwrap();
+    let after_reindent = fs::read_to_string(&src).unwrap();
+    assert!(
+        after_reindent.contains("    let a = 100;\n"),
+        "{after_reindent}"
+    );
+
+    // Multi-hunk atomicity: second failing hunk must leave disk untouched.
+    let err = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"demo.rs","edits":[{"old_text":"let a = 100;","new_text":"let a = 200;"},{"old_text":"MISSING_LINE","new_text":"X"}]}"#,
+        )
+        .unwrap_err();
+    assert!(err.contains("hunk 2"), "{err}");
+    assert!(
+        fs::read_to_string(&src).unwrap().contains("let a = 100;"),
+        "disk must remain unchanged after failed multi-hunk edit"
+    );
+
+    // Valid multi-hunk diff preview + execution.
+    let multi_args = r#"{"path":"demo.rs","edits":[{"old_text":"let a = 100;","new_text":"let a = 200;"},{"old_text":"let b = 2;","new_text":"let b = 300;"}]}"#;
+    let diff = preview_tool_diff(&dir.0, "fs_edit", multi_args, 20).unwrap();
+    assert!(diff.contains("+    let a = 200;"), "{diff}");
+    assert!(diff.contains("+    let b = 300;"), "{diff}");
+    let ok = tools.execute("fs_edit", multi_args).unwrap();
+    assert!(ok.contains("2 replacement(s)"), "{ok}");
+    let updated = fs::read_to_string(&src).unwrap();
+    assert!(updated.contains("let a = 200;"));
+    assert!(updated.contains("let b = 300;"));
+
+    // `load_skill` loads built-in + custom workspace skill without approval.
+    assert!(!WorkspaceTools::approval_required_names().contains(&"load_skill"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"plan_update"));
+    let scent_skill = tools.execute("load_skill", r#"{"name":"scent"}"#).unwrap();
+    assert!(scent_skill.contains("scent_outline"), "{scent_skill}");
+    let custom_skill = tools
+        .execute("load_skill", r#"{"name":"custom-stack"}"#)
+        .unwrap();
+    assert!(
+        custom_skill.contains("Always validate schemas."),
+        "{custom_skill}"
+    );
+    assert!(
+        tools
+            .execute("load_skill", r#"{"name":"../escape"}"#)
+            .is_err()
+    );
+
+    // End-to-end `plan_update` + `load_skill` persisted through `AgentHost` & `WorkspaceLedgerSystem`.
+    let mut host = AgentHost::builder(1)
+        .system(Box::new(WorkspaceLedgerSystem::new()))
+        .build()
+        .unwrap();
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
+    host.spawn(
+        &AgentSpec::new("planner", "load skill and publish plan")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied()),
+    );
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_workspace_vocab(ws_vocab)
+        .wrapping(HeadlessDriver::new());
+    let mut turn = 0usize;
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        turn += 1;
+        match turn {
+            1 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "load_skill",
+                r#"{"name":"scent"}"#,
+            )),
+            2 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "plan_update",
+                r#"{"explanation":"Refactor workflow","steps":[{"step":"Inspect AST","status":"completed"},{"step":"Apply multi-hunk edit","status":"in_progress"},{"step":"Run cargo test","status":"pending"}]}"#,
+            )),
+            _ => Some(Reply::done(req.agent, req.request, "planned")),
+        }
+    })
+    .wrapping(ws_bridge);
+
+    assert!(host.run_until_settled(&mut driver, 24));
+    let plan = graph_workspace_plan(host.graph(), &ws_vocab).expect("plan must be persisted");
+    assert!(plan.contains("Refactor workflow"), "{plan}");
+    assert!(plan.contains("[x] Inspect AST"), "{plan}");
+    assert!(plan.contains("[>] Apply multi-hunk edit"), "{plan}");
+    assert!(plan.contains("[ ] Run cargo test"), "{plan}");
 }
