@@ -8,7 +8,7 @@ use onyx_soul_agents::{
     AgentConfig, AgentGraph, AgentRuntime, AgentSpawner, AgentSpec, AgentState, AgentView, Attr,
     AttrOnly, AttrRegistry, ConceptId, Ctx, Decision, DetRng, DomainEvent, Graph, GraphView,
     IngressEvent, MemoryEntry, MemoryPolicy, OnyxEvent, OnyxSystem, Policy, REPLY_SOURCE, Reply,
-    ScriptedPolicy, SystemEvent, UniformTool, Value, Vocab, spawn_event,
+    ScriptedPolicy, SystemEvent, UniformTool, Value, Vocab, continue_agent, spawn_event,
 };
 
 struct World {
@@ -878,4 +878,60 @@ fn denying_pending_approval_returns_agent_to_idle_with_reason() {
         [("denied".into(), "shell: demasiado peligroso".into())]
     );
     assert!(onyx_soul_agents::pending_approvals(&w.g, &w.v).is_empty());
+}
+
+#[test]
+fn continue_agent_moves_result_to_say_and_keeps_steps_monotonic() {
+    let mut w = World::new(cfg());
+    let id = w.spawn(&AgentSpec::new("alice", "turn 1").with_tools(["search"]));
+    w.run(vec![Reply::done(id, 1, "first reply").to_event()]);
+    assert_eq!(w.state(id), AgentState::Done);
+    assert_eq!(w.text(id, w.v.result), "first reply");
+
+    assert!(!continue_agent(&mut w.g, &w.v, ConceptId(9999), "x", 8, 2));
+    assert!(w.g.continue_agent(&w.v, id, "turn 2", 8, 2));
+    assert_eq!(w.state(id), AgentState::Idle);
+    assert_eq!(w.text(id, w.v.result), "");
+    assert_eq!(
+        w.memory(id),
+        [
+            ("say".into(), "first reply".into()),
+            ("user".into(), "turn 2".into())
+        ]
+    );
+
+    // Siguiente tick abre una nueva petición con `request = steps + 1` (= 2).
+    w.run(vec![]);
+    assert_eq!(w.state(id), AgentState::Thinking);
+    let pending = onyx_soul_agents::pending_requests(&w.g, &w.v);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].request, 2);
+
+    w.run(vec![Reply::done(id, 2, "second reply").to_event()]);
+    assert_eq!(w.state(id), AgentState::Done);
+    assert_eq!(w.text(id, w.v.result), "second reply");
+
+    // Una nota de sistema post-Done (`/mode`, `/undo`) vuelca `result` a `"say"` antes de añadirse.
+    w.g.append_agent_memory(&w.v, id, "system", "[/undo] ok", 5);
+    assert_eq!(w.text(id, w.v.result), "");
+    assert_eq!(
+        w.memory(id),
+        [
+            ("say".into(), "first reply".into()),
+            ("user".into(), "turn 2".into()),
+            ("say".into(), "second reply".into()),
+            ("system".into(), "[/undo] ok".into()),
+        ]
+    );
+    assert!(w.g.continue_agent(&w.v, id, "turn 3", 8, 6));
+    assert_eq!(
+        w.memory(id),
+        [
+            ("say".into(), "first reply".into()),
+            ("user".into(), "turn 2".into()),
+            ("say".into(), "second reply".into()),
+            ("system".into(), "[/undo] ok".into()),
+            ("user".into(), "turn 3".into()),
+        ]
+    );
 }

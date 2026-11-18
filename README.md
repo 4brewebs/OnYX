@@ -24,9 +24,9 @@ onyx-example-agents = deterministic multi-agent tour                  · uses on
 
 ## Workspace
 
-The workspace has these five member crates. The minimum Rust version is 1.85, the edition is 2024, and the workspace uses resolver 3.
+The workspace has eight member crates (`onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-scent`, `onyx-workspace`, `open-onyx`, `onyx-example-app`, and `onyx-example-agents`). The minimum Rust version is `1.85`, the edition is `2024`, and the workspace uses resolver `3`.
 
-`onyx-core`, `onyx-soul`, `onyx-soul-agents`, and both example crates declare no external crates. Souls depend on `onyx-core`. Each example depends on its soul, which reexports the core types the app needs, so the app does not declare `onyx-core`. Future souls and apps may add external dependencies. There is no CI workflow in this tree that enforces the rule.
+`onyx-core`, `onyx-soul`, `onyx-soul-agents`, and both example crates declare zero external crates. Souls depend on `onyx-core`. Each example depends on its soul, which reexports the core types the app needs, so the app does not declare `onyx-core`. Adapter crates (`onyx-scent`, `onyx-workspace`, `open-onyx`) add external dependencies while preserving pure deterministic core/soul semantics. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `fmt`, `check`, `clippy`, `test`, `test --release`, and `doc` checks; run `cargo tree -p onyx-core -p onyx-soul -p onyx-soul-agents` to verify the zero-dependency rule.
 
 ## What exists today
 
@@ -42,6 +42,10 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 
 `tick` does not use `BlueprintLoader` or `SystemRegistry`. Those ports exist so a soul or an app can load stages. There is no `Supervisor` type in core. System states live in a slice the caller passes into `tick`.
 
+**`onyx-core` audit (18 November 2026).** `tick` and `DetRng` match the written contract. This pass does not change traits or phase order. The crate suite is 31 tick tests, 6 `DetRng` tests, 7 graph-port tests, 3 doctests, and 8 `conformance` probes. The new edge cases live in [`onyx-core/tests/tick_contract.rs`](onyx-core/tests/tick_contract.rs) and [`onyx-core/tests/detrng_contract.rs`](onyx-core/tests/detrng_contract.rs). The Spanish contract note is in [README_es.md](README_es.md).
+
+Four behaviors are protocol hazards, not implementation bugs: a same-tick outbox is not quarantined across `RestoreRequested` (domain events keep pre-import `ConceptId`s and payloads, with `SnapshotRestored` between them); the outbox is a shared `Vec`, so a later system can drop an earlier `SnapshotRequested`; ingress is discarded when every system is `Stopped`, and writing `SystemState::Active` by hand skips `on_start`; a panic inside `run` keeps earlier graph writes, drops the already-drained inbox and the not-yet-queued outbox, and skips control and `present`. Unknown `Start`/`Stop` names emit no `Fault`. `Shutdown` still has no runtime policy. Duplicate system names all receive `Start`. `poll` gets the full `EventBus`, and `run` / `on_start` / `on_stop` get the full `Graph`. A failed re-init after a successful import still emits `SnapshotRestored`. `DetRng` matches its fixed vectors; 4096 consecutive ticks for seeds 0, 1, and 91 do not repeat the first output. Full 64-bit collision freedom is not promised.
+
 ### `onyx-soul`
 - `WorldGraph` (in-memory EAV)
 - `FileSnapshotStore` (private binary format, 0 deps)
@@ -53,24 +57,30 @@ The workspace has these five member crates. The minimum Rust version is 1.85, th
 
 ### `onyx-soul-agents`
 - `AgentGraph`, `AgentSnapshotStore` (tick-indexed snapshots & rewind), `AgentBus`, `AgentHost`
-- `AgentSpawner`, `AgentRuntime`, `ToolSystem` / `ToolExecutor`
+- Multi-turn memory lifecycle: `append_agent_memory` (flushing post-`Done` `result` into `"say"` chronologically) and `continue_agent` (reactivating terminal agents with monotonic `steps`)
+- `AgentSpawner`, `AgentRuntime`, `SubagentSystem` (`spawn_agent` / `AgentState::WaitingChildren`), `ToolSystem` / `ToolExecutor`
 - `RecordingBridge` / `ReplayBridge` (`ONYXTR1` / `ONYXTR2` transcripts), `HeadlessDriver`
 - `AgentState::WaitingApproval`, `ApprovalPolicy`, structured tool calls (`Reply::call_structured`)
 
 ### `onyx-scent`
 - Deterministic multi-language (`Rust`, `Python`, `Java`) `tree-sitter` AST indexer with `blake3` incremental cache
-- Integer-only (`0..=10_000` bp) Max-Heat impact diffusion (`distill_heat`) and `@TOON v1` paginated encoder/decoder (`outline_toon`, `impact_toon`)
+- Integer-only (`0..=10_000` bp) Max-Heat impact diffusion (`distill_heat`), `scope:src|test` & `vis:pub|priv` tagging, `exclude_tests` filtering, trait method visibility inheritance, struct field summaries, Java annotations, intra-file call resolution, and `@TOON v1` paginated encoder/decoder (`outline_toon`, `impact_toon`)
 - Pure library by default (`clap` gated behind `feature = "cli"`)
 
 ### `onyx-workspace`
 - `WorkspacePolicy` (canonicalized root sandbox, symlink-safe traversal, ignored dirs, I/O and process-tree timeout limits)
-- `WorkspaceTools` (`fs_read`, `fs_list`, `fs_write`, `fs_edit` with line-trimmed fallback, `code_search`, `shell_exec`, plus read-only `scent_outline` & `scent_impact` under `feature = "scent"`)
-- `WorkspaceMode` (`Plan`, `Build`, `Explore`), `WorkspaceLedgerSystem` (EAV `File` & `ExternalEffect` ledger, `effects_after_tick`), lightweight Git tree checkpoints (`capture_git_tree_checkpoint` / `restore_git_tree_checkpoint`), and `WorkspaceToolBridge`
+- `WorkspaceTools` (`fs_read` with `recall_seen`, `fs_list`, `fs_write`, `fs_edit` with line-trimmed fallback, `code_search`, approval-free `git_status` & `git_diff`, `shell_exec` with secret scrubbing and cache invalidation, plus read-only `scent_outline` & `scent_impact` under `feature = "scent"`)
+- `preview_tool_diff` (pure unified diff preview for `fs_write`/`fs_edit`)
+- `WorkspaceMode` (`Plan`, `Build`, `Explore`), `WorkspaceModeHandle`, graph-backed `ws.mode`, `WorkspaceLedgerSystem` (EAV `File` & `ExternalEffect` ledger, `effects_after_tick`, `latest_undoable_effect`, `mark_latest_effect_undone`, `undone_effects`), Git tree checkpoints (`capture_git_tree_checkpoint` supporting unborn `HEAD`, `restore_git_tree_checkpoint` keeping `.git/index` clean), and `WorkspaceToolBridge` (inline `[checkpoint:<head>:<tree>]` tagging for deterministic `ReplayBridge` playback and live `/undo` materialization)
 
 ### `open-onyx` (`openonyx`)
-- CLI & TUI coding agent harness (`run`, `chat`, `replay`, `inspect`, `rewind [--dry-run]`, `doctor`, `--max-steps <n>`, `--shell-timeout <secs>`)
-- `GeminiResponder` (sync, for `run`/`rewind`) and `AsyncGeminiDriver` (non-blocking background HTTP worker + `has_ready` / `InFlightGuard` RAII + *as-of* `supersede` & `ContextBudget` projection + sequential multi-`functionCall` batch queueing with `thoughtSignature` inheritance, for `chat`)
-- `SubagentSystem` (`AgentState::WaitingChildren` + `spawn_agent` child delegation), `WorkspaceTools` with `recall_seen` (`@TOON v1` deduplication) & `scrub_secrets`, `TuiDriver` (`ratatui` + `crossterm`), per-tick graph snapshots, and Git-reconciled time-travel rewind
+- Modular CLI & TUI coding agent harness:
+  - [`main.rs`](open-onyx/src/main.rs) (`run`, `chat [--resume <dir>]`, `replay`, `inspect`, `rewind [--dry-run]`, `doctor`, `--max-steps <n>`, `--shell-timeout <secs>`)
+  - [`command.rs`](open-onyx/src/command.rs) (pure deterministic `CommandSpawnerSystem` handling `/new`, `/mode`, `/undo`, `on_restore` mode sync, and multi-turn `continue_agent`)
+  - [`session.rs`](open-onyx/src/session.rs) (declared logical surfaces `SURFACE_STATUS`/`SURFACE_TRACE`/`SURFACE_APPROVAL` passed via `AgentHost::step_with`, `SessionDriver`, unified `run_session` + `StopPolicy`)
+  - [`ops.rs`](open-onyx/src/ops.rs) (`inspect`, `rewind` ledger reconciliation, and `doctor`)
+- [`gemini.rs`](open-onyx/src/gemini.rs): `GeminiResponder` (sync), `AsyncGeminiDriver` (non-blocking background HTTP worker + `InFlightGuard`), `~/.onyx/{AGENTS,ONYX}.md` & `<workspace>/{AGENTS,ONYX}.md` instruction loading, *as-of* `supersede` & `ContextBudget`, sequential multi-`functionCall` queueing with `thoughtSignature` propagation, `"user"`/`"system"` turn mapping
+- [`tui.rs`](open-onyx/src/tui.rs): `TuiDriver` (`ratatui` + `crossterm`), `Tab` mode toggle (`[PLAN]`/`[BUILD]` emitted as recorded commands), and colored unified diff preview box on sensitive tool approvals (`y`/`n`)
 
 ### `onyx-example-app` & `onyx-example-agents`
 - `onyx-example-app`: minimal REPL that loads systems/stages, restores/saves snapshots, and processes `agree`, `status`, `exit`

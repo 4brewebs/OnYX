@@ -6,8 +6,9 @@ use onyx_soul_agents::{
     AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply,
 };
 use onyx_workspace::{
-    WorkspaceLedgerSystem, WorkspaceMode, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
-    WorkspaceVocab, capture_git_tree_checkpoint, effects_after_tick, is_file_read,
+    PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
+    WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, capture_git_tree_checkpoint,
+    effects_after_tick, is_file_read, latest_undoable_effect, preview_tool_diff,
     restore_git_tree_checkpoint,
 };
 
@@ -370,6 +371,37 @@ fn fs_edit_line_trimmed_fallback() {
 
 #[test]
 fn git_tree_checkpoint_captures_and_restores_working_tree() {
+    // Unborn HEAD (fresh git init before first commit) must also capture and restore checkpoints.
+    let unborn_dir = TempDir::new("git_ckpt_unborn");
+    let unborn_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&unborn_dir.0)
+            .output()
+            .expect("git must be available");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    unborn_git(&["init"]);
+    unborn_git(&["config", "core.autocrlf", "false"]);
+    let unborn_file = unborn_dir.0.join("draft.txt");
+    fs::write(&unborn_file, "initial-draft\n").unwrap();
+    let (unborn_head, unborn_tree) =
+        capture_git_tree_checkpoint(&unborn_dir.0).expect("unborn git repo must yield tree_sha");
+    assert!(
+        unborn_head.is_empty(),
+        "expected empty head_sha, got {unborn_head}"
+    );
+    assert!(!unborn_tree.is_empty());
+
+    fs::write(&unborn_file, "mutated-draft\n").unwrap();
+    restore_git_tree_checkpoint(&unborn_dir.0, &unborn_tree).unwrap();
+    assert_eq!(fs::read_to_string(&unborn_file).unwrap(), "initial-draft\n");
+
     let dir = TempDir::new("git_ckpt");
     let run_git = |args: &[&str]| {
         let out = std::process::Command::new("git")
@@ -395,16 +427,31 @@ fn git_tree_checkpoint_captures_and_restores_working_tree() {
     run_git(&["add", "tracked.txt"]);
     run_git(&["commit", "-m", "init"]);
 
-    // Modify tracked.txt before capturing checkpoint to verify dirty tree is captured in tree_sha.
+    // Modify tracked.txt and create an untracked file before capturing checkpoint.
+    let untracked = dir.0.join("notes_untracked.md");
     fs::write(&file, "before-edit\n").unwrap();
+    fs::write(&untracked, "v1\n").unwrap();
     let (head_sha, tree_sha) = capture_git_tree_checkpoint(&dir.0).unwrap();
     assert!(!head_sha.is_empty());
     assert!(!tree_sha.is_empty());
 
-    // Mutate file after checkpoint, then restore.
+    // Mutate both files after checkpoint, then restore.
     fs::write(&file, "after-edit\n").unwrap();
+    fs::write(&untracked, "v2\n").unwrap();
     restore_git_tree_checkpoint(&dir.0, &tree_sha).unwrap();
     assert_eq!(fs::read_to_string(&file).unwrap(), "before-edit\n");
+    assert_eq!(fs::read_to_string(&untracked).unwrap(), "v1\n");
+
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_text.contains("?? notes_untracked.md"),
+        "restore must keep untracked file unstaged: {status_text}"
+    );
 }
 
 #[cfg(feature = "scent")]
@@ -496,4 +543,160 @@ fn shell_exec_scrubs_credentials_and_honors_custom_timeout() {
         "{redacted}"
     );
     assert!(redacted.contains("[REDACTED]"), "{redacted}");
+}
+
+#[test]
+fn git_tools_mode_handle_diff_preview_and_undoable_effect_work() {
+    let dir = TempDir::new("git_tools");
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir.0)
+            .output()
+            .expect("git must execute");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    run_git(&["init"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["config", "user.email", "test@example.com"]);
+    run_git(&["config", "core.autocrlf", "false"]);
+
+    let sub = dir.0.join("src");
+    fs::create_dir_all(&sub).unwrap();
+    let file = sub.join("lib.rs");
+    fs::write(&file, "pub fn a() -> i32 { 1 }\npub fn b() -> i32 { 2 }\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+
+    // Preview unified diff antes de aprobar `fs_edit` y `fs_write`.
+    let edit_diff = preview_tool_diff(
+        &dir.0,
+        "fs_edit",
+        r#"{"path":"src/lib.rs","old_text":"pub fn a() -> i32 { 1 }","new_text":"pub fn a() -> i32 { 10 }"}"#,
+        14,
+    )
+    .unwrap();
+    assert!(edit_diff.contains("--- a/src/lib.rs"), "{edit_diff}");
+    assert!(
+        edit_diff.contains("-pub fn a() -> i32 { 1 }"),
+        "{edit_diff}"
+    );
+    assert!(
+        edit_diff.contains("+pub fn a() -> i32 { 10 }"),
+        "{edit_diff}"
+    );
+
+    let write_diff = preview_tool_diff(
+        &dir.0,
+        "fs_write",
+        r#"{"path":"src/new.rs","content":"pub fn c() {}\n"}"#,
+        14,
+    )
+    .unwrap();
+    assert!(write_diff.contains("--- /dev/null"), "{write_diff}");
+    assert!(write_diff.contains("+pub fn c() {}"), "{write_diff}");
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    assert!(WorkspaceTools::all_tool_names().contains(&"git_status"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"git_diff"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"git_status"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"git_diff"));
+
+    // Modo Plan vía `WorkspaceModeHandle`: bloquea `fs_write` pero permite `git_status`/`git_diff`.
+    let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    assert_eq!(mode_handle.toggle_plan_build(), WorkspaceMode::Plan);
+
+    let checkpoints = PendingCheckpoints::default();
+    let mut host = AgentHost::builder(1)
+        .system(Box::new(
+            WorkspaceLedgerSystem::new().with_checkpoints(checkpoints.clone()),
+        ))
+        .build()
+        .unwrap();
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
+    host.spawn(
+        &AgentSpec::new("tester", "check git_status and toggle mode")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied()),
+    );
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools.clone())
+        .with_mode_handle(mode_handle.clone())
+        .with_workspace_vocab(ws_vocab)
+        .with_checkpoints(checkpoints)
+        .wrapping(HeadlessDriver::new());
+    let mut step_turn = 0usize;
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        step_turn += 1;
+        match step_turn {
+            1 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"src/lib.rs","content":"blocked\n"}"#,
+            )),
+            2 => {
+                // Ahora alternamos a Build y llamamos `fs_edit`.
+                mode_handle.toggle_plan_build();
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_edit",
+                    r#"{"path":"src/lib.rs","old_text":"pub fn a() -> i32 { 1 }","new_text":"pub fn a() -> i32 { 99 }"}"#,
+                ))
+            }
+            3 => Some(Reply::call_structured(req.agent, req.request, "git_status", "{}")),
+            4 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "git_diff",
+                r#"{"path":"src/lib.rs","context_lines":1}"#,
+            )),
+            _ => Some(Reply::done(req.agent, req.request, "ok")),
+        }
+    })
+    .wrapping(ws_bridge);
+
+    assert!(host.run_until_settled(&mut driver, 32));
+
+    let view = host.view(host.agents()[0]);
+    let joined_mem: String = view
+        .memory
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined_mem.contains("tool_error:blocked by workspace mode `Plan`"),
+        "{joined_mem}"
+    );
+    assert!(joined_mem.contains("M src/lib.rs"), "{joined_mem}");
+    assert!(
+        joined_mem.contains("+pub fn a() -> i32 { 99 }"),
+        "{joined_mem}"
+    );
+
+    // Verifica traversal bloqueado en `git_diff`.
+    let outside_err = tools
+        .execute("git_diff", r#"{"path":"../outside"}"#)
+        .unwrap_err();
+    assert!(
+        outside_err.contains("outside")
+            || outside_err.contains("cannot resolve")
+            || outside_err.contains("escapes"),
+        "{outside_err}"
+    );
+
+    // `latest_undoable_effect` encuentra el checkpoint del `fs_edit`, y tras marcar undone ya no aparece.
+    let eff = latest_undoable_effect(host.graph(), &ws_vocab).expect("must have undoable effect");
+    assert_eq!(eff.tool, "fs_edit");
+    assert_eq!(eff.target, "src/lib.rs");
+    assert!(eff.tree_sha.is_some());
 }

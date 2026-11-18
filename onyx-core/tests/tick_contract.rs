@@ -1513,3 +1513,552 @@ fn last_active_writer_wins_by_slice_order_not_system_name() {
         }
     }
 }
+
+struct FallibleStore {
+    fail_save: bool,
+    fail_load: bool,
+    saves: usize,
+}
+
+impl SnapshotStore for FallibleStore {
+    fn save(&mut self, _: &str, bytes: &[u8]) -> Result<(), OnyxError> {
+        assert_eq!(bytes, [42]);
+        self.saves += 1;
+        if self.fail_save {
+            Err(OnyxError::Io("full".into()))
+        } else {
+            Ok(())
+        }
+    }
+    fn load(&self, _: &str) -> Result<Vec<u8>, OnyxError> {
+        if self.fail_load {
+            Err(OnyxError::Missing)
+        } else {
+            Ok(vec![42])
+        }
+    }
+}
+
+struct SurfaceDriver {
+    seen: Rc<RefCell<Vec<SurfaceBinding>>>,
+}
+
+impl PlatformDriver for SurfaceDriver {
+    fn poll(&mut self, _: &mut dyn EventBus) {}
+    fn present(&mut self, _: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        *self.seen.borrow_mut() = surfaces.to_vec();
+    }
+}
+
+#[test]
+fn present_forwards_the_surface_slice_unchanged() {
+    use onyx_core::SurfaceId;
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = SurfaceDriver {
+        seen: Rc::clone(&seen),
+    };
+    let mut systems = [system("worker", &Log::default())];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::default();
+    let surfaces = [
+        SurfaceBinding {
+            surface: SurfaceId(3),
+            view: Attr::from_raw(1),
+            focused: false,
+        },
+        SurfaceBinding {
+            surface: SurfaceId(9),
+            view: Attr::from_raw(0),
+            focused: true,
+        },
+    ];
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &surfaces,
+    );
+    assert_eq!(*seen.borrow(), surfaces);
+}
+
+#[test]
+fn save_failure_faults_once_and_still_presents() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = FallibleStore {
+        fail_save: true,
+        fail_load: false,
+        saves: 0,
+    };
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(TestSystem {
+        name: "worker",
+        log: Rc::clone(&log),
+        request_save: true,
+    })];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::default();
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(store.saves, 1);
+    assert!(matches!(graph.value, Value::Int(0)));
+    assert_eq!(*log.borrow(), ["run:worker", "present:Some(Int(0))"]);
+    assert!(
+        matches!(bus.events.as_slice(), [OnyxEvent::System(SystemEvent::Fault(message))] if message.contains("snapshot save failed") && message.contains("full"))
+    );
+    tick(
+        1,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(store.saves, 1, "un Fault no repite el guardado");
+}
+
+#[test]
+fn load_failure_faults_without_import_or_reinit() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = FallibleStore {
+        fail_save: false,
+        fail_load: true,
+        saves: 0,
+    };
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems = [system("worker", &log)];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::from(vec![restore()]);
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert!(matches!(graph.value, Value::Int(0)));
+    assert_eq!(states, [SystemState::Active]);
+    assert_eq!(*log.borrow(), ["run:worker", "present:Some(Int(0))"]);
+    assert!(
+        matches!(bus.events.as_slice(), [OnyxEvent::System(SystemEvent::Fault(message))] if message.contains("snapshot load failed"))
+    );
+}
+
+#[test]
+fn unknown_names_and_shutdown_do_not_transition_systems() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems = [system("worker", &log)];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::from(vec![
+        OnyxEvent::System(SystemEvent::Start("ghost".into())),
+        OnyxEvent::System(SystemEvent::Stop("ghost".into())),
+        OnyxEvent::System(SystemEvent::Shutdown),
+    ]);
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(states, [SystemState::Active]);
+    assert!(
+        bus.is_empty(),
+        "Shutdown en el inbox no es control y no se reencola"
+    );
+    assert!(!log.borrow().iter().any(|entry| entry.contains("Fault")
+        || entry.starts_with("start:")
+        || entry.starts_with("stop:")));
+}
+
+#[test]
+fn shutdown_emitted_by_a_system_is_delivered_verbatim_next_tick() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Log::default());
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(EventSystem {
+        seen: Rc::clone(&seen),
+        emit: vec![OnyxEvent::System(SystemEvent::Shutdown)],
+    })];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::default();
+    tick(
+        4,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    systems[0] = Box::new(EventSystem {
+        seen: Rc::clone(&seen),
+        emit: Vec::new(),
+    });
+    tick(
+        5,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert!(matches!(
+        seen.borrow()[1].as_slice(),
+        [
+            OnyxEvent::System(SystemEvent::Shutdown),
+            OnyxEvent::System(SystemEvent::Tick { n: 5 }),
+        ]
+    ));
+    assert_eq!(states, [SystemState::Active]);
+}
+
+#[test]
+fn stop_then_start_in_the_same_control_phase_ends_active() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems = [system("worker", &log)];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::from(vec![
+        OnyxEvent::System(SystemEvent::Stop("worker".into())),
+        OnyxEvent::System(SystemEvent::Start("worker".into())),
+    ]);
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(states, [SystemState::Active]);
+    assert_eq!(
+        *log.borrow(),
+        [
+            "run:worker",
+            "stop:worker",
+            "start:worker:Some(Int(0))",
+            "present:Some(Int(0))",
+        ]
+    );
+}
+
+#[test]
+fn start_applies_to_every_system_that_shares_the_name() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems = [system("worker", &log), system("worker", &log)];
+    let mut states = [SystemState::Stopped, SystemState::Stopped];
+    let mut bus = TestBus::from(vec![OnyxEvent::System(SystemEvent::Start("worker".into()))]);
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(states, [SystemState::Active, SystemState::Active]);
+    assert_eq!(
+        log.borrow()
+            .iter()
+            .filter(|entry| entry.starts_with("start:worker:"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn ingress_arriving_while_every_system_is_stopped_is_discarded() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = IngressDriver {
+        input: Some(OnyxEvent::Ingress(onyx_core::IngressEvent::Command(
+            "lost".into(),
+        ))),
+    };
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(EventSystem {
+        seen: Rc::clone(&seen),
+        emit: Vec::new(),
+    })];
+    let mut states = [SystemState::Stopped];
+    let mut bus = TestBus::default();
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    bus.push(OnyxEvent::System(SystemEvent::Start("events".into())));
+    tick(
+        1,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    tick(
+        2,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(
+        seen.borrow().len(),
+        1,
+        "el tick parado no entrega el comando a nadie"
+    );
+    assert!(matches!(
+        seen.borrow()[0].as_slice(),
+        [OnyxEvent::System(SystemEvent::Tick { n: 2 })]
+    ));
+}
+
+struct RestoreAndEmit {
+    armed: bool,
+    seen: Rc<RefCell<Vec<Vec<OnyxEvent>>>>,
+}
+
+impl OnyxSystem for RestoreAndEmit {
+    fn name(&self) -> &str {
+        "restore-and-emit"
+    }
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        self.seen.borrow_mut().push(ctx.inbox.to_vec());
+        if self.armed {
+            self.armed = false;
+            let kind = Attr::from_raw(0);
+            let domain = |n: i64| {
+                OnyxEvent::Domain(onyx_core::DomainEvent {
+                    kind,
+                    subject: Some(ConceptId(1)),
+                    data: vec![(kind, Value::Int(n))],
+                })
+            };
+            ctx.outbox.push(domain(7));
+            ctx.outbox.push(restore());
+            ctx.outbox.push(domain(9));
+        }
+    }
+}
+
+#[test]
+fn domain_events_emitted_around_restore_keep_prerestore_payloads() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems: [Box<dyn OnyxSystem>; 1] = [Box::new(RestoreAndEmit {
+        armed: true,
+        seen: Rc::clone(&seen),
+    })];
+    let mut states = [SystemState::Active];
+    let mut bus = TestBus::default();
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert!(matches!(graph.value, Value::Int(42)));
+    assert_eq!(*log.borrow(), ["present:Some(Int(42))"]);
+    tick(
+        1,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    let kind = Attr::from_raw(0);
+    assert!(matches!(seen.borrow()[1].as_slice(), [
+        OnyxEvent::Domain(onyx_core::DomainEvent { kind: k0, subject: Some(ConceptId(1)), data: d0 }),
+        OnyxEvent::System(SystemEvent::SnapshotRestored(key)),
+        OnyxEvent::Domain(onyx_core::DomainEvent { kind: k1, subject: Some(ConceptId(1)), data: d1 }),
+        OnyxEvent::System(SystemEvent::Tick { n: 1 }),
+    ] if *k0 == kind && *k1 == kind && key == "saved"
+        && d0.as_slice() == [(kind, Value::Int(7))]
+        && d1.as_slice() == [(kind, Value::Int(9))]));
+}
+
+struct ClearOutbox;
+
+impl OnyxSystem for ClearOutbox {
+    fn name(&self) -> &str {
+        "clear"
+    }
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        ctx.outbox.clear();
+    }
+}
+
+#[test]
+fn a_later_system_can_drop_an_earlier_snapshot_request() {
+    let log = Log::default();
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Rc::clone(&log));
+    let mut systems: [Box<dyn OnyxSystem>; 2] = [
+        Box::new(TestSystem {
+            name: "saver",
+            log: Rc::clone(&log),
+            request_save: true,
+        }),
+        Box::new(ClearOutbox),
+    ];
+    let mut states = [SystemState::Active, SystemState::Active];
+    let mut bus = TestBus::default();
+    tick(
+        0,
+        1,
+        &mut driver,
+        &mut graph,
+        &mut store,
+        &mut bus,
+        &mut systems,
+        &mut states,
+        &[],
+    );
+    assert_eq!(store.saves, 0);
+    assert!(bus.is_empty());
+}
+
+struct Stamp;
+struct Boom;
+
+impl OnyxSystem for Stamp {
+    fn name(&self) -> &str {
+        "stamp"
+    }
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+    fn run(&mut self, ctx: &mut Ctx) {
+        ctx.graph
+            .set(ConceptId(1), Attr::from_raw(0), Value::Int(5));
+        ctx.outbox
+            .push(OnyxEvent::System(SystemEvent::StageLoaded("lost".into())));
+    }
+}
+
+impl OnyxSystem for Boom {
+    fn name(&self) -> &str {
+        "boom"
+    }
+    fn init(&mut self, _: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+        Ok(())
+    }
+    fn run(&mut self, _: &mut Ctx) {
+        panic!("tick torn by design");
+    }
+}
+
+#[test]
+fn panic_during_run_keeps_earlier_writes_and_drops_the_inbox() {
+    let mut graph = TestGraph::new();
+    let mut store = TestStore::default();
+    let mut driver = TestDriver(Log::default());
+    let mut systems: [Box<dyn OnyxSystem>; 2] = [Box::new(Stamp), Box::new(Boom)];
+    let mut states = [SystemState::Active, SystemState::Active];
+    let mut bus = TestBus::from(vec![OnyxEvent::Ingress(onyx_core::IngressEvent::Command(
+        "pending".into(),
+    ))]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tick(
+            0,
+            1,
+            &mut driver,
+            &mut graph,
+            &mut store,
+            &mut bus,
+            &mut systems,
+            &mut states,
+            &[],
+        );
+    }));
+    assert!(result.is_err());
+    assert!(matches!(graph.value, Value::Int(5)));
+    assert!(
+        bus.is_empty(),
+        "el drain ya consumió el inbox y el outbox no llegó a encolarse"
+    );
+    assert_eq!(states, [SystemState::Active, SystemState::Active]);
+    assert!(driver.0.borrow().is_empty(), "present no se ejecuta");
+}

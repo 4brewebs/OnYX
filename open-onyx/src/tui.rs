@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,7 @@ use onyx_soul_agents::{
     ConceptId, EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, Reply, SurfaceBinding,
     Vocab, pending_approvals,
 };
+use onyx_workspace::{WorkspaceMode, WorkspaceModeHandle, preview_tool_diff};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -30,9 +32,12 @@ use ratatui::{
 struct TuiInner {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     vocab: Vocab,
+    workspace_root: Option<PathBuf>,
+    mode_handle: WorkspaceModeHandle,
     input: String,
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
+    approval_diff: Option<String>,
     seen_approvals: BTreeSet<(u64, u64)>,
     quit: Arc<AtomicBool>,
 }
@@ -77,13 +82,25 @@ impl TuiDriver {
             inner: Rc::new(RefCell::new(TuiInner {
                 terminal,
                 vocab,
+                workspace_root: None,
+                mode_handle: WorkspaceModeHandle::default(),
                 input: String::new(),
                 queued: Vec::new(),
                 active_approval: None,
+                approval_diff: None,
                 seen_approvals: BTreeSet::new(),
                 quit: Arc::new(AtomicBool::new(false)),
             })),
         })
+    }
+
+    pub fn with_workspace(self, root: PathBuf, mode_handle: WorkspaceModeHandle) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.workspace_root = Some(root);
+            inner.mode_handle = mode_handle;
+        }
+        self
     }
 
     pub fn handle(&self) -> TuiHandle {
@@ -136,16 +153,27 @@ impl TuiInner {
                         CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
                             self.queued.push(Reply::approve(agent, req).to_event());
                             self.active_approval = None;
+                            self.approval_diff = None;
                         }
                         CtKeyCode::Char('n') | CtKeyCode::Char('N') => {
                             self.queued
                                 .push(Reply::deny(agent, req, "denied by user in TUI").to_event());
                             self.active_approval = None;
+                            self.approval_diff = None;
                         }
                         _ => {}
                     }
                 } else {
                     match code {
+                        CtKeyCode::Tab => {
+                            let next_cmd = match self.mode_handle.get() {
+                                WorkspaceMode::Build => "/mode plan",
+                                WorkspaceMode::Plan | WorkspaceMode::Explore => "/mode build",
+                            };
+                            self.queued.push(OnyxEvent::Ingress(IngressEvent::Command(
+                                next_cmd.to_string(),
+                            )));
+                        }
                         CtKeyCode::Char(c) => self.input.push(c),
                         CtKeyCode::Backspace => {
                             self.input.pop();
@@ -197,6 +225,10 @@ impl TuiInner {
             for a in &approvals {
                 if self.seen_approvals.insert((a.agent.0, a.request)) {
                     if let Some(p) = &a.pending_approval {
+                        self.approval_diff = self
+                            .workspace_root
+                            .as_deref()
+                            .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
                         self.active_approval =
                             Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
                         break;
@@ -222,6 +254,8 @@ impl TuiInner {
                     "call" => Color::Yellow,
                     "observe" => Color::Green,
                     "tool_error" | "denied" => Color::Red,
+                    "user" => Color::LightCyan,
+                    "system" => Color::Magenta,
                     _ => Color::Cyan,
                 };
                 push_multiline_entry(&mut log_lines, &kind, color, &text);
@@ -236,6 +270,15 @@ impl TuiInner {
 
         let input_snapshot = self.input.clone();
         let approval_snapshot = self.active_approval.clone();
+        let diff_snapshot = self.approval_diff.clone();
+        let mode_label = self.mode_handle.get().as_label();
+        let header_title =
+            format!(" openOnyx [{mode_label}] — Deterministic Harness (Esc/Ctrl+C to quit) ");
+        let bottom_height = if approval_snapshot.is_some() && diff_snapshot.is_some() {
+            16
+        } else {
+            4
+        };
 
         let _ = self.terminal.draw(|f| {
             let chunks = Layout::default()
@@ -243,15 +286,12 @@ impl TuiInner {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(5),
-                    Constraint::Length(4),
+                    Constraint::Length(bottom_height),
                 ])
                 .split(f.area());
 
-            let header = Paragraph::new(status_line).block(
-                Block::default()
-                    .title(" openOnyx — Deterministic Harness (Esc/Ctrl+C to quit) ")
-                    .borders(Borders::ALL),
-            );
+            let header = Paragraph::new(status_line)
+                .block(Block::default().title(header_title).borders(Borders::ALL));
             f.render_widget(header, chunks[0]);
 
             let scroll = log_lines
@@ -267,19 +307,57 @@ impl TuiInner {
                 );
             f.render_widget(body, chunks[1]);
 
-            let (bottom_title, bottom_text, border_color) = match &approval_snapshot {
-                Some((_, _, tool, args)) => (
-                    " Approval Required ([y] Approve / [n] Deny) ",
-                    format!("{tool}: {args}"),
-                    Color::Yellow,
-                ),
+            let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
+                Some((_, _, tool, args)) => {
+                    let args_preview = if diff_snapshot.is_some() && args.len() > 100 {
+                        let mut cut = 100;
+                        while !args.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        format!("{}...", &args[..cut])
+                    } else {
+                        args.clone()
+                    };
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{tool}: "),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(args_preview),
+                    ])];
+                    if let Some(diff) = &diff_snapshot {
+                        for dline in diff.lines() {
+                            let style = if dline.starts_with("+++") || dline.starts_with("---") {
+                                Style::default().fg(Color::DarkGray)
+                            } else if dline.starts_with("@@") {
+                                Style::default().fg(Color::Cyan)
+                            } else if dline.starts_with('+') {
+                                Style::default().fg(Color::Green)
+                            } else if dline.starts_with('-') {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default()
+                            };
+                            lines.push(Line::from(Span::styled(dline.to_string(), style)));
+                        }
+                    }
+                    (
+                        " Approval Required ([y] Approve / [n] Deny) ".to_string(),
+                        lines,
+                        Color::Yellow,
+                    )
+                }
                 None => (
-                    " Goal / Command (Enter to spawn agent) ",
-                    format!("> {input_snapshot}"),
+                    format!(
+                        " [{mode_label}] Goal / Command (Enter to send, Tab Plan/Build, /undo, /new) "
+                    ),
+                    vec![Line::from(format!("> {input_snapshot}"))],
                     Color::White,
                 ),
             };
-            let bottom = Paragraph::new(bottom_text)
+            let bottom = Paragraph::new(bottom_lines)
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()

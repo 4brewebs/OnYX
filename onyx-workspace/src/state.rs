@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onyx_soul_agents::{
@@ -23,6 +24,72 @@ pub enum WorkspaceMode {
 impl WorkspaceMode {
     pub fn allows_mutation(self) -> bool {
         matches!(self, Self::Build)
+    }
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Plan => "PLAN",
+            Self::Build => "BUILD",
+            Self::Explore => "EXPLORE",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "PLAN" => Some(Self::Plan),
+            "BUILD" => Some(Self::Build),
+            "EXPLORE" => Some(Self::Explore),
+            _ => None,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Plan => 0,
+            Self::Build => 1,
+            Self::Explore => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Plan,
+            2 => Self::Explore,
+            _ => Self::Build,
+        }
+    }
+}
+
+/// Handle compartible y thread-safe del `WorkspaceMode` actual para alternar en caliente (e.g. `Tab` en TUI).
+#[derive(Clone, Debug)]
+pub struct WorkspaceModeHandle(Arc<AtomicU8>);
+
+impl WorkspaceModeHandle {
+    pub fn new(mode: WorkspaceMode) -> Self {
+        Self(Arc::new(AtomicU8::new(mode.to_u8())))
+    }
+
+    pub fn get(&self) -> WorkspaceMode {
+        WorkspaceMode::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, mode: WorkspaceMode) {
+        self.0.store(mode.to_u8(), Ordering::Relaxed);
+    }
+
+    pub fn toggle_plan_build(&self) -> WorkspaceMode {
+        let next = match self.get() {
+            WorkspaceMode::Build => WorkspaceMode::Plan,
+            WorkspaceMode::Plan | WorkspaceMode::Explore => WorkspaceMode::Build,
+        };
+        self.set(next);
+        next
+    }
+}
+
+impl Default for WorkspaceModeHandle {
+    fn default() -> Self {
+        Self::new(WorkspaceMode::Build)
     }
 }
 
@@ -50,6 +117,7 @@ impl EffectReversibility {
 /// Vocabulario EAV registrado por `onyx-workspace` en el grafo del host.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkspaceVocab {
+    pub mode: Attr,
     pub file_path: Attr,
     pub file_read_tick: Attr,
     pub file_dirty: Attr,
@@ -62,6 +130,7 @@ pub struct WorkspaceVocab {
     pub effect_summary: Attr,
     pub effect_head_sha: Attr,
     pub effect_tree_sha: Attr,
+    pub effect_undone: Attr,
 }
 
 impl WorkspaceVocab {
@@ -71,6 +140,7 @@ impl WorkspaceVocab {
 
     pub fn resolve_with(mut reg: impl FnMut(&str) -> Attr) -> Self {
         Self {
+            mode: reg("ws.mode"),
             file_path: reg("ws.file.path"),
             file_read_tick: reg("ws.file.read_tick"),
             file_dirty: reg("ws.file.dirty"),
@@ -83,6 +153,7 @@ impl WorkspaceVocab {
             effect_summary: reg("ws.effect.summary"),
             effect_head_sha: reg("ws.effect.head_sha"),
             effect_tree_sha: reg("ws.effect.tree_sha"),
+            effect_undone: reg("ws.effect.undone"),
         }
     }
 }
@@ -107,24 +178,37 @@ pub type PendingCheckpoints = Arc<Mutex<HashMap<(u64, String, String), (String, 
 
 /// Captura `(head_sha, tree_sha)` del árbol de trabajo actual sin mutar `HEAD`,
 /// el índice real de Git ni crear commits (`GIT_INDEX_FILE` temporal + `git add -A` + `git write-tree`).
+/// Funciona incluso antes del primer commit (`head_sha` vacío).
 /// Devuelve `None` si `root` no es un repositorio Git válido.
 pub fn capture_git_tree_checkpoint(root: &Path) -> Option<(String, String)> {
-    let head_out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+    static CKPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let in_repo = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(root)
         .output()
-        .ok()?;
-    if !head_out.status.success() {
+        .ok()
+        .is_some_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true");
+    if !in_repo {
         return None;
     }
-    let head_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+
+    let head_sha = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = CKPT_SEQ.fetch_add(1, Ordering::Relaxed);
     let temp_index =
-        std::env::temp_dir().join(format!("onyx_git_idx_{}_{nanos}", std::process::id()));
+        std::env::temp_dir().join(format!("onyx_git_idx_{}_{nanos}_{seq}", std::process::id()));
 
     let add_ok = Command::new("git")
         .args(["add", "-A"])
@@ -151,11 +235,29 @@ pub fn capture_git_tree_checkpoint(root: &Path) -> Option<(String, String)> {
         return None;
     }
     let tree_sha = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
-    if head_sha.is_empty() || tree_sha.is_empty() {
+    if tree_sha.is_empty() {
         None
     } else {
         Some((head_sha, tree_sha))
     }
+}
+
+pub(crate) fn parse_inline_checkpoint(obs_text: &str) -> Option<(String, String)> {
+    let marker = " [checkpoint:";
+    let start = obs_text.rfind(marker)? + marker.len();
+    let rest = &obs_text[start..];
+    let end = rest.find(']')?;
+    let payload = &rest[..end];
+    let (head, tree) = payload.split_once(':')?;
+    let head = head.trim();
+    let tree = tree.trim();
+    if tree.is_empty() || !tree.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !head.is_empty() && !head.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((head.to_string(), tree.to_string()))
 }
 
 /// Restaura el árbol de trabajo en `root` al estado exacto capturado en `tree_sha`
@@ -166,11 +268,21 @@ pub fn restore_git_tree_checkpoint(root: &Path, tree_sha: &str) -> Result<(), St
         .current_dir(root)
         .status()
         .map_err(|e| format!("failed to run git read-tree: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("git read-tree --reset -u {tree_sha} failed"))
+    if !status.success() {
+        return Err(format!("git read-tree --reset -u {tree_sha} failed"));
     }
+    let has_head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if has_head {
+        let _ = Command::new("git")
+            .args(["reset", "--quiet", "HEAD"])
+            .current_dir(root)
+            .status();
+    }
+    Ok(())
 }
 
 /// Consulta en el grafo si un archivo relativo ya fue leído en la sesión.
@@ -193,43 +305,138 @@ pub fn file_read_tick(graph: &dyn GraphView, ws: &WorkspaceVocab, rel_path: &str
     None
 }
 
+fn read_recorded_effect<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+    id: ConceptId,
+) -> Option<RecordedEffect> {
+    let Value::Int(t) = graph.get(id, ws.effect_tick)? else {
+        return None;
+    };
+    let tick = u64::try_from(t).unwrap_or(0);
+    let agent = match graph.get(id, ws.effect_agent) {
+        Some(Value::Int(a)) => u64::try_from(a).unwrap_or(0),
+        _ => 0,
+    };
+    let tool = prop_text(graph, id, ws.effect_tool).unwrap_or_default();
+    let target = prop_text(graph, id, ws.effect_target).unwrap_or_default();
+    let reversibility = prop_text(graph, id, ws.effect_reversibility).unwrap_or_default();
+    let summary = prop_text(graph, id, ws.effect_summary).unwrap_or_default();
+    let head_sha = prop_text(graph, id, ws.effect_head_sha).filter(|s| !s.is_empty());
+    let tree_sha = prop_text(graph, id, ws.effect_tree_sha).filter(|s| !s.is_empty());
+    Some(RecordedEffect {
+        id,
+        tick,
+        agent,
+        tool,
+        target,
+        reversibility,
+        summary,
+        head_sha,
+        tree_sha,
+    })
+}
+
 /// Devuelve todos los efectos externos registrados después de `after_tick`
 /// para construir el informe de reconciliación antes de un `/rewind`.
-pub fn effects_after_tick(
-    graph: &dyn GraphView,
+pub fn effects_after_tick<G: GraphView + ?Sized>(
+    graph: &G,
     ws: &WorkspaceVocab,
     after_tick: u64,
 ) -> Vec<RecordedEffect> {
     let mut out = Vec::new();
     for id in graph.query(&[ws.effect_tick, ws.effect_tool]) {
-        let Some(Value::Int(t)) = graph.get(id, ws.effect_tick) else {
+        let Some(eff) = read_recorded_effect(graph, ws, id) else {
             continue;
         };
-        let tick = u64::try_from(t).unwrap_or(0);
-        if tick <= after_tick {
+        if eff.tick > after_tick {
+            out.push(eff);
+        }
+    }
+    out.sort_by_key(|e| (e.tick, e.id.0));
+    out
+}
+
+/// Devuelve el último efecto con `tree_sha` que todavía no haya sido deshecho (`effect_undone != true`).
+pub fn latest_undoable_effect<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Option<RecordedEffect> {
+    let mut best: Option<RecordedEffect> = None;
+    for id in graph.query(&[ws.effect_tick, ws.effect_tool]) {
+        if matches!(graph.get(id, ws.effect_undone), Some(Value::Bool(true))) {
             continue;
         }
-        let agent = match graph.get(id, ws.effect_agent) {
-            Some(Value::Int(a)) => u64::try_from(a).unwrap_or(0),
-            _ => 0,
+        let Some(eff) = read_recorded_effect(graph, ws, id) else {
+            continue;
         };
-        let tool = prop_text(graph, id, ws.effect_tool).unwrap_or_default();
-        let target = prop_text(graph, id, ws.effect_target).unwrap_or_default();
-        let reversibility = prop_text(graph, id, ws.effect_reversibility).unwrap_or_default();
-        let summary = prop_text(graph, id, ws.effect_summary).unwrap_or_default();
-        let head_sha = prop_text(graph, id, ws.effect_head_sha).filter(|s| !s.is_empty());
-        let tree_sha = prop_text(graph, id, ws.effect_tree_sha).filter(|s| !s.is_empty());
-        out.push(RecordedEffect {
-            id,
-            tick,
-            agent,
-            tool,
-            target,
-            reversibility,
-            summary,
-            head_sha,
-            tree_sha,
-        });
+        if eff.tree_sha.is_none() {
+            continue;
+        }
+        let replace = match &best {
+            None => true,
+            Some(prev) => (eff.tick, eff.id.0) > (prev.tick, prev.id.0),
+        };
+        if replace {
+            best = Some(eff);
+        }
+    }
+    best
+}
+
+/// Persiste el `WorkspaceMode` actual en el grafo EAV para mantener el estado en snapshots y replays.
+pub fn set_workspace_mode<G: Graph + ?Sized>(
+    graph: &mut G,
+    ws: &WorkspaceVocab,
+    mode: WorkspaceMode,
+) {
+    let id = graph
+        .query(&[ws.mode])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| graph.create());
+    graph.set(id, ws.mode, Value::Text(mode.as_label().to_string()));
+}
+
+/// Lee el `WorkspaceMode` persistido en el grafo EAV, si existe.
+pub fn graph_workspace_mode<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Option<WorkspaceMode> {
+    let id = graph.query(&[ws.mode]).into_iter().next()?;
+    prop_text(graph, id, ws.mode).and_then(|s| WorkspaceMode::parse(&s))
+}
+
+/// Marca en el grafo la intención determinista de deshacer el último efecto reversible,
+/// invalidando `file_dirty` sin ejecutar I/O en disco/git (el driver vivo lo materializa).
+pub fn mark_latest_effect_undone<G: Graph + ?Sized>(
+    graph: &mut G,
+    ws: &WorkspaceVocab,
+) -> Option<RecordedEffect> {
+    let eff = latest_undoable_effect(graph, ws)?;
+    graph.set(eff.id, ws.effect_undone, Value::Bool(true));
+    let file_id = ensure_file_node(graph, ws, &eff.target);
+    graph.set(file_id, ws.file_dirty, Value::Bool(true));
+    Some(eff)
+}
+
+/// Devuelve todos los efectos marcados como deshechos (`ws.effect.undone == true`) que poseen `tree_sha`,
+/// ordenados cronológicamente por `(tick, id)`.
+pub fn undone_effects<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Vec<RecordedEffect> {
+    let mut out = Vec::new();
+    for id in graph.query(&[ws.effect_tick, ws.effect_undone]) {
+        if !matches!(graph.get(id, ws.effect_undone), Some(Value::Bool(true))) {
+            continue;
+        }
+        let Some(eff) = read_recorded_effect(graph, ws, id) else {
+            continue;
+        };
+        if eff.tree_sha.is_some() {
+            out.push(eff);
+        }
     }
     out.sort_by_key(|e| (e.tick, e.id.0));
     out
@@ -332,10 +539,13 @@ impl OnyxSystem for WorkspaceLedgerSystem {
                         record_tool_observation(
                             ctx.graph,
                             &wv,
-                            agent_id.0,
-                            mem_tick,
-                            &tool,
-                            &args,
+                            ToolObservation {
+                                agent_id: agent_id.0,
+                                tick: mem_tick,
+                                tool: &tool,
+                                args_json: &args,
+                                obs_text: &text,
+                            },
                             self.checkpoints.as_ref(),
                         );
                     }
@@ -359,21 +569,26 @@ fn current_tick(inbox: &[OnyxEvent]) -> u64 {
         .unwrap_or(0)
 }
 
+struct ToolObservation<'a> {
+    agent_id: u64,
+    tick: i64,
+    tool: &'a str,
+    args_json: &'a str,
+    obs_text: &'a str,
+}
+
 fn record_tool_observation(
     graph: &mut dyn Graph,
     wv: &WorkspaceVocab,
-    agent_id: u64,
-    tick: i64,
-    tool: &str,
-    args_json: &str,
+    obs: ToolObservation<'_>,
     checkpoints: Option<&PendingCheckpoints>,
 ) {
-    let parsed: JsonValue = serde_json::from_str(args_json).unwrap_or(JsonValue::Null);
-    match tool {
+    let parsed: JsonValue = serde_json::from_str(obs.args_json).unwrap_or(JsonValue::Null);
+    match obs.tool {
         "fs_read" => {
             if let Some(raw_path) = parsed.get("path").and_then(|v| v.as_str()) {
                 let file_id = ensure_file_node(graph, wv, raw_path);
-                graph.set(file_id, wv.file_read_tick, Value::Int(tick));
+                graph.set(file_id, wv.file_read_tick, Value::Int(obs.tick));
             }
         }
         "fs_write" | "fs_edit" => {
@@ -383,21 +598,18 @@ fn record_tool_observation(
                 .unwrap_or("unknown");
             let file_id = ensure_file_node(graph, wv, raw_path);
             graph.set(file_id, wv.file_dirty, Value::Bool(true));
-            graph.set(file_id, wv.file_read_tick, Value::Int(tick));
+            graph.set(file_id, wv.file_read_tick, Value::Int(obs.tick));
 
             let eff = graph.create();
-            graph.set(eff, wv.effect_tick, Value::Int(tick));
+            graph.set(eff, wv.effect_tick, Value::Int(obs.tick));
             graph.set(
                 eff,
                 wv.effect_agent,
-                Value::Int(i64::try_from(agent_id).unwrap_or(0)),
+                Value::Int(i64::try_from(obs.agent_id).unwrap_or(0)),
             );
-            graph.set(eff, wv.effect_tool, Value::Text(tool.to_string()));
-            graph.set(
-                eff,
-                wv.effect_target,
-                Value::Text(normalize_rel_path(raw_path)),
-            );
+            graph.set(eff, wv.effect_tool, Value::Text(obs.tool.to_string()));
+            let target = normalize_rel_path(raw_path);
+            graph.set(eff, wv.effect_target, Value::Text(target.clone()));
             graph.set(
                 eff,
                 wv.effect_reversibility,
@@ -406,17 +618,21 @@ fn record_tool_observation(
             graph.set(
                 eff,
                 wv.effect_summary,
-                Value::Text(format!("{tool} on {}", normalize_rel_path(raw_path))),
+                Value::Text(format!("{} on {target}", obs.tool)),
             );
-            if let Some(cp_map) = checkpoints {
-                let target = normalize_rel_path(raw_path);
-                if let Ok(mut guard) = cp_map.lock() {
-                    if let Some((head_sha, tree_sha)) =
-                        guard.remove(&(agent_id, tool.to_string(), target))
-                    {
-                        graph.set(eff, wv.effect_head_sha, Value::Text(head_sha));
-                        graph.set(eff, wv.effect_tree_sha, Value::Text(tree_sha));
-                    }
+            let cp_from_map = checkpoints.and_then(|cp_map| {
+                cp_map.lock().ok().and_then(|mut guard| {
+                    guard.remove(&(obs.agent_id, obs.tool.to_string(), target))
+                })
+            });
+            if let Some((head_sha, tree_sha)) =
+                parse_inline_checkpoint(obs.obs_text).or(cp_from_map)
+            {
+                if !head_sha.is_empty() {
+                    graph.set(eff, wv.effect_head_sha, Value::Text(head_sha));
+                }
+                if !tree_sha.is_empty() {
+                    graph.set(eff, wv.effect_tree_sha, Value::Text(tree_sha));
                 }
             }
         }
@@ -427,11 +643,11 @@ fn record_tool_observation(
                 .unwrap_or("<command>");
             let rev = classify_shell_reversibility(cmd);
             let eff = graph.create();
-            graph.set(eff, wv.effect_tick, Value::Int(tick));
+            graph.set(eff, wv.effect_tick, Value::Int(obs.tick));
             graph.set(
                 eff,
                 wv.effect_agent,
-                Value::Int(i64::try_from(agent_id).unwrap_or(0)),
+                Value::Int(i64::try_from(obs.agent_id).unwrap_or(0)),
             );
             graph.set(eff, wv.effect_tool, Value::Text("shell_exec".to_string()));
             graph.set(eff, wv.effect_target, Value::Text(cmd.to_string()));
@@ -461,7 +677,11 @@ fn classify_shell_reversibility(cmd: &str) -> EffectReversibility {
     }
 }
 
-fn ensure_file_node(graph: &mut dyn Graph, wv: &WorkspaceVocab, raw_path: &str) -> ConceptId {
+fn ensure_file_node<G: Graph + ?Sized>(
+    graph: &mut G,
+    wv: &WorkspaceVocab,
+    raw_path: &str,
+) -> ConceptId {
     let norm = normalize_rel_path(raw_path);
     for id in graph.query(&[wv.file_path]) {
         if let Some(Value::Text(existing)) = graph.get(id, wv.file_path) {

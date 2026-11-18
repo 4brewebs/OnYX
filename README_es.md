@@ -17,23 +17,11 @@ onyx-example-app    = REPL mínimo sobre onyx-soul                     · usa on
 onyx-example-agents = recorrido completo sobre onyx-soul-agents       · usa onyx-soul-agents
 ```
 
-## Estado al 7 de noviembre de 2026
+## Estado del workspace
 
-La última modificación de código de este cierre es `c22927e`.
-Esta actualización del README no cambia los contratos ni la implementación.
-El workspace contiene solo `onyx-core` y `onyx-soul`, sin dependencias externas.
+Comprobado con Rust `1.85` y edición `2024`. El workspace declara ocho members (`onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-scent`, `onyx-workspace`, `open-onyx`, `onyx-example-app` y `onyx-example-agents`) bajo resolver `3`. Un crate WIP que no compile con la API actual puede pasar a `exclude`, con un comentario, para que `--workspace` siga siendo usable; hoy no hay crates en `exclude`.
 
-### Verificación del cierre
-
-Comprobado con Rust 1.85.1 y edición 2024:
-
-```
-onyx-core           = contratos, tick y RNG determinista         · 0 dependencias
-onyx-soul           = implementaciones por defecto de esos puertos · 0 dependencias externas
-onyx-soul-agents    = alma orientada a agentes, mismos puertos   · 0 dependencias externas
-onyx-example-app    = REPL mínimo sobre onyx-soul                · solo depende de esa alma
-onyx-example-agents = demo de host, herramienta, snapshot y replay · solo depende de onyx-soul-agents
-```
+Regla de dependencias: `onyx-core`, `onyx-soul`, `onyx-soul-agents` y ambos ejemplos no declaran dependencias externas. Las almas dependen de `onyx-core`. Cada ejemplo depende solo de su soul, que reexporta los tipos de core que la aplicación necesita, así que la app no declara `onyx-core`. Los adaptadores (`onyx-scent`, `onyx-workspace`, `open-onyx`) añaden sus dependencias externas manteniendo el cerebro síncrono y determinista. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) verifica formato, clippy (`-D warnings`), tests debug/release y `rustdoc`; usa `cargo tree -p onyx-core -p onyx-soul -p onyx-soul-agents` para comprobar la ausencia de dependencias externas en el núcleo y las almas.
 
 ## Criterio de diseño
 
@@ -64,9 +52,9 @@ OnYX es opinionado en el modelo de ejecución y agnóstico en la representación
 
 ## Workspace
 
-El workspace declara cinco members: `onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-example-app` y `onyx-example-agents`. La versión mínima de Rust es 1.85, la edición es 2024 y el resolver es 3. Un crate WIP que no compile con la API actual puede pasar a `exclude`, con un comentario, para que `--workspace` siga siendo usable. Hoy no hay crates en `exclude`.
+El workspace declara ocho members: `onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-scent`, `onyx-workspace`, `open-onyx`, `onyx-example-app` y `onyx-example-agents`. La versión mínima de Rust es `1.85`, la edición es `2024` y el resolver es `3`. Un crate WIP que no compile con la API actual puede pasar a `exclude`, con un comentario, para que `--workspace` siga siendo usable. Hoy no hay crates en `exclude`.
 
-Regla de dependencias: `onyx-core`, `onyx-soul`, `onyx-soul-agents` y ambos ejemplos no declaran dependencias externas. Las almas dependen de `onyx-core`. Cada ejemplo depende solo de su soul, que reexporta los tipos de core que la aplicación necesita, así que la app no declara `onyx-core`. Los souls o las aplicaciones futuras pueden añadir dependencias externas. En este árbol no hay flujos de CI que exijan esa regla.
+Regla de dependencias: `onyx-core`, `onyx-soul`, `onyx-soul-agents` y ambos ejemplos no declaran dependencias externas. Las almas dependen de `onyx-core`. Cada ejemplo depende solo de su soul, que reexporta los tipos de core que la aplicación necesita, así que la app no declara `onyx-core`. Los crates adaptadores (`onyx-scent`, `onyx-workspace`, `open-onyx`) pueden declarar dependencias externas manteniendo aislado el núcleo determinista. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) verifica formato, clippy, tests y documentación; ejecuta `cargo tree -p onyx-core -p onyx-soul -p onyx-soul-agents` para comprobar la regla de cero dependencias externas.
 
 ## Qué existe hoy
 
@@ -83,6 +71,21 @@ Regla de dependencias: `onyx-core`, `onyx-soul`, `onyx-soul-agents` y ambos ejem
 - `tick` síncrono y ordenado, y `DetRng` (RNG no criptográfico con semilla explícita). Las escrituras en el grafo se ven en el acto, también para los sistemas posteriores del mismo tick. Los eventos nuevos, salvo las peticiones de control, se entregan en el tick siguiente.
 
 No hay un tipo `Supervisor` en core. El llamador conserva el slice de `SystemState` y lo pasa a `tick`.
+
+**Auditoría de `onyx-core` (18 de noviembre de 2026)**
+
+`tick` y `DetRng` cumplen el contrato escrito. Esta pasada no cambia traits ni el orden de fases. La suite del crate queda en 31 tests de tick, 6 de `DetRng`, 7 del puerto de grafo, 3 doctests y 8 controles de `conformance`. Los bordes añadidos están en [`onyx-core/tests/tick_contract.rs`](onyx-core/tests/tick_contract.rs) y [`onyx-core/tests/detrng_contract.rs`](onyx-core/tests/detrng_contract.rs).
+
+Cuatro comportamientos son peligros de protocolo, no fallos de implementación:
+
+- Un `RestoreRequested` no aparta el outbox del mismo tick. Los eventos de dominio emitidos alrededor del restore se entregan en el tick siguiente, con los `ConceptId` y los payloads calculados antes de importar, y `SnapshotRestored` queda entre ellos. El consumidor tiene que descartar esas copias.
+- El outbox es un `Vec` compartido. Un sistema posterior del mismo tick puede vaciarlo y anular, por ejemplo, un `SnapshotRequested` anterior.
+- Si ningún sistema está `Active`, el ingress de ese tick entra en un inbox que nadie lee y no se reencola. Un `Start` posterior no lo recupera. Escribir `SystemState::Active` a mano tampoco dispara `on_start`: ese hook solo corre en la fase de control de `tick`.
+- Un pánico dentro de `run` conserva las escrituras de los sistemas anteriores, pierde el inbox ya drenado y el outbox todavía no encolado, y no ejecuta la fase de control ni `present`.
+
+`Start` y `Stop` de un nombre inexistente no emiten `Fault`. `Shutdown` sigue sin política propia, como dice la lista de arriba. Dos sistemas con el mismo nombre reciben ambos el `Start`. `poll` recibe el `EventBus` completo, y `run`, `on_start` y `on_stop` reciben el `Graph` completo: un driver puede drenar el bus y un sistema puede llamar a `import` fuera del protocolo. Un `init` fallido después de un import correcto sigue emitiendo `SnapshotRestored`: el grafo nuevo está cargado y ese sistema queda `Blocked`.
+
+`DetRng` reproduce los vectores fijos, evita el estado cero y mantiene `gen_range` dentro del intervalo. 4096 ticks consecutivos con semillas 0, 1 y 91 no repiten la primera salida. El módulo no promete ausencia de colisiones en todo el espacio de 64 bits.
 
 **`onyx-soul`**
 
@@ -120,10 +123,10 @@ El snapshot del grafo está implementado en ambos souls. El formato es privado d
 
 **`onyx-soul-agents`**, **`onyx-workspace`** y **`open-onyx`**
 
-- [`onyx-soul-agents`](onyx-soul-agents/README.md): soul sin dependencias externas especializado en harnesses multi-agente deterministas (`AgentGraph`, `AgentSnapshotStore`, `AgentHost`, `RecordingBridge`/`ReplayBridge`, `AgentState::WaitingApproval`, `ApprovalPolicy` y llamadas estructuradas con `call_id`).
-- [`onyx-scent`](onyx-scent/README.md): indexador AST multi-archivo (`Rust`, `Python`, `Java`) con `tree-sitter`, caché incremental `blake3`, difusión térmica entera (`0..=10_000` bp) y codificador/decodificador `@TOON v1` con paginación determinista.
-- [`onyx-workspace`](onyx-workspace/README.md): herramientas de código (`fs_read`, `fs_list`, `fs_write`, `fs_edit` con *fallback* por líneas, `code_search`, `shell_exec` con limpieza completa de árbol de procesos, más `scent_outline`/`scent_impact` de solo lectura bajo `feature = "scent"`), `WorkspacePolicy` (con corte de symlinks), modos `WorkspaceMode` (`Plan`/`Build`/`Explore`), ledger EAV (`WorkspaceLedgerSystem` + `effects_after_tick`), checkpoints Git ligeros (`GIT_INDEX_FILE` temporal) y `WorkspaceToolBridge` para grabación y replay determinista sin tocar disco.
-- [`open-onyx`](open-onyx/README.md): binario `openonyx` con modos `run`, `chat` (TUI con `ratatui`/`crossterm`, `--max-steps` y worker HTTP asíncrono `AsyncGeminiDriver` no bloqueante con encolado secuencial de lotes `functionCall`), `replay`, `inspect` y `rewind` (con `--dry-run` y reconciliación Git en disco).
+- [`onyx-soul-agents`](onyx-soul-agents/README.md): soul sin dependencias externas especializado en harnesses multi-agente deterministas (`AgentGraph`, `append_agent_memory` con volcado post-`Done` de `result` a `"say"`, `continue_agent` multi-turno con `steps` monótonos, `AgentSnapshotStore`, `RecordingBridge`/`ReplayBridge` con `ONYXTR1`/`ONYXTR2`, `SubagentSystem` con `spawn_agent`/`WaitingChildren`, `AgentState::WaitingApproval`, `ApprovalPolicy` y llamadas estructuradas con `call_id`).
+- [`onyx-scent`](onyx-scent/README.md): indexador AST multi-archivo (`Rust`, `Python`, `Java`) con `tree-sitter`, caché incremental `blake3`, difusión térmica entera (`0..=10_000` bp), etiquetas `scope:src|test` y `vis:pub|priv`, filtrado `exclude_tests`, herencia de visibilidad en `trait` públicos de Rust, resumen de campos en `struct`, anotaciones Java, resolución preferente intra-archivo y codificador/decodificador `@TOON v1` con paginación determinista.
+- [`onyx-workspace`](onyx-workspace/README.md): herramientas de código (`fs_read` con `recall_seen`, `fs_list`, `fs_write`, `fs_edit` con *fallback* por líneas, `code_search`, `git_status` y `git_diff` de solo lectura sin aprobación, `shell_exec` con redacción de credenciales, limpieza completa de árbol de procesos e invalidación de lecturas cacheadas, más `scent_outline`/`scent_impact` bajo `feature = "scent"`), `preview_tool_diff`, `WorkspacePolicy` (con corte de symlinks), modos `WorkspaceMode` (`Plan`/`Build`/`Explore`) con `WorkspaceModeHandle` y `ws.mode` en grafo, ledger EAV (`WorkspaceLedgerSystem`, `effects_after_tick`, `latest_undoable_effect`, `mark_latest_effect_undone`, `undone_effects`), checkpoints Git ligeros (`GIT_INDEX_FILE` temporal con soporte incluso sin primer commit y limpieza de staging al restaurar) y `WorkspaceToolBridge` (etiqueta `[checkpoint:<head>:<tree>]` en `Reply::observe` para grabación/replay determinista y materialización en vivo de `/undo`).
+- [`open-onyx`](open-onyx/README.md): binario modular `openonyx` con parsing CLI en [`main.rs`](open-onyx/src/main.rs), `CommandSpawnerSystem` puro en [`command.rs`](open-onyx/src/command.rs) (`/new`, `/mode`, `/undo` sin I/O, continuación multi-turno), superficies lógicas declaradas (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`) y bucle único `run_session` (`StopPolicy`) sobre `AgentHost::step_with` en [`session.rs`](open-onyx/src/session.rs), utilidades offline (`inspect`, `rewind [--dry-run]`, `doctor`) en [`ops.rs`](open-onyx/src/ops.rs), carga automática de `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md` junto a `GeminiResponder`/`AsyncGeminiDriver` en [`gemini.rs`](open-onyx/src/gemini.rs), y TUI `ratatui`/`crossterm` en [`tui.rs`](open-onyx/src/tui.rs) con tecla `Tab` (`[PLAN]`/`[BUILD]` grabado en transcripción), previsualización de diff unificado coloreado al aprobar cambios y `--resume <dir>`.
 - `onyx-example-app` y `onyx-example-agents`: aplicaciones de ejemplo sobre `onyx-soul` y `onyx-soul-agents`.
 
 Verificación reproducible: `cargo test --workspace` y `cargo test --workspace --release`. `WorldGraph` pasa los casos genéricos de consultas, referencias, destrucción, remapeo de atributos y continuidad tras restaurar, además de pruebas privadas de rechazo atómico de snapshots inválidos. Las mutaciones de bytes no se presuponen inválidas: solo si `import` devuelve `Err` se exige conservación del observable y de una sonda de estado privado suministrada por el soul, que cubre registro completo y contador. La suite no exige igualdad de snapshots entre instancias. Esto no demuestra todavía intercambio con una segunda implementación de grafo ni recuperación completa del runtime. También se prueban RNG, tick, bus y capacidades de los puertos. La idempotencia de `init` se comprueba con una fábrica de sistemas consumidores de prueba, no para cualquier sistema externo. `cargo tree --workspace` permite comprobar que no hay dependencias externas. Para ejecutar solo los controles defectuosos: `cargo test -p onyx-core --features conformance --test conformance_probes`.

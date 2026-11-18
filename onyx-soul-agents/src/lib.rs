@@ -52,7 +52,7 @@ pub use bridge::{
 pub use bus::AgentBus;
 pub use config::{AgentConfig, DEFAULT_PREFIX};
 pub use driver::{AgentDriver, AgentRequest};
-pub use graph::AgentGraph;
+pub use graph::{AgentGraph, append_agent_memory, continue_agent};
 pub use headless::{HeadlessDriver, HeadlessHandle};
 pub use host::{AgentHost, Fingerprint, HostBuilder, MemStore};
 pub use loader::RustLoader;

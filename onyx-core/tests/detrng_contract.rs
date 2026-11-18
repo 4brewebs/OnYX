@@ -90,6 +90,20 @@ fn invalid_intervals_return_low_without_advancing_the_sequence() {
 }
 
 #[test]
+fn nearby_ticks_do_not_share_the_first_output() {
+    let mut seen = std::collections::HashSet::new();
+    for seed in [0_u64, 1, 91] {
+        for tick in 0..4096 {
+            let first = DetRng::from_seed_and_tick(seed, tick).next_u64();
+            assert!(
+                seen.insert((seed, first)),
+                "colisión de la primera salida en seed={seed} tick={tick}"
+            );
+        }
+    }
+}
+
+#[test]
 fn floats_and_integer_ranges_stay_within_their_bounds() {
     let mut rng = DetRng::from_seed_and_tick(u64::MAX, 0);
     for _ in 0..4096 {

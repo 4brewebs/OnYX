@@ -1,26 +1,30 @@
+mod command;
 mod gemini;
+mod ops;
+mod session;
 mod tui;
 
-use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
-use gemini::{AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder};
+use command::CommandSpawnerSystem;
+use gemini::{AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, load_project_instructions};
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSnapshotStore, AgentSpec, AgentState, AgentView, AttrRegistry,
-    Ctx, EventBus, GraphView, HeadlessDriver, IngressEvent, OnyxError, OnyxEvent, OnyxSystem,
-    PlatformDriver, RecordingBridge, ReplayBridge, Reply, SnapshotStore, SubagentSystem,
-    SurfaceBinding, Transcript, Value, Vocab, pending_approvals, spawn_event,
+    AgentConfig, AgentSnapshotStore, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge,
+    Transcript,
 };
 use onyx_workspace::{
-    PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceMode, WorkspacePolicy, WorkspaceToolBridge,
-    WorkspaceTools, WorkspaceVocab, effects_after_tick, restore_git_tree_checkpoint,
+    PendingCheckpoints, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge,
+    WorkspaceTools,
+};
+use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
+use session::{
+    CliApprovalDriver, SessionOptions, StopPolicy, build_host, build_host_with_checkpoints,
+    make_spec, run_session,
 };
 use tui::TuiDriver;
 
@@ -33,6 +37,7 @@ struct CliArgs {
     shell_timeout_secs: Option<u64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
+    resume_dir: Option<PathBuf>,
 }
 
 enum Mode {
@@ -54,98 +59,6 @@ enum Mode {
     },
 }
 
-/// Sistema determinista que convierte `IngressEvent::Command(goal)` de la TUI en
-/// un `spawn_event` dentro del bucle `tick()`.
-struct CommandSpawnerSystem {
-    vocab: Option<Vocab>,
-    auto_approve: bool,
-    counter: usize,
-}
-
-impl CommandSpawnerSystem {
-    fn new(auto_approve: bool) -> Self {
-        Self {
-            vocab: None,
-            auto_approve,
-            counter: 0,
-        }
-    }
-}
-
-impl OnyxSystem for CommandSpawnerSystem {
-    fn name(&self) -> &str {
-        "openonyx_command_spawner"
-    }
-
-    fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
-        self.vocab = Some(Vocab::resolve(attrs));
-        Ok(())
-    }
-
-    fn run(&mut self, ctx: &mut Ctx) {
-        let Some(v) = self.vocab else { return };
-        for event in ctx.inbox {
-            if let OnyxEvent::Ingress(IngressEvent::Command(goal)) = event {
-                self.counter += 1;
-                let mut spec = AgentSpec::new(format!("openonyx-{}", self.counter), goal.clone())
-                    .with_tools(WorkspaceTools::all_tool_names().iter().copied());
-                if !self.auto_approve {
-                    spec = spec.with_approval_tools(
-                        WorkspaceTools::approval_required_names().iter().copied(),
-                    );
-                }
-                ctx.outbox.push(spawn_event(&v, &spec, None));
-            }
-        }
-    }
-}
-
-/// Driver CLI para aprobaciones en modo `run`: se envuelve dentro de
-/// `RecordingBridge` para que `Approve`/`Deny` queden grabados en `Transcript`.
-struct CliApprovalDriver {
-    vocab: Vocab,
-    inner: Box<dyn PlatformDriver>,
-    seen: BTreeSet<(u64, u64)>,
-    queued: Vec<Reply>,
-}
-
-impl CliApprovalDriver {
-    fn new(vocab: Vocab, inner: impl PlatformDriver + 'static) -> Self {
-        Self {
-            vocab,
-            inner: Box::new(inner),
-            seen: BTreeSet::new(),
-            queued: Vec::new(),
-        }
-    }
-}
-
-impl PlatformDriver for CliApprovalDriver {
-    fn poll(&mut self, bus: &mut dyn EventBus) {
-        self.inner.poll(bus);
-        for reply in self.queued.drain(..) {
-            bus.push(reply.to_event());
-        }
-    }
-
-    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
-        self.inner.present(graph, surfaces);
-        for view in pending_approvals(graph, &self.vocab) {
-            if !self.seen.insert((view.agent.0, view.request)) {
-                continue;
-            }
-            if let Some(pending) = &view.pending_approval {
-                let reply = if prompt_approval(&pending.tool, &pending.args) {
-                    Reply::approve(view.agent, view.request)
-                } else {
-                    Reply::deny(view.agent, view.request, "denied by user")
-                };
-                self.queued.push(reply);
-            }
-        }
-    }
-}
-
 fn parse_args() -> Result<CliArgs, String> {
     parse_args_from(env::args().skip(1))
 }
@@ -161,6 +74,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut shell_timeout_secs: Option<u64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
+    let mut resume_dir = None;
     let mut tick_opt: Option<u64> = None;
     let mut transcript_opt: Option<PathBuf> = None;
     let mut positional = Vec::new();
@@ -204,6 +118,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
             "--snapshot-dir" => {
                 let p = args.next().ok_or("--snapshot-dir requires a path")?;
                 snapshot_dir = Some(PathBuf::from(p));
+            }
+            "--resume" | "-r" => {
+                let p = args
+                    .next()
+                    .ok_or("--resume requires a snapshot directory path")?;
+                resume_dir = Some(PathBuf::from(p));
             }
             "--tick" => {
                 let t = args.next().ok_or("--tick requires a number")?;
@@ -265,6 +185,10 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         _ => return Err(usage()),
     };
 
+    if resume_dir.is_some() && snapshot_dir.is_none() {
+        snapshot_dir = resume_dir.clone();
+    }
+
     Ok(CliArgs {
         mode,
         workspace,
@@ -274,95 +198,22 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         shell_timeout_secs,
         save_transcript,
         snapshot_dir,
+        resume_dir,
     })
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]".to_string()
 }
 
-fn prompt_approval(tool: &str, args: &str) -> bool {
-    println!("\n[openOnyx] Approval required for `{tool}`:");
-    println!("  args: {args}");
-    print!("Approve? [y/N]: ");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    if io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
-fn all_live_waiting_approval(graph: &dyn GraphView, v: &Vocab) -> bool {
-    all_live_agents_blocked(graph, v, 0)
-}
-
-fn all_live_agents_blocked(graph: &dyn GraphView, v: &Vocab, llm_in_flight: usize) -> bool {
-    let mut any_live = false;
-    for id in graph.query(&[v.state]) {
-        if let Some(Value::Text(s)) = graph.get(id, v.state) {
-            if let Some(state) = AgentState::parse(&s) {
-                if !state.is_terminal() {
-                    any_live = true;
-                    let blocked = matches!(
-                        state,
-                        AgentState::WaitingApproval | AgentState::WaitingChildren
-                    ) || (state == AgentState::Thinking && llm_in_flight > 0);
-                    if !blocked {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    any_live
-}
-
-fn build_host(
-    seed: u64,
-    config: AgentConfig,
-    snapshot_dir: Option<&PathBuf>,
-    extra_system: Option<Box<dyn OnyxSystem>>,
-) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
-    build_host_with_checkpoints(seed, config, snapshot_dir, extra_system, None)
-}
-
-fn build_host_with_checkpoints(
-    seed: u64,
-    config: AgentConfig,
-    snapshot_dir: Option<&PathBuf>,
-    extra_system: Option<Box<dyn OnyxSystem>>,
-    checkpoints: Option<PendingCheckpoints>,
-) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
-    let mut ledger = WorkspaceLedgerSystem::new();
-    if let Some(cp) = checkpoints {
-        ledger = ledger.with_checkpoints(cp);
-    }
-    let mut builder = AgentHost::builder(seed)
-        .config(config.clone())
-        .system(Box::new(SubagentSystem::new(config)))
-        .system(Box::new(ledger));
-    if let Some(sys) = extra_system {
-        builder = builder.system(sys);
-    }
-    if let Some(dir) = snapshot_dir {
-        builder = builder.store(Box::new(AgentSnapshotStore::new(dir)));
-    }
-    let mut host = builder.build()?;
-    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
-    Ok((host, ws_vocab))
-}
-
-fn make_spec(goal: &str, auto_approve: bool) -> AgentSpec {
-    let mut spec = AgentSpec::new("openonyx", goal).with_tools(
-        WorkspaceTools::all_tool_names_with_subagents()
-            .iter()
-            .copied(),
-    );
-    if !auto_approve {
-        spec = spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
-    }
-    spec
+fn gemini_env_and_instructions(
+    workspace: &Path,
+) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+    let api_key =
+        env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
+    let model = env::var("ONYX_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+    let project_instructions = load_project_instructions(workspace);
+    Ok((api_key, model, project_instructions))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -386,7 +237,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..AgentConfig::default()
     };
 
-    let save_snapshots = cli.snapshot_dir.is_some();
+    let session_opts = SessionOptions {
+        snapshot_dir: cli.snapshot_dir.clone(),
+        save_transcript: cli.save_transcript.clone(),
+        save_step_snapshots: cli.snapshot_dir.is_some(),
+    };
 
     match cli.mode {
         Mode::Run(goal) => {
@@ -398,10 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 Some(checkpoints.clone()),
             )?;
-            let api_key = env::var("GEMINI_API_KEY")
-                .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
-            let model =
-                env::var("ONYX_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+            let (api_key, model, project_instructions) =
+                gemini_env_and_instructions(&cli.workspace)?;
 
             host.spawn(&make_spec(&goal, cli.auto_approve));
 
@@ -412,23 +265,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(cli_driver);
-            let mut driver =
-                RecordingBridge::new(host.vocab(), GeminiResponder::new(api_key, model))
-                    .wrapping(ws_bridge);
+            let mut driver = RecordingBridge::new(
+                host.vocab(),
+                GeminiResponder::new(api_key, model)
+                    .with_project_instructions(project_instructions),
+            )
+            .wrapping(ws_bridge);
 
-            for _ in 0..256 {
-                if save_snapshots {
-                    host.request_snapshot(&host.ticks().to_string());
-                }
-                host.step(&mut driver);
-                if host.is_settled() {
-                    break;
-                }
-            }
+            run_session(
+                &mut host,
+                &mut driver,
+                &session_opts,
+                StopPolicy::Settled { max_ticks: 256 },
+            )?;
 
-            if let Some(path) = cli.save_transcript {
-                fs::write(path, driver.transcript().to_bytes())?;
-            }
             if let Some(id) = host.agents().first().copied() {
                 println!(
                     "\n[openOnyx] state={:?} result:\n{}",
@@ -444,24 +294,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_timeout_ticks: 512,
                 ..config
             };
+            let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+            let spawner = CommandSpawnerSystem::new(cli.auto_approve)
+                .with_max_steps(chat_config.default_max_steps)
+                .with_mode_handle(mode_handle.clone());
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 chat_config,
                 cli.snapshot_dir.as_ref(),
-                Some(Box::new(CommandSpawnerSystem::new(cli.auto_approve))),
+                Some(Box::new(spawner)),
                 Some(checkpoints.clone()),
             )?;
-            let api_key = env::var("GEMINI_API_KEY")
-                .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
-            let model =
-                env::var("ONYX_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+            if let Some(resume_path) = &cli.resume_dir {
+                let store = AgentSnapshotStore::new(resume_path);
+                let latest = store
+                    .latest_tick()
+                    .ok_or_else(|| format!("no snapshots found in `{}`", resume_path.display()))?;
+                host.request_restore(&latest.to_string());
+                host.step(&mut HeadlessDriver::new());
+                host.set_tick(latest.saturating_add(1));
+            }
+            let (api_key, model, project_instructions) =
+                gemini_env_and_instructions(&cli.workspace)?;
 
-            let tui = TuiDriver::new(host.vocab())?;
+            let tui = TuiDriver::new(host.vocab())?
+                .with_workspace(cli.workspace.clone(), mode_handle.clone());
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
-                .with_mode(WorkspaceMode::Build)
+                .with_mode_handle(mode_handle)
                 .with_workspace_vocab(ws_vocab)
+                .sync_existing_undos(host.graph())
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(tui);
@@ -474,43 +337,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&llm_in_flight),
                 Arc::clone(&gemini_ready),
             )
+            .with_project_instructions(project_instructions)
             .wrapping(ws_bridge);
             let mut driver =
                 RecordingBridge::new(host.vocab(), |_: &AgentView| None).wrapping(async_gemini);
 
-            tui_handle.render(host.graph());
-            let mut needs_follow_up_tick = false;
-            while !quit.load(Ordering::Relaxed) {
-                let ui_queued = tui_handle.has_queued_events();
-                let llm_ready = gemini_ready.load(Ordering::Acquire);
-                let all_blocked = all_live_agents_blocked(
-                    host.graph(),
-                    &host.vocab(),
-                    llm_in_flight.load(Ordering::Acquire),
-                );
-                let can_advance = !host.is_settled() && !all_blocked;
-                if can_advance || ui_queued || llm_ready || needs_follow_up_tick {
-                    let was_settled = host.is_settled();
-                    if save_snapshots {
-                        host.request_snapshot(&host.ticks().to_string());
-                    }
-                    host.step(&mut driver);
-                    // Un `IngressEvent::Command` tarda 1 tick en convertirse en
-                    // `spawn_event` (por `CommandSpawnerSystem`) y otro en crear
-                    // el agente en el grafo (por `AgentSpawner`).
-                    needs_follow_up_tick = ui_queued;
-                    if !was_settled && host.is_settled() {
-                        if let Some(path) = &cli.save_transcript {
-                            let _ = fs::write(path, driver.transcript().to_bytes());
-                        }
-                    }
-                } else {
-                    tui_handle.pump_idle(host.graph());
-                }
-            }
-            if let Some(path) = cli.save_transcript {
-                fs::write(path, driver.transcript().to_bytes())?;
-            }
+            run_session(
+                &mut host,
+                &mut driver,
+                &session_opts,
+                StopPolicy::Quit {
+                    quit,
+                    tui: tui_handle,
+                    llm_in_flight,
+                    llm_ready: gemini_ready,
+                },
+            )?;
         }
         Mode::Replay(path) => {
             let bytes = fs::read(path)?;
@@ -529,17 +371,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Replay determinista puro: NO toca disco ni llama a Gemini.
             let mut driver = ReplayBridge::new(transcript).wrapping(HeadlessDriver::new());
-            for _ in 0..4096 {
-                if save_snapshots {
-                    host.request_snapshot(&host.ticks().to_string());
-                }
-                host.step(&mut driver);
-                if driver.remaining() == 0
-                    && (host.is_settled() || all_live_waiting_approval(host.graph(), &host.vocab()))
-                {
-                    break;
-                }
-            }
+            run_session(
+                &mut host,
+                &mut driver,
+                &session_opts,
+                StopPolicy::ReplayExhausted { max_ticks: 4096 },
+            )?;
 
             for id in host.agents() {
                 println!(
@@ -551,108 +388,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Mode::Inspect { dir, tick } => {
-            let store = AgentSnapshotStore::new(&dir);
-            let target_tick = match tick {
-                Some(t) => t,
-                None => store
-                    .latest_tick()
-                    .ok_or("no snapshots found in directory")?,
-            };
-            let mut host = AgentHost::builder(1)
-                .config(config)
-                .store(Box::new(store))
-                .build()?;
-            host.request_restore(&target_tick.to_string());
-            host.step(&mut HeadlessDriver::new());
-
-            println!("=== openOnyx Graph Snapshot @ tick {target_tick} ===");
-            let concepts = host.graph().query(&[]);
-            println!("Total concepts: {}", concepts.len());
-            for id in host.agents() {
-                let view = host.view(id);
-                println!(
-                    "\nAgent {} (`{}`) state={:?} req={}",
-                    id.0,
-                    view.name,
-                    host.agent_state(id),
-                    view.request
-                );
-                println!("  goal: {}", view.goal);
-                println!("  tools: {:?}", view.tools);
-                println!("  memory ({} entries):", view.memory.len());
-                for (k, body) in &view.memory {
-                    let preview: String = body.chars().take(120).collect();
-                    println!("    - [{k}] {preview}");
-                }
-                if let Some(p) = &view.pending_approval {
-                    println!("  pending_approval: {} {}", p.tool, p.args);
-                }
-                if let Some(res) = host.result(id) {
-                    println!("  result: {res}");
-                }
-            }
+            run_inspect(&dir, tick, config)?;
         }
         Mode::Rewind {
             dir,
             tick,
             transcript,
         } => {
-            let store = AgentSnapshotStore::new(&dir);
-            if let Some(latest) = store.latest_tick() {
-                if latest > tick {
-                    let (mut probe_host, probe_ws_vocab) =
-                        build_host(1, config.clone(), Some(&dir), None)?;
-                    probe_host.request_restore(&latest.to_string());
-                    probe_host.step(&mut HeadlessDriver::new());
-                    let orphaned = effects_after_tick(probe_host.graph(), &probe_ws_vocab, tick);
-                    if !orphaned.is_empty() {
-                        println!(
-                            "=== [openOnyx rewind] Side-Effect Ledger ({} effects after tick {tick}) ===",
-                            orphaned.len()
-                        );
-                        for eff in &orphaned {
-                            let ckpt_info = eff
-                                .tree_sha
-                                .as_deref()
-                                .map(|sha| format!(" [tree:{sha}]"))
-                                .unwrap_or_default();
-                            println!(
-                                "  - tick={} agent={} [{}] {} -> {} ({}){}",
-                                eff.tick,
-                                eff.agent,
-                                eff.reversibility,
-                                eff.tool,
-                                eff.target,
-                                eff.summary,
-                                ckpt_info
-                            );
-                        }
-                        if let Some(tree_sha) = orphaned.iter().find_map(|e| e.tree_sha.as_deref())
-                        {
-                            if cli.dry_run {
-                                println!(
-                                    "[openOnyx rewind --dry-run] would restore workspace working tree to checkpoint {tree_sha}"
-                                );
-                            } else {
-                                restore_git_tree_checkpoint(&cli.workspace, tree_sha)?;
-                                println!(
-                                    "[openOnyx rewind] restored workspace working tree to checkpoint {tree_sha}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            reconcile_rewind_effects(&cli.workspace, &dir, tick, &config, cli.dry_run)?;
             if cli.dry_run {
                 return Ok(());
             }
 
             let checkpoints = PendingCheckpoints::default();
+            let spawner = CommandSpawnerSystem::new(cli.auto_approve).with_max_steps(128);
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
                 Some(&dir),
-                Some(Box::new(CommandSpawnerSystem::new(cli.auto_approve))),
+                Some(Box::new(spawner)),
                 Some(checkpoints.clone()),
             )?;
             host.request_restore(&tick.to_string());
@@ -661,44 +415,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let next_tick = tick.saturating_add(1);
             host.set_tick(next_tick);
 
+            let rewind_opts = SessionOptions::default();
             if let Some(tr_path) = transcript {
                 let bytes = fs::read(tr_path)?;
                 let tr = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
                 let mut driver = ReplayBridge::new(tr)
                     .starting_at(next_tick)
                     .wrapping(HeadlessDriver::new());
-                for _ in 0..4096 {
-                    host.step(&mut driver);
-                    if driver.remaining() == 0
-                        && (host.is_settled()
-                            || all_live_waiting_approval(host.graph(), &host.vocab()))
-                    {
-                        break;
-                    }
-                }
+                run_session(
+                    &mut host,
+                    &mut driver,
+                    &rewind_opts,
+                    StopPolicy::ReplayExhausted { max_ticks: 4096 },
+                )?;
             } else {
-                let api_key = env::var("GEMINI_API_KEY")
-                    .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
-                let model = env::var("ONYX_GEMINI_MODEL")
-                    .unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+                let (api_key, model, project_instructions) =
+                    gemini_env_and_instructions(&cli.workspace)?;
                 let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
                 let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                     .with_mode(WorkspaceMode::Build)
                     .with_workspace_vocab(ws_vocab)
+                    .sync_existing_undos(host.graph())
                     .with_checkpoints(checkpoints)
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
-                let mut driver =
-                    RecordingBridge::new(host.vocab(), GeminiResponder::new(api_key, model))
-                        .starting_at(next_tick)
-                        .wrapping(ws_bridge);
+                let mut driver = RecordingBridge::new(
+                    host.vocab(),
+                    GeminiResponder::new(api_key, model)
+                        .with_project_instructions(project_instructions),
+                )
+                .starting_at(next_tick)
+                .wrapping(ws_bridge);
 
-                for _ in 0..256 {
-                    host.step(&mut driver);
-                    if host.is_settled() {
-                        break;
-                    }
-                }
+                run_session(
+                    &mut host,
+                    &mut driver,
+                    &rewind_opts,
+                    StopPolicy::Settled { max_ticks: 256 },
+                )?;
             }
 
             for id in host.agents() {
@@ -725,203 +479,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Default)]
-struct DoctorReport {
-    checks: Vec<String>,
-    warnings: Vec<String>,
-    errors: Vec<String>,
-}
-
-impl DoctorReport {
-    fn print(&self) {
-        println!("=== [openOnyx doctor] ===");
-        for item in &self.checks {
-            println!("  [OK]   {item}");
-        }
-        for warn in &self.warnings {
-            println!("  [WARN] {warn}");
-        }
-        for err in &self.errors {
-            println!("  [ERR]  {err}");
-        }
-    }
-}
-
-fn run_doctor(
-    workspace: &Path,
-    snapshot_dir: Option<&PathBuf>,
-    transcript: Option<&PathBuf>,
-) -> DoctorReport {
-    let mut report = DoctorReport::default();
-
-    let git_ok = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(workspace)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if git_ok {
-        report
-            .checks
-            .push(format!("git worktree valid at {}", workspace.display()));
-    } else {
-        report.warnings.push(format!(
-            "workspace `{}` is not a git worktree",
-            workspace.display()
-        ));
-    }
-
-    if let Ok(entries) = fs::read_dir(workspace) {
-        let mut temp_artifacts = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".tr") || (name.starts_with("snaps") && entry.path().is_dir()) {
-                temp_artifacts.push(name);
-            }
-        }
-        temp_artifacts.sort();
-        if temp_artifacts.is_empty() {
-            report
-                .checks
-                .push("no stray *.tr or snaps* artifacts in workspace root".to_string());
-        } else {
-            report.warnings.push(format!(
-                "temporary artifacts in workspace root: {}",
-                temp_artifacts.join(", ")
-            ));
-        }
-    }
-
-    if let Some(tr_path) = transcript {
-        match fs::read(tr_path) {
-            Err(e) => report.errors.push(format!(
-                "failed to read transcript `{}`: {e}",
-                tr_path.display()
-            )),
-            Ok(bytes) => {
-                if !bytes.starts_with(b"ONYXTR2") && !bytes.starts_with(b"ONYXTR1") {
-                    report.errors.push(format!(
-                        "transcript `{}` missing ONYXTR1/ONYXTR2 header",
-                        tr_path.display()
-                    ));
-                }
-                match Transcript::from_bytes(&bytes) {
-                    Ok(tr) => report.checks.push(format!(
-                        "transcript `{}` valid ({} entries, {} commands)",
-                        tr_path.display(),
-                        tr.entries.len(),
-                        tr.commands.len()
-                    )),
-                    Err(e) => report.errors.push(format!(
-                        "transcript `{}` parse error: {e}",
-                        tr_path.display()
-                    )),
-                }
-            }
-        }
-    }
-
-    if let Some(dir) = snapshot_dir {
-        let store = AgentSnapshotStore::new(dir);
-        match fs::read_dir(dir) {
-            Err(e) => report
-                .errors
-                .push(format!("cannot read snapshot dir `{}`: {e}", dir.display())),
-            Ok(entries) => {
-                let mut ticks = Vec::new();
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if let Some(stem) = name
-                        .strip_prefix("tick-")
-                        .and_then(|s| s.strip_suffix(".bin"))
-                    {
-                        if let Ok(t) = stem.parse::<u64>() {
-                            ticks.push(t);
-                        }
-                    }
-                }
-                ticks.sort();
-                if ticks.is_empty() {
-                    report.warnings.push(format!(
-                        "no tick-*.bin snapshots found in `{}`",
-                        dir.display()
-                    ));
-                } else {
-                    let mut bad_snaps = 0usize;
-                    for &t in &ticks {
-                        let key = t.to_string();
-                        match store.load(&key) {
-                            Ok(bytes) if bytes.starts_with(b"ONYXAG") => {}
-                            Ok(_) => {
-                                bad_snaps += 1;
-                                report
-                                    .errors
-                                    .push(format!("snapshot tick-{t}.bin missing ONYXAG header"));
-                            }
-                            Err(e) => {
-                                bad_snaps += 1;
-                                report
-                                    .errors
-                                    .push(format!("snapshot tick-{t}.bin load error: {e}"));
-                            }
-                        }
-                    }
-                    if bad_snaps == 0 {
-                        report.checks.push(format!(
-                            "all {} snapshots in `{}` carry ONYXAG headers and load cleanly",
-                            ticks.len(),
-                            dir.display()
-                        ));
-                    }
-                    if let Some(&latest) = ticks.last() {
-                        match build_host(1, AgentConfig::default(), Some(dir), None) {
-                            Ok((mut host, ws_vocab)) => {
-                                host.request_restore(&latest.to_string());
-                                host.step(&mut HeadlessDriver::new());
-                                let effects = effects_after_tick(host.graph(), &ws_vocab, 0);
-                                let mut checked_shas = 0usize;
-                                for eff in effects {
-                                    if let Some(sha) = eff.tree_sha {
-                                        checked_shas += 1;
-                                        if git_ok {
-                                            let is_tree = Command::new("git")
-                                                .args(["cat-file", "-t", &sha])
-                                                .current_dir(workspace)
-                                                .output()
-                                                .map(|o| {
-                                                    o.status.success()
-                                                        && String::from_utf8_lossy(&o.stdout).trim()
-                                                            == "tree"
-                                                })
-                                                .unwrap_or(false);
-                                            if !is_tree {
-                                                report.errors.push(format!(
-                                                    "ledger tree_sha `{sha}` (tick {}) missing in git object database",
-                                                    eff.tick
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                report.checks.push(format!(
-                                    "verified {checked_shas} ledger tree checkpoint(s) at tick {latest}"
-                                ));
-                            }
-                            Err(e) => report
-                                .errors
-                                .push(format!("failed to inspect snapshot ledger: {e}")),
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    report
-}
-
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
+    use onyx_soul_agents::{AgentHost, AgentState, IngressEvent, OnyxEvent, Reply};
+    use onyx_workspace::{graph_workspace_mode, latest_undoable_effect};
+    use session::{SURFACE_APPROVAL, active_surfaces, all_live_waiting_approval};
+
     use super::*;
 
     #[test]
@@ -954,6 +519,13 @@ mod tests {
         host.step(&mut HeadlessDriver::new());
         assert_eq!(host.agent_state(id), Some(AgentState::WaitingApproval));
         assert!(all_live_waiting_approval(host.graph(), &host.vocab()));
+
+        let surfaces = active_surfaces(host.graph(), &host.vocab());
+        let approval_surface = surfaces
+            .iter()
+            .find(|s| s.surface == SURFACE_APPROVAL)
+            .expect("approval surface must be declared");
+        assert!(approval_surface.focused);
     }
 
     #[test]
@@ -966,8 +538,7 @@ mod tests {
         let policy = WorkspacePolicy::new(&dir).unwrap();
         let tools = WorkspaceTools::new(policy);
         let (mut host, ws_vocab) = build_host(1, AgentConfig::default(), None, None).unwrap();
-        let spec = AgentSpec::new("tester", "write a file")
-            .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+        let spec = agent_spec_for_test("write a file");
         host.spawn(&spec);
 
         let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
@@ -975,33 +546,35 @@ mod tests {
             .with_workspace_vocab(ws_vocab)
             .require_read_before_edit(true)
             .wrapping(HeadlessDriver::new());
-        let mut driver = onyx_soul_agents::RecordingBridge::new(
-            host.vocab(),
-            |req: &onyx_soul_agents::AgentView| {
-                if req.memory.iter().any(|(k, _)| k == "observe") {
-                    Some(Reply::done(req.agent, req.request, "done"))
-                } else if req.memory.iter().any(|(k, _)| k == "call") {
-                    None
-                } else {
-                    Some(Reply::call_structured(
-                        req.agent,
-                        req.request,
-                        "fs_write",
-                        r#"{"path":"out.txt","content":"hello"}"#,
-                    ))
-                }
-            },
-        )
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "done"))
+            } else if req.memory.iter().any(|(k, _)| k == "call") {
+                None
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"out.txt","content":"hello"}"#,
+                ))
+            }
+        })
         .wrapping(ws_bridge);
 
         assert!(host.run_until_settled(&mut driver, 16));
-        let orphaned = effects_after_tick(host.graph(), &ws_vocab, 0);
+        let orphaned = onyx_workspace::effects_after_tick(host.graph(), &ws_vocab, 0);
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].tool, "fs_write");
         assert_eq!(orphaned[0].target, "out.txt");
         assert_eq!(orphaned[0].reversibility, "auto_reversible");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn agent_spec_for_test(goal: &str) -> onyx_soul_agents::AgentSpec {
+        onyx_soul_agents::AgentSpec::new("tester", goal)
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied())
     }
 
     #[test]
@@ -1026,6 +599,227 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed_timeout.shell_timeout_secs, Some(45));
+
+        let parsed_resume = parse_args_from(
+            ["chat", "--resume", "snaps_prev"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(parsed_resume.resume_dir, Some(PathBuf::from("snaps_prev")));
+        assert_eq!(
+            parsed_resume.snapshot_dir,
+            Some(PathBuf::from("snaps_prev"))
+        );
+    }
+
+    #[test]
+    fn command_spawner_supports_multi_turn_mode_new_and_undo() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-chat-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git must run");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "core.autocrlf", "false"]);
+        fs::write(dir.join("note.txt"), "v1\n").unwrap();
+        run_git(&["add", "note.txt"]);
+        run_git(&["commit", "-m", "init"]);
+
+        let checkpoints = PendingCheckpoints::default();
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_max_steps(16)
+            .with_mode_handle(mode_handle.clone());
+        let (mut host, ws_vocab) = build_host_with_checkpoints(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+            Some(checkpoints.clone()),
+        )
+        .unwrap();
+
+        let tools = WorkspaceTools::new(WorkspacePolicy::new(&dir).unwrap());
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle.clone())
+            .with_workspace_vocab(ws_vocab)
+            .with_checkpoints(checkpoints)
+            .wrapping(HeadlessDriver::new());
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| match req.request {
+            1 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"note.txt","content":"v2\n"}"#,
+            )),
+            2 => Some(Reply::done(req.agent, req.request, "updated note")),
+            3 => Some(Reply::done(req.agent, req.request, "follow-up answer")),
+            _ => None,
+        })
+        .wrapping(ws_bridge);
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "edit note".into(),
+        )));
+        host.step(&mut driver);
+        host.step(&mut driver);
+        assert!(host.run_until_settled(&mut driver, 32));
+        assert_eq!(host.agents().len(), 1);
+        assert_eq!(fs::read_to_string(dir.join("note.txt")).unwrap(), "v2\n");
+
+        // `/mode plan` persiste el modo en el grafo y actualiza el handle; `/mode build` vuelve a Build.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/mode plan".into(),
+        )));
+        host.step(&mut driver);
+        assert_eq!(mode_handle.get(), WorkspaceMode::Plan);
+        assert_eq!(
+            graph_workspace_mode(host.graph(), &ws_vocab),
+            Some(WorkspaceMode::Plan)
+        );
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/mode build".into(),
+        )));
+        host.step(&mut driver);
+        assert_eq!(mode_handle.get(), WorkspaceMode::Build);
+        assert_eq!(
+            graph_workspace_mode(host.graph(), &ws_vocab),
+            Some(WorkspaceMode::Build)
+        );
+
+        // `/undo` marca la intención en el grafo (sistema puro) y `WorkspaceToolBridge::present`
+        // restaura `note.txt` a `v1\n`.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("/undo".into())));
+        host.step(&mut driver);
+        assert_eq!(fs::read_to_string(dir.join("note.txt")).unwrap(), "v1\n");
+        assert!(latest_undoable_effect(host.graph(), &ws_vocab).is_none());
+
+        // Turno 2 sobre el mismo agente raíz (`request = 3`).
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "continue work".into(),
+        )));
+        assert!(host.run_until_settled(&mut driver, 32));
+        assert_eq!(host.agents().len(), 1);
+        let a1 = host.agents()[0];
+        assert_eq!(host.result(a1).as_deref(), Some("follow-up answer"));
+        let mem_kinds: Vec<String> = host.view(a1).memory.into_iter().map(|(k, _)| k).collect();
+        assert!(mem_kinds.contains(&"system".to_string()), "{mem_kinds:?}");
+        assert!(mem_kinds.contains(&"say".to_string()), "{mem_kinds:?}");
+        assert!(mem_kinds.contains(&"user".to_string()), "{mem_kinds:?}");
+
+        // `/new fresh goal` crea un segundo agente distinto.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/new fresh goal".into(),
+        )));
+        host.step(&mut driver);
+        host.step(&mut driver);
+        assert_eq!(host.agents().len(), 2);
+
+        // Replay determinista: `ReplayBridge` con comandos `/mode plan` y `/undo`
+        // ejecuta cambios sobre el grafo sin tocar `note.txt` en disco.
+        let mut replay_tr = driver.transcript().clone();
+        replay_tr.commands = vec![
+            onyx_soul_agents::LoggedCommand {
+                poll: 0,
+                command: "edit note".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 5,
+                command: "/mode plan".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 6,
+                command: "/mode build".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 7,
+                command: "/undo".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 8,
+                command: "continue work".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 9,
+                command: "/mode plan".to_string(),
+            },
+        ];
+        fs::write(dir.join("note.txt"), "untouched-during-replay\n").unwrap();
+        let replay_mode = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let (mut replay_host, replay_ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(
+                CommandSpawnerSystem::new(true)
+                    .with_max_steps(16)
+                    .with_mode_handle(replay_mode.clone()),
+            )),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(replay_tr).wrapping(HeadlessDriver::new());
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 64 },
+        )
+        .unwrap();
+        assert_eq!(replay_mode.get(), WorkspaceMode::Plan);
+        assert_eq!(
+            graph_workspace_mode(replay_host.graph(), &replay_ws_vocab),
+            Some(WorkspaceMode::Plan)
+        );
+        assert_eq!(replay_host.agents().len(), 1);
+        let replayed_agent = replay_host.agents()[0];
+        assert_eq!(
+            replay_host.result(replayed_agent).as_deref(),
+            Some("follow-up answer")
+        );
+        let replayed_sys: Vec<String> = replay_host
+            .view(replayed_agent)
+            .memory
+            .into_iter()
+            .filter(|(k, _)| k == "system")
+            .map(|(_, v)| v)
+            .collect();
+        assert!(
+            replayed_sys
+                .iter()
+                .any(|m| m.starts_with("[/undo] Restored git checkpoint ")),
+            "expected [/undo] Restored git checkpoint in replay memory, got: {replayed_sys:?}"
+        );
+        assert!(
+            !replayed_sys
+                .iter()
+                .any(|m| m.contains("No reversible git checkpoint available")),
+            "unexpected missing checkpoint note in replay memory: {replayed_sys:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "untouched-during-replay\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

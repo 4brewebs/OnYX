@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -8,10 +11,12 @@ use onyx_soul_agents::{
     Vocab, pending_requests,
 };
 use onyx_workspace::WorkspaceTools;
+use onyx_workspace::tools::scrub_secrets;
 use serde_json::{Value as JsonValue, json};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 96 * 1024;
+const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {
@@ -33,6 +38,49 @@ type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
 struct GeminiSharedState {
     thought_signatures: SignatureMap,
     pending_calls: PendingCallQueue,
+    project_instructions: Arc<String>,
+}
+
+/// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
+/// aplicando `scrub_secrets` y limitando el conjunto a 16 KiB.
+pub fn load_project_instructions(workspace_root: &Path) -> String {
+    let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+        let onyx_dir = Path::new(&home).join(".onyx");
+        candidates.push(("~/.onyx/AGENTS.md".to_string(), onyx_dir.join("AGENTS.md")));
+        candidates.push(("~/.onyx/ONYX.md".to_string(), onyx_dir.join("ONYX.md")));
+    }
+    candidates.push(("AGENTS.md".to_string(), workspace_root.join("AGENTS.md")));
+    candidates.push(("ONYX.md".to_string(), workspace_root.join("ONYX.md")));
+
+    let mut combined = String::new();
+    for (label, path) in candidates {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let cleaned = scrub_secrets(raw.trim());
+        if cleaned.is_empty() {
+            continue;
+        }
+        let section = format!("## {label}\n{cleaned}\n");
+        if combined.len() + section.len() > MAX_PROJECT_INSTRUCTIONS_BYTES {
+            let remaining = MAX_PROJECT_INSTRUCTIONS_BYTES.saturating_sub(combined.len());
+            if remaining > label.len() + 16 {
+                let mut cut = remaining;
+                while cut > 0 && !section.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                combined.push_str(&section[..cut]);
+                combined.push_str("\n...[truncated]\n");
+            }
+            break;
+        }
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&section);
+    }
+    combined
 }
 
 struct QueuedToolCall {
@@ -132,6 +180,7 @@ fn find_superseded_reads(memory: &[(String, String)]) -> HashMap<usize, String> 
     superseded
 }
 
+#[allow(dead_code)]
 fn build_request_body(
     req: &AgentView,
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
@@ -143,6 +192,15 @@ fn build_request_body_with_budget(
     req: &AgentView,
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: ContextBudget,
+) -> JsonValue {
+    build_request_body_with_context(req, thought_signatures, budget, "")
+}
+
+fn build_request_body_with_context(
+    req: &AgentView,
+    thought_signatures: &HashMap<(u64, usize), JsonValue>,
+    budget: ContextBudget,
+    project_instructions: &str,
 ) -> JsonValue {
     struct ProjectedEntry {
         msg: JsonValue,
@@ -172,6 +230,17 @@ fn build_request_body_with_budget(
     let mut call_index = 0usize;
     for (mem_idx, (kind, text)) in req.memory.iter().enumerate() {
         match kind.as_str() {
+            "user" | "system" => entries.push(ProjectedEntry {
+                bytes: text.len(),
+                msg: json!({
+                    "role": "user",
+                    "parts": [{ "text": text }]
+                }),
+                tool_name: String::new(),
+                is_observe: false,
+                is_toon: false,
+                is_superseded: false,
+            }),
             "say" => entries.push(ProjectedEntry {
                 bytes: text.len(),
                 msg: json!({
@@ -341,10 +410,19 @@ fn build_request_body_with_budget(
         })
         .collect();
 
+    let base_instruction = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, and `git_diff` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, prefer calling one tool at a time, keep changes minimal, and summarize your final answer clearly when done.";
+    let system_text = if project_instructions.trim().is_empty() {
+        base_instruction.to_string()
+    } else {
+        format!(
+            "{base_instruction}\n\n# Project Instructions (ONYX.md / AGENTS.md)\n{project_instructions}"
+        )
+    };
+
     let mut body = json!({
         "systemInstruction": {
             "parts": [{
-                "text": "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, or search files (such as `nl`, `cat`, `grep`, `find`); always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, and `scent_impact`, reserving `shell_exec` strictly for builds, tests, or git/project commands. Verify exact dependency and enum names with `fs_read` before citing them. You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, prefer calling one tool at a time, keep changes minimal, and summarize your final answer clearly when done."
+                "text": system_text
             }]
         },
         "contents": contents
@@ -478,6 +556,11 @@ impl GeminiResponder {
             shared: GeminiSharedState::default(),
         }
     }
+
+    pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.shared.project_instructions = Arc::new(instructions.into());
+        self
+    }
 }
 
 impl Responder for GeminiResponder {
@@ -496,7 +579,12 @@ impl Responder for GeminiResponder {
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            build_request_body(req, &sigs)
+            build_request_body_with_context(
+                req,
+                &sigs,
+                ContextBudget::default(),
+                &self.shared.project_instructions,
+            )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
         Some(execute_gemini_http(
@@ -557,6 +645,11 @@ impl AsyncGeminiDriver {
         self
     }
 
+    pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.shared.project_instructions = Arc::new(instructions.into());
+        self
+    }
+
     fn dispatch_with<F>(&mut self, req: &AgentView, spawn_fn: F)
     where
         F: FnOnce(
@@ -597,7 +690,12 @@ impl AsyncGeminiDriver {
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            build_request_body(req, &sigs)
+            build_request_body_with_context(
+                req,
+                &sigs,
+                ContextBudget::default(),
+                &self.shared.project_instructions,
+            )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
 
@@ -901,5 +999,57 @@ mod tests {
         );
         assert!(serialized.contains("@TOON v1"), "{serialized}");
         assert!(serialized.contains("RECENT_ERROR_KEEP"), "{serialized}");
+    }
+
+    #[test]
+    fn load_project_instructions_reads_markdown_and_scrubs_secrets() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-inst-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("AGENTS.md"), "Always run cargo test.\n").unwrap();
+        fs::write(
+            dir.join("ONYX.md"),
+            "Secret token AIzaSyTestSecretKey1234567890 must be scrubbed.\n",
+        )
+        .unwrap();
+
+        let loaded = load_project_instructions(&dir);
+        assert!(loaded.contains("## AGENTS.md"), "{loaded}");
+        assert!(loaded.contains("Always run cargo test."), "{loaded}");
+        assert!(loaded.contains("## ONYX.md"), "{loaded}");
+        assert!(
+            !loaded.contains("AIzaSyTestSecretKey1234567890"),
+            "{loaded}"
+        );
+        assert!(loaded.contains("[REDACTED]"), "{loaded}");
+
+        let mut req = dummy_agent_view(1, 2);
+        req.memory = vec![
+            ("say".to_string(), "First answer.".to_string()),
+            ("user".to_string(), "Follow-up question.".to_string()),
+            (
+                "system".to_string(),
+                "[/undo] Restored git checkpoint.".to_string(),
+            ),
+        ];
+        let body = build_request_body_with_context(
+            &req,
+            &HashMap::new(),
+            ContextBudget::default(),
+            &loaded,
+        );
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(serialized.contains("Follow-up question."), "{serialized}");
+        assert!(serialized.contains("First answer."), "{serialized}");
+        assert!(
+            serialized.contains("[/undo] Restored git checkpoint."),
+            "{serialized}"
+        );
+        assert!(serialized.contains("Project Instructions"), "{serialized}");
+        assert!(serialized.contains("git_status"), "{serialized}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -58,6 +58,8 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "git_status",
+                "git_diff",
                 "shell_exec",
                 "scent_outline",
                 "scent_impact",
@@ -71,6 +73,8 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "git_status",
+                "git_diff",
                 "shell_exec",
             ]
         }
@@ -85,6 +89,8 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "git_status",
+                "git_diff",
                 "shell_exec",
                 "scent_outline",
                 "scent_impact",
@@ -99,6 +105,8 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "git_status",
+                "git_diff",
                 "shell_exec",
                 "spawn_agent",
             ]
@@ -203,6 +211,28 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
+                name: "git_status",
+                description: "Show concise repository status (`git status --short --branch`) without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {}
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "git_diff",
+                description: "Inspect unified git diff (`git diff --no-color`) for the working tree or a relative path without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "path": { "type": "STRING", "description": "Optional relative file or directory path inside the workspace." },
+                        "staged": { "type": "BOOLEAN", "description": "Optional flag to inspect staged changes (`--cached`)." },
+                        "context_lines": { "type": "INTEGER", "description": "Optional unified context lines (default 3, max 20)." }
+                    }
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
                 name: "shell_exec",
                 description: "Execute a shell command in the workspace root directory.",
                 parameters: json!({
@@ -293,6 +323,12 @@ impl WorkspaceTools {
                     .map_err(|e| format!("invalid code_search args: {e}"))?;
                 self.code_search(args)
             }
+            "git_status" => self.git_status(),
+            "git_diff" => {
+                let args: GitDiffArgs =
+                    serde_json::from_str(raw).map_err(|e| format!("invalid git_diff args: {e}"))?;
+                self.git_diff(args)
+            }
             "shell_exec" => {
                 let args: ShellExecArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid shell_exec args: {e}"))?;
@@ -363,6 +399,12 @@ impl WorkspaceTools {
             }
         }
         Ok(out)
+    }
+
+    pub fn clear_seen_reads(&self) {
+        if let Ok(mut guard) = self.seen_reads.lock() {
+            guard.clear();
+        }
     }
 
     fn invalidate_seen_file(&self, canonical_path: &Path) {
@@ -533,11 +575,59 @@ impl WorkspaceTools {
         }
     }
 
+    fn git_status(&self) -> Result<String, String> {
+        let mut cmd = Command::new("git");
+        cmd.args(["status", "--short", "--branch"]);
+        let (code, stdout, stderr) = self.exec_bounded_raw(cmd, "git status")?;
+        if code != 0 {
+            return Err(format!("git status failed (exit {code}): {stderr}"));
+        }
+        if stdout.trim().is_empty() {
+            Ok("(clean working tree)".to_string())
+        } else {
+            Ok(truncate_utf8(&stdout, self.policy.max_output_bytes))
+        }
+    }
+
+    fn git_diff(&self, args: GitDiffArgs) -> Result<String, String> {
+        let ctx = args.context_lines.unwrap_or(3).min(20);
+        let mut cmd = Command::new("git");
+        cmd.arg("diff").arg("--no-color").arg(format!("-U{ctx}"));
+        if args.staged.unwrap_or(false) {
+            cmd.arg("--cached");
+        }
+        if let Some(raw_path) = args
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let canon = self.policy.resolve_existing(raw_path)?;
+            let rel = canon
+                .strip_prefix(&self.policy.root)
+                .map_err(|_| format!("path `{raw_path}` escapes workspace root"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !rel.is_empty() {
+                cmd.arg("--").arg(rel);
+            }
+        }
+        let (code, stdout, stderr) = self.exec_bounded_raw(cmd, "git diff")?;
+        if code != 0 {
+            return Err(format!("git diff failed (exit {code}): {stderr}"));
+        }
+        if stdout.trim().is_empty() {
+            Ok("(no diff)".to_string())
+        } else {
+            Ok(truncate_utf8(&stdout, self.policy.max_output_bytes))
+        }
+    }
+
     fn shell_exec(&self, args: ShellExecArgs) -> Result<String, String> {
         if args.command.trim().is_empty() {
             return Err("command cannot be empty".to_string());
         }
-        let mut cmd = if cfg!(windows) {
+        let cmd = if cfg!(windows) {
             let mut c = Command::new("pwsh");
             c.args(["-NoProfile", "-Command", &args.command]);
             c
@@ -546,6 +636,17 @@ impl WorkspaceTools {
             c.args(["-c", &args.command]);
             c
         };
+        let (code, stdout, stderr) = self.exec_bounded_raw(cmd, "shell command")?;
+        self.clear_seen_reads();
+        let combined = format!("exit_code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        Ok(truncate_utf8(&combined, self.policy.max_output_bytes))
+    }
+
+    fn exec_bounded_raw(
+        &self,
+        mut cmd: Command,
+        label: &str,
+    ) -> Result<(i32, String, String), String> {
         cmd.current_dir(&self.policy.root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -557,7 +658,7 @@ impl WorkspaceTools {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn shell command: {e}"))?;
+            .map_err(|e| format!("failed to spawn {label}: {e}"))?;
         let out_handle = read_pipe_capped(child.stdout.take(), self.policy.max_output_bytes);
         let err_handle = read_pipe_capped(child.stderr.take(), self.policy.max_output_bytes);
         let deadline = Instant::now() + self.policy.command_timeout;
@@ -588,7 +689,7 @@ impl WorkspaceTools {
                         let _ = out_handle.join();
                         let _ = err_handle.join();
                         return Err(format!(
-                            "command timed out after {:?}",
+                            "{label} timed out after {:?}",
                             self.policy.command_timeout
                         ));
                     }
@@ -598,16 +699,9 @@ impl WorkspaceTools {
             }
         };
 
-        let stdout = out_handle.join().unwrap_or_default();
-        let stderr = err_handle.join().unwrap_or_default();
-
-        let combined = scrub_secrets(&format!(
-            "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
-            status.code().unwrap_or(-1),
-            stdout,
-            stderr
-        ));
-        Ok(truncate_utf8(&combined, self.policy.max_output_bytes))
+        let stdout = scrub_secrets(&out_handle.join().unwrap_or_default());
+        let stderr = scrub_secrets(&err_handle.join().unwrap_or_default());
+        Ok((status.code().unwrap_or(-1), stdout, stderr))
     }
 
     #[cfg(feature = "scent")]
@@ -736,6 +830,16 @@ struct ShellExecArgs {
     command: String,
 }
 
+#[derive(Deserialize, Default)]
+struct GitDiffArgs {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    staged: Option<bool>,
+    #[serde(default)]
+    context_lines: Option<usize>,
+}
+
 #[cfg(feature = "scent")]
 #[derive(Deserialize)]
 struct ScentOutlineArgs {
@@ -756,11 +860,124 @@ struct ScentImpactArgs {
     max_rows: Option<usize>,
 }
 
-fn replace_line_trimmed_unique(
+/// Genera un diff unificado compacto de vista previa antes de aprobar `fs_edit` o `fs_write`.
+pub fn preview_tool_diff(
+    root: &Path,
+    tool: &str,
+    args_json: &str,
+    max_lines: usize,
+) -> Option<String> {
+    let cap = max_lines.max(4);
+    let policy = WorkspacePolicy::new(root).ok()?;
+    match tool {
+        "fs_edit" => {
+            let args: FsEditArgs = serde_json::from_str(args_json).ok()?;
+            let resolved = policy.resolve_existing(&args.path).ok()?;
+            let content = fs::read_to_string(&resolved).ok()?;
+            let (byte_start, byte_end) = find_edit_span(&content, &args.old_text)?;
+            let rel = args.path.trim().replace('\\', "/");
+            Some(format_span_diff(
+                &rel,
+                &content,
+                byte_start,
+                byte_end,
+                &args.new_text,
+                cap,
+            ))
+        }
+        "fs_write" => {
+            let args: FsWriteArgs = serde_json::from_str(args_json).ok()?;
+            let resolved = policy.resolve_for_write(&args.path).ok()?;
+            let rel = args.path.trim().replace('\\', "/");
+            if let Ok(existing) = fs::read_to_string(&resolved) {
+                Some(format_span_diff(
+                    &rel,
+                    &existing,
+                    0,
+                    existing.len(),
+                    &args.content,
+                    cap,
+                ))
+            } else {
+                let mut lines = vec![
+                    "--- /dev/null".to_string(),
+                    format!("+++ b/{rel}"),
+                    format!("@@ -0,0 +1,{} @@", args.content.lines().count().max(1)),
+                ];
+                let new_lines: Vec<&str> = args.content.lines().collect();
+                let show = new_lines.len().min(cap.saturating_sub(3));
+                for l in &new_lines[..show] {
+                    lines.push(format!("+{l}"));
+                }
+                if new_lines.len() > show {
+                    lines.push(format!("... (+{} more lines)", new_lines.len() - show));
+                }
+                Some(lines.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn format_span_diff(
+    rel_path: &str,
     content: &str,
-    old_text: &str,
+    byte_start: usize,
+    byte_end: usize,
     new_text: &str,
-) -> Result<String, String> {
+    max_lines: usize,
+) -> String {
+    let prefix_lines: Vec<&str> = content[..byte_start].lines().collect();
+    let old_slice = &content[byte_start..byte_end];
+    let old_lines: Vec<&str> = old_slice.lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    let suffix_lines: Vec<&str> = content[byte_end..].lines().collect();
+
+    let ctx_before_count = prefix_lines.len().min(2);
+    let ctx_after_count = suffix_lines.len().min(2);
+    let start_line = prefix_lines.len().saturating_sub(ctx_before_count) + 1;
+    let old_total = ctx_before_count + old_lines.len() + ctx_after_count;
+    let new_total = ctx_before_count + new_lines.len() + ctx_after_count;
+
+    let mut diff_lines = vec![
+        format!("--- a/{rel_path}"),
+        format!("+++ b/{rel_path}"),
+        format!("@@ -{start_line},{old_total} +{start_line},{new_total} @@"),
+    ];
+    for l in &prefix_lines[prefix_lines.len() - ctx_before_count..] {
+        diff_lines.push(format!(" {l}"));
+    }
+    for l in &old_lines {
+        diff_lines.push(format!("-{l}"));
+    }
+    for l in &new_lines {
+        diff_lines.push(format!("+{l}"));
+    }
+    for l in &suffix_lines[..ctx_after_count] {
+        diff_lines.push(format!(" {l}"));
+    }
+
+    if diff_lines.len() > max_lines {
+        let omitted = diff_lines.len() - max_lines;
+        diff_lines.truncate(max_lines);
+        diff_lines.push(format!("... (+{omitted} more lines)"));
+    }
+    diff_lines.join("\n")
+}
+
+fn find_edit_span(content: &str, old_text: &str) -> Option<(usize, usize)> {
+    let exact: Vec<(usize, &str)> = content.match_indices(old_text).collect();
+    if exact.len() == 1 {
+        let start = exact[0].0;
+        return Some((start, start + old_text.len()));
+    }
+    if exact.len() > 1 {
+        return None;
+    }
+    find_line_trimmed_unique_span(content, old_text).ok()
+}
+
+fn find_line_trimmed_unique_span(content: &str, old_text: &str) -> Result<(usize, usize), String> {
     let old_lines: Vec<&str> = old_text.lines().collect();
     if old_lines.is_empty() {
         return Err("old_text cannot be empty".to_string());
@@ -797,25 +1014,31 @@ fn replace_line_trimmed_unique(
 
     match matches.len() {
         0 => Err("old_text not found".to_string()),
-        1 => {
-            let (byte_start, byte_end) = matches[0];
-            let mut out = String::with_capacity(content.len() + new_text.len());
-            out.push_str(&content[..byte_start]);
-            out.push_str(new_text);
-            if content[..byte_end].ends_with('\n') && !new_text.ends_with('\n') {
-                if content[..byte_end].ends_with("\r\n") {
-                    out.push_str("\r\n");
-                } else {
-                    out.push('\n');
-                }
-            }
-            out.push_str(&content[byte_end..]);
-            Ok(out)
-        }
+        1 => Ok(matches[0]),
         n => Err(format!(
             "old_text matched {n} times (line-trimmed); provide more context"
         )),
     }
+}
+
+fn replace_line_trimmed_unique(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Result<String, String> {
+    let (byte_start, byte_end) = find_line_trimmed_unique_span(content, old_text)?;
+    let mut out = String::with_capacity(content.len() + new_text.len());
+    out.push_str(&content[..byte_start]);
+    out.push_str(new_text);
+    if content[..byte_end].ends_with('\n') && !new_text.ends_with('\n') {
+        if content[..byte_end].ends_with("\r\n") {
+            out.push_str("\r\n");
+        } else {
+            out.push('\n');
+        }
+    }
+    out.push_str(&content[byte_end..]);
+    Ok(out)
 }
 
 fn fnv1a_hex(bytes: &[u8]) -> String {
