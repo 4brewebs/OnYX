@@ -1,19 +1,126 @@
 //! Sistema determinista que procesa `IngressEvent::Command` en sesiones interactivas:
-//! `/new`, `/mode`, `/undo` (como intención pura sobre el grafo) y continuación multi-turno.
+//! `/new`, `/mode`, `/undo`, `/compact` (como intención pura sobre el grafo) y continuación multi-turno.
 
 use onyx_soul_agents::{
     AgentSpec, AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError, OnyxEvent,
-    OnyxSystem, SystemEvent, Vocab, append_agent_memory, continue_agent, spawn_event,
+    OnyxSystem, SystemEvent, Value, Vocab, append_agent_memory, continue_agent, spawn_event,
 };
 use onyx_workspace::{
-    WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
-    mark_latest_effect_undone, set_workspace_mode,
+    SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab,
+    format_services_panel_from_toon, graph_workspace_mode, graph_workspace_plan,
+    graph_workspace_services, mark_latest_effect_undone, set_workspace_mode,
+    set_workspace_services,
 };
+
+use crate::context::{COMPACT_MARKER, build_compaction_summary};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    New(Option<String>),
+    Mode(Option<String>),
+    Undo,
+    Compact(Option<String>),
+    Services,
+    Service(String),
+}
+
+pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
+    let cmd = raw.trim();
+    if cmd == "/new" {
+        return Some(SlashCommand::New(None));
+    }
+    if let Some(goal) = cmd.strip_prefix("/new ") {
+        let trimmed = goal.trim();
+        return Some(SlashCommand::New(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if cmd == "/mode" {
+        return Some(SlashCommand::Mode(None));
+    }
+    if let Some(arg) = cmd.strip_prefix("/mode ") {
+        let trimmed = arg.trim();
+        return Some(SlashCommand::Mode(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if cmd == "/undo" {
+        return Some(SlashCommand::Undo);
+    }
+    if cmd == "/compact" {
+        return Some(SlashCommand::Compact(None));
+    }
+    if let Some(focus) = cmd.strip_prefix("/compact ") {
+        let trimmed = focus.trim();
+        return Some(SlashCommand::Compact(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if cmd == "/services" || cmd == "/service" {
+        return Some(SlashCommand::Services);
+    }
+    if let Some(rest) = cmd
+        .strip_prefix("/service ")
+        .or_else(|| cmd.strip_prefix("/services "))
+    {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(SlashCommand::Service(trimmed.to_string()));
+        }
+        return Some(SlashCommand::Services);
+    }
+    None
+}
+
+fn read_agent_memory_ordered<G: GraphView + ?Sized>(
+    graph: &G,
+    v: &Vocab,
+    agent: ConceptId,
+) -> (String, Vec<(String, String)>) {
+    let goal = match graph.get(agent, v.goal) {
+        Some(Value::Text(s)) => s,
+        _ => String::new(),
+    };
+    let mut rows: Vec<(i64, String, String)> = graph
+        .related(agent, v.rel_memory)
+        .into_iter()
+        .filter_map(|mem_id| {
+            let seq = match graph.get(mem_id, v.mem_seq) {
+                Some(Value::Int(n)) => n,
+                _ => 0,
+            };
+            let kind = match graph.get(mem_id, v.mem_kind)? {
+                Value::Text(k) => k,
+                _ => return None,
+            };
+            let text = match graph.get(mem_id, v.mem_text) {
+                Some(Value::Text(t)) => t,
+                _ => String::new(),
+            };
+            Some((seq, kind, text))
+        })
+        .collect();
+    rows.sort_by_key(|(seq, _, _)| *seq);
+    let mut memory: Vec<(String, String)> = rows.into_iter().map(|(_, k, t)| (k, t)).collect();
+    if let Some(Value::Text(res)) = graph.get(agent, v.result) {
+        if !res.is_empty() {
+            memory.push(("say".to_string(), res));
+        }
+    }
+    (goal, memory)
+}
 
 pub struct CommandSpawnerSystem {
     vocab: Option<Vocab>,
     ws_vocab: Option<WorkspaceVocab>,
     mode_handle: WorkspaceModeHandle,
+    sprout: Option<SproutSupervisor>,
     auto_approve: bool,
     max_steps_per_turn: i64,
     force_new_agent: bool,
@@ -26,6 +133,7 @@ impl CommandSpawnerSystem {
             vocab: None,
             ws_vocab: None,
             mode_handle: WorkspaceModeHandle::default(),
+            sprout: None,
             auto_approve,
             max_steps_per_turn: 128,
             force_new_agent: false,
@@ -40,6 +148,11 @@ impl CommandSpawnerSystem {
 
     pub fn with_mode_handle(mut self, mode_handle: WorkspaceModeHandle) -> Self {
         self.mode_handle = mode_handle;
+        self
+    }
+
+    pub fn with_sprout(mut self, sprout: SproutSupervisor) -> Self {
+        self.sprout = Some(sprout);
         self
     }
 
@@ -110,91 +223,247 @@ impl OnyxSystem for CommandSpawnerSystem {
                 continue;
             }
 
-            if cmd == "/new" {
-                self.force_new_agent = true;
-                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                    append_agent_memory(
-                        ctx.graph,
-                        &v,
-                        root_id,
-                        "system",
-                        "[/new] Next prompt will start a fresh agent.",
-                        now,
-                    );
-                }
-                continue;
-            }
-
-            if let Some(goal) = cmd
-                .strip_prefix("/new ")
-                .map(str::trim)
-                .filter(|g| !g.is_empty())
-            {
-                self.force_new_agent = false;
-                let spec = self.spawn_spec(&*ctx.graph, &v, goal.to_string());
-                ctx.outbox.push(spawn_event(&v, &spec, None));
-                continue;
-            }
-
-            if cmd == "/mode" || cmd.starts_with("/mode ") {
-                let arg = cmd.strip_prefix("/mode").unwrap_or("").trim();
-                let next_mode = if arg.is_empty() {
-                    match self.mode_handle.get() {
-                        WorkspaceMode::Build => WorkspaceMode::Plan,
-                        WorkspaceMode::Plan | WorkspaceMode::Explore => WorkspaceMode::Build,
+            if let Some(slash) = parse_slash_command(cmd) {
+                match slash {
+                    SlashCommand::New(None) => {
+                        self.force_new_agent = true;
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(
+                                ctx.graph,
+                                &v,
+                                root_id,
+                                "system",
+                                "[/new] Next prompt will start a fresh agent.",
+                                now,
+                            );
+                        }
                     }
-                } else if let Some(parsed) = WorkspaceMode::parse(arg) {
-                    parsed
-                } else {
-                    if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                        append_agent_memory(
-                            ctx.graph,
-                            &v,
-                            root_id,
-                            "system",
-                            &format!(
-                                "[/mode] Unknown workspace mode `{arg}` (use `plan` or `build`)."
-                            ),
-                            now,
-                        );
+                    SlashCommand::New(Some(goal)) => {
+                        self.force_new_agent = false;
+                        let spec = self.spawn_spec(&*ctx.graph, &v, goal);
+                        ctx.outbox.push(spawn_event(&v, &spec, None));
                     }
-                    continue;
-                };
+                    SlashCommand::Mode(arg_opt) => {
+                        let next_mode = match arg_opt.as_deref() {
+                            None => match self.mode_handle.get() {
+                                WorkspaceMode::Build => WorkspaceMode::Plan,
+                                WorkspaceMode::Plan | WorkspaceMode::Explore => {
+                                    WorkspaceMode::Build
+                                }
+                            },
+                            Some(arg) => match WorkspaceMode::parse(arg) {
+                                Some(parsed) => parsed,
+                                None => {
+                                    if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                        append_agent_memory(
+                                            ctx.graph,
+                                            &v,
+                                            root_id,
+                                            "system",
+                                            &format!(
+                                                "[/mode] Unknown workspace mode `{arg}` (use `plan` or `build`)."
+                                            ),
+                                            now,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            },
+                        };
 
-                self.mode_handle.set(next_mode);
-                if let Some(wv) = self.ws_vocab {
-                    set_workspace_mode(ctx.graph, &wv, next_mode);
-                }
-                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                    append_agent_memory(
-                        ctx.graph,
-                        &v,
-                        root_id,
-                        "system",
-                        &format!(
-                            "[/mode] Switched workspace mode to {}",
-                            next_mode.as_label()
-                        ),
-                        now,
-                    );
-                }
-                continue;
-            }
-
-            if cmd == "/undo" {
-                let Some(wv) = self.ws_vocab else { continue };
-                let note = match mark_latest_effect_undone(ctx.graph, &wv) {
-                    Some(eff) => {
-                        let tree_sha = eff.tree_sha.unwrap_or_default();
-                        format!(
-                            "[/undo] Restored git checkpoint {tree_sha} (reverted {} on `{}` from tick {})",
-                            eff.tool, eff.target, eff.tick
-                        )
+                        self.mode_handle.set(next_mode);
+                        if let Some(wv) = self.ws_vocab {
+                            set_workspace_mode(ctx.graph, &wv, next_mode);
+                        }
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(
+                                ctx.graph,
+                                &v,
+                                root_id,
+                                "system",
+                                &format!(
+                                    "[/mode] Switched workspace mode to {}",
+                                    next_mode.as_label()
+                                ),
+                                now,
+                            );
+                        }
                     }
-                    None => "[/undo] No reversible git checkpoint available.".to_string(),
-                };
-                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                    append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                    SlashCommand::Undo => {
+                        let Some(wv) = self.ws_vocab else { continue };
+                        let note = match mark_latest_effect_undone(ctx.graph, &wv) {
+                            Some(eff) => {
+                                let tree_sha = eff.tree_sha.unwrap_or_default();
+                                format!(
+                                    "[/undo] Restored git checkpoint {tree_sha} (reverted {} on `{}` from tick {})",
+                                    eff.tool, eff.target, eff.tick
+                                )
+                            }
+                            None => "[/undo] No reversible git checkpoint available.".to_string(),
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::Compact(focus) => {
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            let (goal, memory) =
+                                read_agent_memory_ordered(&*ctx.graph, &v, root_id);
+                            let active_plan = self
+                                .ws_vocab
+                                .as_ref()
+                                .and_then(|wv| graph_workspace_plan(&*ctx.graph, wv));
+                            let summary = build_compaction_summary(
+                                &goal,
+                                &memory,
+                                active_plan.as_deref(),
+                                focus.as_deref(),
+                            );
+                            let entry = format!("{COMPACT_MARKER}{summary}");
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &entry, now);
+                        }
+                    }
+                    SlashCommand::Services => {
+                        let note = if let Some(sprout) = &self.sprout {
+                            match sprout.status_toon() {
+                                Ok(toon) => {
+                                    if let Some(wv) = self.ws_vocab {
+                                        let panel = format_services_panel_from_toon(&toon);
+                                        set_workspace_services(ctx.graph, &wv, &panel);
+                                    }
+                                    format!("[/services]\n{toon}")
+                                }
+                                Err(err) => {
+                                    if let Some(wv) = self.ws_vocab {
+                                        if ctx.graph.query(&[wv.services_text]).is_empty() {
+                                            set_workspace_services(ctx.graph, &wv, "");
+                                        }
+                                    }
+                                    format!("[/services] {err}")
+                                }
+                            }
+                        } else {
+                            // Keep EAV concept allocation 100% identical to live `chat` during offline replay:
+                            // if `/services` runs before any agent spawns, reserve the `ws.services.text` singleton node.
+                            if let Some(wv) = self.ws_vocab {
+                                if ctx.graph.query(&[wv.services_text]).is_empty() {
+                                    set_workspace_services(ctx.graph, &wv, "");
+                                }
+                            }
+                            if let Some(existing) = self
+                                .ws_vocab
+                                .as_ref()
+                                .and_then(|wv| graph_workspace_services(&*ctx.graph, wv))
+                            {
+                                format!("[/services]\n{existing}")
+                            } else {
+                                "[/services] No sprout.toml services loaded.".to_string()
+                            }
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::Service(arg) => {
+                        let parts: Vec<&str> = arg.split_whitespace().collect();
+                        let mutates_services =
+                            matches!(parts.as_slice(), ["start", _] | ["stop", _]);
+                        let note = if let Some(sprout) = &self.sprout {
+                            match parts.as_slice() {
+                                ["start", target] => {
+                                    if !self.mode_handle.get().allows_mutation() {
+                                        format!(
+                                            "[/service] Blocked in `{}` mode: switch to BUILD to start `{target}`.",
+                                            self.mode_handle.get().as_label()
+                                        )
+                                    } else {
+                                        let res = if target.eq_ignore_ascii_case("all") {
+                                            sprout.start_all(None)
+                                        } else {
+                                            sprout.start(target, None)
+                                        };
+                                        match res {
+                                            Ok(out) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    let panel =
+                                                        format_services_panel_from_toon(&out);
+                                                    set_workspace_services(ctx.graph, &wv, &panel);
+                                                }
+                                                format!("[/service start {target}]\n{out}")
+                                            }
+                                            Err(err) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    if ctx.graph.query(&[wv.services_text]).is_empty()
+                                                    {
+                                                        set_workspace_services(ctx.graph, &wv, "");
+                                                    }
+                                                }
+                                                format!("[/service start {target}] ERROR: {err}")
+                                            }
+                                        }
+                                    }
+                                }
+                                ["stop", target] => {
+                                    if !self.mode_handle.get().allows_mutation() {
+                                        format!(
+                                            "[/service] Blocked in `{}` mode: switch to BUILD to stop `{target}`.",
+                                            self.mode_handle.get().as_label()
+                                        )
+                                    } else {
+                                        let is_all = target.eq_ignore_ascii_case("all");
+                                        let res = if is_all {
+                                            sprout.stop(None, true)
+                                        } else {
+                                            sprout.stop(Some(target), false)
+                                        };
+                                        match res {
+                                            Ok(out) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    let panel =
+                                                        format_services_panel_from_toon(&out);
+                                                    set_workspace_services(ctx.graph, &wv, &panel);
+                                                }
+                                                format!("[/service stop {target}]\n{out}")
+                                            }
+                                            Err(err) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    if ctx.graph.query(&[wv.services_text]).is_empty()
+                                                    {
+                                                        set_workspace_services(ctx.graph, &wv, "");
+                                                    }
+                                                }
+                                                format!("[/service stop {target}] ERROR: {err}")
+                                            }
+                                        }
+                                    }
+                                }
+                                ["logs", id] => match sprout.logs(id, Some(40), None, false) {
+                                    Ok(out) => format!("[/service logs {id}]\n{out}"),
+                                    Err(err) => format!("[/service logs {id}] ERROR: {err}"),
+                                },
+                                ["logs", id, tail_str] => {
+                                    let tail = tail_str.parse::<usize>().ok();
+                                    match sprout.logs(id, tail, None, false) {
+                                        Ok(out) => format!("[/service logs {id}]\n{out}"),
+                                        Err(err) => format!("[/service logs {id}] ERROR: {err}"),
+                                    }
+                                }
+                                _ => "[/service] Usage: /service start <id|all> | /service stop <id|all> | /service logs <id> [tail]".to_string(),
+                            }
+                        } else {
+                            if mutates_services && self.mode_handle.get().allows_mutation() {
+                                if let Some(wv) = self.ws_vocab {
+                                    if ctx.graph.query(&[wv.services_text]).is_empty() {
+                                        set_workspace_services(ctx.graph, &wv, "");
+                                    }
+                                }
+                            }
+                            format!("[/service] {arg} (offline replay)")
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
                 }
                 continue;
             }

@@ -687,6 +687,14 @@ impl OnyxSystem for MilestoneSnapshotSystem {
                     cmd_tag = Some(format!("cmd:{cmd}"));
                 } else if cmd == "/new" || cmd.starts_with("/new ") {
                     cmd_tag = Some("cmd:/new".to_string());
+                } else if cmd == "/compact" || cmd.starts_with("/compact ") {
+                    cmd_tag = Some("cmd:/compact".to_string());
+                } else if cmd == "/services"
+                    || cmd == "/service"
+                    || cmd.starts_with("/service ")
+                    || cmd.starts_with("/services ")
+                {
+                    cmd_tag = Some("cmd:/service".to_string());
                 }
             }
         }

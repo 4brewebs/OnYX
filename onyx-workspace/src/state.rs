@@ -119,6 +119,7 @@ impl EffectReversibility {
 pub struct WorkspaceVocab {
     pub mode: Attr,
     pub plan_text: Attr,
+    pub services_text: Attr,
     pub file_path: Attr,
     pub file_read_tick: Attr,
     pub file_dirty: Attr,
@@ -143,6 +144,7 @@ impl WorkspaceVocab {
         Self {
             mode: reg("ws.mode"),
             plan_text: reg("ws.plan.text"),
+            services_text: reg("ws.services.text"),
             file_path: reg("ws.file.path"),
             file_read_tick: reg("ws.file.read_tick"),
             file_dirty: reg("ws.file.dirty"),
@@ -457,6 +459,29 @@ pub fn graph_workspace_plan<G: GraphView + ?Sized>(
     prop_text(graph, id, ws.plan_text).filter(|s| !s.trim().is_empty())
 }
 
+/// Persiste el resumen de servicios Sprout (`ws.services.text`) en el grafo EAV (`REQ-08.5`).
+pub fn set_workspace_services<G: Graph + ?Sized>(
+    graph: &mut G,
+    ws: &WorkspaceVocab,
+    services_text: &str,
+) {
+    let id = graph
+        .query(&[ws.services_text])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| graph.create());
+    graph.set(id, ws.services_text, Value::Text(services_text.to_string()));
+}
+
+/// Lee el estado de servicios Sprout (`ws.services.text`) persistido en el grafo EAV, si existe.
+pub fn graph_workspace_services<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Option<String> {
+    let id = graph.query(&[ws.services_text]).into_iter().next()?;
+    prop_text(graph, id, ws.services_text).filter(|s| !s.trim().is_empty())
+}
+
 /// Marca en el grafo la intención determinista de deshacer el último efecto reversible,
 /// invalidando `file_dirty` sin ejecutar I/O en disco/git (el driver vivo lo materializa).
 pub fn mark_latest_effect_undone<G: Graph + ?Sized>(
@@ -690,6 +715,71 @@ fn record_tool_observation(
             let plan = crate::tools::format_plan_steps(obs.args_json)
                 .unwrap_or_else(|_| obs.obs_text.to_string());
             set_workspace_plan(graph, wv, &plan);
+        }
+        "service_status" | "service_start" | "service_stop" => {
+            let panel = crate::sprout::format_services_panel_from_toon(obs.obs_text);
+            if !panel.is_empty() {
+                set_workspace_services(graph, wv, &panel);
+            }
+            if matches!(obs.tool, "service_start" | "service_stop") {
+                let target = parsed
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("all")
+                    .to_string();
+                let eff = graph.create();
+                graph.set(eff, wv.effect_tick, Value::Int(obs.tick));
+                graph.set(
+                    eff,
+                    wv.effect_agent,
+                    Value::Int(i64::try_from(obs.agent_id).unwrap_or(0)),
+                );
+                graph.set(eff, wv.effect_tool, Value::Text(obs.tool.to_string()));
+                graph.set(eff, wv.effect_target, Value::Text(target.clone()));
+                graph.set(
+                    eff,
+                    wv.effect_reversibility,
+                    Value::Text(EffectReversibility::Compensable.as_str().to_string()),
+                );
+                graph.set(
+                    eff,
+                    wv.effect_summary,
+                    Value::Text(format!("{}: {target}", obs.tool)),
+                );
+            }
+        }
+        "service_exec" => {
+            let svc_id = parsed
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<service>");
+            let cmd = parsed
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<command>");
+            let eff = graph.create();
+            graph.set(eff, wv.effect_tick, Value::Int(obs.tick));
+            graph.set(
+                eff,
+                wv.effect_agent,
+                Value::Int(i64::try_from(obs.agent_id).unwrap_or(0)),
+            );
+            graph.set(eff, wv.effect_tool, Value::Text("service_exec".to_string()));
+            graph.set(
+                eff,
+                wv.effect_target,
+                Value::Text(format!("{svc_id}:{cmd}")),
+            );
+            graph.set(
+                eff,
+                wv.effect_reversibility,
+                Value::Text(EffectReversibility::Irreversible.as_str().to_string()),
+            );
+            graph.set(
+                eff,
+                wv.effect_summary,
+                Value::Text(format!("service_exec({svc_id}): {cmd}")),
+            );
         }
         "shell_exec" => {
             let cmd = parsed

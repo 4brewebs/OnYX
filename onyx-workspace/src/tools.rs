@@ -6,12 +6,18 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use crate::policy::WorkspacePolicy;
+use crate::policy::{WorkspacePolicy, compile_glob_regex};
+use crate::sandbox::{
+    ProcessJob, clean_process_path, configure_process_isolation, ensure_sandbox_tmp_dir,
+    prepare_sandboxed_shell_command,
+};
+use crate::sprout::SproutSupervisor;
 
 /// Descripción declarativa de una herramienta del workspace para inyectar en LLMs.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,19 +36,31 @@ pub struct WorkspaceTools {
     policy: WorkspacePolicy,
     seen_reads: SeenReadsMap,
     read_seq: Arc<AtomicU64>,
+    sprout: SproutSupervisor,
     #[cfg(feature = "scent")]
     scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
 }
 
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
+        let sprout = SproutSupervisor::new(policy.clone());
         Self {
             policy,
             seen_reads: Arc::new(Mutex::new(BTreeMap::new())),
             read_seq: Arc::new(AtomicU64::new(1)),
+            sprout,
             #[cfg(feature = "scent")]
             scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
         }
+    }
+
+    pub fn with_sprout(mut self, sprout: SproutSupervisor) -> Self {
+        self.sprout = sprout;
+        self
+    }
+
+    pub fn sprout(&self) -> &SproutSupervisor {
+        &self.sprout
     }
 
     pub fn policy(&self) -> &WorkspacePolicy {
@@ -58,11 +76,17 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
                 "scent_outline",
                 "scent_impact",
             ]
@@ -75,11 +99,17 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
             ]
         }
     }
@@ -93,11 +123,17 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
                 "scent_outline",
                 "scent_impact",
                 "spawn_agent",
@@ -111,18 +147,31 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
                 "spawn_agent",
             ]
         }
     }
 
     pub fn approval_required_names() -> &'static [&'static str] {
-        &["fs_write", "fs_edit", "shell_exec"]
+        &[
+            "fs_write",
+            "fs_edit",
+            "shell_exec",
+            "service_start",
+            "service_stop",
+            "service_exec",
+        ]
     }
 
     pub fn subagent_schema() -> ToolSchema {
@@ -218,13 +267,33 @@ impl WorkspaceTools {
             },
             ToolSchema {
                 name: "code_search",
-                description: "Search for a text pattern across workspace files.",
+                description: "Search for a literal or regex pattern across workspace files with optional glob filters, case-insensitivity, and context lines.",
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
-                        "pattern": { "type": "STRING", "description": "Substring to search for." },
+                        "pattern": { "type": "STRING", "description": "Substring or regular expression to search for." },
                         "path": { "type": "STRING", "description": "Optional relative directory or file (defaults to '.')." },
-                        "max_results": { "type": "INTEGER", "description": "Maximum matching lines to return (default 50)." }
+                        "max_results": { "type": "INTEGER", "description": "Maximum matching lines to return (default 50, max 200)." },
+                        "regex": { "type": "BOOLEAN", "description": "Interpret `pattern` as a regular expression (default false)." },
+                        "case_insensitive": { "type": "BOOLEAN", "description": "Perform case-insensitive matching (default false)." },
+                        "include_glob": { "type": "STRING", "description": "Optional glob filter to include matching relative file paths (e.g. `*.rs` or `crates/**/*.rs`)." },
+                        "exclude_glob": { "type": "STRING", "description": "Optional glob filter to exclude matching relative file paths." },
+                        "context_lines": { "type": "INTEGER", "description": "Optional context lines before and after each match (0..=5, default 0)." }
+                    },
+                    "required": ["pattern"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "glob_files",
+                description: "Find workspace files matching a glob pattern (e.g. `crates/**/*.rs` or `**/*SKILL.md`), skipping ignored directories without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "pattern": { "type": "STRING", "description": "Glob pattern to match relative file paths." },
+                        "path": { "type": "STRING", "description": "Optional relative root directory to search under (defaults to '.')." },
+                        "max_results": { "type": "INTEGER", "description": "Maximum file paths to return (default 100, max 500)." },
+                        "sort_by_mtime": { "type": "BOOLEAN", "description": "Sort by most recently modified first instead of deterministic lexicographical order (default false)." }
                     },
                     "required": ["pattern"]
                 }),
@@ -297,6 +366,69 @@ impl WorkspaceTools {
                         "command": { "type": "STRING", "description": "Shell command to execute." }
                     },
                     "required": ["command"]
+                }),
+                requires_approval: true,
+            },
+            ToolSchema {
+                name: "service_status",
+                description: "Return a compact @TOON v1 status table of all local processes and containers declared in `sprout.toml` without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {}
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "service_start",
+                description: "Start a local process or container service (`id`) or all enabled services (`all: true`) from `sprout.toml` in topological DAG order, waiting for readiness probes (`ready_port`, `ready_log`, `ready_cmd`).",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Optional service id from `sprout.toml` (or `\"all\"`)." },
+                        "all": { "type": "BOOLEAN", "description": "Start all enabled services in topological order." },
+                        "wait_ready_secs": { "type": "INTEGER", "description": "Optional readiness wait timeout in seconds (1..=300, default 30)." }
+                    }
+                }),
+                requires_approval: true,
+            },
+            ToolSchema {
+                name: "service_stop",
+                description: "Stop one service (`id`) or all active services (`all: true`) from `sprout.toml`, running `stop_cmd`/`down` and terminating their process trees cleanly.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Optional service id to stop." },
+                        "all": { "type": "BOOLEAN", "description": "Stop all active services in reverse topological order." }
+                    }
+                }),
+                requires_approval: true,
+            },
+            ToolSchema {
+                name: "service_logs",
+                description: "Read recent lines from a service's in-memory log ring-buffer (optionally filtered by literal text or regex, scrubbed for secrets) without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Service id from `sprout.toml`." },
+                        "tail": { "type": "INTEGER", "description": "Optional number of trailing lines to return (1..=500, default 80)." },
+                        "pattern": { "type": "STRING", "description": "Optional substring or regex filter." },
+                        "regex": { "type": "BOOLEAN", "description": "Interpret `pattern` as a regular expression (default false)." }
+                    },
+                    "required": ["id"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "service_exec",
+                description: "Execute a command inside a `kind = \"container\"` service via `docker exec` / `nerdctl exec` with sanitized environment, bounded timeout, and secret scrubbing.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Container service id from `sprout.toml`." },
+                        "command": { "type": "STRING", "description": "Shell command to run inside the container." },
+                        "timeout_secs": { "type": "INTEGER", "description": "Optional command timeout in seconds (1..=300, default 30)." }
+                    },
+                    "required": ["id", "command"]
                 }),
                 requires_approval: true,
             },
@@ -380,6 +512,11 @@ impl WorkspaceTools {
                     .map_err(|e| format!("invalid code_search args: {e}"))?;
                 self.code_search(args)
             }
+            "glob_files" => {
+                let args: GlobFilesArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid glob_files args: {e}"))?;
+                self.glob_files(args)
+            }
             "git_status" => self.git_status(),
             "git_diff" => {
                 let args: GitDiffArgs =
@@ -396,6 +533,41 @@ impl WorkspaceTools {
                 let args: ShellExecArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid shell_exec args: {e}"))?;
                 self.shell_exec(args)
+            }
+            "service_status" => self.sprout.status_toon(),
+            "service_start" => {
+                let args: ServiceStartArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_start args: {e}"))?;
+                if args.all
+                    || args
+                        .id
+                        .as_deref()
+                        .is_some_and(|s| s.trim().eq_ignore_ascii_case("all"))
+                {
+                    self.sprout.start_all(args.wait_ready_secs)
+                } else if let Some(id) = args.id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                {
+                    self.sprout.start(id, args.wait_ready_secs)
+                } else {
+                    Err("service_start requires `id` or `all: true`".to_string())
+                }
+            }
+            "service_stop" => {
+                let args: ServiceStopArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_stop args: {e}"))?;
+                self.sprout.stop(args.id.as_deref(), args.all)
+            }
+            "service_logs" => {
+                let args: ServiceLogsArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_logs args: {e}"))?;
+                self.sprout
+                    .logs(&args.id, args.tail, args.pattern.as_deref(), args.regex)
+            }
+            "service_exec" => {
+                let args: ServiceExecArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_exec args: {e}"))?;
+                self.sprout
+                    .exec_in_container(&args.id, &args.command, args.timeout_secs)
             }
             #[cfg(feature = "scent")]
             "scent_outline" => {
@@ -530,6 +702,7 @@ impl WorkspaceTools {
     }
 
     fn fs_write(&self, args: FsWriteArgs) -> Result<String, String> {
+        self.policy.check_control_plane_write(&args.path)?;
         let path = self.policy.resolve_for_write(&args.path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create parent dir: {e}"))?;
@@ -545,6 +718,7 @@ impl WorkspaceTools {
     }
 
     fn fs_edit(&self, args: FsEditArgs) -> Result<String, String> {
+        self.policy.check_control_plane_write(&args.path)?;
         let hunks = extract_edit_hunks(&args)?;
         let path = self.policy.resolve_existing(&args.path)?;
         let content = fs::read_to_string(&path)
@@ -631,21 +805,59 @@ impl WorkspaceTools {
         }
         let base = args.path.as_deref().unwrap_or(".");
         let start = self.policy.resolve_existing(base)?;
-        let max_results = args.max_results.unwrap_or(50).min(200);
-        let mut hits = Vec::new();
-        self.walk_search(&start, &args.pattern, max_results, &mut hits);
-        if hits.is_empty() {
+        let max_results = args.max_results.unwrap_or(50).clamp(1, 200);
+        let context_lines = args.context_lines.unwrap_or(0).min(5);
+
+        let matcher_src = if args.regex {
+            args.pattern.clone()
+        } else {
+            regex::escape(&args.pattern)
+        };
+        let matcher = RegexBuilder::new(&matcher_src)
+            .case_insensitive(args.case_insensitive)
+            .build()
+            .map_err(|e| format!("invalid regex pattern `{}`: {e}", args.pattern))?;
+
+        let include_re = match args.include_glob.as_deref().map(str::trim) {
+            Some(g) if !g.is_empty() => Some(compile_glob_regex(g, false)?),
+            _ => None,
+        };
+        let exclude_re = match args.exclude_glob.as_deref().map(str::trim) {
+            Some(g) if !g.is_empty() => Some(compile_glob_regex(g, false)?),
+            _ => None,
+        };
+
+        let opts = SearchOptions {
+            matcher: &matcher,
+            include_re: include_re.as_ref(),
+            exclude_re: exclude_re.as_ref(),
+            context_lines,
+            max_results,
+        };
+        let mut match_count = 0usize;
+        let mut blocks: Vec<String> = Vec::new();
+        self.walk_search(&start, &opts, &mut match_count, &mut blocks);
+        if blocks.is_empty() {
             Ok("no matches".to_string())
         } else {
-            Ok(truncate_utf8(
-                &hits.join("\n"),
-                self.policy.max_output_bytes,
-            ))
+            let joined = if context_lines > 0 {
+                blocks.join("\n--\n")
+            } else {
+                blocks.join("\n")
+            };
+            let cleaned = scrub_secrets(&joined);
+            Ok(truncate_utf8(&cleaned, self.policy.max_output_bytes))
         }
     }
 
-    fn walk_search(&self, path: &Path, pattern: &str, max_results: usize, hits: &mut Vec<String>) {
-        if hits.len() >= max_results || self.policy.is_ignored(path) {
+    fn walk_search(
+        &self,
+        path: &Path,
+        opts: &SearchOptions<'_>,
+        match_count: &mut usize,
+        blocks: &mut Vec<String>,
+    ) {
+        if *match_count >= opts.max_results || self.policy.is_ignored(path) {
             return;
         }
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -658,20 +870,67 @@ impl WorkspaceTools {
             if meta.len() > 1024 * 1024 {
                 return;
             }
-            let Ok(text) = fs::read_to_string(path) else {
-                return;
-            };
             let rel = path
                 .strip_prefix(&self.policy.root)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            for (idx, line) in text.lines().enumerate() {
-                if line.contains(pattern) {
-                    hits.push(format!("{rel}:{}: {line}", idx + 1));
-                    if hits.len() >= max_results {
+            if let Some(inc) = opts.include_re {
+                if !inc.is_match(&rel) {
+                    return;
+                }
+            }
+            if let Some(exc) = opts.exclude_re {
+                if exc.is_match(&rel) {
+                    return;
+                }
+            }
+            let Ok(text) = fs::read_to_string(path) else {
+                return;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let mut matched_indices: Vec<usize> = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                if opts.matcher.is_match(line) {
+                    matched_indices.push(idx);
+                    *match_count += 1;
+                    if *match_count >= opts.max_results {
                         break;
                     }
+                }
+            }
+            if matched_indices.is_empty() {
+                return;
+            }
+            if opts.context_lines == 0 {
+                for idx in matched_indices {
+                    blocks.push(format!("{rel}:{}: {}", idx + 1, lines[idx]));
+                }
+            } else {
+                // Agrupa rangos solapados [idx - ctx ..= idx + ctx] en bloques separados por `--`.
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for &idx in &matched_indices {
+                    let start = idx.saturating_sub(opts.context_lines);
+                    let end = (idx + opts.context_lines).min(lines.len().saturating_sub(1));
+                    if let Some(last) = ranges.last_mut() {
+                        if start <= last.1.saturating_add(1) {
+                            last.1 = last.1.max(end);
+                            continue;
+                        }
+                    }
+                    ranges.push((start, end));
+                }
+                for (start, end) in ranges {
+                    let mut hunk = Vec::with_capacity(end - start + 1);
+                    for (line_idx, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+                        let is_match = matched_indices.binary_search(&line_idx).is_ok();
+                        if is_match {
+                            hunk.push(format!("{rel}:{}: {line}", line_idx + 1));
+                        } else {
+                            hunk.push(format!("{rel}-{}- {line}", line_idx + 1));
+                        }
+                    }
+                    blocks.push(hunk.join("\n"));
                 }
             }
             return;
@@ -680,10 +939,105 @@ impl WorkspaceTools {
             let mut items: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
             items.sort();
             for item in items {
-                self.walk_search(&item, pattern, max_results, hits);
-                if hits.len() >= max_results {
+                self.walk_search(&item, opts, match_count, blocks);
+                if *match_count >= opts.max_results {
                     break;
                 }
+            }
+        }
+    }
+
+    fn glob_files(&self, args: GlobFilesArgs) -> Result<String, String> {
+        let raw_pattern = args.pattern.trim();
+        if raw_pattern.is_empty() {
+            return Err("glob pattern cannot be empty".to_string());
+        }
+        if raw_pattern.contains('\0') {
+            return Err("glob pattern contains NUL byte".to_string());
+        }
+        let norm_pattern = raw_pattern.replace('\\', "/");
+        if Path::new(raw_pattern).is_absolute()
+            || norm_pattern.starts_with('/')
+            || norm_pattern.split('/').any(|seg| seg == "..")
+        {
+            return Err(format!(
+                "glob pattern `{raw_pattern}` escapes workspace root"
+            ));
+        }
+
+        let base = args.path.as_deref().unwrap_or(".");
+        let start = self.policy.resolve_existing(base)?;
+        let glob_re = compile_glob_regex(raw_pattern, false)?;
+        let max_results = args.max_results.unwrap_or(100).clamp(1, 500);
+
+        let mut matched: Vec<(String, SystemTime)> = Vec::new();
+        self.walk_glob(&start, &start, &glob_re, &mut matched);
+
+        if args.sort_by_mtime {
+            matched.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        } else {
+            matched.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        if matched.is_empty() {
+            return Ok("no files matched".to_string());
+        }
+
+        let total = matched.len();
+        let mut lines: Vec<String> = matched
+            .into_iter()
+            .take(max_results)
+            .map(|(rel, _)| rel)
+            .collect();
+        if total > max_results {
+            lines.push(format!(
+                "... (truncated to {max_results} of {total} matching files)"
+            ));
+        }
+        Ok(truncate_utf8(
+            &lines.join("\n"),
+            self.policy.max_output_bytes,
+        ))
+    }
+
+    fn walk_glob(
+        &self,
+        start: &Path,
+        path: &Path,
+        glob_re: &Regex,
+        out: &mut Vec<(String, SystemTime)>,
+    ) {
+        if self.policy.is_ignored(path) {
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if meta.is_file() {
+            let rel_root = path
+                .strip_prefix(&self.policy.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let rel_start = path
+                .strip_prefix(start)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if glob_re.is_match(&rel_start) || glob_re.is_match(&rel_root) {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((rel_root, mtime));
+            }
+            return;
+        }
+        if let Ok(read_dir) = fs::read_dir(path) {
+            let mut items: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
+            items.sort();
+            for item in items {
+                self.walk_glob(start, &item, glob_re, out);
             }
         }
     }
@@ -740,15 +1094,13 @@ impl WorkspaceTools {
         if args.command.trim().is_empty() {
             return Err("command cannot be empty".to_string());
         }
-        let cmd = if cfg!(windows) {
-            let mut c = Command::new("pwsh");
-            c.args(["-NoProfile", "-Command", &args.command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", &args.command]);
-            c
-        };
+        let sandbox_tmp = ensure_sandbox_tmp_dir(&self.policy.root)?;
+        let cmd = prepare_sandboxed_shell_command(
+            &self.policy.sandbox,
+            &self.policy.root,
+            &sandbox_tmp,
+            &args.command,
+        )?;
         let (code, stdout, stderr) = self.exec_bounded_raw(cmd, "shell command")?;
         self.clear_seen_reads();
         let combined = format!("exit_code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -760,18 +1112,15 @@ impl WorkspaceTools {
         mut cmd: Command,
         label: &str,
     ) -> Result<(i32, String, String), String> {
-        cmd.current_dir(&self.policy.root)
+        cmd.current_dir(clean_process_path(&self.policy.root))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        configure_process_isolation(&mut cmd, false);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn {label}: {e}"))?;
+        let mut job = ProcessJob::assign(&child, self.policy.sandbox.limits());
         let out_handle = read_pipe_capped(child.stdout.take(), self.policy.max_output_bytes);
         let err_handle = read_pipe_capped(child.stderr.take(), self.policy.max_output_bytes);
         let deadline = Instant::now() + self.policy.command_timeout;
@@ -781,21 +1130,17 @@ impl WorkspaceTools {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        #[cfg(windows)]
-                        {
-                            let _ = Command::new("taskkill")
-                                .args(["/F", "/T", "/PID", &child.id().to_string()])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status();
-                        }
-                        #[cfg(unix)]
-                        {
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{}", child.id())])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status();
+                        if let Some(ref mut j) = job {
+                            j.terminate();
+                        } else {
+                            #[cfg(windows)]
+                            {
+                                let _ = Command::new("taskkill")
+                                    .args(["/F", "/T", "/PID", &child.id().to_string()])
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status();
+                            }
                         }
                         let _ = child.kill();
                         let _ = child.wait();
@@ -812,6 +1157,8 @@ impl WorkspaceTools {
             }
         };
 
+        // Soltar `job` limpia cualquier subproceso huérfano que el comando haya dejado en segundo plano.
+        drop(job);
         let stdout = scrub_secrets(&out_handle.join().unwrap_or_default());
         let stderr = scrub_secrets(&err_handle.join().unwrap_or_default());
         Ok((status.code().unwrap_or(-1), stdout, stderr))
@@ -966,16 +1313,84 @@ struct PlanUpdateArgs {
     steps: Vec<PlanStepItem>,
 }
 
+struct SearchOptions<'a> {
+    matcher: &'a Regex,
+    include_re: Option<&'a Regex>,
+    exclude_re: Option<&'a Regex>,
+    context_lines: usize,
+    max_results: usize,
+}
+
 #[derive(Deserialize)]
 struct CodeSearchArgs {
     pattern: String,
+    #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
     max_results: Option<usize>,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    case_insensitive: bool,
+    #[serde(default)]
+    include_glob: Option<String>,
+    #[serde(default)]
+    exclude_glob: Option<String>,
+    #[serde(default)]
+    context_lines: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GlobFilesArgs {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    sort_by_mtime: bool,
 }
 
 #[derive(Deserialize)]
 struct ShellExecArgs {
     command: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ServiceStartArgs {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    wait_ready_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct ServiceStopArgs {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize)]
+struct ServiceLogsArgs {
+    id: String,
+    #[serde(default)]
+    tail: Option<usize>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    regex: bool,
+}
+
+#[derive(Deserialize)]
+struct ServiceExecArgs {
+    id: String,
+    command: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]

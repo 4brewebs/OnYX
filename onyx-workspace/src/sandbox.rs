@@ -1,0 +1,1303 @@
+//! Sandboxing y aislamiento a nivel de sistema operativo (SDD-06).
+//!
+//! Diseñado para ser compartido tanto por `WorkspaceTools::shell_exec` (SDD-06)
+//! como por `SproutSupervisor` (SDD-08):
+//! - Sanitización estricta de entorno (`env_clear()` + allowlist segura).
+//! - RAII [`ProcessJob`] con Win32 Job Objects (`KILL_ON_JOB_CLOSE`, memoria y límite de PIDs)
+//!   y grupos de procesos POSIX (`PGID`) para evitar procesos zombi/huérfanos.
+//! - Drivers de aislamiento multiplataforma (`bwrap`, `landlock`, `sandbox-exec`, `win32-job`,
+//!   contenedor OCI `docker`/`podman`/`nerdctl`) y detección de capacidades para `openonyx doctor`.
+//! - Protección del *Control Plane* (`.onyx/config.toml`, `.git/hooks/**`, `.git/config`, `.env*`)
+//!   y política de red configurable (`offline`, `localhost`, `unrestricted`).
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use crate::policy::{is_control_plane_rel_path, strip_toml_comment_pub};
+
+/// Nivel de aislamiento aplicado a comandos ejecutados por el agente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxMode {
+    /// Sin sandbox OS (solo `WorkspacePolicy` + timeout); emite aviso en `doctor`/TUI.
+    Off,
+    /// Recomendado por defecto: `env_clear()` + escritura limitada a workspace/tmp + red offline.
+    #[default]
+    WorkspaceWrite,
+    /// Máximo aislamiento para `--auto-approve` / `bench`: contenedor OCI (`docker`/`podman`/`nerdctl`).
+    StrictContainer,
+}
+
+impl SandboxMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Some(Self::Off),
+            "workspace-write" | "workspace" | "ws" => Some(Self::WorkspaceWrite),
+            "strict-container" | "strict" | "container" => Some(Self::StrictContainer),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::StrictContainer => "strict-container",
+        }
+    }
+
+    /// Etiqueta corta para el badge `[SANDBOX:<label>]` en la TUI (`REQ-06.6`).
+    pub fn as_badge(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::WorkspaceWrite => "workspace",
+            Self::StrictContainer => "strict",
+        }
+    }
+}
+
+/// Política de acceso a red para subprocesos bajo sandbox (`REQ-06.3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkPolicy {
+    /// Sin acceso a red saliente (default seguro bajo sandbox).
+    #[default]
+    Offline,
+    /// Permite solo `127.0.0.1` / `localhost` (p. ej. probar APIs locales de Sprout).
+    LocalhostOnly,
+    /// Sin restricción de red saliente.
+    Unrestricted,
+}
+
+impl NetworkPolicy {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "offline" | "none" => Some(Self::Offline),
+            "localhost" | "localhost-only" | "local" => Some(Self::LocalhostOnly),
+            "unrestricted" | "allow" | "full" => Some(Self::Unrestricted),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::LocalhostOnly => "localhost",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+}
+
+/// Driver de sandbox detectado en el sistema anfitrión (`TEST-06.5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxDriverKind {
+    Bwrap,
+    Landlock,
+    SandboxExec,
+    Win32Job,
+    None,
+}
+
+impl SandboxDriverKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bwrap => "bwrap",
+            Self::Landlock => "landlock",
+            Self::SandboxExec => "sandbox-exec",
+            Self::Win32Job => "win32-job",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Capacidades de sandboxing y runtime OCI disponibles en el host actual.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCapabilities {
+    pub native_driver: SandboxDriverKind,
+    pub container_cli: Option<&'static str>,
+    pub notes: Vec<String>,
+}
+
+/// Límites de recursos aplicables a un [`ProcessJob`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessLimits {
+    pub max_memory_mb: Option<u64>,
+    pub max_pids: Option<u32>,
+}
+
+/// Configuración de sandbox cargada desde `[sandbox]` en `.onyx/config.toml` y flags CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxConfig {
+    pub mode: SandboxMode,
+    pub network: NetworkPolicy,
+    pub allow_read_paths: Vec<PathBuf>,
+    pub env_passthrough: Vec<String>,
+    pub max_memory_mb: Option<u64>,
+    pub max_pids: Option<u32>,
+    pub container_image: Option<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::WorkspaceWrite,
+            network: NetworkPolicy::Offline,
+            allow_read_paths: Vec::new(),
+            env_passthrough: Vec::new(),
+            max_memory_mb: Some(4096),
+            max_pids: Some(128),
+            container_image: None,
+        }
+    }
+}
+
+/// Parche parcial leído desde `[sandbox]` en un archivo `.onyx/config.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxPatch {
+    pub mode: Option<SandboxMode>,
+    pub network: Option<NetworkPolicy>,
+    pub allow_read_paths: Vec<PathBuf>,
+    pub env_passthrough: Vec<String>,
+    pub max_memory_mb: Option<u64>,
+    pub max_pids: Option<u32>,
+    pub container_image: Option<String>,
+}
+
+impl SandboxConfig {
+    pub fn limits(&self) -> ProcessLimits {
+        ProcessLimits {
+            max_memory_mb: self.max_memory_mb,
+            max_pids: self.max_pids,
+        }
+    }
+
+    /// Aplica un parche de configuración manteniendo los valores no especificados.
+    pub fn apply_patch(&mut self, patch: SandboxPatch) {
+        if let Some(m) = patch.mode {
+            self.mode = m;
+        }
+        if let Some(n) = patch.network {
+            self.network = n;
+        }
+        for p in patch.allow_read_paths {
+            if !self.allow_read_paths.contains(&p) {
+                self.allow_read_paths.push(p);
+            }
+        }
+        for k in patch.env_passthrough {
+            if !self.env_passthrough.contains(&k) {
+                self.env_passthrough.push(k);
+            }
+        }
+        if let Some(mem) = patch.max_memory_mb {
+            self.max_memory_mb = Some(mem);
+        }
+        if let Some(pids) = patch.max_pids {
+            self.max_pids = Some(pids);
+        }
+        if let Some(img) = patch.container_image {
+            self.container_image = Some(img);
+        }
+    }
+
+    /// Elevación automática de seguridad para `--auto-approve` (`REQ-06.5`):
+    /// si el usuario no pasó `--sandbox` explícitamente por CLI y el modo estaba en `Off`,
+    /// eleva a `WorkspaceWrite` + `Offline`.
+    pub fn elevate_for_auto_approve(&mut self, explicit_cli_mode: bool) {
+        if !explicit_cli_mode && self.mode == SandboxMode::Off {
+            self.mode = SandboxMode::WorkspaceWrite;
+            self.network = NetworkPolicy::Offline;
+        }
+    }
+
+    /// Parsea la sección `[sandbox]` de un archivo TOML (`.onyx/config.toml`).
+    pub fn parse_toml_patch(input: &str) -> Result<SandboxPatch, String> {
+        let mut patch = SandboxPatch::default();
+        let text = input.strip_prefix('\u{feff}').unwrap_or(input);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut in_sandbox = false;
+        let mut i = 0usize;
+
+        while i < lines.len() {
+            let line_no = i + 1;
+            let stripped = strip_toml_comment_pub(lines[i]).trim();
+            if stripped.is_empty() {
+                i += 1;
+                continue;
+            }
+            if stripped.starts_with('[') && stripped.ends_with(']') {
+                let header = stripped[1..stripped.len() - 1].trim();
+                in_sandbox = header == "sandbox";
+                i += 1;
+                continue;
+            }
+            if !in_sandbox {
+                i += 1;
+                continue;
+            }
+
+            let Some((raw_key, raw_val)) = stripped.split_once('=') else {
+                return Err(format!(
+                    "config.toml line {line_no}: expected `key = value` inside [sandbox]"
+                ));
+            };
+            let key = raw_key.trim();
+            let mut val_buf = raw_val.trim().to_string();
+
+            if val_buf.starts_with('[') {
+                while !crate::policy::array_brackets_closed_pub(&val_buf) {
+                    i += 1;
+                    if i >= lines.len() {
+                        return Err(format!(
+                            "config.toml line {line_no}: unterminated array for `[sandbox].{key}`"
+                        ));
+                    }
+                    let next_piece = strip_toml_comment_pub(lines[i]).trim();
+                    if !next_piece.is_empty() {
+                        val_buf.push(' ');
+                        val_buf.push_str(next_piece);
+                    }
+                }
+            }
+
+            match key {
+                "mode" => {
+                    let s = parse_toml_scalar_string(&val_buf)
+                        .map_err(|e| format!("config.toml line {line_no} (`mode`): {e}"))?;
+                    let parsed = SandboxMode::parse(&s).ok_or_else(|| {
+                        format!(
+                            "config.toml line {line_no}: invalid sandbox mode `{s}` (expected `off`, `workspace-write`, or `strict-container`)"
+                        )
+                    })?;
+                    patch.mode = Some(parsed);
+                }
+                "network" => {
+                    let s = parse_toml_scalar_string(&val_buf)
+                        .map_err(|e| format!("config.toml line {line_no} (`network`): {e}"))?;
+                    let parsed = NetworkPolicy::parse(&s).ok_or_else(|| {
+                        format!(
+                            "config.toml line {line_no}: invalid sandbox network `{s}` (expected `offline`, `localhost`, or `unrestricted`)"
+                        )
+                    })?;
+                    patch.network = Some(parsed);
+                }
+                "env_passthrough" => {
+                    let items =
+                        crate::policy::parse_toml_string_array_pub(&val_buf).map_err(|e| {
+                            format!("config.toml line {line_no} (`env_passthrough`): {e}")
+                        })?;
+                    patch.env_passthrough.extend(items);
+                }
+                "allow_read_paths" => {
+                    let items =
+                        crate::policy::parse_toml_string_array_pub(&val_buf).map_err(|e| {
+                            format!("config.toml line {line_no} (`allow_read_paths`): {e}")
+                        })?;
+                    patch
+                        .allow_read_paths
+                        .extend(items.into_iter().map(PathBuf::from));
+                }
+                "max_memory_mb" => {
+                    let parsed = val_buf.replace('_', "").parse::<u64>().map_err(|_| {
+                        format!("config.toml line {line_no}: `max_memory_mb` must be an integer")
+                    })?;
+                    patch.max_memory_mb = Some(parsed);
+                }
+                "max_pids" => {
+                    let parsed = val_buf.replace('_', "").parse::<u32>().map_err(|_| {
+                        format!("config.toml line {line_no}: `max_pids` must be an integer")
+                    })?;
+                    patch.max_pids = Some(parsed);
+                }
+                "container_image" => {
+                    let s = parse_toml_scalar_string(&val_buf).map_err(|e| {
+                        format!("config.toml line {line_no} (`container_image`): {e}")
+                    })?;
+                    if !s.trim().is_empty() {
+                        patch.container_image = Some(s);
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "config.toml line {line_no}: unknown key `{other}` in [sandbox]"
+                    ));
+                }
+            }
+            i += 1;
+        }
+
+        Ok(patch)
+    }
+
+    /// Carga y fusiona `[sandbox]` desde `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml`.
+    pub fn load_for_workspace(workspace_root: &Path) -> Self {
+        let global_path = user_home_dir().map(|h| h.join(".onyx").join("config.toml"));
+        let project_path = workspace_root.join(".onyx").join("config.toml");
+        Self::load_from_paths(global_path.as_deref(), Some(project_path.as_path()))
+            .unwrap_or_default()
+    }
+
+    pub fn load_from_paths(
+        global_path: Option<&Path>,
+        project_path: Option<&Path>,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::default();
+        if let Some(gp) = global_path {
+            if gp.is_file() {
+                let raw = fs::read_to_string(gp)
+                    .map_err(|e| format!("failed to read `{}`: {e}", gp.display()))?;
+                cfg.apply_patch(Self::parse_toml_patch(&raw)?);
+            }
+        }
+        if let Some(pp) = project_path {
+            if pp.is_file() {
+                let raw = fs::read_to_string(pp)
+                    .map_err(|e| format!("failed to read `{}`: {e}", pp.display()))?;
+                cfg.apply_patch(Self::parse_toml_patch(&raw)?);
+            }
+        }
+        Ok(cfg)
+    }
+}
+
+/// Detecta el driver nativo de sandbox y runtime de contenedores disponibles en el host (`TEST-06.5`).
+pub fn detect_sandbox_capabilities() -> SandboxCapabilities {
+    let mut notes = Vec::new();
+    let container_cli = detect_container_cli();
+
+    #[cfg(target_os = "linux")]
+    let native_driver = {
+        if command_succeeds("bwrap", &["--version"]) {
+            notes
+                .push("bubblewrap (`bwrap`) available for filesystem and network isolation".into());
+            SandboxDriverKind::Bwrap
+        } else if linux_landlock_supported() {
+            notes.push(
+                "Linux Landlock LSM active in kernel (install `bwrap` for full --unshare-net)"
+                    .into(),
+            );
+            SandboxDriverKind::Landlock
+        } else {
+            notes.push(
+                "neither `bwrap` nor Landlock LSM detected; only env_clear and PGID limits apply"
+                    .into(),
+            );
+            SandboxDriverKind::None
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    let native_driver = {
+        if Path::new("/usr/bin/sandbox-exec").is_file() {
+            notes.push(
+                "macOS `sandbox-exec` (Seatbelt) available for FS and network isolation".into(),
+            );
+            SandboxDriverKind::SandboxExec
+        } else {
+            notes.push(
+                "`/usr/bin/sandbox-exec` not found; only env_clear and PGID limits apply".into(),
+            );
+            SandboxDriverKind::None
+        }
+    };
+
+    #[cfg(windows)]
+    let native_driver = {
+        if win::probe_job_object_available() {
+            notes.push(
+                "Win32 Job Objects (`KILL_ON_JOB_CLOSE`, memory/PID limits) + env_clear active"
+                    .into(),
+            );
+            SandboxDriverKind::Win32Job
+        } else {
+            notes.push("Win32 Job Object creation unavailable".into());
+            SandboxDriverKind::None
+        }
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let native_driver = {
+        notes.push("no native OS sandbox driver for this target; env_clear applies".into());
+        SandboxDriverKind::None
+    };
+
+    if let Some(cli) = container_cli {
+        notes.push(format!("OCI container runtime `{cli}` detected on PATH"));
+    }
+
+    SandboxCapabilities {
+        native_driver,
+        container_cli,
+        notes,
+    }
+}
+
+/// Detecta el primer CLI de contenedores disponible (`docker`, `nerdctl` o `podman`).
+pub fn detect_container_cli() -> Option<&'static str> {
+    ["docker", "nerdctl", "podman"]
+        .into_iter()
+        .find(|&bin| command_succeeds(bin, &["--version"]))
+}
+
+/// Indica si el nombre de una variable de entorno corresponde a un secreto o credencial
+/// que nunca debe heredarse por defecto en subprocesos (`REQ-06.1`).
+pub fn is_sensitive_env_key(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("API_KEY")
+        || upper.contains("SECRET")
+        || upper.contains("TOKEN")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
+        || upper.contains("CREDENTIAL")
+        || upper.contains("PRIVATE_KEY")
+        || upper.starts_with("AWS_")
+        || upper.starts_with("AZURE_")
+        || upper.starts_with("GCP_")
+        || upper.starts_with("GOOGLE_")
+        || upper.starts_with("GEMINI_")
+        || upper.starts_with("OPENAI_")
+        || upper.starts_with("ANTHROPIC_")
+        || upper.starts_with("ONYX_API")
+        || upper.starts_with("GITHUB_")
+        || upper.starts_with("GH_")
+        || upper.starts_with("GITLAB_")
+        || upper.starts_with("NPM_TOKEN")
+        || upper.starts_with("CARGO_REGISTRY_")
+}
+
+/// Aplica sanitización estricta de variables de entorno sobre `cmd` (`REQ-06.1`).
+///
+/// Reutilizable por `WorkspaceTools::shell_exec` y por `SproutSupervisor` (SDD-08):
+/// - Arranca con `cmd.env_clear()`.
+/// - Solo copia una allowlist mínima de variables de runtime del SO y toolchains.
+/// - **Nunca** hereda `GEMINI_API_KEY`, `OPENAI_API_KEY`, `AWS_*`, `*_TOKEN`, etc.
+///   salvo opt-in explícito en `config.env_passthrough`.
+/// - Redirige `TMP`/`TEMP`/`TMPDIR` a `sandbox_tmp` y añade hints offline cuando
+///   `config.network == NetworkPolicy::Offline`.
+pub fn apply_sanitized_env(
+    cmd: &mut Command,
+    config: &SandboxConfig,
+    workspace_root: &Path,
+    sandbox_tmp: &Path,
+) {
+    cmd.env_clear();
+
+    const SAFE_BASE_KEYS: &[&str] = &[
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CLICOLOR",
+        "TZ",
+        "RUSTUP_HOME",
+        "CARGO_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "CARGO_TARGET_DIR",
+        "RUSTFLAGS",
+        "JAVA_HOME",
+        "MAVEN_HOME",
+        "M2_HOME",
+        "GRADLE_HOME",
+        "GOPATH",
+        "GOROOT",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "NODE_OPTIONS",
+    ];
+
+    #[cfg(windows)]
+    const SAFE_OS_KEYS: &[&str] = &[
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+        "SYSTEMDRIVE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "PROGRAMDATA",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PSModulePath",
+    ];
+
+    #[cfg(not(windows))]
+    const SAFE_OS_KEYS: &[&str] = &["USER", "LOGNAME", "SHELL", "XDG_CACHE_HOME"];
+
+    let mut allowed: BTreeSet<String> = BTreeSet::new();
+    for k in SAFE_BASE_KEYS.iter().chain(SAFE_OS_KEYS.iter()) {
+        allowed.insert((*k).to_string());
+    }
+
+    // Preservar valores reales del entorno actual solo para la allowlist segura (nunca secretos).
+    for (k, v) in std::env::vars() {
+        let in_default_allow = allowed.iter().any(|a| a.eq_ignore_ascii_case(&k));
+        let in_passthrough = config
+            .env_passthrough
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(&k));
+        if (in_default_allow && !is_sensitive_env_key(&k)) || in_passthrough {
+            cmd.env(&k, v);
+        }
+    }
+
+    // En Unix, redirigimos HOME al directorio temporal aislado preservando CARGO_HOME / RUSTUP_HOME.
+    #[cfg(not(windows))]
+    {
+        if let Some(real_home) = user_home_dir() {
+            if std::env::var_os("CARGO_HOME").is_none() {
+                let cargo_home = real_home.join(".cargo");
+                if cargo_home.exists() {
+                    cmd.env("CARGO_HOME", cargo_home);
+                }
+            }
+            if std::env::var_os("RUSTUP_HOME").is_none() {
+                let rustup_home = real_home.join(".rustup");
+                if rustup_home.exists() {
+                    cmd.env("RUSTUP_HOME", rustup_home);
+                }
+            }
+        }
+        cmd.env("HOME", sandbox_tmp);
+    }
+
+    // En Windows, aseguramos CARGO_HOME/RUSTUP_HOME si existen bajo USERPROFILE.
+    #[cfg(windows)]
+    {
+        if let Some(real_home) = user_home_dir() {
+            if std::env::var_os("CARGO_HOME").is_none() {
+                let cargo_home = real_home.join(".cargo");
+                if cargo_home.exists() {
+                    cmd.env("CARGO_HOME", cargo_home);
+                }
+            }
+            if std::env::var_os("RUSTUP_HOME").is_none() {
+                let rustup_home = real_home.join(".rustup");
+                if rustup_home.exists() {
+                    cmd.env("RUSTUP_HOME", rustup_home);
+                }
+            }
+        }
+    }
+
+    // Directorio temporal acotado a la sesión.
+    let clean_tmp = clean_process_path(sandbox_tmp);
+    let clean_ws = clean_process_path(workspace_root);
+    cmd.env("TMPDIR", &clean_tmp);
+    cmd.env("TMP", &clean_tmp);
+    cmd.env("TEMP", &clean_tmp);
+    cmd.env("ONYX_SANDBOX_MODE", config.mode.as_str());
+    cmd.env("ONYX_SANDBOX_NET", config.network.as_str());
+    cmd.env("ONYX_WORKSPACE_ROOT", &clean_ws);
+
+    if config.network == NetworkPolicy::Offline {
+        cmd.env("CARGO_NET_OFFLINE", "true");
+        cmd.env("PIP_NO_INDEX", "1");
+        cmd.env("NPM_CONFIG_OFFLINE", "true");
+        cmd.env("NO_PROXY", "127.0.0.1,localhost");
+    }
+}
+
+/// Normaliza rutas canónicas para pasarlas como `current_dir` / variables de entorno a procesos
+/// hijos: en Windows elimina el prefijo verbatim `\\?\` (p. ej. `\\?\C:\...` -> `C:\...`) para
+/// que `pwsh`, `cmd.exe`, `mvn`, `java` y `node` operen sin errores de proveedor de rutas.
+pub fn clean_process_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+        path.to_path_buf()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// Crea (si no existe) un directorio temporal seguro específico para el sandbox del workspace.
+pub fn ensure_sandbox_tmp_dir(workspace_root: &Path) -> Result<PathBuf, String> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in workspace_root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let dir = std::env::temp_dir().join(format!("onyx-sandbox-{hash:016x}"));
+    fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "failed to prepare sandbox temp dir `{}`: {e}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Verifica si un comando de shell intenta escribir o alterar rutas del Control Plane
+/// (`.onyx/config.toml`, `.git/hooks`, `.git/config`, `.env*`) (`REQ-06.4`, `TEST-06.4`).
+pub fn check_control_plane_shell_write(command: &str) -> Result<(), String> {
+    let lower = command.to_ascii_lowercase();
+    let mentions_cp = lower.contains(".onyx/config")
+        || lower.contains(".onyx\\config")
+        || lower.contains(".git/hooks")
+        || lower.contains(".git\\hooks")
+        || lower.contains(".git/config")
+        || lower.contains(".git\\config")
+        || mentions_dotenv_token(&lower);
+    if !mentions_cp {
+        return Ok(());
+    }
+
+    let is_write_intent = lower.contains('>')
+        || lower.contains("set-content")
+        || lower.contains("add-content")
+        || lower.contains("out-file")
+        || lower.contains("new-item")
+        || lower.contains("remove-item")
+        || lower.contains("move-item")
+        || lower.contains("copy-item")
+        || lower.contains("touch ")
+        || lower.contains("tee ")
+        || lower.contains("sed -i")
+        || lower.contains("chmod ")
+        || lower.contains("rm ")
+        || lower.contains("del ")
+        || lower.contains("mv ")
+        || lower.contains("cp ")
+        || lower.contains("truncate ")
+        || lower.contains("git config");
+
+    if is_write_intent {
+        return Err(
+            "blocked by control-plane protection (read-only): shell command cannot modify `.onyx/config.toml`, `.git/hooks/**`, `.git/config`, or `.env*`"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Verifica en hosts sin aislamiento de namespace de red (p. ej. Windows sin `StrictContainer`)
+/// que un comando bajo `NetworkPolicy::Offline` no intente conexiones salientes directas (`REQ-06.3`, `TEST-06.3`).
+pub fn check_offline_network_command(command: &str, network: NetworkPolicy) -> Result<(), String> {
+    if network == NetworkPolicy::Unrestricted {
+        return Ok(());
+    }
+    let lower = command.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '\'' | '"'))
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let is_network_tool = tokens.iter().any(|t| {
+        matches!(
+            *t,
+            "curl"
+                | "curl.exe"
+                | "wget"
+                | "wget.exe"
+                | "invoke-webrequest"
+                | "invoke-restmethod"
+                | "iwr"
+                | "irm"
+                | "nc"
+                | "ncat"
+                | "netcat"
+                | "telnet"
+                | "ssh"
+                | "scp"
+                | "sftp"
+                | "rsync"
+                | "ftp"
+                | "nslookup"
+                | "dig"
+        )
+    }) || lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("tcpclient")
+        || lower.contains("webclient")
+        || (tokens.contains(&"git")
+            && tokens
+                .iter()
+                .any(|t| matches!(*t, "fetch" | "pull" | "push" | "clone" | "ls-remote")));
+
+    if !is_network_tool {
+        return Ok(());
+    }
+
+    if network == NetworkPolicy::LocalhostOnly {
+        let targets_only_local =
+            lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("[::1]");
+        if targets_only_local && !contains_non_local_url(&lower) {
+            return Ok(());
+        }
+        return Err(
+            "blocked by sandbox network policy (localhost): outbound non-localhost network access requires `--sandbox-net unrestricted` or approval"
+                .to_string(),
+        );
+    }
+
+    Err(
+        "blocked by sandbox network policy (offline): outbound network access is disabled; pass `--sandbox-net unrestricted` (or configure `[sandbox].network` in `.onyx/config.toml`) to allow"
+            .to_string(),
+    )
+}
+
+/// Construye un `std::process::Command` listo para ejecutar `raw_command` bajo `config` (`REQ-06.1`..`REQ-06.5`).
+pub fn prepare_sandboxed_shell_command(
+    config: &SandboxConfig,
+    workspace_root: &Path,
+    sandbox_tmp: &Path,
+    raw_command: &str,
+) -> Result<Command, String> {
+    if raw_command.trim().is_empty() {
+        return Err("command cannot be empty".to_string());
+    }
+
+    if config.mode == SandboxMode::Off {
+        let mut cmd = plain_shell_command(raw_command);
+        cmd.current_dir(clean_process_path(workspace_root));
+        return Ok(cmd);
+    }
+
+    // Capa 1 (transversal): protección del Control Plane en cualquier plataforma.
+    check_control_plane_shell_write(raw_command)?;
+
+    // Capa 2: modo StrictContainer (contenedor OCI `docker`/`podman`/`nerdctl`).
+    if config.mode == SandboxMode::StrictContainer {
+        return build_container_command(config, workspace_root, raw_command);
+    }
+
+    // Capa 3: modo WorkspaceWrite según SO anfitrión.
+    #[cfg(target_os = "linux")]
+    {
+        if command_succeeds("bwrap", &["--version"]) {
+            return build_bwrap_command(config, workspace_root, sandbox_tmp, raw_command);
+        }
+        check_offline_network_command(raw_command, config.network)?;
+        let mut cmd = plain_shell_command(raw_command);
+        cmd.current_dir(clean_process_path(workspace_root));
+        apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
+        Ok(cmd)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new("/usr/bin/sandbox-exec").is_file() {
+            return build_seatbelt_command(config, workspace_root, sandbox_tmp, raw_command);
+        }
+        check_offline_network_command(raw_command, config.network)?;
+        let mut cmd = plain_shell_command(raw_command);
+        cmd.current_dir(clean_process_path(workspace_root));
+        apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
+        Ok(cmd)
+    }
+
+    #[cfg(windows)]
+    {
+        check_offline_network_command(raw_command, config.network)?;
+        let mut cmd = plain_shell_command(raw_command);
+        cmd.current_dir(clean_process_path(workspace_root));
+        apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
+        Ok(cmd)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        check_offline_network_command(raw_command, config.network)?;
+        let mut cmd = plain_shell_command(raw_command);
+        cmd.current_dir(clean_process_path(workspace_root));
+        apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
+        Ok(cmd)
+    }
+}
+
+/// Configura flags de grupo de proceso / ventana oculta en un `Command` antes de `spawn`.
+/// Útil tanto para `shell_exec` como para procesos en segundo plano de `SproutSupervisor` (SDD-08).
+pub fn configure_process_isolation(cmd: &mut Command, hide_window: bool) {
+    #[cfg(unix)]
+    {
+        let _ = hide_window;
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        if hide_window {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+}
+
+fn plain_shell_command(raw_command: &str) -> Command {
+    if cfg!(windows) {
+        let mut c = Command::new("pwsh");
+        c.args(["-NoProfile", "-Command", raw_command]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", raw_command]);
+        c
+    }
+}
+
+fn build_container_command(
+    config: &SandboxConfig,
+    workspace_root: &Path,
+    raw_command: &str,
+) -> Result<Command, String> {
+    let cli = detect_container_cli().ok_or_else(|| {
+        "strict-container sandbox requested, but neither `docker`, `nerdctl`, nor `podman` was found on PATH"
+            .to_string()
+    })?;
+    let image = config.container_image.as_deref().unwrap_or("alpine:latest");
+    let mut cmd = Command::new(cli);
+    cmd.args(["run", "--rm", "-i", "--workdir", "/workspace"]);
+
+    match config.network {
+        NetworkPolicy::Offline => {
+            cmd.arg("--network=none");
+        }
+        NetworkPolicy::LocalhostOnly => {
+            cmd.arg("--network=host");
+        }
+        NetworkPolicy::Unrestricted => {}
+    }
+    if let Some(mem) = config.max_memory_mb {
+        cmd.arg(format!("--memory={mem}m"));
+    }
+    if let Some(pids) = config.max_pids {
+        cmd.arg(format!("--pids-limit={pids}"));
+    }
+
+    let ws_mount = format!("{}:/workspace", workspace_root.display());
+    cmd.args(["-v", &ws_mount]);
+
+    // Montaje read-only de ficheros existentes del Control Plane dentro del contenedor.
+    for rel in [".onyx/config.toml", ".git/hooks", ".git/config", ".env"] {
+        let host_path = workspace_root.join(rel);
+        if host_path.exists() {
+            cmd.args([
+                "-v",
+                &format!("{}:/workspace/{rel}:ro", host_path.display()),
+            ]);
+        }
+    }
+
+    for key in &config.env_passthrough {
+        if let Ok(val) = std::env::var(key) {
+            cmd.args(["-e", &format!("{key}={val}")]);
+        }
+    }
+    cmd.args([image, "sh", "-c", raw_command]);
+    cmd.current_dir(workspace_root);
+    Ok(cmd)
+}
+
+#[cfg(target_os = "linux")]
+fn build_bwrap_command(
+    config: &SandboxConfig,
+    workspace_root: &Path,
+    sandbox_tmp: &Path,
+    raw_command: &str,
+) -> Result<Command, String> {
+    let mut cmd = Command::new("bwrap");
+    cmd.args([
+        "--die-with-parent",
+        "--new-session",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+    ]);
+    if config.network == NetworkPolicy::Offline {
+        cmd.arg("--unshare-net");
+    }
+    let ws = workspace_root.to_string_lossy().to_string();
+    let tmp = sandbox_tmp.to_string_lossy().to_string();
+    cmd.args([
+        "--bind", &ws, &ws, "--bind", &tmp, &tmp, "--bind", &tmp, "/tmp",
+    ]);
+
+    // Ocultar credenciales sensibles del usuario en $HOME real.
+    if let Some(real_home) = user_home_dir() {
+        for sensitive in [".ssh", ".gnupg", ".aws", ".kube"] {
+            let p = real_home.join(sensitive);
+            if p.exists() {
+                cmd.args(["--tmpfs", &p.to_string_lossy()]);
+            }
+        }
+    }
+
+    // Rutas de solo lectura adicionales explícitas.
+    for extra in &config.allow_read_paths {
+        if extra.exists() {
+            let s = extra.to_string_lossy().to_string();
+            cmd.args(["--ro-bind", &s, &s]);
+        }
+    }
+
+    // Re-montar Control Plane como read-only dentro del workspace.
+    for rel in [".onyx/config.toml", ".git/hooks", ".git/config", ".env"] {
+        let p = workspace_root.join(rel);
+        if p.exists() {
+            let s = p.to_string_lossy().to_string();
+            cmd.args(["--ro-bind", &s, &s]);
+        }
+    }
+
+    cmd.args(["--chdir", &ws, "sh", "-c", raw_command]);
+    cmd.current_dir(workspace_root);
+    apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
+    Ok(cmd)
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_command(
+    config: &SandboxConfig,
+    workspace_root: &Path,
+    sandbox_tmp: &Path,
+    raw_command: &str,
+) -> Result<Command, String> {
+    let ws = escape_seatbelt_path(workspace_root);
+    let tmp = escape_seatbelt_path(sandbox_tmp);
+    let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+    profile.push_str(&format!(
+        "(allow file-write* (subpath \"{ws}\") (subpath \"{tmp}\") (subpath \"/dev\"))\n"
+    ));
+
+    // Control Plane read-only.
+    for rel in [".onyx/config.toml", ".git/hooks", ".git/config", ".env"] {
+        let p = escape_seatbelt_path(&workspace_root.join(rel));
+        profile.push_str(&format!("(deny file-write* (subpath \"{p}\"))\n"));
+    }
+
+    // Ocultar lectura de credenciales en $HOME.
+    if let Some(real_home) = user_home_dir() {
+        for sensitive in [".ssh", ".gnupg", ".aws", ".kube"] {
+            let p = escape_seatbelt_path(&real_home.join(sensitive));
+            profile.push_str(&format!("(deny file-read* (subpath \"{p}\"))\n"));
+        }
+    }
+
+    match config.network {
+        NetworkPolicy::Offline => {
+            profile.push_str("(deny network*)\n");
+        }
+        NetworkPolicy::LocalhostOnly => {
+            profile.push_str("(deny network*)\n(allow network* (local ip \"localhost:*\") (remote ip \"localhost:*\"))\n");
+        }
+        NetworkPolicy::Unrestricted => {}
+    }
+
+    let mut cmd = Command::new("/usr/bin/sandbox-exec");
+    cmd.args(["-p", &profile, "sh", "-c", raw_command]);
+    cmd.current_dir(workspace_root);
+    apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
+    Ok(cmd)
+}
+
+#[cfg(target_os = "macos")]
+fn escape_seatbelt_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_supported() -> bool {
+    fs::read_to_string("/sys/kernel/security/lsm")
+        .map(|s| s.split(',').any(|m| m.trim() == "landlock"))
+        .unwrap_or(false)
+}
+
+fn command_succeeds(bin: &str, args: &[&str]) -> bool {
+    Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn parse_toml_scalar_string(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Ok(inner.replace("\\\"", "\"").replace("\\\\", "\\"));
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
+        return Ok(inner.to_string());
+    }
+    Err(format!("expected quoted string, found `{trimmed}`"))
+}
+
+fn mentions_dotenv_token(lower: &str) -> bool {
+    lower
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '|' | '&' | '>' | '<' | '(' | ')')
+        })
+        .any(|tok| !tok.is_empty() && is_control_plane_rel_path(tok))
+}
+
+fn contains_non_local_url(lower: &str) -> bool {
+    for scheme in ["http://", "https://"] {
+        let mut rest = lower;
+        while let Some(idx) = rest.find(scheme) {
+            let after = &rest[idx + scheme.len()..];
+            let host = after
+                .split(|c: char| c == '/' || c == ':' || c.is_whitespace() || c == '"' || c == '\'')
+                .next()
+                .unwrap_or("");
+            if !host.is_empty() && host != "localhost" && host != "127.0.0.1" && host != "[::1]" {
+                return true;
+            }
+            rest = after;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// RAII ProcessJob (Win32 Job Objects / POSIX PGID) — compartido con SDD-08
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    use super::ProcessLimits;
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+    const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
+    const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(lp_job_attributes: *const c_void, lp_name: *const u16) -> isize;
+        fn SetInformationJobObject(
+            h_job: isize,
+            job_object_information_class: u32,
+            lp_job_object_information: *const c_void,
+            cb_job_object_information_length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(h_job: isize, h_process: isize) -> i32;
+        fn TerminateJobObject(h_job: isize, u_exit_code: u32) -> i32;
+        fn CloseHandle(h_object: isize) -> i32;
+    }
+
+    pub fn probe_job_object_available() -> bool {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == 0 {
+                return false;
+            }
+            CloseHandle(job);
+            true
+        }
+    }
+
+    /// Handle RAII a un Win32 Job Object con `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    /// Al destruirse (`Drop`) o llamar a [`Self::terminate`], mata todo el árbol de procesos hijo.
+    pub struct ProcessJob {
+        handle: isize,
+    }
+
+    // Los handles de Win32 Job Object son válidos a nivel de proceso y seguros de mover entre hilos.
+    unsafe impl Send for ProcessJob {}
+
+    impl ProcessJob {
+        pub fn assign(child: &Child, limits: ProcessLimits) -> Option<Self> {
+            let raw_proc = child.as_raw_handle() as isize;
+            if raw_proc == 0 {
+                return None;
+            }
+            // Intenta primero con límites completos (KILL_ON_JOB_CLOSE + memoria + PIDs);
+            // si un sandbox anidado rechaza límites extra, cae limpiamente a KILL_ON_JOB_CLOSE.
+            if let Some(job) = Self::try_assign(raw_proc, limits, true) {
+                return Some(job);
+            }
+            Self::try_assign(raw_proc, ProcessLimits::default(), false)
+        }
+
+        fn try_assign(raw_proc: isize, limits: ProcessLimits, apply_extras: bool) -> Option<Self> {
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job == 0 {
+                    return None;
+                }
+
+                let mut info: JobObjectExtendedLimitInformation = zeroed();
+                let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if apply_extras {
+                    if let Some(mb) = limits.max_memory_mb {
+                        if let Some(bytes) = usize::try_from(mb)
+                            .ok()
+                            .and_then(|m| m.checked_mul(1024 * 1024))
+                        {
+                            if bytes > 0 {
+                                flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+                                info.job_memory_limit = bytes;
+                            }
+                        }
+                    }
+                    if let Some(pids) = limits.max_pids {
+                        if pids > 0 {
+                            flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                            info.basic_limit_information.active_process_limit = pids;
+                        }
+                    }
+                }
+                info.basic_limit_information.limit_flags = flags;
+
+                let ok = SetInformationJobObject(
+                    job,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    &info as *const _ as *const c_void,
+                    size_of::<JobObjectExtendedLimitInformation>() as u32,
+                );
+                if ok == 0 || AssignProcessToJobObject(job, raw_proc) == 0 {
+                    CloseHandle(job);
+                    return None;
+                }
+                Some(Self { handle: job })
+            }
+        }
+
+        /// Termina inmediatamente todo el árbol de procesos asociado a este Job Object.
+        pub fn terminate(&mut self) {
+            if self.handle != 0 {
+                unsafe {
+                    TerminateJobObject(self.handle, 1);
+                    CloseHandle(self.handle);
+                }
+                self.handle = 0;
+            }
+        }
+    }
+
+    impl Drop for ProcessJob {
+        fn drop(&mut self) {
+            if self.handle != 0 {
+                unsafe {
+                    CloseHandle(self.handle);
+                }
+                self.handle = 0;
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod unix_job {
+    use std::process::{Child, Command, Stdio};
+
+    use super::ProcessLimits;
+
+    /// Handle RAII a un grupo de procesos POSIX (`PGID`); al soltar o terminar mata `-pgid`.
+    pub struct ProcessJob {
+        pgid: u32,
+        terminated: bool,
+    }
+
+    impl ProcessJob {
+        pub fn assign(child: &Child, _limits: ProcessLimits) -> Option<Self> {
+            let pid = child.id();
+            if pid == 0 {
+                return None;
+            }
+            Some(Self {
+                pgid: pid,
+                terminated: false,
+            })
+        }
+
+        pub fn terminate(&mut self) {
+            if !self.terminated {
+                self.terminated = true;
+                let _ = Command::new("kill")
+                    .args(["-9", &format!("-{}", self.pgid)])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    impl Drop for ProcessJob {
+        fn drop(&mut self) {
+            self.terminate();
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use win::ProcessJob;
+
+#[cfg(not(windows))]
+pub use unix_job::ProcessJob;

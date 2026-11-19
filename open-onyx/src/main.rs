@@ -1,4 +1,5 @@
 mod command;
+mod context;
 mod gemini;
 mod openai;
 mod ops;
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use command::CommandSpawnerSystem;
+use context::{SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
     AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
     load_project_instructions,
@@ -22,8 +24,8 @@ use onyx_soul_agents::{
     AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
 };
 use onyx_workspace::{
-    PendingCheckpoints, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge,
-    WorkspaceTools,
+    NetworkPolicy, PendingCheckpoints, SandboxMode, WorkspaceMode, WorkspaceModeHandle,
+    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
 };
 use openai::{AsyncOpenAiDriver, DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
@@ -67,6 +69,9 @@ struct CliArgs {
     model: Option<String>,
     api_base: Option<String>,
     auto_approve: bool,
+    ignore_deny: bool,
+    sandbox_mode: Option<SandboxMode>,
+    sandbox_network: Option<NetworkPolicy>,
     dry_run: bool,
     max_steps: Option<i64>,
     shell_timeout_secs: Option<u64>,
@@ -86,6 +91,9 @@ impl CliArgs {
             model: None,
             api_base: None,
             auto_approve: false,
+            ignore_deny: false,
+            sandbox_mode: None,
+            sandbox_network: None,
             dry_run: false,
             max_steps: None,
             shell_timeout_secs: None,
@@ -139,6 +147,9 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut model: Option<String> = None;
     let mut api_base: Option<String> = None;
     let mut auto_approve = false;
+    let mut ignore_deny = false;
+    let mut sandbox_mode: Option<SandboxMode> = None;
+    let mut sandbox_network: Option<NetworkPolicy> = None;
     let mut dry_run = false;
     let mut max_steps: Option<i64> = None;
     let mut shell_timeout_secs: Option<u64> = None;
@@ -180,6 +191,29 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 api_base = Some(u);
             }
             "--auto-approve" => auto_approve = true,
+            "--ignore-deny" => ignore_deny = true,
+            "--sandbox" => {
+                let s = args
+                    .next()
+                    .ok_or("--sandbox requires `off`, `workspace-write`, or `strict-container`")?;
+                let parsed = SandboxMode::parse(&s).ok_or_else(|| {
+                    format!(
+                        "unsupported --sandbox mode `{s}` (expected `off`, `workspace-write`, or `strict-container`)"
+                    )
+                })?;
+                sandbox_mode = Some(parsed);
+            }
+            "--sandbox-net" => {
+                let s = args
+                    .next()
+                    .ok_or("--sandbox-net requires `offline`, `localhost`, or `unrestricted`")?;
+                let parsed = NetworkPolicy::parse(&s).ok_or_else(|| {
+                    format!(
+                        "unsupported --sandbox-net policy `{s}` (expected `offline`, `localhost`, or `unrestricted`)"
+                    )
+                })?;
+                sandbox_network = Some(parsed);
+            }
             "--dry-run" => dry_run = true,
             "--max-steps" => {
                 let s = args
@@ -322,6 +356,9 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         model,
         api_base,
         auto_approve,
+        ignore_deny,
+        sandbox_mode,
+        sandbox_network,
         dry_run,
         max_steps,
         shell_timeout_secs,
@@ -334,7 +371,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -353,7 +390,10 @@ OPTIONS:
       --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
       --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
       --api-base <url>     Custom API base URL (e.g. `http://localhost:11434/v1`; no OPENAI_API_KEY needed when set)
-      --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`)
+      --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`; `deny` rules in `.onyx/config.toml` still apply and sandbox elevates to `workspace-write` + `offline` unless `--sandbox off`)
+      --ignore-deny        Explicitly bypass `[permissions].deny` rules loaded from `.onyx/config.toml`
+      --sandbox <mode>     OS sandbox profile for `shell_exec`: `workspace-write` (default), `strict-container`, or `off`
+      --sandbox-net <pol>  Network policy inside sandbox: `offline` (default), `localhost`, or `unrestricted`
       --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
       --shell-timeout <s>  Timeout in seconds per `shell_exec` command
       --save-transcript <f>, --record <f>
@@ -377,6 +417,10 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
   /undo                    Revert the latest reversible git checkpoint created during the session
+  /compact [focus]         Compact older turns into a verified session summary (creating a `cmd:/compact` milestone)
+  /services                Show @TOON v1 status of local processes & containers from `sprout.toml`
+  /service <start|stop|logs> <id|all> [tail]
+                           Control Sprout services interactively from the TUI
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
@@ -475,18 +519,32 @@ fn resolve_llm_config(
     }
 }
 
-fn build_sync_responder(llm: &LlmConfig) -> Box<dyn Responder> {
+fn build_sync_responder(
+    llm: &LlmConfig,
+    telemetry: Option<SessionTelemetryHandle>,
+) -> Box<dyn Responder> {
+    let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     match llm.provider {
-        LlmProvider::Gemini => Box::new(
-            GeminiResponder::new(llm.api_key.clone(), llm.model.clone())
+        LlmProvider::Gemini => {
+            let mut r = GeminiResponder::new(llm.api_key.clone(), llm.model.clone())
                 .with_api_base(llm.api_base.clone())
-                .with_project_instructions(llm.project_instructions.clone()),
-        ),
-        LlmProvider::OpenAi => Box::new(
-            OpenAiResponder::new(llm.api_key.clone(), llm.model.clone())
+                .with_project_instructions(llm.project_instructions.clone())
+                .with_context_config(ctx_cfg);
+            if let Some(tel) = telemetry {
+                r = r.with_telemetry(tel);
+            }
+            Box::new(r)
+        }
+        LlmProvider::OpenAi => {
+            let mut r = OpenAiResponder::new(llm.api_key.clone(), llm.model.clone())
                 .with_api_base(llm.api_base.clone())
-                .with_project_instructions(llm.project_instructions.clone()),
-        ),
+                .with_project_instructions(llm.project_instructions.clone())
+                .with_context_config(ctx_cfg);
+            if let Some(tel) = telemetry {
+                r = r.with_telemetry(tel);
+            }
+            Box::new(r)
+        }
     }
 }
 
@@ -511,11 +569,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    let mut policy = WorkspacePolicy::new(&cli.workspace)?;
+    let mut policy = WorkspacePolicy::new(&cli.workspace)?.with_loaded_config();
     if let Some(secs) = cli.shell_timeout_secs {
         policy = policy.with_command_timeout(Duration::from_secs(secs));
     }
-    let tools = WorkspaceTools::new(policy);
+    if cli.ignore_deny {
+        policy = policy.with_ignore_deny(true);
+    }
+    if let Some(sm) = cli.sandbox_mode {
+        policy.sandbox.mode = sm;
+    }
+    if let Some(sn) = cli.sandbox_network {
+        policy.sandbox.network = sn;
+    }
+    if cli.auto_approve {
+        policy
+            .sandbox
+            .elevate_for_auto_approve(cli.sandbox_mode.is_some());
+    }
+    let tools = WorkspaceTools::new(policy.clone());
 
     let config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(64),
@@ -540,15 +612,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             host.spawn(&make_spec(goal, cli.auto_approve));
 
-            let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
+            let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
+                .with_policy(policy.clone());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode(WorkspaceMode::Build)
                 .with_workspace_vocab(ws_vocab)
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(cli_driver);
-            let mut driver =
-                RecordingBridge::new(host.vocab(), build_sync_responder(&llm)).wrapping(ws_bridge);
+            let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
+            let mut driver = RecordingBridge::new(
+                host.vocab(),
+                build_sync_responder(&llm, Some(telemetry.clone())),
+            )
+            .wrapping(ws_bridge);
 
             run_session(
                 &mut host,
@@ -564,6 +641,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host.result(id).unwrap_or_default()
                 );
             }
+            let snap = telemetry.snapshot();
+            if snap.cumulative.input_tokens > 0 || snap.cumulative.output_tokens > 0 {
+                println!("[openOnyx telemetry] {}", snap.format_status_bar());
+            }
         }
         Mode::Chat => {
             let checkpoints = PendingCheckpoints::default();
@@ -575,7 +656,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
             let spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(chat_config.default_max_steps)
-                .with_mode_handle(mode_handle.clone());
+                .with_mode_handle(mode_handle.clone())
+                .with_sprout(tools.sprout().clone());
             let (mut host, ws_vocab) = build_host_with_options(
                 1,
                 chat_config,
@@ -594,18 +676,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let llm = resolve_llm_config(&cli, &cli.workspace)?;
             let stream_preview = StreamPreviewHandle::new();
+            let ctx_cfg = TieredContextConfig::for_model(&llm.model);
+            let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
 
             let tui = TuiDriver::new(host.vocab())?
                 .with_workspace(cli.workspace.clone(), mode_handle.clone())
+                .with_policy(policy.clone())
+                .with_sprout(tools.sprout().clone())
                 .with_workspace_vocab(ws_vocab)
-                .with_stream_preview(stream_preview.clone());
+                .with_stream_preview(stream_preview.clone())
+                .with_telemetry(telemetry.clone())
+                .with_context_config(ctx_cfg);
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
+            let bridge_ready = Arc::new(AtomicBool::new(false));
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode_handle(mode_handle)
                 .with_workspace_vocab(ws_vocab)
                 .sync_existing_undos(host.graph())
                 .with_checkpoints(checkpoints)
+                .with_ready_flag(Arc::clone(&bridge_ready))
                 .require_read_before_edit(true)
                 .wrapping(tui);
             let llm_in_flight = Arc::new(AtomicUsize::new(0));
@@ -623,6 +713,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_api_base(llm.api_base)
                     .with_project_instructions(llm.project_instructions)
                     .with_stream_preview(stream_preview)
+                    .with_telemetry(telemetry)
+                    .with_context_config(ctx_cfg)
                     .wrapping(ws_bridge),
                 ),
                 LlmProvider::OpenAi => rec_bridge.wrapping(
@@ -636,6 +728,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_api_base(llm.api_base)
                     .with_project_instructions(llm.project_instructions)
                     .with_stream_preview(stream_preview)
+                    .with_telemetry(telemetry)
+                    .with_context_config(ctx_cfg)
                     .wrapping(ws_bridge),
                 ),
             };
@@ -649,6 +743,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tui: tui_handle,
                     llm_in_flight,
                     llm_ready,
+                    bridge_ready,
                 },
             )?;
         }
@@ -656,12 +751,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bytes = fs::read(path)?;
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
             let has_commands = !transcript.commands.is_empty();
+            let replay_config = AgentConfig {
+                default_max_steps: cli.max_steps.unwrap_or(128),
+                default_timeout_ticks: 512,
+                ..config
+            };
+            let replay_spawner = CommandSpawnerSystem::new(cli.auto_approve)
+                .with_max_steps(replay_config.default_max_steps);
 
             let (mut host, _ws_vocab) = build_host_with_options(
                 1,
-                config,
+                replay_config,
                 &session_opts,
-                Some(Box::new(CommandSpawnerSystem::new(cli.auto_approve))),
+                Some(Box::new(replay_spawner)),
                 Some(PendingCheckpoints::default()),
             )?;
             if !has_commands {
@@ -746,7 +848,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             } else {
                 let llm = resolve_llm_config(&cli, &cli.workspace)?;
-                let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
+                let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
+                    .with_policy(policy.clone());
                 let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                     .with_mode(WorkspaceMode::Build)
                     .with_workspace_vocab(ws_vocab)
@@ -754,9 +857,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_checkpoints(checkpoints)
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
-                let mut driver = RecordingBridge::new(host.vocab(), build_sync_responder(&llm))
-                    .starting_at(next_tick)
-                    .wrapping(ws_bridge);
+                let mut driver =
+                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None))
+                        .starting_at(next_tick)
+                        .wrapping(ws_bridge);
 
                 run_session(
                     &mut host,
@@ -1164,6 +1268,16 @@ mod tests {
         let report = run_doctor(&dir, Some(&snap_dir), Some(&tr_path));
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(
+            report.checks.iter().any(|c| {
+                c.starts_with("sandbox driver: ")
+                    && ["bwrap", "landlock", "sandbox-exec", "win32-job", "none"]
+                        .iter()
+                        .any(|drv| c.contains(drv))
+            }),
+            "expected sandbox driver report in doctor checks: {:?}",
+            report.checks
+        );
+        assert!(
             report
                 .warnings
                 .iter()
@@ -1193,6 +1307,11 @@ mod tests {
                 "10",
                 "--max-snapshots",
                 "5",
+                "--ignore-deny",
+                "--sandbox",
+                "workspace-write",
+                "--sandbox-net",
+                "localhost",
             ]
             .into_iter()
             .map(str::to_string),
@@ -1202,6 +1321,18 @@ mod tests {
         assert_eq!(parsed.snapshot_dir, Some(PathBuf::from("snaps_out")));
         assert_eq!(parsed.snapshot_every, Some(10));
         assert_eq!(parsed.max_snapshots, Some(5));
+        assert!(parsed.ignore_deny);
+        assert_eq!(parsed.sandbox_mode, Some(SandboxMode::WorkspaceWrite));
+        assert_eq!(parsed.sandbox_network, Some(NetworkPolicy::LocalhostOnly));
+
+        let err_bad_sandbox = parse_args_from(
+            ["chat", "--sandbox", "bogus"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .err()
+        .expect("invalid --sandbox must be rejected");
+        assert!(err_bad_sandbox.contains("--sandbox"), "{err_bad_sandbox}");
 
         let inspect_parsed = parse_args_from(
             ["inspect", "snaps_out", "--list", "--json", "--tick", "4"]
@@ -1489,6 +1620,7 @@ mod tests {
             "--resume",
             "TUI CONTROLS & SLASH COMMANDS",
             "/undo",
+            "/compact",
             "/mode",
             "/new",
             "Tab",
@@ -1505,5 +1637,384 @@ mod tests {
         ] {
             assert!(help.contains(needle), "help text missing `{needle}`");
         }
+    }
+
+    #[test]
+    fn compact_command_creates_milestone_reduces_context_fill_and_replays_cleanly() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-compact-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let big_body = "let line = 1234567890;\n".repeat(1200);
+        fs::write(dir.join("big.txt"), &big_body).unwrap();
+
+        let snap_dir = dir.join("snaps_compact");
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_transcript: None,
+            save_step_snapshots: true,
+            snapshot_every: None,
+            max_snapshots: None,
+        };
+        let checkpoints = PendingCheckpoints::default();
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_max_steps(16)
+            .with_mode_handle(mode_handle.clone());
+        let (mut host, ws_vocab) = build_host_with_options(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            &opts,
+            Some(Box::new(spawner)),
+            Some(checkpoints.clone()),
+        )
+        .unwrap();
+
+        let tools = WorkspaceTools::new(WorkspacePolicy::new(&dir).unwrap());
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .with_checkpoints(checkpoints)
+            .wrapping(HeadlessDriver::new());
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| match req.request {
+            1 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_read",
+                r#"{"path":"big.txt"}"#,
+            )),
+            2 => Some(Reply::done(req.agent, req.request, "analyzed big.txt")),
+            3 => Some(Reply::done(
+                req.agent,
+                req.request,
+                "continued after compact",
+            )),
+            _ => None,
+        })
+        .wrapping(ws_bridge);
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "analyze big.txt".into(),
+        )));
+        host.step(&mut driver);
+        host.step(&mut driver);
+        run_session(
+            &mut host,
+            &mut driver,
+            &opts,
+            StopPolicy::Settled { max_ticks: 32 },
+        )
+        .unwrap();
+
+        let a1 = host.agents()[0];
+        let view_before = host.view(a1);
+        let ctx_cfg = TieredContextConfig {
+            model_context_tokens: 10_000,
+            ..TieredContextConfig::default()
+        };
+        let proj_before = context::project_memory(&view_before.goal, &view_before.memory, &ctx_cfg);
+        let telemetry = SessionTelemetryHandle::new("gpt-4o", false);
+        let mut tel_before = context::SessionTelemetry::new("gpt-4o", false);
+        tel_before.model_context_tokens = ctx_cfg.model_context_tokens;
+        tel_before.update_estimated_context_bytes(proj_before.total_bytes);
+        telemetry.sync_estimated_context_bytes(proj_before.total_bytes);
+
+        // Execute `/compact keep auth details`
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/compact keep auth details".into(),
+        )));
+        host.step(&mut driver);
+
+        let view_after = host.view(a1);
+        let proj_after = context::project_memory(&view_after.goal, &view_after.memory, &ctx_cfg);
+        assert_eq!(
+            proj_after.highest_tier,
+            context::ToolOutputTier::Tier2Compacted
+        );
+        assert!(
+            proj_after.total_bytes < proj_before.total_bytes / 4,
+            "expected sharp drop: before={} after={}",
+            proj_before.total_bytes,
+            proj_after.total_bytes
+        );
+
+        let mut tel_after = tel_before.clone();
+        tel_after.update_estimated_context_bytes(proj_after.total_bytes);
+        assert!(
+            tel_after.context_fill_pct < tel_before.context_fill_pct,
+            "context_fill_pct must drop after /compact: before={} after={}",
+            tel_before.context_fill_pct,
+            tel_after.context_fill_pct
+        );
+
+        let first_turn = match &proj_after.turns[0] {
+            context::ProjectedTurn::User(s) => s.as_str(),
+            other => panic!("expected User session_summary turn, got {other:?}"),
+        };
+        assert!(first_turn.contains("[session_summary]"), "{first_turn}");
+        assert!(
+            first_turn.contains("focus: keep auth details"),
+            "{first_turn}"
+        );
+        assert!(first_turn.contains("big.txt"), "{first_turn}");
+
+        // Milestone `cmd:/compact` exists in `snapshots.onyxpack`, with pre-compact ticks preserved.
+        let store = PackSnapshotStore::new(&snap_dir);
+        let tags: Vec<String> = store.entries().into_iter().map(|m| m.tag).collect();
+        assert!(tags.iter().any(|t| t == "cmd:/compact"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "tool:fs_read"), "tags={tags:?}");
+
+        // Continue with a follow-up turn after compaction and verify ONYXTR2 replay compatibility (TEST-01.4).
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "next step".into(),
+        )));
+        run_session(
+            &mut host,
+            &mut driver,
+            &opts,
+            StopPolicy::Settled { max_ticks: 32 },
+        )
+        .unwrap();
+        assert_eq!(host.result(a1).as_deref(), Some("continued after compact"));
+
+        let mut replay_tr = driver.transcript().clone();
+        replay_tr.commands = vec![
+            onyx_soul_agents::LoggedCommand {
+                poll: 0,
+                command: "analyze big.txt".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 5,
+                command: "/compact keep auth details".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 6,
+                command: "next step".to_string(),
+            },
+        ];
+        let tr_bytes = replay_tr.to_bytes();
+        let decoded = Transcript::from_bytes(&tr_bytes).unwrap();
+        let (mut replay_host, _) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(CommandSpawnerSystem::new(true).with_max_steps(16))),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(decoded).wrapping(HeadlessDriver::new());
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 64 },
+        )
+        .unwrap();
+        let ra1 = replay_host.agents()[0];
+        assert_eq!(
+            replay_host.result(ra1).as_deref(),
+            Some("continued after compact")
+        );
+        assert!(
+            replay_host
+                .view(ra1)
+                .memory
+                .iter()
+                .any(|(k, t)| k == "system" && t.starts_with(context::COMPACT_MARKER))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sprout_tui_panel_slash_commands_and_doctor_validation() {
+        // TEST-08.5: slash command parsing for `/services` and `/service ...` (including plural alias).
+        assert_eq!(
+            command::parse_slash_command("/services"),
+            Some(command::SlashCommand::Services)
+        );
+        assert_eq!(
+            command::parse_slash_command("/service"),
+            Some(command::SlashCommand::Services)
+        );
+        assert_eq!(
+            command::parse_slash_command("/service start postgres"),
+            Some(command::SlashCommand::Service("start postgres".to_string()))
+        );
+        assert_eq!(
+            command::parse_slash_command("/services  start all"),
+            Some(command::SlashCommand::Service("start all".to_string()))
+        );
+        assert_eq!(
+            command::parse_slash_command("/service stop all"),
+            Some(command::SlashCommand::Service("stop all".to_string()))
+        );
+
+        // Styled lines for `Services (Sprout)` TUI panel.
+        let panel_text = "[READY] postgres (container :5432)\n[STARTING] orders-api (process :8080)\n[FAILED] worker (process)\n[OFF] redis (container :6379)";
+        let styled = tui::render_services_lines(panel_text);
+        assert_eq!(styled.len(), 4);
+
+        // Doctor audit of `sprout.toml`: valid config + occupied port warning + cycle error.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-sprout-doctor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_port = listener.local_addr().unwrap().port();
+        fs::write(
+            dir.join("sprout.toml"),
+            format!(
+                r#"
+[services.api]
+kind = "process"
+cmd = "echo api"
+ready_port = {occupied_port}
+"#
+            ),
+        )
+        .unwrap();
+
+        let report_ok = run_doctor(&dir, None, None);
+        assert!(report_ok.errors.is_empty(), "{:?}", report_ok.errors);
+        assert!(
+            report_ok
+                .checks
+                .iter()
+                .any(|c| c.contains("sprout.toml valid") && c.contains("DAG acyclic")),
+            "{:?}",
+            report_ok.checks
+        );
+        assert!(
+            report_ok.warnings.iter().any(|w| {
+                w.contains(&occupied_port.to_string()) && w.contains("already in use")
+            }),
+            "expected occupied port warning: {:?}",
+            report_ok.warnings
+        );
+        drop(listener);
+
+        // Cyclic `sprout.toml` must surface as an error in `doctor`.
+        fs::write(
+            dir.join("sprout.toml"),
+            r#"
+[services.a]
+cmd = "echo a"
+depends_on = ["b"]
+
+[services.b]
+cmd = "echo b"
+depends_on = ["a"]
+"#,
+        )
+        .unwrap();
+        let report_bad = run_doctor(&dir, None, None);
+        assert!(
+            report_bad
+                .errors
+                .iter()
+                .any(|e| e.contains("sprout.toml") && e.contains("cycle")),
+            "expected cycle error in doctor report: {:?}",
+            report_bad.errors
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn services_command_before_first_spawn_replays_with_identical_concept_ids() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-sprout-replay-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("sprout.toml"),
+            r#"
+[services.bus]
+kind = "process"
+cmd = "echo READY_BUS"
+ready_log = "READY_BUS"
+"#,
+        )
+        .unwrap();
+
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy);
+        let sprout = tools.sprout().clone();
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_mode_handle(mode_handle.clone())
+            .with_sprout(sprout);
+        let (mut live_host, live_ws_vocab) =
+            build_host(1, AgentConfig::default(), None, Some(Box::new(spawner))).unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "/services".to_string(),
+        )));
+        let handle = headless.handle();
+        let ws_bridge = WorkspaceToolBridge::new(live_host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(live_ws_vocab)
+            .wrapping(headless);
+        let mut driver = RecordingBridge::new(live_host.vocab(), |req: &AgentView| {
+            Some(Reply::done(req.agent, req.request, "all good"))
+        })
+        .wrapping(ws_bridge);
+
+        // Tick 1: process `/services` BEFORE any agent exists.
+        live_host.step(&mut driver);
+        assert!(live_host.agents().is_empty());
+
+        // Tick 2+: send a regular prompt so an agent spawns AFTER `/services`.
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "check status".to_string(),
+        )));
+        live_host.step(&mut driver);
+        live_host.step(&mut driver);
+        assert!(live_host.run_until_settled(&mut driver, 16));
+        assert_eq!(live_host.agents().len(), 1);
+        let live_agent_id = live_host.agents()[0];
+        assert_eq!(live_host.agent_state(live_agent_id), Some(AgentState::Done));
+
+        // Now replay OFFLINE (`sprout = None`) with the recorded `ONYXTR2` transcript.
+        let tr_bytes = driver.transcript().to_bytes();
+        assert!(tr_bytes.starts_with(b"ONYXTR2\n"));
+        let decoded = Transcript::from_bytes(&tr_bytes).unwrap();
+
+        let replay_mode = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let replay_spawner = CommandSpawnerSystem::new(true).with_mode_handle(replay_mode);
+        let (mut replay_host, _) = build_host(
+            1,
+            AgentConfig::default(),
+            None,
+            Some(Box::new(replay_spawner)),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(decoded).wrapping(HeadlessDriver::new());
+        for _ in 0..3 {
+            replay_host.step(&mut replay_driver);
+        }
+        assert!(replay_host.run_until_settled(&mut replay_driver, 24));
+        assert_eq!(replay_host.agents(), vec![live_agent_id]);
+        assert_eq!(
+            replay_host.agent_state(live_agent_id),
+            Some(AgentState::Done)
+        );
+        assert_eq!(
+            replay_host.result(live_agent_id).as_deref(),
+            Some("all good")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

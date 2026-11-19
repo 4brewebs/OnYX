@@ -1,6 +1,6 @@
 [package]
 name = "onyx-workspace"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,5 +19,6 @@ scent = ["dep:onyx-scent"]
 [dependencies]
 onyx-scent = { workspace = true, optional = true }
 onyx-soul-agents = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

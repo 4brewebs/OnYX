@@ -1,0 +1,19 @@
+
+    [permissions]
+    deny = [
+      "shell_exec(rm -rf *)",
+      "shell_exec(git push --force*)",
+      "fs_write(.env*)",
+    ]
+  
+    allow = [
+      "shell_exec(cargo check*)",
+      "shell_exec(cargo test*)",
+      "fs_edit(docs/**)",
+    ]
+  
+    ask = [
+      "shell_exec(*)",
+      "fs_write(*)",
+      "fs_edit(*)",
+    ]

@@ -6,10 +6,12 @@ use onyx_soul_agents::{
     AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply,
 };
 use onyx_workspace::{
-    PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
-    WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, capture_git_tree_checkpoint,
-    discover_skills_summary, effects_after_tick, graph_workspace_plan, is_file_read,
-    latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
+    NetworkPolicy, PendingCheckpoints, PermissionDecision, PermissionRules, ProcessJob,
+    ProcessLimits, SandboxConfig, SandboxMode, ServiceKind, SproutConfig, WorkspaceLedgerSystem,
+    WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
+    WorkspaceVocab, capture_git_tree_checkpoint, detect_sandbox_capabilities,
+    discover_skills_summary, effects_after_tick, graph_workspace_plan, graph_workspace_services,
+    is_file_read, latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
 };
 
 struct TempDir(PathBuf);
@@ -835,4 +837,1057 @@ fn multi_hunk_edit_reindentation_skills_and_plan_update_work() {
     assert!(plan.contains("[x] Inspect AST"), "{plan}");
     assert!(plan.contains("[>] Apply multi-hunk edit"), "{plan}");
     assert!(plan.contains("[ ] Run cargo test"), "{plan}");
+}
+
+#[test]
+fn code_search_v2_supports_regex_case_insensitive_globs_context_and_rejects_bad_regex() {
+    let dir = TempDir::new("search_v2");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::create_dir_all(dir.0.join("docs")).unwrap();
+    fs::write(
+        dir.0.join("src/auth.rs"),
+        "line1\nline2\npub fn Validate_Token(x: i32) -> bool {\n    let ok = x > 0;\n    ok\n}\nline7\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("src/ignore_me.rs"),
+        "pub fn Validate_Token_ignored() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("docs/notes.md"),
+        "Validate_Token appears in markdown too\n",
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-02.1: regex + case_insensitive + include_glob + exclude_glob + context_lines: 2
+    let out = tools
+        .execute(
+            "code_search",
+            r#"{"pattern":"fn\\s+validate_\\w+","regex":true,"case_insensitive":true,"include_glob":"*.rs","exclude_glob":"*ignore_me*","context_lines":2}"#,
+        )
+        .unwrap();
+    assert!(out.contains("src/auth.rs-1- line1"), "{out}");
+    assert!(out.contains("src/auth.rs-2- line2"), "{out}");
+    assert!(
+        out.contains("src/auth.rs:3: pub fn Validate_Token(x: i32) -> bool {"),
+        "{out}"
+    );
+    assert!(out.contains("src/auth.rs-4-     let ok = x > 0;"), "{out}");
+    assert!(out.contains("src/auth.rs-5-     ok"), "{out}");
+    assert!(!out.contains("ignore_me.rs"), "{out}");
+    assert!(!out.contains("docs/notes.md"), "{out}");
+
+    // Backward-compatible call without v2 fields still emits exact `path:line: content`.
+    let legacy = tools
+        .execute("code_search", r#"{"pattern":"Validate_Token"}"#)
+        .unwrap();
+    assert!(
+        legacy.contains("src/auth.rs:3: pub fn Validate_Token(x: i32) -> bool {"),
+        "{legacy}"
+    );
+    assert!(!legacy.contains("\n--\n"), "{legacy}");
+
+    // Malformed regex returns a descriptive error without panic.
+    let bad = tools
+        .execute("code_search", r#"{"pattern":"[unclosed(","regex":true}"#)
+        .unwrap_err();
+    assert!(bad.contains("invalid regex pattern"), "{bad}");
+}
+
+#[test]
+fn glob_files_blocks_traversal_skips_ignored_and_sorts_deterministically() {
+    let dir = TempDir::new("glob_files");
+    fs::create_dir_all(dir.0.join("crates/a/src")).unwrap();
+    fs::create_dir_all(dir.0.join("crates/b/tests")).unwrap();
+    fs::create_dir_all(dir.0.join(".onyx/skills/demo")).unwrap();
+    fs::create_dir_all(dir.0.join("target/debug")).unwrap();
+    fs::create_dir_all(dir.0.join(".git")).unwrap();
+
+    fs::write(dir.0.join("crates/b/tests/z.rs"), "// z\n").unwrap();
+    fs::write(dir.0.join("crates/a/src/lib.rs"), "// a\n").unwrap();
+    fs::write(dir.0.join(".onyx/skills/demo/SKILL.md"), "# demo\n").unwrap();
+    fs::write(dir.0.join("target/debug/should_skip.rs"), "// skip\n").unwrap();
+    fs::write(dir.0.join(".git/skip.rs"), "// skip\n").unwrap();
+
+    assert!(WorkspaceTools::all_tool_names().contains(&"glob_files"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"glob_files"));
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-02.2: deterministic lexicographical order + ignores `target/` and `.git/`
+    let rs_files = tools
+        .execute("glob_files", r#"{"pattern":"crates/**/*.rs"}"#)
+        .unwrap();
+    assert_eq!(rs_files, "crates/a/src/lib.rs\ncrates/b/tests/z.rs");
+
+    let skills = tools
+        .execute("glob_files", r#"{"pattern":"**/*SKILL.md"}"#)
+        .unwrap();
+    assert_eq!(skills, ".onyx/skills/demo/SKILL.md");
+
+    // Path traversal blocked in both `path` and `pattern`.
+    let err_path = tools
+        .execute("glob_files", r#"{"pattern":"*.rs","path":"../"}"#)
+        .unwrap_err();
+    assert!(err_path.contains("escapes workspace root"), "{err_path}");
+
+    let err_pat = tools
+        .execute("glob_files", r#"{"pattern":"../**/*.rs"}"#)
+        .unwrap_err();
+    assert!(err_pat.contains("escapes workspace root"), "{err_pat}");
+}
+
+#[test]
+fn permission_rules_toml_precedence_global_deny_and_auto_approve_enforcement() {
+    let dir = TempDir::new("perm_rules");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::create_dir_all(dir.0.join("docs")).unwrap();
+    fs::write(dir.0.join("docs/guide.md"), "v1\n").unwrap();
+
+    let global_cfg = dir.0.join("global_config.toml");
+    fs::write(
+        &global_cfg,
+        r#"
+[permissions]
+# Global deny cannot be overridden by project allow
+deny = ["shell_exec(rm -rf *)"]
+"#,
+    )
+    .unwrap();
+
+    let project_cfg = dir.0.join(".onyx/config.toml");
+    fs::write(
+        &project_cfg,
+        r#"
+[other_section]
+ignored_key = "hello"
+
+[permissions]
+deny = [
+  "shell_exec(git push --force*)",
+  "fs_write(.env*)",
+]
+
+allow = [
+  "shell_exec(cargo check*)",
+  "shell_exec(cargo test*)",
+  "shell_exec(rm -rf *)", # Attempt to override global deny must fail
+  "fs_edit(docs/**)",
+]
+
+ask = [
+  "shell_exec(*)",
+  "fs_write(*)",
+  "fs_edit(*)",
+]
+"#,
+    )
+    .unwrap();
+
+    let rules = PermissionRules::load_from_paths(Some(&global_cfg), Some(&project_cfg)).unwrap();
+    let policy = WorkspacePolicy::new(&dir.0)
+        .unwrap()
+        .with_permissions(rules);
+
+    // TEST-02.3: deny > ask > allow
+    assert_eq!(
+        policy.evaluate_permission("shell_exec", r#"{"command":"cargo test -p open-onyx"}"#),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission("shell_exec", r#"{"command":"rm -rf ."}"#),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission(
+            "shell_exec",
+            r#"{"command":"git push --force origin main"}"#
+        ),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission("fs_write", r#"{"path":".env.local","content":"SECRET=1"}"#),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission("fs_edit", r#"{"path":"docs/guide.md"}"#),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission("fs_edit", r#"{"path":"src/main.rs"}"#),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_permission("shell_exec", r#"{"command":"echo hi"}"#),
+        PermissionDecision::Ask
+    );
+
+    // Equal or more specific `ask` wins over `allow`.
+    let tie_rules = PermissionRules::parse_toml(
+        r#"
+[permissions]
+allow = ["shell_exec(cargo *)"]
+ask = ["shell_exec(cargo publish*)"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        tie_rules.evaluate("shell_exec", r#"{"command":"cargo publish"}"#, false),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        tie_rules.evaluate("shell_exec", r#"{"command":"cargo check"}"#, false),
+        PermissionDecision::Allow
+    );
+
+    // Enforcement under `--auto-approve` (no approval_tools on AgentSpec):
+    // `deny` STILL blocks `fs_write(.env)` inside `WorkspaceToolBridge`, unless `ignore_deny` is set.
+    let tools = WorkspaceTools::new(policy.clone());
+    let mut host = AgentHost::builder(1).build().unwrap();
+    host.spawn(
+        &AgentSpec::new("auto", "try writing .env")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied()),
+    );
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(HeadlessDriver::new());
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        if let Some((_, err)) = req.memory.iter().find(|(k, _)| k == "tool_error") {
+            Some(Reply::done(req.agent, req.request, err.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":".env","content":"SECRET=1"}"#,
+            ))
+        }
+    })
+    .wrapping(ws_bridge);
+    assert!(host.run_until_settled(&mut driver, 16));
+    let id = host.agents()[0];
+    let res = host.result(id).unwrap_or_default();
+    assert!(res.contains("deny rule"), "expected deny error, got: {res}");
+    assert!(!dir.0.join(".env").exists(), ".env must not be created");
+
+    // With explicit `--ignore-deny`, `evaluate_permission` bypasses deny rules.
+    let ignore_policy = policy.with_ignore_deny(true);
+    assert_eq!(
+        ignore_policy.evaluate_permission("shell_exec", r#"{"command":"rm -rf ."}"#),
+        PermissionDecision::Allow
+    );
+}
+
+#[test]
+fn plan_mode_blocks_mutating_tools_even_when_allowed_in_config_toml() {
+    let dir = TempDir::new("plan_overrides_allow");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::create_dir_all(dir.0.join("docs")).unwrap();
+    fs::write(dir.0.join("docs/guide.md"), "original\n").unwrap();
+    fs::write(
+        dir.0.join(".onyx/config.toml"),
+        r#"
+[permissions]
+allow = [
+  "fs_edit(docs/**)",
+  "fs_write(docs/**)",
+  "shell_exec(cargo check*)",
+]
+"#,
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap().with_loaded_config();
+    assert_eq!(
+        policy.evaluate_permission("fs_write", r#"{"path":"docs/new.md","content":"x"}"#),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission_in_mode(
+            WorkspaceMode::Plan,
+            "fs_write",
+            r#"{"path":"docs/new.md","content":"x"}"#,
+        ),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission_in_mode(
+            WorkspaceMode::Explore,
+            "shell_exec",
+            r#"{"command":"cargo check"}"#,
+        ),
+        PermissionDecision::Deny
+    );
+
+    // TEST-02.4: End-to-end with AgentHost + approval_tools enabled:
+    // 1. In Plan mode, even `fs_write(docs/**)` listed in `allow` is denied automatically without mutating disk.
+    let mut plan_host = AgentHost::builder(1).build().unwrap();
+    plan_host.spawn(
+        &AgentSpec::new("planner", "write doc in plan mode")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied())
+            .with_approval_tools(WorkspaceTools::approval_required_names().iter().copied()),
+    );
+    let plan_bridge =
+        WorkspaceToolBridge::new(plan_host.vocab(), WorkspaceTools::new(policy.clone()))
+            .with_mode(WorkspaceMode::Plan)
+            .wrapping(HeadlessDriver::new());
+    let mut plan_driver = RecordingBridge::new(plan_host.vocab(), |req: &AgentView| {
+        if let Some((_, msg)) = req
+            .memory
+            .iter()
+            .find(|(k, _)| k == "denied" || k == "tool_error")
+        {
+            Some(Reply::done(req.agent, req.request, msg.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"docs/blocked.md","content":"nope"}"#,
+            ))
+        }
+    })
+    .wrapping(plan_bridge);
+    assert!(plan_host.run_until_settled(&mut plan_driver, 16));
+    assert!(!dir.0.join("docs/blocked.md").exists());
+    let plan_res = plan_host.result(plan_host.agents()[0]).unwrap_or_default();
+    assert!(
+        plan_res.contains("read-only mode"),
+        "expected read-only denial, got: {plan_res}"
+    );
+
+    // 2. In Build mode with `approval_tools` enabled, `fs_write(docs/ok.md)` matches `allow`
+    // and auto-approves cleanly without human interaction!
+    let mut build_host = AgentHost::builder(2).build().unwrap();
+    build_host.spawn(
+        &AgentSpec::new("builder", "write allowed doc in build mode")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied())
+            .with_approval_tools(WorkspaceTools::approval_required_names().iter().copied()),
+    );
+    let build_bridge = WorkspaceToolBridge::new(build_host.vocab(), WorkspaceTools::new(policy))
+        .with_mode(WorkspaceMode::Build)
+        .wrapping(HeadlessDriver::new());
+    let mut build_driver = RecordingBridge::new(build_host.vocab(), |req: &AgentView| {
+        if let Some((_, obs)) = req.memory.iter().find(|(k, _)| k == "observe") {
+            Some(Reply::done(req.agent, req.request, obs.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"docs/ok.md","content":"allowed!\n"}"#,
+            ))
+        }
+    })
+    .wrapping(build_bridge);
+    assert!(build_host.run_until_settled(&mut build_driver, 16));
+    assert_eq!(
+        fs::read_to_string(dir.0.join("docs/ok.md")).unwrap(),
+        "allowed!\n"
+    );
+}
+
+#[test]
+fn sandbox_sanitizes_env_hiding_api_keys_and_honoring_passthrough() {
+    let dir = TempDir::new("sandbox_env");
+    // TEST-06.1: inject a sensitive API key and an explicit passthrough var in the parent process.
+    unsafe {
+        std::env::set_var("ONYX_TEST_SECRET_API_KEY", "super-secret-leak-check-9999");
+        std::env::set_var("ONYX_TEST_PASSTHROUGH_VAR", "allowed-passthrough-val");
+    }
+
+    let mut cfg = SandboxConfig::default();
+    cfg.env_passthrough
+        .push("ONYX_TEST_PASSTHROUGH_VAR".to_string());
+    let policy = WorkspacePolicy::new(&dir.0).unwrap().with_sandbox(cfg);
+    let tools = WorkspaceTools::new(policy);
+
+    let cmd = if cfg!(windows) {
+        r#"{"command":"Get-ChildItem Env: | ForEach-Object { \"$($_.Name)=$($_.Value)\" }"}"#
+    } else {
+        r#"{"command":"env"}"#
+    };
+    let out = tools.execute("shell_exec", cmd).unwrap();
+
+    unsafe {
+        std::env::remove_var("ONYX_TEST_SECRET_API_KEY");
+        std::env::remove_var("ONYX_TEST_PASSTHROUGH_VAR");
+    }
+
+    assert!(
+        !out.contains("ONYX_TEST_SECRET_API_KEY") && !out.contains("super-secret-leak-check-9999"),
+        "sensitive API key must never enter sandboxed child env: {out}"
+    );
+    assert!(
+        out.contains("ONYX_TEST_PASSTHROUGH_VAR=allowed-passthrough-val"),
+        "explicit env_passthrough var must be forwarded: {out}"
+    );
+    assert!(
+        out.contains("CARGO_NET_OFFLINE=true"),
+        "offline network hint must be injected: {out}"
+    );
+    assert!(
+        out.contains("ONYX_SANDBOX_MODE=workspace-write"),
+        "sandbox mode env marker missing: {out}"
+    );
+}
+
+#[test]
+fn sandbox_config_toml_auto_approve_elevation_workspace_write_and_process_job() {
+    let dir = TempDir::new("sandbox_cfg");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::write(
+        dir.0.join(".onyx/config.toml"),
+        r#"
+[permissions]
+allow = ["shell_exec(echo *)"]
+
+[sandbox]
+mode = "off"
+network = "localhost"
+env_passthrough = ["RUST_LOG", "RUST_BACKTRACE"]
+max_memory_mb = 2048
+max_pids = 64
+"#,
+    )
+    .unwrap();
+
+    let mut policy = WorkspacePolicy::new(&dir.0).unwrap().with_loaded_config();
+    assert_eq!(policy.sandbox.mode, SandboxMode::Off);
+    assert_eq!(policy.sandbox.network, NetworkPolicy::LocalhostOnly);
+    assert_eq!(
+        policy.sandbox.env_passthrough,
+        vec!["RUST_LOG".to_string(), "RUST_BACKTRACE".to_string()]
+    );
+    assert_eq!(policy.sandbox.max_memory_mb, Some(2048));
+    assert_eq!(policy.sandbox.max_pids, Some(64));
+
+    // Elevation rule (REQ-06.5): explicit CLI `--sandbox off` is honored; implicit elevates to WorkspaceWrite + Offline.
+    let mut explicit_off = policy.sandbox.clone();
+    explicit_off.elevate_for_auto_approve(true);
+    assert_eq!(explicit_off.mode, SandboxMode::Off);
+
+    policy.sandbox.elevate_for_auto_approve(false);
+    assert_eq!(policy.sandbox.mode, SandboxMode::WorkspaceWrite);
+    assert_eq!(policy.sandbox.network, NetworkPolicy::Offline);
+
+    // TEST-06.2: writing inside <workspace> succeeds under WorkspaceWrite.
+    let tools = WorkspaceTools::new(policy);
+    let write_cmd = if cfg!(windows) {
+        r#"{"command":"Set-Content -Path inside_ok.txt -Value 'ok-in-ws'"}"#
+    } else {
+        r#"{"command":"printf 'ok-in-ws' > inside_ok.txt"}"#
+    };
+    let out = tools.execute("shell_exec", write_cmd).unwrap();
+    assert!(out.contains("exit_code: 0"), "{out}");
+    assert!(
+        fs::read_to_string(dir.0.join("inside_ok.txt"))
+            .unwrap()
+            .contains("ok-in-ws")
+    );
+
+    // Verify RAII ProcessJob attaches and cleanly terminates a spawned child process.
+    let mut sleeper = if cfg!(windows) {
+        let mut c = std::process::Command::new("pwsh");
+        c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        c
+    };
+    onyx_workspace::configure_process_isolation(&mut sleeper, true);
+    let mut child = sleeper
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut job = ProcessJob::assign(&child, ProcessLimits::default())
+        .expect("ProcessJob must attach on Windows and Unix");
+    job.terminate();
+    let _ = child.wait();
+    assert!(
+        detect_sandbox_capabilities().native_driver.as_str() != "",
+        "driver string must be non-empty"
+    );
+}
+
+#[test]
+fn sandbox_network_policy_blocks_outbound_under_offline_and_allows_localhost() {
+    let dir = TempDir::new("sandbox_net");
+    let offline_policy = WorkspacePolicy::new(&dir.0)
+        .unwrap()
+        .with_sandbox(SandboxConfig {
+            mode: SandboxMode::WorkspaceWrite,
+            network: NetworkPolicy::Offline,
+            ..SandboxConfig::default()
+        });
+    let offline_tools = WorkspaceTools::new(offline_policy);
+
+    // TEST-06.3: Outbound network command under Offline fails with an actionable error.
+    let err = offline_tools
+        .execute("shell_exec", r#"{"command":"curl https://example.com"}"#)
+        .unwrap_err();
+    assert!(
+        err.contains("--sandbox-net unrestricted") || err.contains("offline"),
+        "expected actionable offline network error, got: {err}"
+    );
+
+    // Under LocalhostOnly, external domains remain blocked while localhost URLs pass the guard.
+    assert!(
+        onyx_workspace::sandbox::check_offline_network_command(
+            "curl https://example.com",
+            NetworkPolicy::LocalhostOnly
+        )
+        .is_err()
+    );
+    assert!(
+        onyx_workspace::sandbox::check_offline_network_command(
+            "curl http://127.0.0.1:8080/health",
+            NetworkPolicy::LocalhostOnly
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn control_plane_protection_blocks_fs_and_shell_writes() {
+    let dir = TempDir::new("control_plane");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::create_dir_all(dir.0.join(".git/hooks")).unwrap();
+    fs::write(dir.0.join(".onyx/config.toml"), "[permissions]\n").unwrap();
+    fs::write(dir.0.join(".git/config"), "[core]\n").unwrap();
+
+    // No `[permissions].deny` rules configured — protection must come from invariant Control Plane guard!
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-06.4: `fs_write` / `fs_edit` targeting control-plane files must be rejected.
+    let err_cfg = tools
+        .execute(
+            "fs_write",
+            r#"{"path":".onyx/config.toml","content":"[permissions]\nallow = [\"*\"]\n"}"#,
+        )
+        .unwrap_err();
+    assert!(err_cfg.contains("control-plane protection"), "{err_cfg}");
+
+    let err_edit = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":".onyx/config.toml","old_text":"[permissions]","new_text":"[hacked]"}"#,
+        )
+        .unwrap_err();
+    assert!(err_edit.contains("control-plane protection"), "{err_edit}");
+
+    let err_hook = tools
+        .execute(
+            "fs_write",
+            r##"{"path":".git/hooks/pre-commit","content":"#!/bin/sh\necho pwned\n"}"##,
+        )
+        .unwrap_err();
+    assert!(err_hook.contains("control-plane protection"), "{err_hook}");
+
+    let err_git_cfg = tools
+        .execute(
+            "fs_write",
+            r#"{"path":".git/config","content":"[core]\nsshCommand = evil\n"}"#,
+        )
+        .unwrap_err();
+    assert!(
+        err_git_cfg.contains("control-plane protection"),
+        "{err_git_cfg}"
+    );
+
+    let err_env = tools
+        .execute("fs_write", r#"{"path":".env.prod","content":"KEY=1"}"#)
+        .unwrap_err();
+    assert!(err_env.contains("control-plane protection"), "{err_env}");
+
+    // `shell_exec` attempting to overwrite `.onyx/config.toml` or `.git/hooks/pre-commit` is rejected.
+    let err_sh_cfg = tools
+        .execute(
+            "shell_exec",
+            r#"{"command":"echo hacked > .onyx/config.toml"}"#,
+        )
+        .unwrap_err();
+    assert!(
+        err_sh_cfg.contains("control-plane protection"),
+        "{err_sh_cfg}"
+    );
+
+    let err_sh_hook = tools
+        .execute(
+            "shell_exec",
+            r#"{"command":"echo evil > .git/hooks/pre-commit"}"#,
+        )
+        .unwrap_err();
+    assert!(
+        err_sh_hook.contains("control-plane protection"),
+        "{err_sh_hook}"
+    );
+
+    // Original `.onyx/config.toml` remains intact.
+    assert_eq!(
+        fs::read_to_string(dir.0.join(".onyx/config.toml")).unwrap(),
+        "[permissions]\n"
+    );
+}
+
+#[test]
+fn sprout_parser_supports_modern_and_legacy_formats_and_rejects_dag_cycles() {
+    let dir = TempDir::new("sprout_dag");
+    fs::create_dir_all(dir.0.join("services/orders-api")).unwrap();
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+
+    // TEST-08.1: Modern `[runtime]` + `[services.<id>]` with process + container + depends_on.
+    let modern_toml = r#"
+[runtime]
+container_cli = "docker"
+env_wrapper = "call env.bat &&"
+
+[services.postgres]
+kind = "container"
+up = "docker compose up -d postgres"
+logs = "docker compose logs -f postgres"
+down = "docker compose stop postgres"
+container = "app-postgres"
+ready_port = 5432
+
+[services.redis]
+up = "docker compose up -d redis"
+container = "app-redis"
+ready_port = 6379
+
+[services.orders-api]
+kind = "process"
+depends_on = ["postgres", "redis"]
+cwd = "services/orders-api"
+cmd = "mvnw.cmd spring-boot:run"
+debug_port = 5005
+ready_log = "Started OrdersApplication"
+ready_port = 8080
+"#;
+    let cfg = SproutConfig::parse_toml(modern_toml, &dir.0, Some(&policy)).unwrap();
+    assert_eq!(cfg.container_cli.as_deref(), Some("docker"));
+    assert_eq!(cfg.env_wrapper.as_deref(), Some("call env.bat &&"));
+    assert_eq!(cfg.services["postgres"].kind, ServiceKind::Container);
+    assert_eq!(cfg.services["redis"].kind, ServiceKind::Container); // inferred from `up`/`container`
+    assert_eq!(cfg.services["orders-api"].kind, ServiceKind::Process);
+    assert_eq!(cfg.services["orders-api"].debug_port, Some(5005));
+
+    let order = cfg.transitive_start_order("orders-api").unwrap();
+    assert_eq!(order, vec!["postgres", "redis", "orders-api"]);
+
+    // Legacy `[global]` + `[[service]]` format.
+    let legacy_toml = r#"
+[global]
+env_wrapper = "call legacy.bat &&"
+
+[[service]]
+id = "db"
+name = "Local DB"
+dir = "."
+cmd = "echo db"
+
+[[service]]
+id = "api"
+name = "Orders API"
+dir = "services/orders-api"
+cmd = "echo api"
+depends_on = ["db"]
+"#;
+    let legacy = SproutConfig::parse_toml(legacy_toml, &dir.0, Some(&policy)).unwrap();
+    assert_eq!(legacy.env_wrapper.as_deref(), Some("call legacy.bat &&"));
+    assert_eq!(legacy.topo_order().unwrap(), vec!["db", "api"]);
+
+    // Rejects cycle (`a -> b -> a`).
+    let cyclic_toml = r#"
+[services.a]
+cmd = "echo a"
+depends_on = ["b"]
+
+[services.b]
+cmd = "echo b"
+depends_on = ["a"]
+"#;
+    let cycle_err = SproutConfig::parse_toml(cyclic_toml, &dir.0, Some(&policy)).unwrap_err();
+    assert!(cycle_err.contains("cycle"), "{cycle_err}");
+
+    // Rejects unknown dependency.
+    let missing_dep = r#"
+[services.a]
+cmd = "echo a"
+depends_on = ["nonexistent"]
+"#;
+    let dep_err = SproutConfig::parse_toml(missing_dep, &dir.0, Some(&policy)).unwrap_err();
+    assert!(dep_err.contains("unknown service"), "{dep_err}");
+
+    // Rejects cwd escape outside workspace root.
+    let escape_cwd = r#"
+[services.a]
+cwd = "../outside"
+cmd = "echo a"
+"#;
+    let esc_err = SproutConfig::parse_toml(escape_cwd, &dir.0, Some(&policy)).unwrap_err();
+    assert!(esc_err.contains("escapes workspace root"), "{esc_err}");
+}
+
+#[test]
+fn sprout_process_lifecycle_probes_logs_and_clean_drop_teardown() {
+    let dir = TempDir::new("sprout_proc");
+    // Open an ephemeral TCP listener on 127.0.0.1 to prove real `ready_port` TCP probing.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let cmd_str = if cfg!(windows) {
+        "pwsh -NoProfile -Command \"Write-Output 'Started DemoService'; Write-Output 'Authorization: Bearer secret_sprout_token_9999'; Start-Sleep -Seconds 20\""
+    } else {
+        "echo Started DemoService; echo 'Authorization: Bearer secret_sprout_token_9999'; sleep 20"
+    };
+    let cmd_escaped = cmd_str.replace('\\', "\\\\").replace('"', "\\\"");
+    fs::write(
+        dir.0.join("sprout.toml"),
+        format!(
+            r#"
+[services.demo-api]
+kind = "process"
+cmd = "{cmd_escaped}"
+ready_log = "Started DemoService"
+ready_port = {port}
+"#
+        ),
+    )
+    .unwrap();
+
+    assert!(WorkspaceTools::all_tool_names().contains(&"service_status"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"service_start"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"service_stop"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"service_logs"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"service_exec"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"service_status"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"service_logs"));
+    assert!(WorkspaceTools::approval_required_names().contains(&"service_start"));
+    assert!(WorkspaceTools::approval_required_names().contains(&"service_stop"));
+    assert!(WorkspaceTools::approval_required_names().contains(&"service_exec"));
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-08.2: initial status is OFF.
+    let st0 = tools.execute("service_status", "{}").unwrap();
+    assert!(st0.starts_with("@TOON v1"), "{st0}");
+    assert!(st0.contains("demo-api | process | OFF"), "{st0}");
+
+    // Start transitions to READY when both `ready_log` and `ready_port` succeed.
+    let started = tools
+        .execute("service_start", r#"{"id":"demo-api","wait_ready_secs":15}"#)
+        .unwrap();
+    assert!(started.contains("demo-api | process | READY"), "{started}");
+
+    // Logs capture output, support regex filtering, and scrub secrets.
+    let logs_all = tools
+        .execute("service_logs", r#"{"id":"demo-api","tail":50}"#)
+        .unwrap();
+    assert!(logs_all.contains("Started DemoService"), "{logs_all}");
+    assert!(
+        !logs_all.contains("secret_sprout_token_9999") && logs_all.contains("[REDACTED]"),
+        "service_logs must scrub secrets: {logs_all}"
+    );
+    let logs_filtered = tools
+        .execute(
+            "service_logs",
+            r#"{"id":"demo-api","pattern":"Started\\s+Demo\\w+","regex":true}"#,
+        )
+        .unwrap();
+    assert!(
+        logs_filtered.contains("Started DemoService"),
+        "{logs_filtered}"
+    );
+
+    // Explicit stop tears down the ProcessJob cleanly and resets status to OFF.
+    let stopped = tools
+        .execute("service_stop", r#"{"id":"demo-api"}"#)
+        .unwrap();
+    assert!(stopped.contains("demo-api | process | OFF"), "{stopped}");
+
+    // `service_start` also supports `all: true`.
+    let started_all = tools
+        .execute("service_start", r#"{"all":true,"wait_ready_secs":15}"#)
+        .unwrap();
+    assert!(
+        started_all.contains("demo-api | process | READY"),
+        "{started_all}"
+    );
+    let stopped_all = tools.execute("service_stop", r#"{"all":true}"#).unwrap();
+    assert!(
+        stopped_all.contains("demo-api | process | OFF"),
+        "{stopped_all}"
+    );
+
+    drop(tools);
+    drop(listener);
+}
+
+fn create_container_stub(dir: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("fake-docker.cmd");
+        let script = "@echo off\r\n\
+if \"%1\"==\"--version\" (echo Docker stub 1.0 & exit /b 0)\r\n\
+if \"%1\"==\"info\" (echo Stub Daemon OK & exit /b 0)\r\n\
+if \"%1\"==\"compose\" (echo compose %2 %3 %4 & exit /b 0)\r\n\
+if \"%1\"==\"exec\" (\r\n\
+  echo CONTAINER=%2\r\n\
+  echo LEAKED=%ONYX_TEST_SPROUT_API_KEY%\r\n\
+  echo SECRET=sk-test1234567890abcdef1234\r\n\
+  echo CMD=%5\r\n\
+  exit /b 0\r\n\
+)\r\n\
+exit /b 0\r\n";
+        fs::write(&path, script).unwrap();
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-docker.sh");
+        let script = "#!/bin/sh\n\
+case \"$1\" in\n\
+  --version) echo 'Docker stub 1.0'; exit 0 ;;\n\
+  info) echo 'Stub Daemon OK'; exit 0 ;;\n\
+  compose) echo \"compose $2 $3 $4\"; exit 0 ;;\n\
+  exec)\n\
+    echo \"CONTAINER=$2\"\n\
+    echo \"LEAKED=${ONYX_TEST_SPROUT_API_KEY}\"\n\
+    echo \"SECRET=sk-test1234567890abcdef1234\"\n\
+    echo \"CMD=$5\"\n\
+    exit 0 ;;\n\
+esac\n\
+exit 0\n";
+        fs::write(&path, script).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+}
+
+#[test]
+fn sprout_container_service_exec_uses_sanitized_env_scrubs_secrets_and_respects_plan_and_deny() {
+    let dir = TempDir::new("sprout_container");
+    let stub = create_container_stub(&dir.0);
+    let stub_toml = stub.to_string_lossy().replace('\\', "\\\\");
+
+    fs::write(
+        dir.0.join("sprout.toml"),
+        format!(
+            r#"
+[runtime]
+container_cli = "{stub_toml}"
+
+[services.postgres]
+kind = "container"
+up = "{stub_toml} compose up -d postgres"
+down = "{stub_toml} compose stop postgres"
+container = "app-postgres"
+"#
+        ),
+    )
+    .unwrap();
+
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::write(
+        dir.0.join(".onyx/config.toml"),
+        r#"
+[permissions]
+deny = ["service_exec(*DROP DATABASE*)"]
+allow = ["service_start(postgres)", "service_exec(postgres:psql*)"]
+"#,
+    )
+    .unwrap();
+
+    unsafe {
+        std::env::set_var("ONYX_TEST_SPROUT_API_KEY", "never-leak-into-container-999");
+    }
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap().with_loaded_config();
+    assert_eq!(
+        policy.evaluate_permission(
+            "service_exec",
+            r#"{"id":"postgres","command":"psql -c \\dt"}"#
+        ),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission(
+            "service_exec",
+            r#"{"id":"postgres","command":"psql -c 'DROP DATABASE app'"}"#
+        ),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission_in_mode(
+            WorkspaceMode::Plan,
+            "service_exec",
+            r#"{"id":"postgres","command":"psql -c \\dt"}"#
+        ),
+        PermissionDecision::Deny
+    );
+
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-08.3: Start container service (verifies daemon via `stub info`), then `service_exec`.
+    let started = tools
+        .execute("service_start", r#"{"id":"postgres","wait_ready_secs":10}"#)
+        .unwrap();
+    assert!(
+        started.contains("postgres | container | READY"),
+        "{started}"
+    );
+
+    let exec_out = tools
+        .execute(
+            "service_exec",
+            r#"{"id":"postgres","command":"psql -U app -c dt"}"#,
+        )
+        .unwrap();
+    unsafe {
+        std::env::remove_var("ONYX_TEST_SPROUT_API_KEY");
+    }
+    assert!(exec_out.contains("CONTAINER=app-postgres"), "{exec_out}");
+    assert!(
+        !exec_out.contains("never-leak-into-container-999"),
+        "env_clear must strip sensitive keys in service_exec: {exec_out}"
+    );
+    assert!(
+        !exec_out.contains("sk-test1234567890abcdef1234") && exec_out.contains("[REDACTED]"),
+        "scrub_secrets must redact secrets in service_exec output: {exec_out}"
+    );
+
+    let _ = tools.execute("service_stop", r#"{"all":true}"#);
+}
+
+#[test]
+fn sprout_session_replays_deterministically_from_onyxtr2_without_spawning_processes() {
+    let dir = TempDir::new("sprout_replay");
+    let stub = create_container_stub(&dir.0);
+    let stub_toml = stub.to_string_lossy().replace('\\', "\\\\");
+
+    fs::write(
+        dir.0.join("sprout.toml"),
+        format!(
+            r#"
+[runtime]
+container_cli = "{stub_toml}"
+
+[services.postgres]
+kind = "container"
+up = "{stub_toml} compose up -d postgres"
+down = "{stub_toml} compose stop postgres"
+container = "app-postgres"
+"#
+        ),
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let mut host = AgentHost::builder(7)
+        .system(Box::new(WorkspaceLedgerSystem::new()))
+        .build()
+        .unwrap();
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
+    host.spawn(
+        &AgentSpec::new("sprout-agent", "start postgres and check tables")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied()),
+    );
+
+    let mut headless = HeadlessDriver::new();
+    headless.push_event(onyx_soul_agents::OnyxEvent::Ingress(
+        onyx_soul_agents::IngressEvent::Command("/services".to_string()),
+    ));
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_workspace_vocab(ws_vocab)
+        .wrapping(headless);
+    let mut turn = 0usize;
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        turn += 1;
+        match turn {
+            1 => Some(
+                Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "service_start",
+                    r#"{"id":"postgres","wait_ready_secs":10}"#,
+                )
+                .with_call_id("sprout-1"),
+            ),
+            2 => Some(
+                Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "service_logs",
+                    r#"{"id":"postgres","tail":10}"#,
+                )
+                .with_call_id("sprout-2"),
+            ),
+            3 => Some(
+                Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "service_exec",
+                    r#"{"id":"postgres","command":"psql -c dt"}"#,
+                )
+                .with_call_id("sprout-3"),
+            ),
+            _ => Some(Reply::done(req.agent, req.request, "postgres checked")),
+        }
+    })
+    .wrapping(ws_bridge);
+
+    assert!(host.run_until_settled(&mut driver, 32));
+    let live_panel = graph_workspace_services(host.graph(), &ws_vocab)
+        .expect("ws.services.text must be projected into EAV graph");
+    assert!(
+        live_panel.contains("[READY] postgres (container)"),
+        "{live_panel}"
+    );
+
+    // Serialize transcript (`ONYXTR2`) and remove `sprout.toml` + stub to prove 0 subprocesses in replay (TEST-08.4).
+    let tr_bytes = driver.transcript().to_bytes();
+    assert!(tr_bytes.starts_with(b"ONYXTR2"));
+    let _ = fs::remove_file(dir.0.join("sprout.toml"));
+    let _ = fs::remove_file(&stub);
+
+    let decoded = onyx_soul_agents::Transcript::from_bytes(&tr_bytes).unwrap();
+    let mut replay_host = AgentHost::builder(7)
+        .system(Box::new(WorkspaceLedgerSystem::new()))
+        .build()
+        .unwrap();
+    let replay_ws_vocab = WorkspaceVocab::resolve_with(|name| replay_host.attr(name));
+    replay_host.spawn(
+        &AgentSpec::new("sprout-agent", "start postgres and check tables")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied()),
+    );
+    let mut replay_driver = ReplayBridge::new(decoded).wrapping(HeadlessDriver::new());
+    assert!(replay_host.run_until_settled(&mut replay_driver, 32));
+
+    let replayed_agent = replay_host.agents()[0];
+    assert_eq!(
+        replay_host.result(replayed_agent).as_deref(),
+        Some("postgres checked")
+    );
+    let replayed_panel = graph_workspace_services(replay_host.graph(), &replay_ws_vocab)
+        .expect("ws.services.text must replay deterministically");
+    assert_eq!(replayed_panel, live_panel);
 }

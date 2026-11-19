@@ -1,10 +1,14 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use onyx_soul_agents::{
-    EventBus, GraphView, PlatformDriver, Reply, SurfaceBinding, Vocab, pending_tool_calls,
+    EventBus, GraphView, PlatformDriver, Reply, SurfaceBinding, Vocab, pending_approvals,
+    pending_tool_calls,
 };
 use serde_json::Value as JsonValue;
 
+use crate::policy::{PermissionDecision, is_mutating_tool};
 use crate::state::{
     PendingCheckpoints, WorkspaceMode, WorkspaceModeHandle, WorkspaceVocab,
     capture_git_tree_checkpoint, file_read_tick, graph_workspace_mode, is_file_read,
@@ -30,8 +34,10 @@ pub struct WorkspaceToolBridge {
     tools: WorkspaceTools,
     inner: Option<Box<dyn PlatformDriver>>,
     dispatched: BTreeSet<(u64, u64)>,
+    handled_approvals: BTreeSet<(u64, u64)>,
     applied_undos: BTreeSet<u64>,
     queued: Vec<Reply>,
+    ready_flag: Option<Arc<AtomicBool>>,
 }
 
 impl WorkspaceToolBridge {
@@ -45,8 +51,10 @@ impl WorkspaceToolBridge {
             tools,
             inner: None,
             dispatched: BTreeSet::new(),
+            handled_approvals: BTreeSet::new(),
             applied_undos: BTreeSet::new(),
             queued: Vec::new(),
+            ready_flag: None,
         }
     }
 
@@ -93,9 +101,30 @@ impl WorkspaceToolBridge {
         self
     }
 
+    /// Señala a un bucle de sesión externo (p. ej. `StopPolicy::Quit`) cuando el puente
+    /// tiene respuestas de auto-aprobación/auto-denegación o resultados de herramienta listos.
+    pub fn with_ready_flag(mut self, ready_flag: Arc<AtomicBool>) -> Self {
+        self.ready_flag = Some(ready_flag);
+        self
+    }
+
     pub fn wrapping(mut self, inner: impl PlatformDriver + 'static) -> Self {
         self.inner = Some(Box::new(inner));
         self
+    }
+
+    fn current_mode(&self, graph: &dyn GraphView) -> WorkspaceMode {
+        self.ws_vocab
+            .as_ref()
+            .and_then(|wv| graph_workspace_mode(graph, wv))
+            .unwrap_or_else(|| self.mode.get())
+    }
+
+    fn push_reply(&mut self, reply: Reply) {
+        self.queued.push(reply);
+        if let Some(flag) = &self.ready_flag {
+            flag.store(true, Ordering::Release);
+        }
     }
 
     fn validate_policy(
@@ -104,16 +133,17 @@ impl WorkspaceToolBridge {
         tool: &str,
         args_json: &str,
     ) -> Result<(), String> {
-        let current_mode = self
-            .ws_vocab
-            .as_ref()
-            .and_then(|wv| graph_workspace_mode(graph, wv))
-            .unwrap_or_else(|| self.mode.get());
-        let is_mutating = matches!(tool, "fs_write" | "fs_edit" | "shell_exec");
-        if is_mutating && !current_mode.allows_mutation() {
+        let current_mode = self.current_mode(graph);
+        if is_mutating_tool(tool) && !current_mode.allows_mutation() {
             return Err(format!(
                 "blocked by workspace mode `{:?}`: `{tool}` is not permitted in read-only mode",
                 current_mode
+            ));
+        }
+
+        if self.tools.policy().evaluate_permission(tool, args_json) == PermissionDecision::Deny {
+            return Err(format!(
+                "blocked by permission policy (deny rule): `{tool}`"
             ));
         }
 
@@ -144,6 +174,9 @@ impl PlatformDriver for WorkspaceToolBridge {
         for reply in self.queued.drain(..) {
             bus.push(reply.to_event());
         }
+        if let Some(flag) = &self.ready_flag {
+            flag.store(false, Ordering::Release);
+        }
     }
 
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
@@ -160,6 +193,57 @@ impl PlatformDriver for WorkspaceToolBridge {
                 }
             }
         }
+
+        // Evalúa aprobaciones pendientes frente a `WorkspaceMode` y `PermissionRules`
+        // (`deny > ask > allow`) antes de delegar la interacción humana al driver interno.
+        let current_mode = self.current_mode(graph);
+        for view in pending_approvals(graph, &self.vocab) {
+            let Some(pending) = &view.pending_approval else {
+                continue;
+            };
+            let decision = self.tools.policy().evaluate_permission_in_mode(
+                current_mode,
+                &pending.tool,
+                &pending.args,
+            );
+            match decision {
+                PermissionDecision::Allow => {
+                    if self.handled_approvals.insert((view.agent.0, view.request)) {
+                        self.push_reply(Reply::approve(view.agent, view.request));
+                    }
+                }
+                PermissionDecision::Deny => {
+                    if self.handled_approvals.insert((view.agent.0, view.request)) {
+                        let reason = if is_mutating_tool(&pending.tool)
+                            && !current_mode.allows_mutation()
+                        {
+                            format!(
+                                "blocked by workspace mode `{:?}`: `{}` is not permitted in read-only mode",
+                                current_mode, pending.tool
+                            )
+                        } else if self
+                            .tools
+                            .policy()
+                            .evaluate_permission(&pending.tool, &pending.args)
+                            == PermissionDecision::Deny
+                        {
+                            format!(
+                                "blocked by permission policy (deny rule): `{}`",
+                                pending.tool
+                            )
+                        } else {
+                            format!(
+                                "blocked by control-plane protection (read-only): `{}`",
+                                pending.tool
+                            )
+                        };
+                        self.push_reply(Reply::deny(view.agent, view.request, reason));
+                    }
+                }
+                PermissionDecision::Ask => {}
+            }
+        }
+
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
@@ -220,7 +304,7 @@ impl PlatformDriver for WorkspaceToolBridge {
             if let Some(cid) = pending.call_id {
                 reply = reply.with_call_id(cid);
             }
-            self.queued.push(reply);
+            self.push_reply(reply);
         }
     }
 }
