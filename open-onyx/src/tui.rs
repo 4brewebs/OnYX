@@ -2,7 +2,7 @@
 //! Vive fuera de `onyx-core` y `onyx-soul-agents` para mantener los souls con 0 dependencias.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -286,6 +286,9 @@ impl TuiInner {
             let state = prop_text(graph, *id, self.vocab.state).unwrap_or_default();
             let goal = prop_text(graph, *id, self.vocab.goal).unwrap_or_default();
             status_line = format!("agent={} state={} goal={}", name, state, goal);
+            if !goal.is_empty() {
+                push_multiline_entry(&mut log_lines, "user", Color::LightCyan, &goal);
+            }
 
             for mem_id in graph.related(*id, self.vocab.rel_memory) {
                 let kind = prop_text(graph, mem_id, self.vocab.mem_kind).unwrap_or_default();
@@ -331,16 +334,83 @@ impl TuiInner {
         let mode_label = self.mode_handle.get().as_label();
         let header_title =
             format!(" openOnyx [{mode_label}] — Deterministic Harness (Esc/Ctrl+C to quit) ");
-        let bottom_height = if approval_snapshot.is_some() && diff_snapshot.is_some() {
-            16
-        } else {
-            4
-        };
-
         let terminal = &mut self.terminal;
         let scroll_from_bottom = &mut self.scroll_from_bottom;
         let last_viewport_height = &mut self.last_viewport_height;
         let _ = terminal.draw(|f| {
+            let is_approval = approval_snapshot.is_some();
+            let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
+                Some((_, _, tool, args)) => {
+                    let args_preview = if diff_snapshot.is_some() && args.len() > 100 {
+                        let mut cut = 100;
+                        while !args.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        format!("{}...", &args[..cut])
+                    } else {
+                        args.clone()
+                    };
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{tool}: "),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(args_preview),
+                    ])];
+                    if let Some(diff) = &diff_snapshot {
+                        for dline in diff.lines() {
+                            let style = if dline.starts_with("+++") || dline.starts_with("---") {
+                                Style::default().fg(Color::DarkGray)
+                            } else if dline.starts_with("@@") {
+                                Style::default().fg(Color::Cyan)
+                            } else if dline.starts_with('+') {
+                                Style::default().fg(Color::Green)
+                            } else if dline.starts_with('-') {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default()
+                            };
+                            lines.push(Line::from(Span::styled(dline.to_string(), style)));
+                        }
+                    }
+                    (
+                        " Approval Required ([y] Approve / [n] Deny) ".to_string(),
+                        lines,
+                        Color::Yellow,
+                    )
+                }
+                None => (
+                    format!(
+                        " [{mode_label}] Goal / Command (Enter to send, Tab Plan/Build, /undo, /new) "
+                    ),
+                    vec![Line::from(format!("> {input_snapshot}"))],
+                    Color::White,
+                ),
+            };
+
+            let bottom_inner_width = f.area().width.saturating_sub(2);
+            let bottom_rows = visual_row_count(&bottom_lines, bottom_inner_width).max(1);
+            let max_bottom = f.area().height.saturating_sub(8).max(4);
+            let bottom_height = if is_approval {
+                u16::try_from(bottom_rows.saturating_add(2))
+                    .unwrap_or(16)
+                    .clamp(5, 16)
+                    .min(max_bottom)
+            } else {
+                u16::try_from(bottom_rows.saturating_add(2))
+                    .unwrap_or(4)
+                    .clamp(4, 8)
+                    .min(max_bottom)
+            };
+            let bottom_inner_height = usize::from(bottom_height.saturating_sub(2));
+            let bottom_scroll = if is_approval {
+                0
+            } else {
+                bottom_rows.saturating_sub(bottom_inner_height)
+            };
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -413,57 +483,7 @@ impl TuiInner {
                 f.render_widget(plan_widget, p_area);
             }
 
-            let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
-                Some((_, _, tool, args)) => {
-                    let args_preview = if diff_snapshot.is_some() && args.len() > 100 {
-                        let mut cut = 100;
-                        while !args.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        format!("{}...", &args[..cut])
-                    } else {
-                        args.clone()
-                    };
-                    let mut lines = vec![Line::from(vec![
-                        Span::styled(
-                            format!("{tool}: "),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(args_preview),
-                    ])];
-                    if let Some(diff) = &diff_snapshot {
-                        for dline in diff.lines() {
-                            let style = if dline.starts_with("+++") || dline.starts_with("---") {
-                                Style::default().fg(Color::DarkGray)
-                            } else if dline.starts_with("@@") {
-                                Style::default().fg(Color::Cyan)
-                            } else if dline.starts_with('+') {
-                                Style::default().fg(Color::Green)
-                            } else if dline.starts_with('-') {
-                                Style::default().fg(Color::Red)
-                            } else {
-                                Style::default()
-                            };
-                            lines.push(Line::from(Span::styled(dline.to_string(), style)));
-                        }
-                    }
-                    (
-                        " Approval Required ([y] Approve / [n] Deny) ".to_string(),
-                        lines,
-                        Color::Yellow,
-                    )
-                }
-                None => (
-                    format!(
-                        " [{mode_label}] Goal / Command (Enter to send, Tab Plan/Build, /undo, /new) "
-                    ),
-                    vec![Line::from(format!("> {input_snapshot}"))],
-                    Color::White,
-                ),
-            };
-            let bottom = Paragraph::new(bottom_lines)
+            let mut bottom = Paragraph::new(bottom_lines)
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
@@ -471,21 +491,33 @@ impl TuiInner {
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(border_color)),
                 );
+            if bottom_scroll > 0 {
+                bottom = bottom.scroll((u16::try_from(bottom_scroll).unwrap_or(u16::MAX), 0));
+            }
             f.render_widget(bottom, chunks[2]);
         });
     }
 }
 
+fn sanitize_display_line(raw: &str) -> String {
+    raw.trim_end_matches('\r').replace('\t', "    ")
+}
+
 fn push_multiline_entry(out: &mut Vec<Line<'static>>, label: &str, color: Color, text: &str) {
     let prefix_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let mut lines = text.split('\n');
-    let first = lines.next().unwrap_or("");
+    let first = sanitize_display_line(lines.next().unwrap_or(""));
     out.push(Line::from(vec![
         Span::styled(format!("[{label}] "), prefix_style),
-        Span::raw(first.to_string()),
+        Span::raw(first),
     ]));
     for line in lines {
-        out.push(Line::from(Span::raw(format!("  {line}"))));
+        let clean = sanitize_display_line(line);
+        if clean.trim().is_empty() {
+            out.push(Line::from(""));
+        } else {
+            out.push(Line::from(Span::raw(format!("  {clean}"))));
+        }
     }
 }
 
@@ -540,57 +572,117 @@ pub(crate) fn apply_scroll_key(
     }
 }
 
-/// Calcula el número total de filas visuales que ocupan `lines` al envolver texto a `inner_width` columnas.
+/// Calcula el número total de filas visuales que ocupan `lines` al envolver texto a `inner_width` columnas,
+/// replicando exactamente la máquina de estados de `ratatui::widgets::reflow::WordWrapper` con `Wrap { trim: false }`.
 pub(crate) fn visual_row_count(lines: &[Line<'_>], inner_width: u16) -> usize {
-    let w = usize::from(inner_width);
-    if w == 0 {
+    if inner_width == 0 {
         return lines.len();
     }
-    let mut rows = 0usize;
-    for line in lines {
-        let line_width = line.width();
-        if line_width == 0 || line_width <= w {
-            rows += 1;
+    lines
+        .iter()
+        .map(|line| wrapped_line_rows(line, inner_width))
+        .sum()
+}
+
+fn wrapped_line_rows(line: &Line<'_>, max_line_width: u16) -> usize {
+    if max_line_width == 0 {
+        return 0;
+    }
+    let mut wrapped_count = 0usize;
+    let mut pending_line_empty = true;
+    let mut line_width: u16 = 0;
+    let mut word_width: u16 = 0;
+    let mut whitespace_width: u16 = 0;
+    let mut non_whitespace_previous = false;
+    let mut pending_word_empty = true;
+    let mut pending_whitespace: VecDeque<u16> = VecDeque::new();
+
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let symbol = grapheme.symbol;
+        let is_whitespace = symbol == "\u{200b}"
+            || (symbol.chars().all(char::is_whitespace) && symbol != "\u{00a0}");
+        let symbol_width = u16::try_from(Span::raw(symbol).width()).unwrap_or(u16::MAX);
+        if symbol_width > max_line_width {
             continue;
         }
-        let mut flat = String::new();
-        for span in &line.spans {
-            flat.push_str(span.content.as_ref());
+
+        let word_found = non_whitespace_previous && is_whitespace;
+        let untrimmed_overflow = pending_line_empty
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(symbol_width)
+                > max_line_width;
+
+        if word_found || untrimmed_overflow {
+            if !pending_whitespace.is_empty() || !pending_word_empty {
+                pending_line_empty = false;
+            }
+            line_width = line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width);
+            pending_whitespace.clear();
+            whitespace_width = 0;
+            pending_word_empty = true;
+            word_width = 0;
         }
-        let mut current_rows = 1usize;
-        let mut col = 0usize;
-        let mut pending_space = 0usize;
-        for word in flat.split(' ') {
-            let word_w = Span::raw(word).width();
-            if word_w == 0 {
-                pending_space += 1;
+
+        let line_full = line_width >= max_line_width;
+        let pending_word_overflow = symbol_width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= max_line_width;
+
+        if line_full || pending_word_overflow {
+            let mut remaining_width = max_line_width.saturating_sub(line_width);
+            wrapped_count += 1;
+            pending_line_empty = true;
+            line_width = 0;
+
+            while let Some(&w) = pending_whitespace.front() {
+                if w > remaining_width {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(w);
+                remaining_width = remaining_width.saturating_sub(w);
+                pending_whitespace.pop_front();
+            }
+
+            if is_whitespace && pending_whitespace.is_empty() {
                 continue;
             }
-            if col > 0 && col + pending_space + word_w > w {
-                current_rows += 1;
-                col = 0;
-                pending_space = 0;
-            }
-            let start_col = col + pending_space;
-            if start_col + word_w > w {
-                let first_fit = w.saturating_sub(start_col);
-                let remaining = word_w - first_fit;
-                let extra = remaining.div_ceil(w);
-                current_rows += extra;
-                let mod_rem = remaining % w;
-                col = if mod_rem == 0 { w } else { mod_rem };
-            } else {
-                col = start_col + word_w;
-            }
-            pending_space = 1;
         }
-        rows += current_rows;
+
+        if is_whitespace {
+            whitespace_width = whitespace_width.saturating_add(symbol_width);
+            pending_whitespace.push_back(symbol_width);
+        } else {
+            word_width = word_width.saturating_add(symbol_width);
+            pending_word_empty = false;
+        }
+
+        non_whitespace_previous = !is_whitespace;
     }
-    rows
+
+    if pending_line_empty && pending_word_empty && !pending_whitespace.is_empty() {
+        wrapped_count += 1;
+    }
+    if !pending_whitespace.is_empty() || !pending_word_empty {
+        pending_line_empty = false;
+    }
+    if !pending_line_empty {
+        wrapped_count += 1;
+    }
+    if wrapped_count == 0 {
+        wrapped_count = 1;
+    }
+    wrapped_count
 }
 
 #[cfg(test)]
 mod tests {
+    use ratatui::backend::TestBackend;
+
     use super::*;
 
     #[test]
@@ -653,5 +745,100 @@ mod tests {
             KeyModifiers::NONE
         ));
         assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn visual_row_count_matches_ratatui_paragraph_rendering_to_the_last_line() {
+        let mut log_lines: Vec<Line<'static>> = Vec::new();
+        push_multiline_entry(
+            &mut log_lines,
+            "user",
+            Color::LightCyan,
+            "Inspect the workspace\r\n\r\nand explain everything step by step.",
+        );
+        push_multiline_entry(
+            &mut log_lines,
+            "call",
+            Color::Yellow,
+            r#"fs_read {"path":"very/long/nested/directory/structure/without/spaces/file_name_extra_long.rs","start_line":1,"end_line":120}"#,
+        );
+        push_multiline_entry(
+            &mut log_lines,
+            "observe",
+            Color::Green,
+            "fn alpha() {\n\tlet x = 1;\n\n\tlet beta_long_identifier_name_here = 2;\n    \n}",
+        );
+        push_multiline_entry(
+            &mut log_lines,
+            "result",
+            Color::LightGreen,
+            "Summary paragraph with multiple lines.\n\nSecond paragraph.\n\nExactBoundaryWord1234567890Tail\nPrevTail",
+        );
+        push_multiline_entry(
+            &mut log_lines,
+            "stream",
+            Color::LightCyan,
+            "Streaming line 1\n\nStreaming line 2\nTAIL_END_OK▍",
+        );
+
+        let extract_rows =
+            |buf: &ratatui::buffer::Buffer, width: u16, height: u16| -> Vec<String> {
+                (0..height)
+                    .map(|y| {
+                        let mut row = String::new();
+                        for x in 0..width {
+                            row.push_str(buf[(x, y)].symbol());
+                        }
+                        row.trim_end().to_string()
+                    })
+                    .collect()
+            };
+
+        for width in [26u16, 33u16, 42u16, 80u16] {
+            let height = 10u16;
+            let total_rows = visual_row_count(&log_lines, width);
+            let viewport_height = usize::from(height);
+            assert!(
+                total_rows > viewport_height,
+                "expected total_rows ({total_rows}) > viewport ({viewport_height}) for width {width}"
+            );
+            let max_scroll = total_rows.saturating_sub(viewport_height);
+
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let render_lines = log_lines.clone();
+            terminal
+                .draw(|f| {
+                    let p = Paragraph::new(render_lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((u16::try_from(max_scroll).unwrap_or(u16::MAX), 0));
+                    f.render_widget(p, f.area());
+                })
+                .unwrap();
+
+            let rows_text = extract_rows(terminal.backend().buffer(), width, height);
+            let last_row = rows_text.last().expect("last row exists");
+            assert_eq!(
+                last_row, "  TAIL_END_OK▍",
+                "width={width}: expected exact bottom row match, got rows: {rows_text:#?}"
+            );
+
+            // Prove there is zero undercounting or overcounting by scrolling 1 row further.
+            let over_scroll = max_scroll + 1;
+            let over_lines = log_lines.clone();
+            terminal
+                .draw(|f| {
+                    let p = Paragraph::new(over_lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((u16::try_from(over_scroll).unwrap_or(u16::MAX), 0));
+                    f.render_widget(p, f.area());
+                })
+                .unwrap();
+            let over_rows = extract_rows(terminal.backend().buffer(), width, height);
+            assert!(
+                over_rows.last().expect("last row").is_empty(),
+                "width={width}: scrolling by max_scroll + 1 should clear last row, got: {over_rows:#?}"
+            );
+        }
     }
 }

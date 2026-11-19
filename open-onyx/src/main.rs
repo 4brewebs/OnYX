@@ -77,7 +77,30 @@ struct CliArgs {
     max_snapshots: Option<usize>,
 }
 
+impl CliArgs {
+    fn simple(mode: Mode) -> Self {
+        Self {
+            mode,
+            workspace: PathBuf::new(),
+            provider: None,
+            model: None,
+            api_base: None,
+            auto_approve: false,
+            dry_run: false,
+            max_steps: None,
+            shell_timeout_secs: None,
+            save_transcript: None,
+            snapshot_dir: None,
+            resume_dir: None,
+            snapshot_every: None,
+            max_snapshots: None,
+        }
+    }
+}
+
 enum Mode {
+    Help,
+    Version,
     Run(String),
     Chat,
     Replay(PathBuf),
@@ -106,6 +129,11 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let Some(cmd) = args.next() else {
         return Err(usage());
     };
+    match cmd.as_str() {
+        "--help" | "-h" | "help" => return Ok(CliArgs::simple(Mode::Help)),
+        "--version" | "-V" | "version" => return Ok(CliArgs::simple(Mode::Version)),
+        _ => {}
+    }
     let mut workspace = env::current_dir().map_err(|e| e.to_string())?;
     let mut provider: Option<LlmProvider> = None;
     let mut model: Option<String> = None;
@@ -225,7 +253,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
             }
             "--list" | "-l" => list = true,
             "--json" => json = true,
-            "--help" | "-h" => return Err(usage()),
+            "--help" | "-h" => return Ok(CliArgs::simple(Mode::Help)),
+            "--version" | "-V" => return Ok(CliArgs::simple(Mode::Version)),
             _ if arg.starts_with('-') => {
                 return Err(format!("unknown flag `{arg}`\n\n{}", usage()));
             }
@@ -305,7 +334,71 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
+}
+
+fn help_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let usage_str = usage();
+    let body = r#"SUBCOMMANDS:
+  chat                     Launch interactive TUI with SSE streaming, diff approvals, Plan/Build toggle, and Live Plan
+  run <goal>               Run a single headless turn toward <goal> and print the final result
+  replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
+  inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
+  rewind <dir> <tick>      Restore git checkpoints to <tick> (or prior milestone) and replay/continue
+  doctor                   Verify workspace git repository, snapshot packs, and transcript integrity
+
+OPTIONS:
+  -w, --workspace <dir>    Target workspace directory (default: current working directory)
+      --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
+      --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
+      --api-base <url>     Custom API base URL (e.g. `http://localhost:11434/v1`; no OPENAI_API_KEY needed when set)
+      --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`)
+      --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
+      --shell-timeout <s>  Timeout in seconds per `shell_exec` command
+      --save-transcript <f>, --record <f>
+                           Record deterministic `ONYXTR2` transcript to `<file>`
+      --snapshot-dir <dir> Save compressed milestone snapshots to `<dir>/snapshots.onyxpack`
+      --snapshot-every <n> Also capture periodic snapshots every <n> ticks
+      --max-snapshots <n>  Opt-in sliding window retention (keeps `init` + latest `n - 1` milestones)
+  -r, --resume <dir>       Resume `chat` from the latest snapshot stored in `<dir>`
+      --tick <n>           Specific tick to inspect (use with `inspect`)
+  -l, --list               List all stored snapshot milestones with tags and git checkpoints (use with `inspect`)
+      --json               Emit machine-readable JSON output (use with `inspect`)
+      --transcript <file>  Replay transcript from rewind point (`rewind`) or validate transcript (`doctor`)
+      --dry-run            Preview orphaned effects and git rollback plan in `rewind` without modifying files
+  -h, --help               Print this help guide and exit 0
+  -V, --version            Print openOnyx version and exit 0
+
+TUI CONTROLS & SLASH COMMANDS (chat):
+  Enter                    Submit goal, follow-up prompt, or slash command
+  Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
+  y / n                    Approve or deny a pending mutating tool diff
+  Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
+                           Scroll the `Memory & Trace` history panel
+  /undo                    Revert the latest reversible git checkpoint created during the session
+  /mode [plan|build|explore]
+                           Switch or toggle workspace mode
+  /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
+  Esc / Ctrl+C             Quit cleanly (flushing exit snapshot & transcript if configured)
+
+PROJECT INSTRUCTIONS, SKILLS & LIVE PLAN:
+  ONYX.md / AGENTS.md      Loaded from the workspace root into system instructions
+  .onyx/skills/<name>/SKILL.md (also skills/, ~/.onyx/skills/)
+                           Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
+  Live Plan panel          Updated via `plan_update` and shown on the right when terminal width >= 100 columns
+
+ENVIRONMENT VARIABLES:
+  GEMINI_API_KEY, OPENAI_API_KEY, ONYX_API_KEY
+  ONYX_PROVIDER            Default provider (`gemini` | `openai`)
+  ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
+  GEMINI_API_BASE          Custom Gemini API endpoint
+  OPENAI_API_BASE / OPENAI_BASE_URL
+                           Custom OpenAI-compatible API endpoint"#
+        .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
+        .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL);
+
+    format!("openOnyx {version} — Deterministic Coding Agent Harness\n\n{usage_str}\n\n{body}")
 }
 
 fn resolve_llm_config(
@@ -405,6 +498,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
     };
+
+    match &cli.mode {
+        Mode::Help => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        Mode::Version => {
+            println!("openOnyx {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => {}
+    }
 
     let mut policy = WorkspacePolicy::new(&cli.workspace)?;
     if let Some(secs) = cli.shell_timeout_secs {
@@ -680,6 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("doctor detected {} error(s)", report.errors.len()).into());
             }
         }
+        Mode::Help | Mode::Version => unreachable!(),
     }
 
     Ok(())
@@ -1340,5 +1446,64 @@ mod tests {
         .err()
         .expect("unknown provider must fail");
         assert!(err.contains("unsupported provider"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_supports_help_and_version_cleanly() {
+        for args in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["help"],
+            vec!["chat", "--help"],
+            vec!["inspect", "--help"],
+        ] {
+            let parsed = parse_args_from(args.into_iter().map(str::to_string)).unwrap();
+            assert!(matches!(parsed.mode, Mode::Help));
+        }
+
+        for args in [
+            vec!["--version"],
+            vec!["-V"],
+            vec!["version"],
+            vec!["chat", "-V"],
+        ] {
+            let parsed = parse_args_from(args.into_iter().map(str::to_string)).unwrap();
+            assert!(matches!(parsed.mode, Mode::Version));
+        }
+
+        let help = help_text();
+        for needle in [
+            "SUBCOMMANDS:",
+            "chat",
+            "run",
+            "replay",
+            "inspect",
+            "rewind",
+            "doctor",
+            "OPTIONS:",
+            "--provider",
+            "--model",
+            "--api-base",
+            "--snapshot-dir",
+            "--record",
+            "--resume",
+            "TUI CONTROLS & SLASH COMMANDS",
+            "/undo",
+            "/mode",
+            "/new",
+            "Tab",
+            "PgUp",
+            "PROJECT INSTRUCTIONS, SKILLS & LIVE PLAN:",
+            "SKILL.md",
+            "load_skill",
+            "Live Plan",
+            "ENVIRONMENT VARIABLES:",
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "ONYX_PROVIDER",
+            "OPENAI_API_BASE",
+        ] {
+            assert!(help.contains(needle), "help text missing `{needle}`");
+        }
     }
 }

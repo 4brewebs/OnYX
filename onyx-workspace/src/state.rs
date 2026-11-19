@@ -275,12 +275,12 @@ pub(crate) fn parse_inline_checkpoint(obs_text: &str) -> Option<(String, String)
 /// Restaura el árbol de trabajo en `root` al estado exacto capturado en `tree_sha`
 /// sin reescribir la historia de commits (`git read-tree --reset -u <tree_sha>`).
 pub fn restore_git_tree_checkpoint(root: &Path, tree_sha: &str) -> Result<(), String> {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .args(["read-tree", "--reset", "-u", tree_sha])
         .current_dir(root)
-        .status()
+        .output()
         .map_err(|e| format!("failed to run git read-tree: {e}"))?;
-    if !status.success() {
+    if !out.status.success() {
         return Err(format!("git read-tree --reset -u {tree_sha} failed"));
     }
     let has_head = Command::new("git")
@@ -292,7 +292,7 @@ pub fn restore_git_tree_checkpoint(root: &Path, tree_sha: &str) -> Result<(), St
         let _ = Command::new("git")
             .args(["reset", "--quiet", "HEAD"])
             .current_dir(root)
-            .status();
+            .output();
     }
     Ok(())
 }
