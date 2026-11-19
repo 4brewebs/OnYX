@@ -31,12 +31,15 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+use crate::gemini::StreamPreviewHandle;
+
 struct TuiInner {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     vocab: Vocab,
     ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
     mode_handle: WorkspaceModeHandle,
+    stream_preview: StreamPreviewHandle,
     input: String,
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
@@ -62,10 +65,14 @@ impl TuiHandle {
     }
 
     /// Lee entrada de teclado/resize cuando el cerebro está en reposo (`is_settled()`),
-    /// redibujando la UI sin avanzar `host.ticks()`.
+    /// o refresca deltas SSE en vuelo sin avanzar `host.ticks()`.
     pub fn pump_idle(&self, graph: &dyn GraphView) {
         let mut inner = self.inner.borrow_mut();
-        if inner.poll_crossterm() && inner.queued.is_empty() && !inner.quit.load(Ordering::Relaxed)
+        let ui_event = inner.poll_crossterm();
+        let stream_dirty = inner.stream_preview.take_dirty();
+        if (ui_event || stream_dirty)
+            && inner.queued.is_empty()
+            && !inner.quit.load(Ordering::Relaxed)
         {
             inner.render(graph);
         }
@@ -90,6 +97,7 @@ impl TuiDriver {
                 ws_vocab: None,
                 workspace_root: None,
                 mode_handle: WorkspaceModeHandle::default(),
+                stream_preview: StreamPreviewHandle::default(),
                 input: String::new(),
                 queued: Vec::new(),
                 active_approval: None,
@@ -115,6 +123,14 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.ws_vocab = Some(ws_vocab);
+        }
+        self
+    }
+
+    pub fn with_stream_preview(self, stream_preview: StreamPreviewHandle) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.stream_preview = stream_preview;
         }
         self
     }
@@ -288,6 +304,19 @@ impl TuiInner {
             if let Some(res) = prop_text(graph, *id, self.vocab.result) {
                 if !res.is_empty() {
                     push_multiline_entry(&mut log_lines, "result", Color::LightGreen, &res);
+                }
+            }
+
+            if state == "thinking" {
+                if let Some(preview) = self.stream_preview.get() {
+                    if preview.agent == id.0 && !preview.text.is_empty() {
+                        push_multiline_entry(
+                            &mut log_lines,
+                            "stream",
+                            Color::LightCyan,
+                            &format!("{}▍", preview.text),
+                        );
+                    }
                 }
             }
         }
