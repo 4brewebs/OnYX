@@ -6,12 +6,13 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use crate::policy::WorkspacePolicy;
+use crate::policy::{WorkspacePolicy, compile_glob_regex};
 
 /// Descripción declarativa de una herramienta del workspace para inyectar en LLMs.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +59,7 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
@@ -75,6 +77,7 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
@@ -93,6 +96,7 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
@@ -111,6 +115,7 @@ impl WorkspaceTools {
                 "fs_write",
                 "fs_edit",
                 "code_search",
+                "glob_files",
                 "git_status",
                 "git_diff",
                 "load_skill",
@@ -218,13 +223,33 @@ impl WorkspaceTools {
             },
             ToolSchema {
                 name: "code_search",
-                description: "Search for a text pattern across workspace files.",
+                description: "Search for a literal or regex pattern across workspace files with optional glob filters, case-insensitivity, and context lines.",
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
-                        "pattern": { "type": "STRING", "description": "Substring to search for." },
+                        "pattern": { "type": "STRING", "description": "Substring or regular expression to search for." },
                         "path": { "type": "STRING", "description": "Optional relative directory or file (defaults to '.')." },
-                        "max_results": { "type": "INTEGER", "description": "Maximum matching lines to return (default 50)." }
+                        "max_results": { "type": "INTEGER", "description": "Maximum matching lines to return (default 50, max 200)." },
+                        "regex": { "type": "BOOLEAN", "description": "Interpret `pattern` as a regular expression (default false)." },
+                        "case_insensitive": { "type": "BOOLEAN", "description": "Perform case-insensitive matching (default false)." },
+                        "include_glob": { "type": "STRING", "description": "Optional glob filter to include matching relative file paths (e.g. `*.rs` or `crates/**/*.rs`)." },
+                        "exclude_glob": { "type": "STRING", "description": "Optional glob filter to exclude matching relative file paths." },
+                        "context_lines": { "type": "INTEGER", "description": "Optional context lines before and after each match (0..=5, default 0)." }
+                    },
+                    "required": ["pattern"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "glob_files",
+                description: "Find workspace files matching a glob pattern (e.g. `crates/**/*.rs` or `**/*SKILL.md`), skipping ignored directories without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "pattern": { "type": "STRING", "description": "Glob pattern to match relative file paths." },
+                        "path": { "type": "STRING", "description": "Optional relative root directory to search under (defaults to '.')." },
+                        "max_results": { "type": "INTEGER", "description": "Maximum file paths to return (default 100, max 500)." },
+                        "sort_by_mtime": { "type": "BOOLEAN", "description": "Sort by most recently modified first instead of deterministic lexicographical order (default false)." }
                     },
                     "required": ["pattern"]
                 }),
@@ -379,6 +404,11 @@ impl WorkspaceTools {
                 let args: CodeSearchArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid code_search args: {e}"))?;
                 self.code_search(args)
+            }
+            "glob_files" => {
+                let args: GlobFilesArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid glob_files args: {e}"))?;
+                self.glob_files(args)
             }
             "git_status" => self.git_status(),
             "git_diff" => {
@@ -631,21 +661,59 @@ impl WorkspaceTools {
         }
         let base = args.path.as_deref().unwrap_or(".");
         let start = self.policy.resolve_existing(base)?;
-        let max_results = args.max_results.unwrap_or(50).min(200);
-        let mut hits = Vec::new();
-        self.walk_search(&start, &args.pattern, max_results, &mut hits);
-        if hits.is_empty() {
+        let max_results = args.max_results.unwrap_or(50).clamp(1, 200);
+        let context_lines = args.context_lines.unwrap_or(0).min(5);
+
+        let matcher_src = if args.regex {
+            args.pattern.clone()
+        } else {
+            regex::escape(&args.pattern)
+        };
+        let matcher = RegexBuilder::new(&matcher_src)
+            .case_insensitive(args.case_insensitive)
+            .build()
+            .map_err(|e| format!("invalid regex pattern `{}`: {e}", args.pattern))?;
+
+        let include_re = match args.include_glob.as_deref().map(str::trim) {
+            Some(g) if !g.is_empty() => Some(compile_glob_regex(g, false)?),
+            _ => None,
+        };
+        let exclude_re = match args.exclude_glob.as_deref().map(str::trim) {
+            Some(g) if !g.is_empty() => Some(compile_glob_regex(g, false)?),
+            _ => None,
+        };
+
+        let opts = SearchOptions {
+            matcher: &matcher,
+            include_re: include_re.as_ref(),
+            exclude_re: exclude_re.as_ref(),
+            context_lines,
+            max_results,
+        };
+        let mut match_count = 0usize;
+        let mut blocks: Vec<String> = Vec::new();
+        self.walk_search(&start, &opts, &mut match_count, &mut blocks);
+        if blocks.is_empty() {
             Ok("no matches".to_string())
         } else {
-            Ok(truncate_utf8(
-                &hits.join("\n"),
-                self.policy.max_output_bytes,
-            ))
+            let joined = if context_lines > 0 {
+                blocks.join("\n--\n")
+            } else {
+                blocks.join("\n")
+            };
+            let cleaned = scrub_secrets(&joined);
+            Ok(truncate_utf8(&cleaned, self.policy.max_output_bytes))
         }
     }
 
-    fn walk_search(&self, path: &Path, pattern: &str, max_results: usize, hits: &mut Vec<String>) {
-        if hits.len() >= max_results || self.policy.is_ignored(path) {
+    fn walk_search(
+        &self,
+        path: &Path,
+        opts: &SearchOptions<'_>,
+        match_count: &mut usize,
+        blocks: &mut Vec<String>,
+    ) {
+        if *match_count >= opts.max_results || self.policy.is_ignored(path) {
             return;
         }
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -658,20 +726,67 @@ impl WorkspaceTools {
             if meta.len() > 1024 * 1024 {
                 return;
             }
-            let Ok(text) = fs::read_to_string(path) else {
-                return;
-            };
             let rel = path
                 .strip_prefix(&self.policy.root)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            for (idx, line) in text.lines().enumerate() {
-                if line.contains(pattern) {
-                    hits.push(format!("{rel}:{}: {line}", idx + 1));
-                    if hits.len() >= max_results {
+            if let Some(inc) = opts.include_re {
+                if !inc.is_match(&rel) {
+                    return;
+                }
+            }
+            if let Some(exc) = opts.exclude_re {
+                if exc.is_match(&rel) {
+                    return;
+                }
+            }
+            let Ok(text) = fs::read_to_string(path) else {
+                return;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let mut matched_indices: Vec<usize> = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                if opts.matcher.is_match(line) {
+                    matched_indices.push(idx);
+                    *match_count += 1;
+                    if *match_count >= opts.max_results {
                         break;
                     }
+                }
+            }
+            if matched_indices.is_empty() {
+                return;
+            }
+            if opts.context_lines == 0 {
+                for idx in matched_indices {
+                    blocks.push(format!("{rel}:{}: {}", idx + 1, lines[idx]));
+                }
+            } else {
+                // Agrupa rangos solapados [idx - ctx ..= idx + ctx] en bloques separados por `--`.
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for &idx in &matched_indices {
+                    let start = idx.saturating_sub(opts.context_lines);
+                    let end = (idx + opts.context_lines).min(lines.len().saturating_sub(1));
+                    if let Some(last) = ranges.last_mut() {
+                        if start <= last.1.saturating_add(1) {
+                            last.1 = last.1.max(end);
+                            continue;
+                        }
+                    }
+                    ranges.push((start, end));
+                }
+                for (start, end) in ranges {
+                    let mut hunk = Vec::with_capacity(end - start + 1);
+                    for (line_idx, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+                        let is_match = matched_indices.binary_search(&line_idx).is_ok();
+                        if is_match {
+                            hunk.push(format!("{rel}:{}: {line}", line_idx + 1));
+                        } else {
+                            hunk.push(format!("{rel}-{}- {line}", line_idx + 1));
+                        }
+                    }
+                    blocks.push(hunk.join("\n"));
                 }
             }
             return;
@@ -680,10 +795,105 @@ impl WorkspaceTools {
             let mut items: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
             items.sort();
             for item in items {
-                self.walk_search(&item, pattern, max_results, hits);
-                if hits.len() >= max_results {
+                self.walk_search(&item, opts, match_count, blocks);
+                if *match_count >= opts.max_results {
                     break;
                 }
+            }
+        }
+    }
+
+    fn glob_files(&self, args: GlobFilesArgs) -> Result<String, String> {
+        let raw_pattern = args.pattern.trim();
+        if raw_pattern.is_empty() {
+            return Err("glob pattern cannot be empty".to_string());
+        }
+        if raw_pattern.contains('\0') {
+            return Err("glob pattern contains NUL byte".to_string());
+        }
+        let norm_pattern = raw_pattern.replace('\\', "/");
+        if Path::new(raw_pattern).is_absolute()
+            || norm_pattern.starts_with('/')
+            || norm_pattern.split('/').any(|seg| seg == "..")
+        {
+            return Err(format!(
+                "glob pattern `{raw_pattern}` escapes workspace root"
+            ));
+        }
+
+        let base = args.path.as_deref().unwrap_or(".");
+        let start = self.policy.resolve_existing(base)?;
+        let glob_re = compile_glob_regex(raw_pattern, false)?;
+        let max_results = args.max_results.unwrap_or(100).clamp(1, 500);
+
+        let mut matched: Vec<(String, SystemTime)> = Vec::new();
+        self.walk_glob(&start, &start, &glob_re, &mut matched);
+
+        if args.sort_by_mtime {
+            matched.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        } else {
+            matched.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        if matched.is_empty() {
+            return Ok("no files matched".to_string());
+        }
+
+        let total = matched.len();
+        let mut lines: Vec<String> = matched
+            .into_iter()
+            .take(max_results)
+            .map(|(rel, _)| rel)
+            .collect();
+        if total > max_results {
+            lines.push(format!(
+                "... (truncated to {max_results} of {total} matching files)"
+            ));
+        }
+        Ok(truncate_utf8(
+            &lines.join("\n"),
+            self.policy.max_output_bytes,
+        ))
+    }
+
+    fn walk_glob(
+        &self,
+        start: &Path,
+        path: &Path,
+        glob_re: &Regex,
+        out: &mut Vec<(String, SystemTime)>,
+    ) {
+        if self.policy.is_ignored(path) {
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if meta.is_file() {
+            let rel_root = path
+                .strip_prefix(&self.policy.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let rel_start = path
+                .strip_prefix(start)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if glob_re.is_match(&rel_start) || glob_re.is_match(&rel_root) {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((rel_root, mtime));
+            }
+            return;
+        }
+        if let Ok(read_dir) = fs::read_dir(path) {
+            let mut items: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
+            items.sort();
+            for item in items {
+                self.walk_glob(start, &item, glob_re, out);
             }
         }
     }
@@ -966,11 +1176,42 @@ struct PlanUpdateArgs {
     steps: Vec<PlanStepItem>,
 }
 
+struct SearchOptions<'a> {
+    matcher: &'a Regex,
+    include_re: Option<&'a Regex>,
+    exclude_re: Option<&'a Regex>,
+    context_lines: usize,
+    max_results: usize,
+}
+
 #[derive(Deserialize)]
 struct CodeSearchArgs {
     pattern: String,
+    #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
     max_results: Option<usize>,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    case_insensitive: bool,
+    #[serde(default)]
+    include_glob: Option<String>,
+    #[serde(default)]
+    exclude_glob: Option<String>,
+    #[serde(default)]
+    context_lines: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GlobFilesArgs {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    max_results: Option<usize>,
+    #[serde(default)]
+    sort_by_mtime: bool,
 }
 
 #[derive(Deserialize)]

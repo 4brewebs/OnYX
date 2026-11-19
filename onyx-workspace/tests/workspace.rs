@@ -6,10 +6,10 @@ use onyx_soul_agents::{
     AgentHost, AgentSpec, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply,
 };
 use onyx_workspace::{
-    PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
-    WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, capture_git_tree_checkpoint,
-    discover_skills_summary, effects_after_tick, graph_workspace_plan, is_file_read,
-    latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
+    PendingCheckpoints, PermissionDecision, PermissionRules, WorkspaceLedgerSystem, WorkspaceMode,
+    WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab,
+    capture_git_tree_checkpoint, discover_skills_summary, effects_after_tick, graph_workspace_plan,
+    is_file_read, latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
 };
 
 struct TempDir(PathBuf);
@@ -835,4 +835,361 @@ fn multi_hunk_edit_reindentation_skills_and_plan_update_work() {
     assert!(plan.contains("[x] Inspect AST"), "{plan}");
     assert!(plan.contains("[>] Apply multi-hunk edit"), "{plan}");
     assert!(plan.contains("[ ] Run cargo test"), "{plan}");
+}
+
+#[test]
+fn code_search_v2_supports_regex_case_insensitive_globs_context_and_rejects_bad_regex() {
+    let dir = TempDir::new("search_v2");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::create_dir_all(dir.0.join("docs")).unwrap();
+    fs::write(
+        dir.0.join("src/auth.rs"),
+        "line1\nline2\npub fn Validate_Token(x: i32) -> bool {\n    let ok = x > 0;\n    ok\n}\nline7\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("src/ignore_me.rs"),
+        "pub fn Validate_Token_ignored() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("docs/notes.md"),
+        "Validate_Token appears in markdown too\n",
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-02.1: regex + case_insensitive + include_glob + exclude_glob + context_lines: 2
+    let out = tools
+        .execute(
+            "code_search",
+            r#"{"pattern":"fn\\s+validate_\\w+","regex":true,"case_insensitive":true,"include_glob":"*.rs","exclude_glob":"*ignore_me*","context_lines":2}"#,
+        )
+        .unwrap();
+    assert!(out.contains("src/auth.rs-1- line1"), "{out}");
+    assert!(out.contains("src/auth.rs-2- line2"), "{out}");
+    assert!(
+        out.contains("src/auth.rs:3: pub fn Validate_Token(x: i32) -> bool {"),
+        "{out}"
+    );
+    assert!(out.contains("src/auth.rs-4-     let ok = x > 0;"), "{out}");
+    assert!(out.contains("src/auth.rs-5-     ok"), "{out}");
+    assert!(!out.contains("ignore_me.rs"), "{out}");
+    assert!(!out.contains("docs/notes.md"), "{out}");
+
+    // Backward-compatible call without v2 fields still emits exact `path:line: content`.
+    let legacy = tools
+        .execute("code_search", r#"{"pattern":"Validate_Token"}"#)
+        .unwrap();
+    assert!(
+        legacy.contains("src/auth.rs:3: pub fn Validate_Token(x: i32) -> bool {"),
+        "{legacy}"
+    );
+    assert!(!legacy.contains("\n--\n"), "{legacy}");
+
+    // Malformed regex returns a descriptive error without panic.
+    let bad = tools
+        .execute("code_search", r#"{"pattern":"[unclosed(","regex":true}"#)
+        .unwrap_err();
+    assert!(bad.contains("invalid regex pattern"), "{bad}");
+}
+
+#[test]
+fn glob_files_blocks_traversal_skips_ignored_and_sorts_deterministically() {
+    let dir = TempDir::new("glob_files");
+    fs::create_dir_all(dir.0.join("crates/a/src")).unwrap();
+    fs::create_dir_all(dir.0.join("crates/b/tests")).unwrap();
+    fs::create_dir_all(dir.0.join(".onyx/skills/demo")).unwrap();
+    fs::create_dir_all(dir.0.join("target/debug")).unwrap();
+    fs::create_dir_all(dir.0.join(".git")).unwrap();
+
+    fs::write(dir.0.join("crates/b/tests/z.rs"), "// z\n").unwrap();
+    fs::write(dir.0.join("crates/a/src/lib.rs"), "// a\n").unwrap();
+    fs::write(dir.0.join(".onyx/skills/demo/SKILL.md"), "# demo\n").unwrap();
+    fs::write(dir.0.join("target/debug/should_skip.rs"), "// skip\n").unwrap();
+    fs::write(dir.0.join(".git/skip.rs"), "// skip\n").unwrap();
+
+    assert!(WorkspaceTools::all_tool_names().contains(&"glob_files"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"glob_files"));
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // TEST-02.2: deterministic lexicographical order + ignores `target/` and `.git/`
+    let rs_files = tools
+        .execute("glob_files", r#"{"pattern":"crates/**/*.rs"}"#)
+        .unwrap();
+    assert_eq!(rs_files, "crates/a/src/lib.rs\ncrates/b/tests/z.rs");
+
+    let skills = tools
+        .execute("glob_files", r#"{"pattern":"**/*SKILL.md"}"#)
+        .unwrap();
+    assert_eq!(skills, ".onyx/skills/demo/SKILL.md");
+
+    // Path traversal blocked in both `path` and `pattern`.
+    let err_path = tools
+        .execute("glob_files", r#"{"pattern":"*.rs","path":"../"}"#)
+        .unwrap_err();
+    assert!(err_path.contains("escapes workspace root"), "{err_path}");
+
+    let err_pat = tools
+        .execute("glob_files", r#"{"pattern":"../**/*.rs"}"#)
+        .unwrap_err();
+    assert!(err_pat.contains("escapes workspace root"), "{err_pat}");
+}
+
+#[test]
+fn permission_rules_toml_precedence_global_deny_and_auto_approve_enforcement() {
+    let dir = TempDir::new("perm_rules");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::create_dir_all(dir.0.join("docs")).unwrap();
+    fs::write(dir.0.join("docs/guide.md"), "v1\n").unwrap();
+
+    let global_cfg = dir.0.join("global_config.toml");
+    fs::write(
+        &global_cfg,
+        r#"
+[permissions]
+# Global deny cannot be overridden by project allow
+deny = ["shell_exec(rm -rf *)"]
+"#,
+    )
+    .unwrap();
+
+    let project_cfg = dir.0.join(".onyx/config.toml");
+    fs::write(
+        &project_cfg,
+        r#"
+[other_section]
+ignored_key = "hello"
+
+[permissions]
+deny = [
+  "shell_exec(git push --force*)",
+  "fs_write(.env*)",
+]
+
+allow = [
+  "shell_exec(cargo check*)",
+  "shell_exec(cargo test*)",
+  "shell_exec(rm -rf *)", # Attempt to override global deny must fail
+  "fs_edit(docs/**)",
+]
+
+ask = [
+  "shell_exec(*)",
+  "fs_write(*)",
+  "fs_edit(*)",
+]
+"#,
+    )
+    .unwrap();
+
+    let rules = PermissionRules::load_from_paths(Some(&global_cfg), Some(&project_cfg)).unwrap();
+    let policy = WorkspacePolicy::new(&dir.0)
+        .unwrap()
+        .with_permissions(rules);
+
+    // TEST-02.3: deny > ask > allow
+    assert_eq!(
+        policy.evaluate_permission("shell_exec", r#"{"command":"cargo test -p open-onyx"}"#),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission("shell_exec", r#"{"command":"rm -rf ."}"#),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission(
+            "shell_exec",
+            r#"{"command":"git push --force origin main"}"#
+        ),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission("fs_write", r#"{"path":".env.local","content":"SECRET=1"}"#),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission("fs_edit", r#"{"path":"docs/guide.md"}"#),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission("fs_edit", r#"{"path":"src/main.rs"}"#),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate_permission("shell_exec", r#"{"command":"echo hi"}"#),
+        PermissionDecision::Ask
+    );
+
+    // Equal or more specific `ask` wins over `allow`.
+    let tie_rules = PermissionRules::parse_toml(
+        r#"
+[permissions]
+allow = ["shell_exec(cargo *)"]
+ask = ["shell_exec(cargo publish*)"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        tie_rules.evaluate("shell_exec", r#"{"command":"cargo publish"}"#, false),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        tie_rules.evaluate("shell_exec", r#"{"command":"cargo check"}"#, false),
+        PermissionDecision::Allow
+    );
+
+    // Enforcement under `--auto-approve` (no approval_tools on AgentSpec):
+    // `deny` STILL blocks `fs_write(.env)` inside `WorkspaceToolBridge`, unless `ignore_deny` is set.
+    let tools = WorkspaceTools::new(policy.clone());
+    let mut host = AgentHost::builder(1).build().unwrap();
+    host.spawn(
+        &AgentSpec::new("auto", "try writing .env")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied()),
+    );
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools).wrapping(HeadlessDriver::new());
+    let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        if let Some((_, err)) = req.memory.iter().find(|(k, _)| k == "tool_error") {
+            Some(Reply::done(req.agent, req.request, err.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":".env","content":"SECRET=1"}"#,
+            ))
+        }
+    })
+    .wrapping(ws_bridge);
+    assert!(host.run_until_settled(&mut driver, 16));
+    let id = host.agents()[0];
+    let res = host.result(id).unwrap_or_default();
+    assert!(res.contains("deny rule"), "expected deny error, got: {res}");
+    assert!(!dir.0.join(".env").exists(), ".env must not be created");
+
+    // With explicit `--ignore-deny`, `evaluate_permission` bypasses deny rules.
+    let ignore_policy = policy.with_ignore_deny(true);
+    assert_eq!(
+        ignore_policy.evaluate_permission("shell_exec", r#"{"command":"rm -rf ."}"#),
+        PermissionDecision::Allow
+    );
+}
+
+#[test]
+fn plan_mode_blocks_mutating_tools_even_when_allowed_in_config_toml() {
+    let dir = TempDir::new("plan_overrides_allow");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::create_dir_all(dir.0.join("docs")).unwrap();
+    fs::write(dir.0.join("docs/guide.md"), "original\n").unwrap();
+    fs::write(
+        dir.0.join(".onyx/config.toml"),
+        r#"
+[permissions]
+allow = [
+  "fs_edit(docs/**)",
+  "fs_write(docs/**)",
+  "shell_exec(cargo check*)",
+]
+"#,
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap().with_loaded_config();
+    assert_eq!(
+        policy.evaluate_permission("fs_write", r#"{"path":"docs/new.md","content":"x"}"#),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate_permission_in_mode(
+            WorkspaceMode::Plan,
+            "fs_write",
+            r#"{"path":"docs/new.md","content":"x"}"#,
+        ),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        policy.evaluate_permission_in_mode(
+            WorkspaceMode::Explore,
+            "shell_exec",
+            r#"{"command":"cargo check"}"#,
+        ),
+        PermissionDecision::Deny
+    );
+
+    // TEST-02.4: End-to-end with AgentHost + approval_tools enabled:
+    // 1. In Plan mode, even `fs_write(docs/**)` listed in `allow` is denied automatically without mutating disk.
+    let mut plan_host = AgentHost::builder(1).build().unwrap();
+    plan_host.spawn(
+        &AgentSpec::new("planner", "write doc in plan mode")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied())
+            .with_approval_tools(WorkspaceTools::approval_required_names().iter().copied()),
+    );
+    let plan_bridge =
+        WorkspaceToolBridge::new(plan_host.vocab(), WorkspaceTools::new(policy.clone()))
+            .with_mode(WorkspaceMode::Plan)
+            .wrapping(HeadlessDriver::new());
+    let mut plan_driver = RecordingBridge::new(plan_host.vocab(), |req: &AgentView| {
+        if let Some((_, msg)) = req
+            .memory
+            .iter()
+            .find(|(k, _)| k == "denied" || k == "tool_error")
+        {
+            Some(Reply::done(req.agent, req.request, msg.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"docs/blocked.md","content":"nope"}"#,
+            ))
+        }
+    })
+    .wrapping(plan_bridge);
+    assert!(plan_host.run_until_settled(&mut plan_driver, 16));
+    assert!(!dir.0.join("docs/blocked.md").exists());
+    let plan_res = plan_host.result(plan_host.agents()[0]).unwrap_or_default();
+    assert!(
+        plan_res.contains("read-only mode"),
+        "expected read-only denial, got: {plan_res}"
+    );
+
+    // 2. In Build mode with `approval_tools` enabled, `fs_write(docs/ok.md)` matches `allow`
+    // and auto-approves cleanly without human interaction!
+    let mut build_host = AgentHost::builder(2).build().unwrap();
+    build_host.spawn(
+        &AgentSpec::new("builder", "write allowed doc in build mode")
+            .with_tools(WorkspaceTools::all_tool_names().iter().copied())
+            .with_approval_tools(WorkspaceTools::approval_required_names().iter().copied()),
+    );
+    let build_bridge = WorkspaceToolBridge::new(build_host.vocab(), WorkspaceTools::new(policy))
+        .with_mode(WorkspaceMode::Build)
+        .wrapping(HeadlessDriver::new());
+    let mut build_driver = RecordingBridge::new(build_host.vocab(), |req: &AgentView| {
+        if let Some((_, obs)) = req.memory.iter().find(|(k, _)| k == "observe") {
+            Some(Reply::done(req.agent, req.request, obs.clone()))
+        } else if req.memory.iter().any(|(k, _)| k == "call") {
+            None
+        } else {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"docs/ok.md","content":"allowed!\n"}"#,
+            ))
+        }
+    })
+    .wrapping(build_bridge);
+    assert!(build_host.run_until_settled(&mut build_driver, 16));
+    assert_eq!(
+        fs::read_to_string(dir.0.join("docs/ok.md")).unwrap(),
+        "allowed!\n"
+    );
 }

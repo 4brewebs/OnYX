@@ -20,7 +20,8 @@ use onyx_soul_agents::{
     Vocab, pending_approvals,
 };
 use onyx_workspace::{
-    WorkspaceMode, WorkspaceModeHandle, WorkspaceVocab, graph_workspace_plan, preview_tool_diff,
+    PermissionDecision, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceVocab,
+    graph_workspace_plan, preview_tool_diff,
 };
 use ratatui::{
     Terminal,
@@ -41,6 +42,7 @@ struct TuiInner {
     vocab: Vocab,
     ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
+    policy: Option<WorkspacePolicy>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
@@ -103,6 +105,7 @@ impl TuiDriver {
                 vocab,
                 ws_vocab: None,
                 workspace_root: None,
+                policy: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
                 telemetry: SessionTelemetryHandle::default(),
@@ -125,6 +128,14 @@ impl TuiDriver {
             let mut inner = self.inner.borrow_mut();
             inner.workspace_root = Some(root);
             inner.mode_handle = mode_handle;
+        }
+        self
+    }
+
+    pub fn with_policy(self, policy: WorkspacePolicy) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.policy = Some(policy);
         }
         self
     }
@@ -288,17 +299,27 @@ impl TuiInner {
     fn render(&mut self, graph: &dyn GraphView) {
         let approvals = pending_approvals(graph, &self.vocab);
         if self.active_approval.is_none() {
+            let current_mode = self.mode_handle.get();
             for a in &approvals {
-                if self.seen_approvals.insert((a.agent.0, a.request)) {
-                    if let Some(p) = &a.pending_approval {
-                        self.approval_diff = self
-                            .workspace_root
-                            .as_deref()
-                            .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
-                        self.active_approval =
-                            Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
-                        break;
+                let Some(p) = &a.pending_approval else {
+                    continue;
+                };
+                if let Some(policy) = &self.policy {
+                    if policy.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                        != PermissionDecision::Ask
+                    {
+                        // Auto-aprobado o auto-denegado por `WorkspaceToolBridge` según política.
+                        continue;
                     }
+                }
+                if self.seen_approvals.insert((a.agent.0, a.request)) {
+                    self.approval_diff = self
+                        .workspace_root
+                        .as_deref()
+                        .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
+                    self.active_approval =
+                        Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
+                    break;
                 }
             }
         }

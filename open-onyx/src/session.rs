@@ -12,7 +12,10 @@ use onyx_soul_agents::{
     PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder, SubagentSystem,
     SurfaceBinding, SurfaceId, Vocab, pending_approvals,
 };
-use onyx_workspace::{PendingCheckpoints, WorkspaceLedgerSystem, WorkspaceTools, WorkspaceVocab};
+use onyx_workspace::{
+    PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode, WorkspacePolicy,
+    WorkspaceTools, WorkspaceVocab,
+};
 
 use crate::pack::{MilestoneSnapshotSystem, PackSnapshotStore};
 use crate::tui::TuiHandle;
@@ -102,6 +105,7 @@ pub enum StopPolicy {
         tui: TuiHandle,
         llm_in_flight: Arc<AtomicUsize>,
         llm_ready: Arc<AtomicBool>,
+        bridge_ready: Arc<AtomicBool>,
     },
 }
 
@@ -141,13 +145,15 @@ pub fn run_session<D: SessionDriver>(
             tui,
             llm_in_flight,
             llm_ready,
+            bridge_ready,
         } => {
             tui.render(host.graph());
             let mut needs_follow_up_tick = false;
             let mut stepped_in_session = false;
             while !quit.load(Ordering::Relaxed) {
                 let ui_queued = tui.has_queued_events();
-                let ready = llm_ready.load(Ordering::Acquire);
+                let ready =
+                    llm_ready.load(Ordering::Acquire) || bridge_ready.load(Ordering::Acquire);
                 let all_blocked = all_live_agents_blocked(
                     host.graph(),
                     &host.vocab(),
@@ -209,6 +215,7 @@ fn save_transcript_if_configured<D: SessionDriver>(
 /// `RecordingBridge` para que `Approve`/`Deny` queden grabados en `Transcript`.
 pub struct CliApprovalDriver {
     vocab: Vocab,
+    policy: Option<WorkspacePolicy>,
     inner: Box<dyn PlatformDriver>,
     seen: BTreeSet<(u64, u64)>,
     queued: Vec<Reply>,
@@ -218,10 +225,16 @@ impl CliApprovalDriver {
     pub fn new(vocab: Vocab, inner: impl PlatformDriver + 'static) -> Self {
         Self {
             vocab,
+            policy: None,
             inner: Box::new(inner),
             seen: BTreeSet::new(),
             queued: Vec::new(),
         }
+    }
+
+    pub fn with_policy(mut self, policy: WorkspacePolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 }
 
@@ -236,17 +249,28 @@ impl PlatformDriver for CliApprovalDriver {
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
         self.inner.present(graph, surfaces);
         for view in pending_approvals(graph, &self.vocab) {
+            let Some(pending) = &view.pending_approval else {
+                continue;
+            };
+            if let Some(policy) = &self.policy {
+                if policy.evaluate_permission_in_mode(
+                    WorkspaceMode::Build,
+                    &pending.tool,
+                    &pending.args,
+                ) != PermissionDecision::Ask
+                {
+                    continue;
+                }
+            }
             if !self.seen.insert((view.agent.0, view.request)) {
                 continue;
             }
-            if let Some(pending) = &view.pending_approval {
-                let reply = if prompt_approval(&pending.tool, &pending.args) {
-                    Reply::approve(view.agent, view.request)
-                } else {
-                    Reply::deny(view.agent, view.request, "denied by user")
-                };
-                self.queued.push(reply);
-            }
+            let reply = if prompt_approval(&pending.tool, &pending.args) {
+                Reply::approve(view.agent, view.request)
+            } else {
+                Reply::deny(view.agent, view.request, "denied by user")
+            };
+            self.queued.push(reply);
         }
     }
 }

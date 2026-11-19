@@ -69,6 +69,7 @@ struct CliArgs {
     model: Option<String>,
     api_base: Option<String>,
     auto_approve: bool,
+    ignore_deny: bool,
     dry_run: bool,
     max_steps: Option<i64>,
     shell_timeout_secs: Option<u64>,
@@ -88,6 +89,7 @@ impl CliArgs {
             model: None,
             api_base: None,
             auto_approve: false,
+            ignore_deny: false,
             dry_run: false,
             max_steps: None,
             shell_timeout_secs: None,
@@ -141,6 +143,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut model: Option<String> = None;
     let mut api_base: Option<String> = None;
     let mut auto_approve = false;
+    let mut ignore_deny = false;
     let mut dry_run = false;
     let mut max_steps: Option<i64> = None;
     let mut shell_timeout_secs: Option<u64> = None;
@@ -182,6 +185,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 api_base = Some(u);
             }
             "--auto-approve" => auto_approve = true,
+            "--ignore-deny" => ignore_deny = true,
             "--dry-run" => dry_run = true,
             "--max-steps" => {
                 let s = args
@@ -324,6 +328,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         model,
         api_base,
         auto_approve,
+        ignore_deny,
         dry_run,
         max_steps,
         shell_timeout_secs,
@@ -336,7 +341,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -355,7 +360,8 @@ OPTIONS:
       --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
       --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
       --api-base <url>     Custom API base URL (e.g. `http://localhost:11434/v1`; no OPENAI_API_KEY needed when set)
-      --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`)
+      --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`; `deny` rules in `.onyx/config.toml` still apply)
+      --ignore-deny        Explicitly bypass `[permissions].deny` rules loaded from `.onyx/config.toml`
       --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
       --shell-timeout <s>  Timeout in seconds per `shell_exec` command
       --save-transcript <f>, --record <f>
@@ -528,11 +534,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    let mut policy = WorkspacePolicy::new(&cli.workspace)?;
+    let mut policy = WorkspacePolicy::new(&cli.workspace)?.with_loaded_config();
     if let Some(secs) = cli.shell_timeout_secs {
         policy = policy.with_command_timeout(Duration::from_secs(secs));
     }
-    let tools = WorkspaceTools::new(policy);
+    if cli.ignore_deny {
+        policy = policy.with_ignore_deny(true);
+    }
+    let tools = WorkspaceTools::new(policy.clone());
 
     let config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(64),
@@ -557,7 +566,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             host.spawn(&make_spec(goal, cli.auto_approve));
 
-            let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
+            let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
+                .with_policy(policy.clone());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode(WorkspaceMode::Build)
                 .with_workspace_vocab(ws_vocab)
@@ -624,17 +634,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let tui = TuiDriver::new(host.vocab())?
                 .with_workspace(cli.workspace.clone(), mode_handle.clone())
+                .with_policy(policy.clone())
                 .with_workspace_vocab(ws_vocab)
                 .with_stream_preview(stream_preview.clone())
                 .with_telemetry(telemetry.clone())
                 .with_context_config(ctx_cfg);
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
+            let bridge_ready = Arc::new(AtomicBool::new(false));
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode_handle(mode_handle)
                 .with_workspace_vocab(ws_vocab)
                 .sync_existing_undos(host.graph())
                 .with_checkpoints(checkpoints)
+                .with_ready_flag(Arc::clone(&bridge_ready))
                 .require_read_before_edit(true)
                 .wrapping(tui);
             let llm_in_flight = Arc::new(AtomicUsize::new(0));
@@ -682,6 +695,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tui: tui_handle,
                     llm_in_flight,
                     llm_ready,
+                    bridge_ready,
                 },
             )?;
         }
@@ -779,7 +793,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             } else {
                 let llm = resolve_llm_config(&cli, &cli.workspace)?;
-                let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
+                let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
+                    .with_policy(policy.clone());
                 let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                     .with_mode(WorkspaceMode::Build)
                     .with_workspace_vocab(ws_vocab)
@@ -1227,6 +1242,7 @@ mod tests {
                 "10",
                 "--max-snapshots",
                 "5",
+                "--ignore-deny",
             ]
             .into_iter()
             .map(str::to_string),
@@ -1236,6 +1252,7 @@ mod tests {
         assert_eq!(parsed.snapshot_dir, Some(PathBuf::from("snaps_out")));
         assert_eq!(parsed.snapshot_every, Some(10));
         assert_eq!(parsed.max_snapshots, Some(5));
+        assert!(parsed.ignore_deny);
 
         let inspect_parsed = parse_args_from(
             ["inspect", "snaps_out", "--list", "--json", "--tick", "4"]

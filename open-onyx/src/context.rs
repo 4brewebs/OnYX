@@ -307,7 +307,7 @@ pub fn summarize_tool_output_tier1(tool_name: &str, call_args: &str, output: &st
             let mut files = BTreeSet::new();
             for line in output.lines() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with("...[") {
+                if trimmed.is_empty() || trimmed.starts_with("...[") || trimmed == "--" {
                     continue;
                 }
                 if let Some((file, rest)) = trimmed.split_once(':') {
@@ -326,6 +326,28 @@ pub fn summarize_tool_output_tier1(tool_name: &str, call_args: &str, output: &st
                 truncate_chars(&pat, 48),
                 files.len()
             )
+        }
+        "glob_files" => {
+            let pat = extract_call_str_arg(call_args, "pattern").unwrap_or_default();
+            let files: Vec<&str> = output
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with("...") && *l != "no files matched")
+                .collect();
+            let top: Vec<&str> = files.iter().take(5).copied().collect();
+            if files.is_empty() {
+                format!(
+                    "[summary glob_files '{}': 0 files]",
+                    truncate_chars(&pat, 48)
+                )
+            } else {
+                format!(
+                    "[summary glob_files '{}': {} files (top: {})]",
+                    truncate_chars(&pat, 48),
+                    files.len(),
+                    truncate_chars(&top.join(", "), 180)
+                )
+            }
         }
         "shell_exec" => {
             let cmd = extract_call_str_arg(call_args, "command").unwrap_or_default();
@@ -392,11 +414,16 @@ pub fn build_compaction_summary(
 
     let mut files_read = BTreeSet::new();
     let mut files_modified = BTreeSet::new();
+    let mut files_found = BTreeSet::new();
     let mut tools_used = BTreeSet::new();
     let mut recent_errors: Vec<String> = Vec::new();
     let mut recent_says: Vec<String> = Vec::new();
     let mut user_prompts: Vec<String> = Vec::new();
     let mut prior_summary: Option<String> = None;
+    let mut last_call_tool: Option<String> = None;
+
+    let focus_keywords = focus.map(extract_focus_keywords).unwrap_or_default();
+    let mut focus_candidates: Vec<(usize, usize, String)> = Vec::new();
 
     for (idx, (kind, text)) in memory.iter().enumerate().skip(start_idx) {
         match kind.as_str() {
@@ -414,6 +441,7 @@ pub fn build_compaction_summary(
                     None => (text.as_str(), "{}"),
                 };
                 tools_used.insert(tool.to_string());
+                last_call_tool = Some(tool.to_string());
                 if let Some(path) = extract_call_path(args) {
                     match tool {
                         "fs_read" => {
@@ -426,11 +454,51 @@ pub fn build_compaction_summary(
                     }
                 }
             }
+            "observe" => {
+                if last_call_tool.as_deref() == Some("code_search") {
+                    for line in text.lines() {
+                        let trimmed = line.trim();
+                        if let Some((file, rest)) = trimmed.split_once(':') {
+                            if rest
+                                .split_once(':')
+                                .and_then(|(ln, _)| ln.trim().parse::<u64>().ok())
+                                .is_some()
+                            {
+                                files_found.insert(file.trim().to_string());
+                            }
+                        }
+                    }
+                }
+                if !focus_keywords.is_empty() {
+                    if let Some((score, snippet)) =
+                        extract_focus_snippet(text, &focus_keywords, 280)
+                    {
+                        let label = last_call_tool.as_deref().unwrap_or("observe");
+                        focus_candidates.push((score, idx, format!("[{label}] {snippet}")));
+                    }
+                }
+            }
             "tool_error" | "denied" => {
-                recent_errors.push(truncate_chars(text.trim(), 180));
+                let trimmed = text.trim();
+                recent_errors.push(truncate_chars(trimmed, 180));
+                if !focus_keywords.is_empty() {
+                    if let Some((score, snippet)) =
+                        extract_focus_snippet(trimmed, &focus_keywords, 220)
+                    {
+                        focus_candidates.push((score, idx, format!("[{kind}] {snippet}")));
+                    }
+                }
             }
             "say" => {
-                recent_says.push(truncate_chars(text.trim(), 240));
+                let trimmed = text.trim();
+                recent_says.push(truncate_chars(trimmed, 240));
+                if !focus_keywords.is_empty() {
+                    if let Some((score, snippet)) =
+                        extract_focus_snippet(trimmed, &focus_keywords, 280)
+                    {
+                        focus_candidates.push((score, idx, format!("[say] {snippet}")));
+                    }
+                }
             }
             _ => {}
         }
@@ -463,6 +531,10 @@ pub fn build_compaction_summary(
             files_read.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    if !files_found.is_empty() {
+        let top_found: Vec<String> = files_found.into_iter().take(12).collect();
+        parts.push(format!("files_found: {}", top_found.join(", ")));
+    }
     if !tools_used.is_empty() {
         parts.push(format!(
             "tools_used: {}",
@@ -471,6 +543,23 @@ pub fn build_compaction_summary(
     }
     if let Some(plan) = active_plan.map(str::trim).filter(|p| !p.is_empty()) {
         parts.push(format!("active_plan:\n{plan}"));
+    }
+    if !focus_candidates.is_empty() {
+        // Prioriza mayor coincidencia de palabras clave y luego orden cronológico reciente.
+        focus_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let mut chosen: Vec<(usize, String)> = Vec::new();
+        let mut seen_snippets = BTreeSet::new();
+        for (_, idx, snippet) in focus_candidates {
+            if seen_snippets.insert(snippet.clone()) {
+                chosen.push((idx, snippet));
+                if chosen.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        chosen.sort_by_key(|(idx, _)| *idx);
+        let bullets: Vec<String> = chosen.into_iter().map(|(_, s)| format!("- {s}")).collect();
+        parts.push(format!("focus_matches:\n{}", bullets.join("\n")));
     }
     if !recent_errors.is_empty() {
         let keep = recent_errors.len().saturating_sub(3);
@@ -487,6 +576,87 @@ pub fn build_compaction_summary(
         ));
     }
     parts.join("\n")
+}
+
+fn extract_focus_keywords(focus: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "para",
+        "como",
+        "sobre",
+        "conservar",
+        "guardar",
+        "mantener",
+        "resumen",
+        "ubicacion",
+        "ubicación",
+        "archivo",
+        "archivos",
+        "donde",
+        "dónde",
+        "esta",
+        "está",
+        "keep",
+        "with",
+        "from",
+        "that",
+        "this",
+        "about",
+        "focus",
+        "summary",
+        "details",
+        "preserve",
+        "file",
+        "files",
+    ];
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for raw in focus.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.')) {
+        let lower = raw.trim_matches('.').to_ascii_lowercase();
+        if lower.chars().count() < 4 || STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+fn extract_focus_snippet(
+    text: &str,
+    keywords: &[String],
+    max_chars: usize,
+) -> Option<(usize, String)> {
+    let lower_full = text.to_ascii_lowercase();
+    let total_score = keywords
+        .iter()
+        .filter(|kw| lower_full.contains(kw.as_str()))
+        .count();
+    if total_score == 0 {
+        return None;
+    }
+
+    // Extrae las líneas que realmente coinciden con el foco (más denso que truncar desde el inicio).
+    let mut matched_lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "--" {
+            continue;
+        }
+        let lower_line = trimmed.to_ascii_lowercase();
+        if keywords.iter().any(|kw| lower_line.contains(kw.as_str())) {
+            matched_lines.push(trimmed);
+            if matched_lines.len() >= 3 {
+                break;
+            }
+        }
+    }
+    let body = if matched_lines.is_empty() {
+        text.trim().to_string()
+    } else {
+        matched_lines.join(" | ")
+    };
+    Some((total_score, truncate_chars(&body, max_chars)))
 }
 
 /// Proyecta `(goal, memory)` aplicando:
@@ -793,7 +963,13 @@ impl SessionTelemetry {
     /// Indicador compacto para la barra de estado de la TUI (SDD-01 §3.2):
     /// `ctx: 34% · in: 18.4k (cache 12.1k) · out: 1.9k · ~$0.024`
     pub fn format_status_bar(&self) -> String {
-        let mut out = format!("ctx: {}%", self.context_fill_pct);
+        let mut out = if self.context_fill_pct == 0
+            && (self.last_turn.input_tokens > 0 || self.cumulative.input_tokens > 0)
+        {
+            "ctx: <1%".to_string()
+        } else {
+            format!("ctx: {}%", self.context_fill_pct)
+        };
         if self.cumulative.input_tokens > 0 || self.cumulative.output_tokens > 0 {
             let in_s = format_token_count(self.cumulative.input_tokens);
             if self.cumulative.cached_input_tokens > 0 {
@@ -1134,6 +1310,61 @@ mod tests {
                 && bar.contains("out: 1.9k")
                 && bar.contains("~$"),
             "{bar}"
+        );
+
+        // Small input on a 1M context window formats as `ctx: <1%` instead of `ctx: 0%`.
+        let small = SessionTelemetryHandle::new("gemini-4-hydrogen", false);
+        small.record_turn(TokenUsage {
+            input_tokens: 4_000,
+            cached_input_tokens: 0,
+            output_tokens: 100,
+            reasoning_tokens: 0,
+        });
+        assert!(
+            small.snapshot().format_status_bar().starts_with("ctx: <1%"),
+            "{}",
+            small.snapshot().format_status_bar()
+        );
+    }
+
+    #[test]
+    fn compaction_summary_rescues_focus_matches_and_search_files_from_older_turns() {
+        let memory = vec![
+            (
+                "call".to_string(),
+                r#"code_search {"pattern":"evaluate_permission","regex":true}"#.to_string(),
+            ),
+            (
+                "observe".to_string(),
+                "onyx-workspace/src/policy.rs-485- /// Evalúa reglas\nonyx-workspace/src/policy.rs:487: pub fn evaluate_permission(&self, tool: &str) -> PermissionDecision {\n".to_string(),
+            ),
+            (
+                "say".to_string(),
+                "evaluate_permission está definida en onyx-workspace/src/policy.rs:487.".to_string(),
+            ),
+            ("user".to_string(), "turn 3".to_string()),
+            ("say".to_string(), "unrelated answer 3".to_string()),
+            ("user".to_string(), "turn 4".to_string()),
+            ("say".to_string(), "unrelated answer 4".to_string()),
+            ("user".to_string(), "turn 5".to_string()),
+            ("say".to_string(), "unrelated answer 5".to_string()),
+        ];
+
+        let summary = build_compaction_summary(
+            "audit SDD-02",
+            &memory,
+            None,
+            Some("conservar la ubicacion de evaluate_permission"),
+        );
+        assert!(
+            summary.contains("files_found: onyx-workspace/src/policy.rs"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("focus_matches:")
+                && summary.contains("onyx-workspace/src/policy.rs:487")
+                && summary.contains("evaluate_permission"),
+            "{summary}"
         );
     }
 }

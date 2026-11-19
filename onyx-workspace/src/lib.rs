@@ -6,7 +6,9 @@ pub mod state;
 pub mod tools;
 
 pub use bridge::WorkspaceToolBridge;
-pub use policy::WorkspacePolicy;
+pub use policy::{
+    PermissionDecision, PermissionRules, WorkspacePolicy, compile_glob_regex, is_mutating_tool,
+};
 pub use state::{
     EffectReversibility, PendingCheckpoints, RecordedEffect, WorkspaceLedgerSystem, WorkspaceMode,
     WorkspaceModeHandle, WorkspaceVocab, all_recorded_effects, capture_git_tree_checkpoint,
