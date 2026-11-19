@@ -1,17 +1,23 @@
 [package]
 name = "onyx-workspace"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Workspace capabilities (filesystem, search, edit, shell) with sandbox policy for OnYX agent harnesses."
-license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["agents", "workspace", "sandbox", "tools", "onyx"]
+categories = ["development-tools"]
+exclude = ["snapshots/", "snaps*/", "*.tr", "*.onyxpack", "*.onyxpack.tmp"]
 
 [features]
 default = []
 scent = ["dep:onyx-scent"]
 
 [dependencies]
-onyx-scent = { path = "../onyx-scent", optional = true }
-onyx-soul-agents = { path = "../onyx-soul-agents" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+onyx-scent = { workspace = true, optional = true }
+onyx-soul-agents = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

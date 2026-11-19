@@ -1,6 +1,8 @@
 mod command;
 mod gemini;
+mod openai;
 mod ops;
+mod pack;
 mod session;
 mod tui;
 
@@ -12,25 +14,58 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use command::CommandSpawnerSystem;
-use gemini::{AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, load_project_instructions};
+use gemini::{
+    AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
+    load_project_instructions,
+};
 use onyx_soul_agents::{
-    AgentConfig, AgentSnapshotStore, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge,
-    Transcript,
+    AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
 };
 use onyx_workspace::{
     PendingCheckpoints, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge,
     WorkspaceTools,
 };
+use openai::{AsyncOpenAiDriver, DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
+use pack::PackSnapshotStore;
 use session::{
-    CliApprovalDriver, SessionOptions, StopPolicy, build_host, build_host_with_checkpoints,
-    make_spec, run_session,
+    CliApprovalDriver, SessionOptions, StopPolicy, build_host_with_checkpoints,
+    build_host_with_options, make_spec, run_session,
 };
 use tui::TuiDriver;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlmProvider {
+    Gemini,
+    OpenAi,
+}
+
+impl LlmProvider {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gemini" => Ok(Self::Gemini),
+            "openai" => Ok(Self::OpenAi),
+            other => Err(format!(
+                "unsupported provider `{other}` (expected `gemini` or `openai`)"
+            )),
+        }
+    }
+}
+
+struct LlmConfig {
+    provider: LlmProvider,
+    api_key: String,
+    model: String,
+    api_base: Option<String>,
+    project_instructions: String,
+}
 
 struct CliArgs {
     mode: Mode,
     workspace: PathBuf,
+    provider: Option<LlmProvider>,
+    model: Option<String>,
+    api_base: Option<String>,
     auto_approve: bool,
     dry_run: bool,
     max_steps: Option<i64>,
@@ -38,15 +73,42 @@ struct CliArgs {
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
     resume_dir: Option<PathBuf>,
+    snapshot_every: Option<u64>,
+    max_snapshots: Option<usize>,
+}
+
+impl CliArgs {
+    fn simple(mode: Mode) -> Self {
+        Self {
+            mode,
+            workspace: PathBuf::new(),
+            provider: None,
+            model: None,
+            api_base: None,
+            auto_approve: false,
+            dry_run: false,
+            max_steps: None,
+            shell_timeout_secs: None,
+            save_transcript: None,
+            snapshot_dir: None,
+            resume_dir: None,
+            snapshot_every: None,
+            max_snapshots: None,
+        }
+    }
 }
 
 enum Mode {
+    Help,
+    Version,
     Run(String),
     Chat,
     Replay(PathBuf),
     Inspect {
         dir: PathBuf,
         tick: Option<u64>,
+        list: bool,
+        json: bool,
     },
     Rewind {
         dir: PathBuf,
@@ -67,7 +129,15 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let Some(cmd) = args.next() else {
         return Err(usage());
     };
+    match cmd.as_str() {
+        "--help" | "-h" | "help" => return Ok(CliArgs::simple(Mode::Help)),
+        "--version" | "-V" | "version" => return Ok(CliArgs::simple(Mode::Version)),
+        _ => {}
+    }
     let mut workspace = env::current_dir().map_err(|e| e.to_string())?;
+    let mut provider: Option<LlmProvider> = None;
+    let mut model: Option<String> = None;
+    let mut api_base: Option<String> = None;
     let mut auto_approve = false;
     let mut dry_run = false;
     let mut max_steps: Option<i64> = None;
@@ -75,8 +145,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut save_transcript = None;
     let mut snapshot_dir = None;
     let mut resume_dir = None;
+    let mut snapshot_every: Option<u64> = None;
+    let mut max_snapshots: Option<usize> = None;
     let mut tick_opt: Option<u64> = None;
     let mut transcript_opt: Option<PathBuf> = None;
+    let mut list = false;
+    let mut json = false;
     let mut positional = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -84,6 +158,26 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
             "--workspace" | "-w" => {
                 let p = args.next().ok_or("--workspace requires a path")?;
                 workspace = PathBuf::from(p);
+            }
+            "--provider" => {
+                let p = args
+                    .next()
+                    .ok_or("--provider requires `gemini` or `openai`")?;
+                provider = Some(LlmProvider::parse(&p)?);
+            }
+            "--model" => {
+                let m = args.next().ok_or("--model requires a model name")?;
+                if m.trim().is_empty() {
+                    return Err("--model must not be empty".to_string());
+                }
+                model = Some(m);
+            }
+            "--api-base" => {
+                let u = args.next().ok_or("--api-base requires a URL")?;
+                if u.trim().is_empty() {
+                    return Err("--api-base must not be empty".to_string());
+                }
+                api_base = Some(u);
             }
             "--auto-approve" => auto_approve = true,
             "--dry-run" => dry_run = true,
@@ -111,13 +205,37 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 }
                 shell_timeout_secs = Some(parsed);
             }
-            "--save-transcript" => {
+            "--save-transcript" | "--record" => {
                 let p = args.next().ok_or("--save-transcript requires a path")?;
                 save_transcript = Some(PathBuf::from(p));
             }
             "--snapshot-dir" => {
                 let p = args.next().ok_or("--snapshot-dir requires a path")?;
                 snapshot_dir = Some(PathBuf::from(p));
+            }
+            "--snapshot-every" => {
+                let s = args
+                    .next()
+                    .ok_or("--snapshot-every requires a positive integer")?;
+                let parsed = s
+                    .parse::<u64>()
+                    .map_err(|_| "--snapshot-every must be a positive integer")?;
+                if parsed == 0 {
+                    return Err("--snapshot-every must be > 0".to_string());
+                }
+                snapshot_every = Some(parsed);
+            }
+            "--max-snapshots" => {
+                let s = args
+                    .next()
+                    .ok_or("--max-snapshots requires a positive integer")?;
+                let parsed = s
+                    .parse::<usize>()
+                    .map_err(|_| "--max-snapshots must be a positive integer")?;
+                if parsed == 0 {
+                    return Err("--max-snapshots must be > 0".to_string());
+                }
+                max_snapshots = Some(parsed);
             }
             "--resume" | "-r" => {
                 let p = args
@@ -133,7 +251,13 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 let p = args.next().ok_or("--transcript requires a path")?;
                 transcript_opt = Some(PathBuf::from(p));
             }
-            "--help" | "-h" => return Err(usage()),
+            "--list" | "-l" => list = true,
+            "--json" => json = true,
+            "--help" | "-h" => return Ok(CliArgs::simple(Mode::Help)),
+            "--version" | "-V" => return Ok(CliArgs::simple(Mode::Version)),
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown flag `{arg}`\n\n{}", usage()));
+            }
             _ => positional.push(arg),
         }
     }
@@ -161,6 +285,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
             Mode::Inspect {
                 dir: PathBuf::from(dir),
                 tick: tick_opt,
+                list,
+                json,
             }
         }
         "rewind" => {
@@ -192,6 +318,9 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     Ok(CliArgs {
         mode,
         workspace,
+        provider,
+        model,
+        api_base,
         auto_approve,
         dry_run,
         max_steps,
@@ -199,21 +328,166 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         save_transcript,
         snapshot_dir,
         resume_dir,
+        snapshot_every,
+        max_snapshots,
     })
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file>] [--snapshot-dir <dir>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>]\n  openonyx inspect <snapshot_dir> [--tick <n>]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--auto-approve] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
-fn gemini_env_and_instructions(
+fn help_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let usage_str = usage();
+    let body = r#"SUBCOMMANDS:
+  chat                     Launch interactive TUI with SSE streaming, diff approvals, Plan/Build toggle, and Live Plan
+  run <goal>               Run a single headless turn toward <goal> and print the final result
+  replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
+  inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
+  rewind <dir> <tick>      Restore git checkpoints to <tick> (or prior milestone) and replay/continue
+  doctor                   Verify workspace git repository, snapshot packs, and transcript integrity
+
+OPTIONS:
+  -w, --workspace <dir>    Target workspace directory (default: current working directory)
+      --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
+      --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
+      --api-base <url>     Custom API base URL (e.g. `http://localhost:11434/v1`; no OPENAI_API_KEY needed when set)
+      --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`)
+      --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
+      --shell-timeout <s>  Timeout in seconds per `shell_exec` command
+      --save-transcript <f>, --record <f>
+                           Record deterministic `ONYXTR2` transcript to `<file>`
+      --snapshot-dir <dir> Save compressed milestone snapshots to `<dir>/snapshots.onyxpack`
+      --snapshot-every <n> Also capture periodic snapshots every <n> ticks
+      --max-snapshots <n>  Opt-in sliding window retention (keeps `init` + latest `n - 1` milestones)
+  -r, --resume <dir>       Resume `chat` from the latest snapshot stored in `<dir>`
+      --tick <n>           Specific tick to inspect (use with `inspect`)
+  -l, --list               List all stored snapshot milestones with tags and git checkpoints (use with `inspect`)
+      --json               Emit machine-readable JSON output (use with `inspect`)
+      --transcript <file>  Replay transcript from rewind point (`rewind`) or validate transcript (`doctor`)
+      --dry-run            Preview orphaned effects and git rollback plan in `rewind` without modifying files
+  -h, --help               Print this help guide and exit 0
+  -V, --version            Print openOnyx version and exit 0
+
+TUI CONTROLS & SLASH COMMANDS (chat):
+  Enter                    Submit goal, follow-up prompt, or slash command
+  Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
+  y / n                    Approve or deny a pending mutating tool diff
+  Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
+                           Scroll the `Memory & Trace` history panel
+  /undo                    Revert the latest reversible git checkpoint created during the session
+  /mode [plan|build|explore]
+                           Switch or toggle workspace mode
+  /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
+  Esc / Ctrl+C             Quit cleanly (flushing exit snapshot & transcript if configured)
+
+PROJECT INSTRUCTIONS, SKILLS & LIVE PLAN:
+  ONYX.md / AGENTS.md      Loaded from the workspace root into system instructions
+  .onyx/skills/<name>/SKILL.md (also skills/, ~/.onyx/skills/)
+                           Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
+  Live Plan panel          Updated via `plan_update` and shown on the right when terminal width >= 100 columns
+
+ENVIRONMENT VARIABLES:
+  GEMINI_API_KEY, OPENAI_API_KEY, ONYX_API_KEY
+  ONYX_PROVIDER            Default provider (`gemini` | `openai`)
+  ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
+  GEMINI_API_BASE          Custom Gemini API endpoint
+  OPENAI_API_BASE / OPENAI_BASE_URL
+                           Custom OpenAI-compatible API endpoint"#
+        .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
+        .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL);
+
+    format!("openOnyx {version} — Deterministic Coding Agent Harness\n\n{usage_str}\n\n{body}")
+}
+
+fn resolve_llm_config(
+    cli: &CliArgs,
     workspace: &Path,
-) -> Result<(String, String, String), Box<dyn std::error::Error>> {
-    let api_key =
-        env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
-    let model = env::var("ONYX_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string());
+) -> Result<LlmConfig, Box<dyn std::error::Error>> {
+    let provider = match cli.provider {
+        Some(p) => p,
+        None => match env::var("ONYX_PROVIDER") {
+            Ok(s) if !s.trim().is_empty() => LlmProvider::parse(&s)?,
+            _ => LlmProvider::Gemini,
+        },
+    };
     let project_instructions = load_project_instructions(workspace);
-    Ok((api_key, model, project_instructions))
+
+    match provider {
+        LlmProvider::Gemini => {
+            let api_key = env::var("GEMINI_API_KEY")
+                .or_else(|_| env::var("ONYX_API_KEY"))
+                .map_err(|_| "GEMINI_API_KEY environment variable is not set")?;
+            let model = cli
+                .model
+                .clone()
+                .or_else(|| env::var("ONYX_MODEL").ok().filter(|s| !s.trim().is_empty()))
+                .or_else(|| {
+                    env::var("ONYX_GEMINI_MODEL")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+            let api_base = cli
+                .api_base
+                .clone()
+                .or_else(|| env::var("GEMINI_API_BASE").ok())
+                .filter(|s| !s.trim().is_empty());
+            Ok(LlmConfig {
+                provider,
+                api_key,
+                model,
+                api_base,
+                project_instructions,
+            })
+        }
+        LlmProvider::OpenAi => {
+            let api_base = cli
+                .api_base
+                .clone()
+                .or_else(|| env::var("OPENAI_API_BASE").ok())
+                .or_else(|| env::var("OPENAI_BASE_URL").ok())
+                .filter(|s| !s.trim().is_empty());
+            let api_key = match env::var("OPENAI_API_KEY").or_else(|_| env::var("ONYX_API_KEY")) {
+                Ok(k) => k,
+                Err(_) if api_base.is_some() => String::new(),
+                Err(_) => return Err("OPENAI_API_KEY environment variable is not set".into()),
+            };
+            let model = cli
+                .model
+                .clone()
+                .or_else(|| env::var("ONYX_MODEL").ok().filter(|s| !s.trim().is_empty()))
+                .or_else(|| {
+                    env::var("OPENAI_MODEL")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
+            Ok(LlmConfig {
+                provider,
+                api_key,
+                model,
+                api_base,
+                project_instructions,
+            })
+        }
+    }
+}
+
+fn build_sync_responder(llm: &LlmConfig) -> Box<dyn Responder> {
+    match llm.provider {
+        LlmProvider::Gemini => Box::new(
+            GeminiResponder::new(llm.api_key.clone(), llm.model.clone())
+                .with_api_base(llm.api_base.clone())
+                .with_project_instructions(llm.project_instructions.clone()),
+        ),
+        LlmProvider::OpenAi => Box::new(
+            OpenAiResponder::new(llm.api_key.clone(), llm.model.clone())
+                .with_api_base(llm.api_base.clone())
+                .with_project_instructions(llm.project_instructions.clone()),
+        ),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -224,6 +498,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
     };
+
+    match &cli.mode {
+        Mode::Help => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        Mode::Version => {
+            println!("openOnyx {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => {}
+    }
 
     let mut policy = WorkspacePolicy::new(&cli.workspace)?;
     if let Some(secs) = cli.shell_timeout_secs {
@@ -241,22 +527,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_dir: cli.snapshot_dir.clone(),
         save_transcript: cli.save_transcript.clone(),
         save_step_snapshots: cli.snapshot_dir.is_some(),
+        snapshot_every: cli.snapshot_every,
+        max_snapshots: cli.max_snapshots,
     };
 
-    match cli.mode {
+    match &cli.mode {
         Mode::Run(goal) => {
             let checkpoints = PendingCheckpoints::default();
-            let (mut host, ws_vocab) = build_host_with_checkpoints(
-                1,
-                config,
-                cli.snapshot_dir.as_ref(),
-                None,
-                Some(checkpoints.clone()),
-            )?;
-            let (api_key, model, project_instructions) =
-                gemini_env_and_instructions(&cli.workspace)?;
+            let (mut host, ws_vocab) =
+                build_host_with_options(1, config, &session_opts, None, Some(checkpoints.clone()))?;
+            let llm = resolve_llm_config(&cli, &cli.workspace)?;
 
-            host.spawn(&make_spec(&goal, cli.auto_approve));
+            host.spawn(&make_spec(goal, cli.auto_approve));
 
             let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
@@ -265,12 +547,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(cli_driver);
-            let mut driver = RecordingBridge::new(
-                host.vocab(),
-                GeminiResponder::new(api_key, model)
-                    .with_project_instructions(project_instructions),
-            )
-            .wrapping(ws_bridge);
+            let mut driver =
+                RecordingBridge::new(host.vocab(), build_sync_responder(&llm)).wrapping(ws_bridge);
 
             run_session(
                 &mut host,
@@ -298,15 +576,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(chat_config.default_max_steps)
                 .with_mode_handle(mode_handle.clone());
-            let (mut host, ws_vocab) = build_host_with_checkpoints(
+            let (mut host, ws_vocab) = build_host_with_options(
                 1,
                 chat_config,
-                cli.snapshot_dir.as_ref(),
+                &session_opts,
                 Some(Box::new(spawner)),
                 Some(checkpoints.clone()),
             )?;
             if let Some(resume_path) = &cli.resume_dir {
-                let store = AgentSnapshotStore::new(resume_path);
+                let store = PackSnapshotStore::new(resume_path);
                 let latest = store
                     .latest_tick()
                     .ok_or_else(|| format!("no snapshots found in `{}`", resume_path.display()))?;
@@ -314,12 +592,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 host.step(&mut HeadlessDriver::new());
                 host.set_tick(latest.saturating_add(1));
             }
-            let (api_key, model, project_instructions) =
-                gemini_env_and_instructions(&cli.workspace)?;
+            let llm = resolve_llm_config(&cli, &cli.workspace)?;
+            let stream_preview = StreamPreviewHandle::new();
 
             let tui = TuiDriver::new(host.vocab())?
                 .with_workspace(cli.workspace.clone(), mode_handle.clone())
-                .with_workspace_vocab(ws_vocab);
+                .with_workspace_vocab(ws_vocab)
+                .with_stream_preview(stream_preview.clone());
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
@@ -330,18 +609,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .require_read_before_edit(true)
                 .wrapping(tui);
             let llm_in_flight = Arc::new(AtomicUsize::new(0));
-            let gemini_ready = Arc::new(AtomicBool::new(false));
-            let async_gemini = AsyncGeminiDriver::new(
-                host.vocab(),
-                api_key,
-                model,
-                Arc::clone(&llm_in_flight),
-                Arc::clone(&gemini_ready),
-            )
-            .with_project_instructions(project_instructions)
-            .wrapping(ws_bridge);
-            let mut driver =
-                RecordingBridge::new(host.vocab(), |_: &AgentView| None).wrapping(async_gemini);
+            let llm_ready = Arc::new(AtomicBool::new(false));
+            let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
+            let mut driver = match llm.provider {
+                LlmProvider::Gemini => rec_bridge.wrapping(
+                    AsyncGeminiDriver::new(
+                        host.vocab(),
+                        llm.api_key,
+                        llm.model,
+                        Arc::clone(&llm_in_flight),
+                        Arc::clone(&llm_ready),
+                    )
+                    .with_api_base(llm.api_base)
+                    .with_project_instructions(llm.project_instructions)
+                    .with_stream_preview(stream_preview)
+                    .wrapping(ws_bridge),
+                ),
+                LlmProvider::OpenAi => rec_bridge.wrapping(
+                    AsyncOpenAiDriver::new(
+                        host.vocab(),
+                        llm.api_key,
+                        llm.model,
+                        Arc::clone(&llm_in_flight),
+                        Arc::clone(&llm_ready),
+                    )
+                    .with_api_base(llm.api_base)
+                    .with_project_instructions(llm.project_instructions)
+                    .with_stream_preview(stream_preview)
+                    .wrapping(ws_bridge),
+                ),
+            };
 
             run_session(
                 &mut host,
@@ -351,7 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     quit,
                     tui: tui_handle,
                     llm_in_flight,
-                    llm_ready: gemini_ready,
+                    llm_ready,
                 },
             )?;
         }
@@ -360,11 +657,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
             let has_commands = !transcript.commands.is_empty();
 
-            let (mut host, _ws_vocab) = build_host(
+            let (mut host, _ws_vocab) = build_host_with_options(
                 1,
                 config,
-                cli.snapshot_dir.as_ref(),
+                &session_opts,
                 Some(Box::new(CommandSpawnerSystem::new(cli.auto_approve))),
+                Some(PendingCheckpoints::default()),
             )?;
             if !has_commands {
                 host.spawn(&make_spec("replay", cli.auto_approve));
@@ -388,15 +686,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Mode::Inspect { dir, tick } => {
-            run_inspect(&dir, tick, config)?;
+        Mode::Inspect {
+            dir,
+            tick,
+            list,
+            json,
+        } => {
+            run_inspect(dir, *tick, *list, *json, config)?;
         }
         Mode::Rewind {
             dir,
             tick,
             transcript,
         } => {
-            reconcile_rewind_effects(&cli.workspace, &dir, tick, &config, cli.dry_run)?;
+            let store = PackSnapshotStore::new(dir);
+            let target_tick = store.resolve_tick_or_floor(*tick).ok_or_else(|| {
+                format!(
+                    "no snapshots found in `{}` at or before tick {tick}",
+                    dir.display()
+                )
+            })?;
+            if target_tick != *tick {
+                println!(
+                    "[openOnyx rewind] requested tick {tick} is not a milestone; resolving to prior milestone tick {target_tick}"
+                );
+            }
+            reconcile_rewind_effects(&cli.workspace, dir, target_tick, &config, cli.dry_run)?;
             if cli.dry_run {
                 return Ok(());
             }
@@ -406,14 +721,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
-                Some(&dir),
+                Some(dir),
                 Some(Box::new(spawner)),
                 Some(checkpoints.clone()),
             )?;
-            host.request_restore(&tick.to_string());
+            host.request_restore(&target_tick.to_string());
             host.step(&mut HeadlessDriver::new());
 
-            let next_tick = tick.saturating_add(1);
+            let next_tick = target_tick.saturating_add(1);
             host.set_tick(next_tick);
 
             let rewind_opts = SessionOptions::default();
@@ -430,8 +745,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     StopPolicy::ReplayExhausted { max_ticks: 4096 },
                 )?;
             } else {
-                let (api_key, model, project_instructions) =
-                    gemini_env_and_instructions(&cli.workspace)?;
+                let llm = resolve_llm_config(&cli, &cli.workspace)?;
                 let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new());
                 let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                     .with_mode(WorkspaceMode::Build)
@@ -440,13 +754,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_checkpoints(checkpoints)
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
-                let mut driver = RecordingBridge::new(
-                    host.vocab(),
-                    GeminiResponder::new(api_key, model)
-                        .with_project_instructions(project_instructions),
-                )
-                .starting_at(next_tick)
-                .wrapping(ws_bridge);
+                let mut driver = RecordingBridge::new(host.vocab(), build_sync_responder(&llm))
+                    .starting_at(next_tick)
+                    .wrapping(ws_bridge);
 
                 run_session(
                     &mut host,
@@ -458,7 +768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for id in host.agents() {
                 println!(
-                    "\n[openOnyx rewind@{tick}] agent={} state={:?} result:\n{}",
+                    "\n[openOnyx rewind@{target_tick}] agent={} state={:?} result:\n{}",
                     id.0,
                     host.agent_state(id),
                     host.result(id).unwrap_or_default()
@@ -475,6 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("doctor detected {} error(s)", report.errors.len()).into());
             }
         }
+        Mode::Help | Mode::Version => unreachable!(),
     }
 
     Ok(())
@@ -486,7 +797,10 @@ mod tests {
 
     use onyx_soul_agents::{AgentHost, AgentState, IngressEvent, OnyxEvent, Reply};
     use onyx_workspace::{graph_workspace_mode, latest_undoable_effect};
-    use session::{SURFACE_APPROVAL, SURFACE_PLAN, active_surfaces, all_live_waiting_approval};
+    use ops::render_inspect;
+    use session::{
+        SURFACE_APPROVAL, SURFACE_PLAN, active_surfaces, all_live_waiting_approval, build_host,
+    };
 
     use super::*;
 
@@ -864,5 +1178,332 @@ mod tests {
         assert!(!bad_report.errors.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_args_supports_record_snapshot_controls_inspect_flags_and_rejects_unknown_flags() {
+        let parsed = parse_args_from(
+            [
+                "chat",
+                "--record",
+                "session.tr",
+                "--snapshot-dir",
+                "snaps_out",
+                "--snapshot-every",
+                "10",
+                "--max-snapshots",
+                "5",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(parsed.save_transcript, Some(PathBuf::from("session.tr")));
+        assert_eq!(parsed.snapshot_dir, Some(PathBuf::from("snaps_out")));
+        assert_eq!(parsed.snapshot_every, Some(10));
+        assert_eq!(parsed.max_snapshots, Some(5));
+
+        let inspect_parsed = parse_args_from(
+            ["inspect", "snaps_out", "--list", "--json", "--tick", "4"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        match inspect_parsed.mode {
+            Mode::Inspect {
+                dir,
+                tick,
+                list,
+                json,
+            } => {
+                assert_eq!(dir, PathBuf::from("snaps_out"));
+                assert_eq!(tick, Some(4));
+                assert!(list);
+                assert!(json);
+            }
+            _ => panic!("expected Mode::Inspect"),
+        }
+
+        let err_zero = parse_args_from(
+            ["chat", "--max-snapshots", "0"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .err()
+        .expect("0 max-snapshots must be rejected");
+        assert!(err_zero.contains("--max-snapshots"), "{err_zero}");
+
+        let err_unknown =
+            parse_args_from(["chat", "--unknown-flag"].into_iter().map(str::to_string))
+                .err()
+                .expect("unknown flag must be rejected");
+        assert!(err_unknown.contains("--unknown-flag"), "{err_unknown}");
+    }
+
+    #[test]
+    fn milestone_pack_snapshots_support_non_contiguous_inspect_rewind_and_doctor() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-milestone-pack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git must run");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "core.autocrlf", "false"]);
+        fs::write(dir.join("note.txt"), "v1\n").unwrap();
+        run_git(&["add", "note.txt"]);
+        run_git(&["commit", "-m", "init"]);
+
+        let snap_dir = dir.join("snaps_pack");
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_transcript: None,
+            save_step_snapshots: true,
+            snapshot_every: None,
+            max_snapshots: None,
+        };
+        let checkpoints = PendingCheckpoints::default();
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_max_steps(16)
+            .with_mode_handle(mode_handle.clone());
+        let (mut host, ws_vocab) = build_host_with_options(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            &opts,
+            Some(Box::new(spawner)),
+            Some(checkpoints.clone()),
+        )
+        .unwrap();
+
+        let tools = WorkspaceTools::new(WorkspacePolicy::new(&dir).unwrap());
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .with_checkpoints(checkpoints)
+            .wrapping(HeadlessDriver::new());
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| match req.request {
+            1 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"note.txt","content":"v2\n"}"#,
+            )),
+            2 => Some(Reply::done(req.agent, req.request, "updated note")),
+            _ => None,
+        })
+        .wrapping(ws_bridge);
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "edit note".into(),
+        )));
+        // Tick 0 processes IngressEvent::Command -> emits ev_spawn; Tick 1 spawns agent.
+        host.step(&mut driver);
+        host.step(&mut driver);
+        run_session(
+            &mut host,
+            &mut driver,
+            &opts,
+            StopPolicy::Settled { max_ticks: 32 },
+        )
+        .unwrap();
+
+        // Commands on subsequent ticks trigger cmd milestones too.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/mode plan".into(),
+        )));
+        host.step(&mut driver);
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("/undo".into())));
+        host.step(&mut driver);
+
+        let pack_file = snap_dir.join(pack::PACK_FILE_NAME);
+        assert!(pack_file.exists(), "snapshots.onyxpack must be written");
+        let legacy_bins: Vec<_> = fs::read_dir(&snap_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".bin"))
+            .collect();
+        assert!(
+            legacy_bins.is_empty(),
+            "must not emit tick-*.bin files: {legacy_bins:?}"
+        );
+
+        let store = PackSnapshotStore::new(&snap_dir);
+        let ticks = store.ticks();
+        assert!(
+            ticks.len() < host.ticks() as usize,
+            "milestone snapshots ({:?}) should be strictly fewer than total ticks ({})",
+            ticks,
+            host.ticks()
+        );
+        assert!(
+            !ticks.contains(&2),
+            "non-milestone Acting tick 2 must not be stored: {ticks:?}"
+        );
+        let tags: Vec<String> = store.entries().into_iter().map(|m| m.tag).collect();
+        assert!(tags.iter().any(|t| t == "init"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "spawn"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "tool:fs_write"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "settled"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "cmd:/mode plan"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "cmd:/undo"), "tags={tags:?}");
+
+        // Verify non-contiguous rewind floor resolution.
+        let tool_meta = store
+            .entries()
+            .into_iter()
+            .find(|m| m.tag == "tool:fs_write")
+            .unwrap();
+        let floor = store.resolve_tick_or_floor(tool_meta.tick).unwrap();
+        assert_eq!(floor, tool_meta.tick);
+        assert_eq!(store.resolve_tick_or_floor(2), Some(1));
+        let missing_err = render_inspect(
+            &snap_dir,
+            Some(999_999),
+            false,
+            false,
+            AgentConfig::default(),
+        )
+        .expect_err("missing tick must fail with helpful error");
+        assert!(missing_err.to_string().contains("--list"), "{missing_err}");
+
+        // Verify `inspect --list --json`.
+        let list_json_str =
+            render_inspect(&snap_dir, None, true, true, AgentConfig::default()).unwrap();
+        let list_json: serde_json::Value = serde_json::from_str(&list_json_str).unwrap();
+        let list_arr = list_json.as_array().unwrap();
+        assert_eq!(list_arr.len(), ticks.len());
+        assert!(
+            list_arr.iter().any(|item| item["tag"] == "tool:fs_write"
+                && item["git_checkpoint"]["tree_sha"].is_string()),
+            "{list_json_str}"
+        );
+
+        // Verify `inspect --tick <tool_tick> --json`.
+        let snap_json_str = render_inspect(
+            &snap_dir,
+            Some(tool_meta.tick),
+            false,
+            true,
+            AgentConfig::default(),
+        )
+        .unwrap();
+        let snap_json: serde_json::Value = serde_json::from_str(&snap_json_str).unwrap();
+        assert_eq!(snap_json["tick"], tool_meta.tick);
+        assert_eq!(snap_json["tag"], "tool:fs_write");
+        assert!(!snap_json["agents"].as_array().unwrap().is_empty());
+        assert!(!snap_json["checkpoints"].as_array().unwrap().is_empty());
+        assert!(!snap_json["concepts"].as_array().unwrap().is_empty());
+
+        // Verify `doctor` validates the pack file cleanly with 0 errors.
+        let report = run_doctor(&dir, Some(&snap_dir), None);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_args_supports_provider_model_and_api_base() {
+        let parsed = parse_args_from(
+            [
+                "chat",
+                "--provider",
+                "openai",
+                "--model",
+                "qwen2.5-coder:14b",
+                "--api-base",
+                "http://localhost:11434/v1",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(parsed.provider, Some(LlmProvider::OpenAi));
+        assert_eq!(parsed.model.as_deref(), Some("qwen2.5-coder:14b"));
+        assert_eq!(
+            parsed.api_base.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+
+        let err = parse_args_from(
+            ["run", "hello", "--provider", "unknown"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .err()
+        .expect("unknown provider must fail");
+        assert!(err.contains("unsupported provider"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_supports_help_and_version_cleanly() {
+        for args in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["help"],
+            vec!["chat", "--help"],
+            vec!["inspect", "--help"],
+        ] {
+            let parsed = parse_args_from(args.into_iter().map(str::to_string)).unwrap();
+            assert!(matches!(parsed.mode, Mode::Help));
+        }
+
+        for args in [
+            vec!["--version"],
+            vec!["-V"],
+            vec!["version"],
+            vec!["chat", "-V"],
+        ] {
+            let parsed = parse_args_from(args.into_iter().map(str::to_string)).unwrap();
+            assert!(matches!(parsed.mode, Mode::Version));
+        }
+
+        let help = help_text();
+        for needle in [
+            "SUBCOMMANDS:",
+            "chat",
+            "run",
+            "replay",
+            "inspect",
+            "rewind",
+            "doctor",
+            "OPTIONS:",
+            "--provider",
+            "--model",
+            "--api-base",
+            "--snapshot-dir",
+            "--record",
+            "--resume",
+            "TUI CONTROLS & SLASH COMMANDS",
+            "/undo",
+            "/mode",
+            "/new",
+            "Tab",
+            "PgUp",
+            "PROJECT INSTRUCTIONS, SKILLS & LIVE PLAN:",
+            "SKILL.md",
+            "load_skill",
+            "Live Plan",
+            "ENVIRONMENT VARIABLES:",
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "ONYX_PROVIDER",
+            "OPENAI_API_BASE",
+        ] {
+            assert!(help.contains(needle), "help text missing `{needle}`");
+        }
     }
 }

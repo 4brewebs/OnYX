@@ -266,7 +266,7 @@ impl WorkspaceTools {
             },
             ToolSchema {
                 name: "plan_update",
-                description: "Publish or update a structured multi-step progress checklist (`[x]`, `[>]`, `[ ]`) rendered in the TUI without requiring approval.",
+                description: "Publish or update a structured multi-step progress checklist (`[x]`, `[>]`, `[ ]`) rendered in the TUI without requiring approval. Never call `plan_update` multiple times in a row without executing real workspace tools in between; for conceptual questions or answers that do not inspect or modify the workspace, omit `plan_update` or call it at most once.",
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {

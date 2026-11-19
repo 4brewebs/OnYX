@@ -1,12 +1,19 @@
 [package]
-license = "MIT OR Apache-2.0"
 name = "onyx-soul"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Zero-dependency reference soul implementing the OnYX core ports (in-memory EAV graph, priority bus, supervisor, and snapshot store)."
+readme = "README.md"
+keywords = ["deterministic", "eav", "runtime", "onyx"]
+categories = ["data-structures", "simulation"]
+exclude = ["snapshots/", "snaps*/", "*.tr", "*.onyxpack", "*.onyxpack.tmp"]
 
 [dependencies]
-onyx-core = { path = "../onyx-core" }
+onyx-core = { workspace = true }
 
 [dev-dependencies]
-onyx-core = { path = "../onyx-core", features = ["conformance"] }
+onyx-core = { workspace = true, features = ["conformance"] }

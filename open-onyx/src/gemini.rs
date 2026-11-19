@@ -15,6 +15,7 @@ use onyx_workspace::tools::{discover_skills_summary, scrub_secrets};
 use serde_json::{Value as JsonValue, json};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
+pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 96 * 1024;
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 
@@ -32,7 +33,53 @@ impl Default for ContextBudget {
 }
 
 type SignatureMap = Arc<Mutex<HashMap<(u64, usize), JsonValue>>>;
-type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
+pub(crate) type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamPreview {
+    pub agent: u64,
+    pub request: u64,
+    pub text: String,
+}
+
+#[derive(Clone, Default)]
+pub struct StreamPreviewHandle {
+    inner: Arc<Mutex<Option<StreamPreview>>>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl StreamPreviewHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, agent: u64, request: u64, text: impl Into<String>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(StreamPreview {
+                agent,
+                request,
+                text: text.into(),
+            });
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard.take().is_some() {
+                self.dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    pub fn get(&self) -> Option<StreamPreview> {
+        self.inner.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+}
 
 #[derive(Clone, Default)]
 struct GeminiSharedState {
@@ -94,12 +141,12 @@ pub fn load_project_instructions(workspace_root: &Path) -> String {
     combined
 }
 
-struct QueuedToolCall {
-    name: String,
-    args: String,
+pub(crate) struct QueuedToolCall {
+    pub name: String,
+    pub args: String,
 }
 
-fn next_queued_call(pending_calls: &PendingCallQueue, req: &AgentView) -> Option<Reply> {
+pub(crate) fn next_queued_call(pending_calls: &PendingCallQueue, req: &AgentView) -> Option<Reply> {
     let mut guard = pending_calls.lock().ok()?;
     if matches!(
         req.memory.last().map(|(k, _)| k.as_str()),
@@ -116,7 +163,7 @@ fn next_queued_call(pending_calls: &PendingCallQueue, req: &AgentView) -> Option
     Some(Reply::call_structured(req.agent, req.request, name, args))
 }
 
-fn push_queued_calls(
+pub(crate) fn push_queued_calls(
     pending_calls: &PendingCallQueue,
     agent: ConceptId,
     calls: impl IntoIterator<Item = QueuedToolCall>,
@@ -132,7 +179,7 @@ fn push_queued_calls(
     }
 }
 
-struct InFlightGuard(Arc<AtomicUsize>);
+pub(crate) struct InFlightGuard(pub Arc<AtomicUsize>);
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
@@ -155,7 +202,7 @@ fn extract_call_path(args_json: &str) -> Option<String> {
         .map(normalize_tool_path)
 }
 
-fn find_superseded_reads(memory: &[(String, String)]) -> HashMap<usize, String> {
+pub(crate) fn find_superseded_reads(memory: &[(String, String)]) -> HashMap<usize, String> {
     let mut read_observe_indices: HashMap<String, Vec<usize>> = HashMap::new();
     let mut superseded: HashMap<usize, String> = HashMap::new();
     let mut last_call: Option<(String, Option<String>)> = None;
@@ -205,6 +252,18 @@ fn build_request_body_with_budget(
     budget: ContextBudget,
 ) -> JsonValue {
     build_request_body_with_context(req, thought_signatures, budget, "")
+}
+
+const BASE_INSTRUCTION: &str = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step workspace tasks, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`), but never call `plan_update` multiple times in a row without executing real workspace tools in between; for purely conceptual questions or single-step answers that do not inspect or modify the workspace, omit `plan_update` (or call it at most once). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
+
+pub(crate) fn system_instruction_text(project_instructions: &str) -> String {
+    if project_instructions.trim().is_empty() {
+        BASE_INSTRUCTION.to_string()
+    } else {
+        format!(
+            "{BASE_INSTRUCTION}\n\n# Project Instructions (ONYX.md / AGENTS.md)\n{project_instructions}"
+        )
+    }
 }
 
 fn build_request_body_with_context(
@@ -421,14 +480,7 @@ fn build_request_body_with_context(
         })
         .collect();
 
-    let base_instruction = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step work, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
-    let system_text = if project_instructions.trim().is_empty() {
-        base_instruction.to_string()
-    } else {
-        format!(
-            "{base_instruction}\n\n# Project Instructions (ONYX.md / AGENTS.md)\n{project_instructions}"
-        )
-    };
+    let system_text = system_instruction_text(project_instructions);
 
     let mut body = json!({
         "systemInstruction": {
@@ -512,6 +564,113 @@ fn parse_gemini_response(
     }
 }
 
+fn post_gemini_json(
+    url: &str,
+    api_key: &str,
+    body: JsonValue,
+    agent: ConceptId,
+    request: u64,
+) -> Result<ureq::Response, Reply> {
+    match ureq::post(url)
+        .set("x-goog-api-key", api_key)
+        .send_json(body)
+    {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(code, r)) => {
+            let err_body = r.into_string().unwrap_or_default();
+            Err(Reply::fail(
+                agent,
+                request,
+                format!("gemini HTTP {code}: {err_body}"),
+            ))
+        }
+        Err(ureq::Error::Transport(t)) => Err(Reply::fail(
+            agent,
+            request,
+            format!(
+                "gemini transport error ({:?}): {}",
+                t.kind(),
+                t.message().unwrap_or("request failed")
+            ),
+        )),
+    }
+}
+
+pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
+    reader: R,
+    agent: ConceptId,
+    request: u64,
+    preview: Option<&StreamPreviewHandle>,
+) -> Result<JsonValue, String> {
+    let mut text_acc = String::new();
+    let mut call_parts: Vec<JsonValue> = Vec::new();
+    let mut last_finish_reason: Option<String> = None;
+    let mut saw_sse_data = false;
+    let mut raw_fallback = String::new();
+
+    for line_res in reader.lines() {
+        let line = line_res.map_err(|e| e.to_string())?;
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("data:") {
+            let data = rest.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let chunk: JsonValue = serde_json::from_str(data).map_err(|e| e.to_string())?;
+            saw_sse_data = true;
+            if let Some(candidate) = chunk.get("candidates").and_then(|c| c.get(0)) {
+                if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+                    last_finish_reason = Some(fr.to_string());
+                }
+                if let Some(parts) = candidate
+                    .get("content")
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|p| p.as_array())
+                {
+                    for part in parts {
+                        if let Some(fc) = part.get("functionCall") {
+                            call_parts.push(part.clone());
+                            if text_acc.is_empty() {
+                                if let Some(prev) = preview {
+                                    let name =
+                                        fc.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                                    prev.set(agent.0, request, format!("[calling `{name}`...]"));
+                                }
+                            }
+                        } else if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                            continue;
+                        } else if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                            text_acc.push_str(t);
+                            if let Some(prev) = preview {
+                                prev.set(agent.0, request, &text_acc);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !saw_sse_data {
+            raw_fallback.push_str(&line);
+            raw_fallback.push('\n');
+        }
+    }
+
+    if saw_sse_data {
+        let mut parts = Vec::new();
+        if !text_acc.is_empty() {
+            parts.push(json!({ "text": text_acc }));
+        }
+        parts.extend(call_parts);
+        Ok(json!({
+            "candidates": [{
+                "content": { "parts": parts },
+                "finishReason": last_finish_reason.unwrap_or_else(|| "STOP".to_string())
+            }]
+        }))
+    } else {
+        serde_json::from_str(&raw_fallback).map_err(|e| e.to_string())
+    }
+}
+
 fn execute_gemini_http(
     url: &str,
     api_key: &str,
@@ -521,26 +680,9 @@ fn execute_gemini_http(
     call_index: usize,
     shared: &GeminiSharedState,
 ) -> Reply {
-    let resp = match ureq::post(url)
-        .set("x-goog-api-key", api_key)
-        .send_json(body)
-    {
+    let resp = match post_gemini_json(url, api_key, body, agent, request) {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, r)) => {
-            let err_body = r.into_string().unwrap_or_default();
-            return Reply::fail(agent, request, format!("gemini HTTP {code}: {err_body}"));
-        }
-        Err(ureq::Error::Transport(t)) => {
-            return Reply::fail(
-                agent,
-                request,
-                format!(
-                    "gemini transport error ({:?}): {}",
-                    t.kind(),
-                    t.message().unwrap_or("request failed")
-                ),
-            );
-        }
+        Err(reply) => return reply,
     };
     let json: JsonValue = match resp.into_json() {
         Ok(v) => v,
@@ -552,10 +694,64 @@ fn execute_gemini_http(
     parse_gemini_response(&json, agent, request, call_index, shared)
 }
 
+struct GeminiStreamTarget<'a> {
+    url: &'a str,
+    api_key: &'a str,
+    agent: ConceptId,
+    request: u64,
+    call_index: usize,
+    shared: &'a GeminiSharedState,
+    preview: Option<&'a StreamPreviewHandle>,
+}
+
+fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: JsonValue) -> Reply {
+    let resp = match post_gemini_json(
+        target.url,
+        target.api_key,
+        body,
+        target.agent,
+        target.request,
+    ) {
+        Ok(r) => r,
+        Err(reply) => {
+            if let Some(prev) = target.preview {
+                prev.clear();
+            }
+            return reply;
+        }
+    };
+    let reader = std::io::BufReader::new(resp.into_reader());
+    let json =
+        match accumulate_gemini_sse_reader(reader, target.agent, target.request, target.preview) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(prev) = target.preview {
+                    prev.clear();
+                }
+                return Reply::fail(
+                    target.agent,
+                    target.request,
+                    format!("gemini stream error: {e}"),
+                );
+            }
+        };
+    if let Some(prev) = target.preview {
+        prev.clear();
+    }
+    parse_gemini_response(
+        &json,
+        target.agent,
+        target.request,
+        target.call_index,
+        target.shared,
+    )
+}
+
 /// Adaptador síncrono para Google AI Studio (Gemini `generateContent` REST API).
 pub struct GeminiResponder {
     api_key: String,
     model: String,
+    api_base: String,
     shared: GeminiSharedState,
 }
 
@@ -564,8 +760,19 @@ impl GeminiResponder {
         Self {
             api_key: api_key.into(),
             model: model.into(),
+            api_base: DEFAULT_GEMINI_API_BASE.to_string(),
             shared: GeminiSharedState::default(),
         }
+    }
+
+    pub fn with_api_base(mut self, api_base: Option<String>) -> Self {
+        if let Some(base) = api_base {
+            let trimmed = base.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                self.api_base = trimmed.to_string();
+            }
+        }
+        self
     }
 
     pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
@@ -579,10 +786,7 @@ impl Responder for GeminiResponder {
         if let Some(queued_reply) = next_queued_call(&self.shared.pending_calls, req) {
             return Some(queued_reply);
         }
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-            self.model
-        );
+        let url = format!("{}/models/{}:generateContent", self.api_base, self.model);
         let body = {
             let sigs = self
                 .shared
@@ -612,17 +816,19 @@ impl Responder for GeminiResponder {
 
 /// Driver asíncrono no bloqueante para la TUI de `Mode::Chat`.
 ///
-/// Despacha peticiones HTTP en `present()` y entrega los `Reply` recibidos en `poll()`,
-/// de modo que `RecordingBridge` pueda grabarlos vía `RecordingBus` sin violar el
-/// contrato de disparo único de `Responder::respond`.
+/// Despacha peticiones SSE en `present()` actualizando `StreamPreviewHandle` y entrega
+/// el `Reply` consolidado en `poll()`, de modo que `RecordingBridge` lo grabe vía
+/// `RecordingBus` sin violar el determinismo ni ensuciar el grafo con deltas parciales.
 pub struct AsyncGeminiDriver {
     vocab: Vocab,
     api_key: String,
     model: String,
+    api_base: String,
     shared: GeminiSharedState,
     dispatched: HashSet<(u64, u64)>,
     in_flight_count: Arc<AtomicUsize>,
     has_ready: Arc<AtomicBool>,
+    stream_preview: Option<StreamPreviewHandle>,
     rx: mpsc::Receiver<Reply>,
     tx: mpsc::Sender<Reply>,
     inner: Option<Box<dyn PlatformDriver>>,
@@ -641,10 +847,12 @@ impl AsyncGeminiDriver {
             vocab,
             api_key: api_key.into(),
             model: model.into(),
+            api_base: DEFAULT_GEMINI_API_BASE.to_string(),
             shared: GeminiSharedState::default(),
             dispatched: HashSet::new(),
             in_flight_count,
             has_ready,
+            stream_preview: None,
             rx,
             tx,
             inner: None,
@@ -656,11 +864,27 @@ impl AsyncGeminiDriver {
         self
     }
 
+    pub fn with_api_base(mut self, api_base: Option<String>) -> Self {
+        if let Some(base) = api_base {
+            let trimmed = base.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                self.api_base = trimmed.to_string();
+            }
+        }
+        self
+    }
+
     pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.shared.project_instructions = Arc::new(instructions.into());
         self
     }
 
+    pub fn with_stream_preview(mut self, preview: StreamPreviewHandle) -> Self {
+        self.stream_preview = Some(preview);
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_with<F>(&mut self, req: &AgentView, spawn_fn: F)
     where
         F: FnOnce(
@@ -691,8 +915,8 @@ impl AsyncGeminiDriver {
         self.in_flight_count.fetch_add(1, Ordering::Release);
         let guard = InFlightGuard(Arc::clone(&self.in_flight_count));
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-            self.model
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.api_base, self.model
         );
         let body = {
             let sigs = self
@@ -732,6 +956,9 @@ impl PlatformDriver for AsyncGeminiDriver {
         }
         self.has_ready.store(false, Ordering::Release);
         while let Ok(reply) = self.rx.try_recv() {
+            if let Some(prev) = &self.stream_preview {
+                prev.clear();
+            }
             bus.push(reply.to_event());
         }
     }
@@ -740,14 +967,25 @@ impl PlatformDriver for AsyncGeminiDriver {
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
+        let preview = self.stream_preview.clone();
         for req in pending_requests(graph, &self.vocab) {
+            let thread_preview = preview.clone();
             self.dispatch_with(
                 &req,
                 |url, api_key, body, agent, request, call_index, shared, guard, ready_flag, tx| {
                     thread::spawn(move || {
                         let _guard = guard;
-                        let reply = execute_gemini_http(
-                            &url, &api_key, body, agent, request, call_index, &shared,
+                        let reply = execute_gemini_stream_http(
+                            GeminiStreamTarget {
+                                url: &url,
+                                api_key: &api_key,
+                                agent,
+                                request,
+                                call_index,
+                                shared: &shared,
+                                preview: thread_preview.as_ref(),
+                            },
+                            body,
                         );
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
@@ -1062,5 +1300,57 @@ mod tests {
         assert!(serialized.contains("git_status"), "{serialized}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gemini_sse_reader_accumulates_text_deltas_and_tool_calls_updating_preview() {
+        let preview = StreamPreviewHandle::new();
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"hidden\"},{\"text\":\"Hola \"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OnYX!\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "data: [DONE]\n"
+        );
+        let shared = GeminiSharedState::default();
+        let json = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(sse.as_bytes()),
+            ConceptId(3),
+            9,
+            Some(&preview),
+        )
+        .unwrap();
+        let snap = preview.get().expect("preview should hold accumulated text");
+        assert_eq!(snap.agent, 3);
+        assert_eq!(snap.request, 9);
+        assert_eq!(snap.text, "Hola OnYX!");
+        assert!(preview.take_dirty());
+        assert!(!preview.take_dirty());
+
+        let reply = parse_gemini_response(&json, ConceptId(3), 9, 0, &shared);
+        assert_eq!(reply, Reply::done(ConceptId(3), 9, "Hola OnYX!"));
+
+        // Tool call chunks over SSE also accumulate cleanly.
+        let tool_sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"fs_read\",\"args\":{\"path\":\"Cargo.toml\"}},\"thoughtSignature\":\"sig-sse\"}]}}]}\n\n",
+            "data: [DONE]\n"
+        );
+        preview.clear();
+        let tool_json = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(tool_sse.as_bytes()),
+            ConceptId(3),
+            10,
+            Some(&preview),
+        )
+        .unwrap();
+        assert_eq!(preview.get().unwrap().text, "[calling `fs_read`...]");
+        let tool_reply = parse_gemini_response(&tool_json, ConceptId(3), 10, 0, &shared);
+        assert!(
+            matches!(tool_reply.verb, onyx_soul_agents::Verb::Call),
+            "{tool_reply:?}"
+        );
+        assert!(tool_reply.payload.contains("fs_read"), "{tool_reply:?}");
+        assert_eq!(
+            shared.thought_signatures.lock().unwrap().get(&(3, 0)),
+            Some(&json!("sig-sse"))
+        );
     }
 }

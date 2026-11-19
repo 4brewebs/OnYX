@@ -46,6 +46,13 @@ fn workspace_tools_write_read_edit_search_and_list() {
     let dir = TempDir::new("crud");
     fs::create_dir_all(dir.0.join(".git")).unwrap();
     fs::write(dir.0.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::create_dir_all(dir.0.join("snaps_demo")).unwrap();
+    fs::write(dir.0.join("snaps_demo/tick-0.bin"), b"ONYXAG").unwrap();
+    fs::create_dir_all(dir.0.join("snapshots")).unwrap();
+    fs::write(dir.0.join("snapshots/snapshots.onyxpack"), b"ONYXPK1").unwrap();
+    fs::create_dir_all(dir.0.join("target/debug")).unwrap();
+    fs::write(dir.0.join("target/debug/out.o"), b"").unwrap();
+    fs::write(dir.0.join("session.tr"), b"ONYXTR2").unwrap();
 
     let policy = WorkspacePolicy::new(&dir.0).unwrap();
     let tools = WorkspaceTools::new(policy);
@@ -82,6 +89,10 @@ fn workspace_tools_write_read_edit_search_and_list() {
     let l = tools.execute("fs_list", r#"{}"#).unwrap();
     assert!(l.contains("src/lib.rs"));
     assert!(!l.contains(".git"));
+    assert!(!l.contains("snaps_demo"));
+    assert!(!l.contains("snapshots.onyxpack"));
+    assert!(!l.contains("target"));
+    assert!(!l.contains("session.tr"));
 }
 
 #[test]

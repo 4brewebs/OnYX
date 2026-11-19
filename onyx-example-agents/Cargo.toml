@@ -1,14 +1,17 @@
 [package]
 name = "onyx-example-agents"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Multi-agent application built on onyx-soul-agents."
-license = "MIT OR Apache-2.0"
+publish = false
 
 [[bin]]
 name = "onyx-example-agents"
 path = "src/main.rs"
 
 [dependencies]
-onyx-soul-agents = { path = "../onyx-soul-agents" }
+onyx-soul-agents = { workspace = true }

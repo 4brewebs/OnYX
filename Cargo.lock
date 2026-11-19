@@ -657,6 +657,7 @@ name = "open-onyx"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "flate2",
  "onyx-soul-agents",
  "onyx-workspace",
  "ratatui",
