@@ -86,7 +86,7 @@ cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
 
 ## Milestone Snapshots & `snapshots.onyxpack`
 
-When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapshots only at meaningful graph transitions (tagged as `init`, `spawn`, `approval:<tool>`, `tool:<tool>`, `tool_error:<tool>`, `cmd:/undo`, `cmd:/mode ...`, `cmd:/new`, `settled`, `failed`, `exit`, plus optional `--snapshot-every <n>` `periodic` frames) instead of dumping full uncompressed `tick-*.bin` files on idle or internal micro-ticks.
+When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapshots only at meaningful graph transitions (tagged as `init`, `spawn`, `approval:<tool>`, `tool:<tool>`, `tool_error:<tool>`, `cmd:/undo`, `cmd:/compact`, `cmd:/mode ...`, `cmd:/new`, `settled`, `failed`, `exit`, plus optional `--snapshot-every <n>` `periodic` frames) instead of dumping full uncompressed `tick-*.bin` files on idle or internal micro-ticks.
 
 `PackSnapshotStore` writes canonical `ONYXAG\x01\0` graph payloads into an append-only compressed container `<dir>/snapshots.onyxpack` (`ONYXPK1` frames with zlib compression, raw/stored lengths, and 64-bit FNV-1a checksums). Interrupted writes that leave a truncated tail frame are ignored safely on read and healed automatically on the next append, legacy `tick-*.bin` directories remain readable via transparent fallback, and `--max-snapshots <n>` is available as an opt-in retention bound (disabled by default so full session history stays rewindable).
 
@@ -98,8 +98,10 @@ When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapsh
 - **`y` / `n`**: approve or deny pending mutating tools (`fs_write`, `fs_edit`, `shell_exec`) when `AgentState::WaitingApproval` is active. For `fs_write` / multi-hunk `fs_edit`, the approval box expands and renders a colored unified diff preview (`preview_tool_diff`).
 - **Live Plan side panel**: when `plan_update` has recorded steps in `ws.plan.text` and terminal width `>= 100` columns, `TuiDriver` splits the main area (`70%` Memory & Trace / `30%` Live Plan) displaying `[x]`, `[>]`, and `[ ]` items live.
 - **`/undo`**: marks the latest reversible `fs_write`/`fs_edit` checkpoint (`ws.effect.undone`) inside `CommandSpawnerSystem`; `WorkspaceToolBridge::present` restores the Git tree checkpoint on disk (`restore_git_tree_checkpoint` + `clear_seen_reads()`), while `ReplayBridge` reproduces the graph state without touching disk.
+- **`/compact [focus]`**: deterministically compacts prior turns into a verified `[session_summary]` boundary (`cmd:/compact` milestone in `snapshots.onyxpack`), dropping active prompt fill immediately while keeping pre-compact ticks recoverable via `rewind`.
 - **`/mode [plan|build|explore]`**: switch workspace mode explicitly via command.
 - **`/new` or `/new <goal>`**: instruct the next prompt to spawn a new root agent (or immediately spawn one with `<goal>`).
+- **Live telemetry bar**: renders context fill percentage, cumulative input/cached/output/reasoning tokens, and estimated USD cost (`ctx: 34% · in: 18.4k (cache 12.1k) · out: 1.9k · ~$0.024`) on the header border without mutating deterministic graph ticks.
 - **`Esc` or `Ctrl+C`**: save the latest snapshot (when stepped) and transcript, then exit the TUI cleanly.
 
 ## Architecture
@@ -107,7 +109,8 @@ When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapsh
 `open-onyx` keeps external concurrency, HTTP, terminal I/O, and disk mutation strictly inside `PlatformDriver` adapters, while graph state transitions live in deterministic `OnyxSystem`s:
 
 - [`src/main.rs`](src/main.rs): CLI parsing (`CliArgs`, `Mode`, `parse_args_from`), driver stack composition, system registration (`SubagentSystem`, `WorkspaceLedgerSystem`, `CommandSpawnerSystem`, `MilestoneSnapshotSystem`), and delegation to `run_session` / `ops`.
-- [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `/new`, `/mode`, `/undo` (`mark_latest_effect_undone`), `on_restore` mode sync, and multi-turn `continue_agent`.
+- [`src/context.rs`](src/context.rs): shared `TieredContextConfig` / `ToolOutputTier` projection (Tier 0 full recent outputs, deterministic coordinate-preserving Tier 1 summaries for older outputs, Tier 2 `/compact` and auto-compaction boundaries, prompt-cache-stable prefixes) plus `TokenUsage` / `SessionTelemetryHandle` extraction for Gemini and OpenAI.
+- [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `SlashCommand` (`/new`, `/mode`, `/undo`, `/compact`), `on_restore` mode sync, and multi-turn `continue_agent`.
 - [`src/pack.rs`](src/pack.rs): `PackSnapshotStore` (`SnapshotStore` implementation over append-only zlib-compressed `snapshots.onyxpack` with FNV-1a verification, truncated-tail crash tolerance, opt-in `--max-snapshots` compaction, and legacy `tick-*.bin` fallback) and `MilestoneSnapshotSystem` (deterministic `OnyxSystem` requesting snapshots on meaningful transitions and `--snapshot-every`).
 - [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`, `SURFACE_PLAN` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `build_host` / `build_host_with_options`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
 - [`src/ops.rs`](src/ops.rs): offline snapshot & ledger utilities (`render_inspect` / `run_inspect` with `--list` and `--json`, `reconcile_rewind_effects`, `run_doctor`).

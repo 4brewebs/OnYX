@@ -1,4 +1,5 @@
 mod command;
+mod context;
 mod gemini;
 mod openai;
 mod ops;
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use command::CommandSpawnerSystem;
+use context::{SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
     AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
     load_project_instructions,
@@ -377,6 +379,7 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
   /undo                    Revert the latest reversible git checkpoint created during the session
+  /compact [focus]         Compact older turns into a verified session summary (creating a `cmd:/compact` milestone)
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
@@ -475,18 +478,32 @@ fn resolve_llm_config(
     }
 }
 
-fn build_sync_responder(llm: &LlmConfig) -> Box<dyn Responder> {
+fn build_sync_responder(
+    llm: &LlmConfig,
+    telemetry: Option<SessionTelemetryHandle>,
+) -> Box<dyn Responder> {
+    let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     match llm.provider {
-        LlmProvider::Gemini => Box::new(
-            GeminiResponder::new(llm.api_key.clone(), llm.model.clone())
+        LlmProvider::Gemini => {
+            let mut r = GeminiResponder::new(llm.api_key.clone(), llm.model.clone())
                 .with_api_base(llm.api_base.clone())
-                .with_project_instructions(llm.project_instructions.clone()),
-        ),
-        LlmProvider::OpenAi => Box::new(
-            OpenAiResponder::new(llm.api_key.clone(), llm.model.clone())
+                .with_project_instructions(llm.project_instructions.clone())
+                .with_context_config(ctx_cfg);
+            if let Some(tel) = telemetry {
+                r = r.with_telemetry(tel);
+            }
+            Box::new(r)
+        }
+        LlmProvider::OpenAi => {
+            let mut r = OpenAiResponder::new(llm.api_key.clone(), llm.model.clone())
                 .with_api_base(llm.api_base.clone())
-                .with_project_instructions(llm.project_instructions.clone()),
-        ),
+                .with_project_instructions(llm.project_instructions.clone())
+                .with_context_config(ctx_cfg);
+            if let Some(tel) = telemetry {
+                r = r.with_telemetry(tel);
+            }
+            Box::new(r)
+        }
     }
 }
 
@@ -547,8 +564,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(cli_driver);
-            let mut driver =
-                RecordingBridge::new(host.vocab(), build_sync_responder(&llm)).wrapping(ws_bridge);
+            let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
+            let mut driver = RecordingBridge::new(
+                host.vocab(),
+                build_sync_responder(&llm, Some(telemetry.clone())),
+            )
+            .wrapping(ws_bridge);
 
             run_session(
                 &mut host,
@@ -563,6 +584,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host.agent_state(id),
                     host.result(id).unwrap_or_default()
                 );
+            }
+            let snap = telemetry.snapshot();
+            if snap.cumulative.input_tokens > 0 || snap.cumulative.output_tokens > 0 {
+                println!("[openOnyx telemetry] {}", snap.format_status_bar());
             }
         }
         Mode::Chat => {
@@ -594,11 +619,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let llm = resolve_llm_config(&cli, &cli.workspace)?;
             let stream_preview = StreamPreviewHandle::new();
+            let ctx_cfg = TieredContextConfig::for_model(&llm.model);
+            let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
 
             let tui = TuiDriver::new(host.vocab())?
                 .with_workspace(cli.workspace.clone(), mode_handle.clone())
                 .with_workspace_vocab(ws_vocab)
-                .with_stream_preview(stream_preview.clone());
+                .with_stream_preview(stream_preview.clone())
+                .with_telemetry(telemetry.clone())
+                .with_context_config(ctx_cfg);
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
@@ -623,6 +652,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_api_base(llm.api_base)
                     .with_project_instructions(llm.project_instructions)
                     .with_stream_preview(stream_preview)
+                    .with_telemetry(telemetry)
+                    .with_context_config(ctx_cfg)
                     .wrapping(ws_bridge),
                 ),
                 LlmProvider::OpenAi => rec_bridge.wrapping(
@@ -636,6 +667,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_api_base(llm.api_base)
                     .with_project_instructions(llm.project_instructions)
                     .with_stream_preview(stream_preview)
+                    .with_telemetry(telemetry)
+                    .with_context_config(ctx_cfg)
                     .wrapping(ws_bridge),
                 ),
             };
@@ -754,9 +787,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_checkpoints(checkpoints)
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
-                let mut driver = RecordingBridge::new(host.vocab(), build_sync_responder(&llm))
-                    .starting_at(next_tick)
-                    .wrapping(ws_bridge);
+                let mut driver =
+                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None))
+                        .starting_at(next_tick)
+                        .wrapping(ws_bridge);
 
                 run_session(
                     &mut host,
@@ -1489,6 +1523,7 @@ mod tests {
             "--resume",
             "TUI CONTROLS & SLASH COMMANDS",
             "/undo",
+            "/compact",
             "/mode",
             "/new",
             "Tab",
@@ -1505,5 +1540,199 @@ mod tests {
         ] {
             assert!(help.contains(needle), "help text missing `{needle}`");
         }
+    }
+
+    #[test]
+    fn compact_command_creates_milestone_reduces_context_fill_and_replays_cleanly() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-compact-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let big_body = "let line = 1234567890;\n".repeat(1200);
+        fs::write(dir.join("big.txt"), &big_body).unwrap();
+
+        let snap_dir = dir.join("snaps_compact");
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_transcript: None,
+            save_step_snapshots: true,
+            snapshot_every: None,
+            max_snapshots: None,
+        };
+        let checkpoints = PendingCheckpoints::default();
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_max_steps(16)
+            .with_mode_handle(mode_handle.clone());
+        let (mut host, ws_vocab) = build_host_with_options(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            &opts,
+            Some(Box::new(spawner)),
+            Some(checkpoints.clone()),
+        )
+        .unwrap();
+
+        let tools = WorkspaceTools::new(WorkspacePolicy::new(&dir).unwrap());
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .with_checkpoints(checkpoints)
+            .wrapping(HeadlessDriver::new());
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| match req.request {
+            1 => Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_read",
+                r#"{"path":"big.txt"}"#,
+            )),
+            2 => Some(Reply::done(req.agent, req.request, "analyzed big.txt")),
+            3 => Some(Reply::done(
+                req.agent,
+                req.request,
+                "continued after compact",
+            )),
+            _ => None,
+        })
+        .wrapping(ws_bridge);
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "analyze big.txt".into(),
+        )));
+        host.step(&mut driver);
+        host.step(&mut driver);
+        run_session(
+            &mut host,
+            &mut driver,
+            &opts,
+            StopPolicy::Settled { max_ticks: 32 },
+        )
+        .unwrap();
+
+        let a1 = host.agents()[0];
+        let view_before = host.view(a1);
+        let ctx_cfg = TieredContextConfig {
+            model_context_tokens: 10_000,
+            ..TieredContextConfig::default()
+        };
+        let proj_before = context::project_memory(&view_before.goal, &view_before.memory, &ctx_cfg);
+        let telemetry = SessionTelemetryHandle::new("gpt-4o", false);
+        let mut tel_before = context::SessionTelemetry::new("gpt-4o", false);
+        tel_before.model_context_tokens = ctx_cfg.model_context_tokens;
+        tel_before.update_estimated_context_bytes(proj_before.total_bytes);
+        telemetry.sync_estimated_context_bytes(proj_before.total_bytes);
+
+        // Execute `/compact keep auth details`
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/compact keep auth details".into(),
+        )));
+        host.step(&mut driver);
+
+        let view_after = host.view(a1);
+        let proj_after = context::project_memory(&view_after.goal, &view_after.memory, &ctx_cfg);
+        assert_eq!(
+            proj_after.highest_tier,
+            context::ToolOutputTier::Tier2Compacted
+        );
+        assert!(
+            proj_after.total_bytes < proj_before.total_bytes / 4,
+            "expected sharp drop: before={} after={}",
+            proj_before.total_bytes,
+            proj_after.total_bytes
+        );
+
+        let mut tel_after = tel_before.clone();
+        tel_after.update_estimated_context_bytes(proj_after.total_bytes);
+        assert!(
+            tel_after.context_fill_pct < tel_before.context_fill_pct,
+            "context_fill_pct must drop after /compact: before={} after={}",
+            tel_before.context_fill_pct,
+            tel_after.context_fill_pct
+        );
+
+        let first_turn = match &proj_after.turns[0] {
+            context::ProjectedTurn::User(s) => s.as_str(),
+            other => panic!("expected User session_summary turn, got {other:?}"),
+        };
+        assert!(first_turn.contains("[session_summary]"), "{first_turn}");
+        assert!(
+            first_turn.contains("focus: keep auth details"),
+            "{first_turn}"
+        );
+        assert!(first_turn.contains("big.txt"), "{first_turn}");
+
+        // Milestone `cmd:/compact` exists in `snapshots.onyxpack`, with pre-compact ticks preserved.
+        let store = PackSnapshotStore::new(&snap_dir);
+        let tags: Vec<String> = store.entries().into_iter().map(|m| m.tag).collect();
+        assert!(tags.iter().any(|t| t == "cmd:/compact"), "tags={tags:?}");
+        assert!(tags.iter().any(|t| t == "tool:fs_read"), "tags={tags:?}");
+
+        // Continue with a follow-up turn after compaction and verify ONYXTR2 replay compatibility (TEST-01.4).
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "next step".into(),
+        )));
+        run_session(
+            &mut host,
+            &mut driver,
+            &opts,
+            StopPolicy::Settled { max_ticks: 32 },
+        )
+        .unwrap();
+        assert_eq!(host.result(a1).as_deref(), Some("continued after compact"));
+
+        let mut replay_tr = driver.transcript().clone();
+        replay_tr.commands = vec![
+            onyx_soul_agents::LoggedCommand {
+                poll: 0,
+                command: "analyze big.txt".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 5,
+                command: "/compact keep auth details".to_string(),
+            },
+            onyx_soul_agents::LoggedCommand {
+                poll: 6,
+                command: "next step".to_string(),
+            },
+        ];
+        let tr_bytes = replay_tr.to_bytes();
+        let decoded = Transcript::from_bytes(&tr_bytes).unwrap();
+        let (mut replay_host, _) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(CommandSpawnerSystem::new(true).with_max_steps(16))),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(decoded).wrapping(HeadlessDriver::new());
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 64 },
+        )
+        .unwrap();
+        let ra1 = replay_host.agents()[0];
+        assert_eq!(
+            replay_host.result(ra1).as_deref(),
+            Some("continued after compact")
+        );
+        assert!(
+            replay_host
+                .view(ra1)
+                .memory
+                .iter()
+                .any(|(k, t)| k == "system" && t.starts_with(context::COMPACT_MARKER))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

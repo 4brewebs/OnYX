@@ -2,6 +2,14 @@
 
 All notable changes to the **OnYX** workspace crates (`onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-scent`, `onyx-workspace`, and `open-onyx`) are documented in this file.
 
+## [Unreleased]
+
+### Added (`open-onyx` — SDD-01: Tiered Context, Prompt Caching & Live Telemetry)
+
+- **Shared tiered context engine (`open-onyx/src/context.rs`)**: unified `TieredContextConfig` and `ToolOutputTier` (`Tier0Full`, `Tier1Summary`, `Tier2Compacted`) reused by both Gemini and OpenAI backends. Keeps the last 10 tool observations in full (Tier 0), deterministically summarizes older tool outputs preserving coordinates (`fs_read`, `scent_outline`, `scent_impact`, `code_search`, `shell_exec`, Tier 1) with cache-stable prefixes, and supports automatic Tier 2 compaction (`auto_compact_ratio`, default `80%`).
+- **`/compact [focus]` & `cmd:/compact` milestone**: deterministic conversation compaction in `CommandSpawnerSystem` (`SlashCommand::Compact`), automatic `cmd:/compact` milestone tagging in `MilestoneSnapshotSystem` (`snapshots.onyxpack`), and 100% backward compatibility with `ONYXTR2` transcripts and `ReplayBridge`.
+- **Real-time token & cost telemetry**: extracts exact provider counters from Gemini (`usageMetadata` REST + SSE) and OpenAI (`stream_options: { include_usage: true }` + `usage` + `prompt_tokens_details.cached_tokens`), displaying `ctx: XX% · in / cache / out · ~$cost` on the TUI header border (and `[openOnyx telemetry]` in headless `run`) without polluting the deterministic EAV graph.
+
 ## [0.1.0] - 2026-11-19
 
 Initial public release of the deterministic OnYX agent microkernel, reference souls, AST distiller, sandboxed workspace tools, and the `openonyx` CLI/TUI harness.

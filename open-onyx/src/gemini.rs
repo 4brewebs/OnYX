@@ -14,23 +14,14 @@ use onyx_workspace::WorkspaceTools;
 use onyx_workspace::tools::{discover_skills_summary, scrub_secrets};
 use serde_json::{Value as JsonValue, json};
 
+use crate::context::{
+    ContextBudget, ProjectedTurn, SessionTelemetryHandle, TieredContextConfig,
+    extract_gemini_usage, project_memory,
+};
+
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 96 * 1024;
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 16 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextBudget {
-    pub max_memory_bytes: usize,
-}
-
-impl Default for ContextBudget {
-    fn default() -> Self {
-        Self {
-            max_memory_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
-        }
-    }
-}
 
 type SignatureMap = Arc<Mutex<HashMap<(u64, usize), JsonValue>>>;
 pub(crate) type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
@@ -86,6 +77,8 @@ struct GeminiSharedState {
     thought_signatures: SignatureMap,
     pending_calls: PendingCallQueue,
     project_instructions: Arc<String>,
+    telemetry: Option<SessionTelemetryHandle>,
+    context_config: TieredContextConfig,
 }
 
 /// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
@@ -187,57 +180,6 @@ impl Drop for InFlightGuard {
     }
 }
 
-fn normalize_tool_path(raw: &str) -> String {
-    raw.trim()
-        .trim_start_matches("./")
-        .trim_start_matches(".\\")
-        .replace('\\', "/")
-}
-
-fn extract_call_path(args_json: &str) -> Option<String> {
-    let parsed: JsonValue = serde_json::from_str(args_json).ok()?;
-    parsed
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(normalize_tool_path)
-}
-
-pub(crate) fn find_superseded_reads(memory: &[(String, String)]) -> HashMap<usize, String> {
-    let mut read_observe_indices: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut superseded: HashMap<usize, String> = HashMap::new();
-    let mut last_call: Option<(String, Option<String>)> = None;
-
-    for (idx, (kind, text)) in memory.iter().enumerate() {
-        match kind.as_str() {
-            "call" => {
-                let (tool, args) = match text.split_once(' ') {
-                    Some((t, a)) => (t, a),
-                    None => (text.as_str(), "{}"),
-                };
-                last_call = Some((tool.to_string(), extract_call_path(args)));
-            }
-            "observe" => {
-                if let Some((tool, Some(path))) = last_call.take() {
-                    if tool == "fs_read" {
-                        read_observe_indices.entry(path).or_default().push(idx);
-                    } else if matches!(tool.as_str(), "fs_write" | "fs_edit") {
-                        if let Some(indices) = read_observe_indices.remove(&path) {
-                            for old_idx in indices {
-                                superseded.insert(old_idx, path.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            "tool_error" | "denied" => {
-                last_call = None;
-            }
-            _ => {}
-        }
-    }
-    superseded
-}
-
 #[allow(dead_code)]
 fn build_request_body(
     req: &AgentView,
@@ -251,7 +193,7 @@ fn build_request_body_with_budget(
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: ContextBudget,
 ) -> JsonValue {
-    build_request_body_with_context(req, thought_signatures, budget, "")
+    build_request_body_with_context(req, thought_signatures, budget.into(), "")
 }
 
 const BASE_INSTRUCTION: &str = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step workspace tasks, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`), but never call `plan_update` multiple times in a row without executing real workspace tools in between; for purely conceptual questions or single-step answers that do not inspect or modify the workspace, omit `plan_update` (or call it at most once). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
@@ -269,205 +211,73 @@ pub(crate) fn system_instruction_text(project_instructions: &str) -> String {
 fn build_request_body_with_context(
     req: &AgentView,
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
-    budget: ContextBudget,
+    budget: TieredContextConfig,
     project_instructions: &str,
 ) -> JsonValue {
-    struct ProjectedEntry {
-        msg: JsonValue,
-        tool_name: String,
-        bytes: usize,
-        is_observe: bool,
-        is_toon: bool,
-        is_superseded: bool,
-    }
-
-    let superseded = find_superseded_reads(&req.memory);
-    let mut entries: Vec<ProjectedEntry> = Vec::with_capacity(req.memory.len() + 1);
-    let goal_text = format!("Goal: {}", req.goal);
-    entries.push(ProjectedEntry {
-        bytes: goal_text.len(),
-        msg: json!({
-            "role": "user",
-            "parts": [{ "text": goal_text }]
-        }),
-        tool_name: String::new(),
-        is_observe: false,
-        is_toon: false,
-        is_superseded: false,
-    });
-
-    let mut last_tool: Option<String> = None;
-    let mut call_index = 0usize;
-    for (mem_idx, (kind, text)) in req.memory.iter().enumerate() {
-        match kind.as_str() {
-            "user" | "system" => entries.push(ProjectedEntry {
-                bytes: text.len(),
-                msg: json!({
-                    "role": "user",
-                    "parts": [{ "text": text }]
-                }),
-                tool_name: String::new(),
-                is_observe: false,
-                is_toon: false,
-                is_superseded: false,
-            }),
-            "say" => entries.push(ProjectedEntry {
-                bytes: text.len(),
-                msg: json!({
-                    "role": "model",
-                    "parts": [{ "text": text }]
-                }),
-                tool_name: String::new(),
-                is_observe: false,
-                is_toon: false,
-                is_superseded: false,
-            }),
-            "call" => {
-                let (tool, args) = match text.split_once(' ') {
-                    Some((t, a)) => (t, a),
-                    None => (text.as_str(), "{}"),
-                };
-                last_tool = Some(tool.to_string());
-                let parsed_args: JsonValue =
-                    serde_json::from_str(args).unwrap_or_else(|_| json!({ "raw": args }));
+    let projected = project_memory(&req.goal, &req.memory, &budget);
+    let mut contents: Vec<JsonValue> = Vec::with_capacity(projected.turns.len());
+    for turn in projected.turns {
+        match turn {
+            ProjectedTurn::User(text) => contents.push(json!({
+                "role": "user",
+                "parts": [{ "text": text }]
+            })),
+            ProjectedTurn::AssistantText(text) => contents.push(json!({
+                "role": "model",
+                "parts": [{ "text": text }]
+            })),
+            ProjectedTurn::ToolCall {
+                call_index,
+                name,
+                args_json,
+                ..
+            } => {
+                let parsed_args: JsonValue = serde_json::from_str(&args_json)
+                    .unwrap_or_else(|_| json!({ "raw": args_json }));
                 let mut part = json!({
-                    "functionCall": { "name": tool, "args": parsed_args }
+                    "functionCall": { "name": name, "args": parsed_args }
                 });
                 if let Some(sig) = thought_signatures.get(&(req.agent.0, call_index)) {
                     part["thoughtSignature"] = sig.clone();
                 }
-                call_index += 1;
-                entries.push(ProjectedEntry {
-                    bytes: tool.len() + args.len(),
-                    msg: json!({
-                        "role": "model",
-                        "parts": [part]
-                    }),
-                    tool_name: tool.to_string(),
-                    is_observe: false,
-                    is_toon: false,
-                    is_superseded: false,
-                });
+                contents.push(json!({
+                    "role": "model",
+                    "parts": [part]
+                }));
             }
-            "observe" => {
-                let name = last_tool.take().unwrap_or_else(|| "tool".to_string());
-                if let Some(sup_path) = superseded.get(&mem_idx) {
-                    let marker = format!(
-                        "[superseded: prior fs_read of `{sup_path}` was invalidated by a subsequent edit]"
-                    );
-                    entries.push(ProjectedEntry {
-                        bytes: marker.len(),
-                        msg: json!({
-                            "role": "user",
-                            "parts": [{
-                                "functionResponse": {
-                                    "name": name,
-                                    "response": { "result": marker }
-                                }
-                            }]
-                        }),
-                        tool_name: name,
-                        is_observe: true,
-                        is_toon: false,
-                        is_superseded: true,
-                    });
-                } else {
-                    let is_toon = text.trim_start().starts_with("@TOON v1");
-                    entries.push(ProjectedEntry {
-                        bytes: text.len(),
-                        msg: json!({
-                            "role": "user",
-                            "parts": [{
-                                "functionResponse": {
-                                    "name": name,
-                                    "response": { "result": text }
-                                }
-                            }]
-                        }),
-                        tool_name: name,
-                        is_observe: true,
-                        is_toon,
-                        is_superseded: false,
-                    });
-                }
-            }
-            "tool_error" => {
-                let name = last_tool.take().unwrap_or_else(|| "tool".to_string());
-                entries.push(ProjectedEntry {
-                    bytes: text.len(),
-                    msg: json!({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": name,
-                                "response": { "error": text }
-                            }
-                        }]
-                    }),
-                    tool_name: name,
-                    is_observe: false,
-                    is_toon: false,
-                    is_superseded: false,
-                });
-            }
-            "denied" => {
-                let name = last_tool.take().unwrap_or_else(|| "tool".to_string());
-                let msg_text = format!("Tool call denied: {text}. Adjust your plan.");
-                entries.push(ProjectedEntry {
-                    bytes: msg_text.len(),
-                    msg: json!({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": name,
-                                "response": { "error": msg_text }
-                            }
-                        }]
-                    }),
-                    tool_name: name,
-                    is_observe: false,
-                    is_toon: false,
-                    is_superseded: false,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    let mut total_bytes: usize = entries.iter().map(|e| e.bytes).sum();
-    let keep_tail_from = entries.len().saturating_sub(4);
-    if total_bytes > budget.max_memory_bytes {
-        // Pase 1 del presupuesto: compactar observaciones no-TOON antiguas antes de tocar TOON.
-        for pass_toon in [false, true] {
-            for entry in entries.iter_mut().take(keep_tail_from) {
-                if total_bytes <= budget.max_memory_bytes {
-                    break;
-                }
-                if !entry.is_observe || entry.is_superseded || entry.is_toon != pass_toon {
-                    continue;
-                }
-                let marker = format!(
-                    "[trimmed by ContextBudget: prior `{}` output ({} bytes) omitted]",
-                    entry.tool_name, entry.bytes
-                );
-                if marker.len() < entry.bytes {
-                    total_bytes = total_bytes - entry.bytes + marker.len();
-                    entry.bytes = marker.len();
-                    entry.msg = json!({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": entry.tool_name,
-                                "response": { "result": marker }
-                            }
-                        }]
-                    });
-                }
+            ProjectedTurn::ToolObserve { name, content, .. } => contents.push(json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": name,
+                        "response": { "result": content }
+                    }
+                }]
+            })),
+            ProjectedTurn::ToolError { name, error, .. } => contents.push(json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": name,
+                        "response": { "error": error }
+                    }
+                }]
+            })),
+            ProjectedTurn::ToolDenied { name, reason, .. } => {
+                let msg_text = format!("Tool call denied: {reason}. Adjust your plan.");
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": name,
+                            "response": { "error": msg_text }
+                        }
+                    }]
+                }));
             }
         }
     }
 
-    let contents: Vec<JsonValue> = entries.into_iter().map(|e| e.msg).collect();
     let declarations: Vec<JsonValue> = WorkspaceTools::schemas_with_subagents(true)
         .into_iter()
         .filter(|s| req.tools.iter().any(|t| t == s.name))
@@ -504,6 +314,11 @@ fn parse_gemini_response(
     call_index: usize,
     shared: &GeminiSharedState,
 ) -> Reply {
+    if let Some(usage) = extract_gemini_usage(json) {
+        if let Some(telemetry) = &shared.telemetry {
+            telemetry.record_turn(usage);
+        }
+    }
     let parts = json["candidates"][0]["content"]["parts"]
         .as_array()
         .cloned()
@@ -605,6 +420,7 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
     let mut text_acc = String::new();
     let mut call_parts: Vec<JsonValue> = Vec::new();
     let mut last_finish_reason: Option<String> = None;
+    let mut last_usage: Option<JsonValue> = None;
     let mut saw_sse_data = false;
     let mut raw_fallback = String::new();
 
@@ -618,6 +434,11 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
             }
             let chunk: JsonValue = serde_json::from_str(data).map_err(|e| e.to_string())?;
             saw_sse_data = true;
+            if let Some(usage) = chunk.get("usageMetadata") {
+                if !usage.is_null() {
+                    last_usage = Some(usage.clone());
+                }
+            }
             if let Some(candidate) = chunk.get("candidates").and_then(|c| c.get(0)) {
                 if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str()) {
                     last_finish_reason = Some(fr.to_string());
@@ -660,12 +481,16 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
             parts.push(json!({ "text": text_acc }));
         }
         parts.extend(call_parts);
-        Ok(json!({
+        let mut out = json!({
             "candidates": [{
                 "content": { "parts": parts },
                 "finishReason": last_finish_reason.unwrap_or_else(|| "STOP".to_string())
             }]
-        }))
+        });
+        if let Some(usage) = last_usage {
+            out["usageMetadata"] = usage;
+        }
+        Ok(out)
     } else {
         serde_json::from_str(&raw_fallback).map_err(|e| e.to_string())
     }
@@ -779,6 +604,16 @@ impl GeminiResponder {
         self.shared.project_instructions = Arc::new(instructions.into());
         self
     }
+
+    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
+        self.shared.telemetry = Some(telemetry);
+        self
+    }
+
+    pub fn with_context_config(mut self, cfg: TieredContextConfig) -> Self {
+        self.shared.context_config = cfg;
+        self
+    }
 }
 
 impl Responder for GeminiResponder {
@@ -797,7 +632,7 @@ impl Responder for GeminiResponder {
             build_request_body_with_context(
                 req,
                 &sigs,
-                ContextBudget::default(),
+                self.shared.context_config,
                 &self.shared.project_instructions,
             )
         };
@@ -884,6 +719,16 @@ impl AsyncGeminiDriver {
         self
     }
 
+    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
+        self.shared.telemetry = Some(telemetry);
+        self
+    }
+
+    pub fn with_context_config(mut self, cfg: TieredContextConfig) -> Self {
+        self.shared.context_config = cfg;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_with<F>(&mut self, req: &AgentView, spawn_fn: F)
     where
@@ -928,7 +773,7 @@ impl AsyncGeminiDriver {
             build_request_body_with_context(
                 req,
                 &sigs,
-                ContextBudget::default(),
+                self.shared.context_config,
                 &self.shared.project_instructions,
             )
         };
@@ -1243,7 +1088,7 @@ mod tests {
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(!serialized.contains(&"X".repeat(200)), "{serialized}");
         assert!(
-            serialized.contains("trimmed by ContextBudget"),
+            serialized.contains("[summary fs_read huge.rs"),
             "{serialized}"
         );
         assert!(serialized.contains("@TOON v1"), "{serialized}");
@@ -1286,7 +1131,7 @@ mod tests {
         let body = build_request_body_with_context(
             &req,
             &HashMap::new(),
-            ContextBudget::default(),
+            TieredContextConfig::default(),
             &loaded,
         );
         let serialized = serde_json::to_string(&body).unwrap();
@@ -1305,12 +1150,16 @@ mod tests {
     #[test]
     fn gemini_sse_reader_accumulates_text_deltas_and_tool_calls_updating_preview() {
         let preview = StreamPreviewHandle::new();
+        let telemetry = SessionTelemetryHandle::new("gemini-4-hydrogen", false);
         let sse = concat!(
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"hidden\"},{\"text\":\"Hola \"}]}}]}\n\n",
-            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OnYX!\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OnYX!\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":12000,\"cachedContentTokenCount\":8000,\"candidatesTokenCount\":350,\"thoughtsTokenCount\":120}}\n\n",
             "data: [DONE]\n"
         );
-        let shared = GeminiSharedState::default();
+        let shared = GeminiSharedState {
+            telemetry: Some(telemetry.clone()),
+            ..GeminiSharedState::default()
+        };
         let json = accumulate_gemini_sse_reader(
             std::io::BufReader::new(sse.as_bytes()),
             ConceptId(3),
@@ -1327,6 +1176,12 @@ mod tests {
 
         let reply = parse_gemini_response(&json, ConceptId(3), 9, 0, &shared);
         assert_eq!(reply, Reply::done(ConceptId(3), 9, "Hola OnYX!"));
+        let tel_snap = telemetry.snapshot();
+        assert_eq!(tel_snap.last_turn.input_tokens, 12_000);
+        assert_eq!(tel_snap.last_turn.cached_input_tokens, 8_000);
+        assert_eq!(tel_snap.last_turn.output_tokens, 350);
+        assert_eq!(tel_snap.last_turn.reasoning_tokens, 120);
+        assert!(tel_snap.format_status_bar().contains("cache 8.0k"));
 
         // Tool call chunks over SSE also accumulate cleanly.
         let tool_sse = concat!(

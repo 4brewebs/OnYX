@@ -1,14 +1,103 @@
 //! Sistema determinista que procesa `IngressEvent::Command` en sesiones interactivas:
-//! `/new`, `/mode`, `/undo` (como intención pura sobre el grafo) y continuación multi-turno.
+//! `/new`, `/mode`, `/undo`, `/compact` (como intención pura sobre el grafo) y continuación multi-turno.
 
 use onyx_soul_agents::{
     AgentSpec, AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError, OnyxEvent,
-    OnyxSystem, SystemEvent, Vocab, append_agent_memory, continue_agent, spawn_event,
+    OnyxSystem, SystemEvent, Value, Vocab, append_agent_memory, continue_agent, spawn_event,
 };
 use onyx_workspace::{
     WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
-    mark_latest_effect_undone, set_workspace_mode,
+    graph_workspace_plan, mark_latest_effect_undone, set_workspace_mode,
 };
+
+use crate::context::{COMPACT_MARKER, build_compaction_summary};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    New(Option<String>),
+    Mode(Option<String>),
+    Undo,
+    Compact(Option<String>),
+}
+
+pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
+    let cmd = raw.trim();
+    if cmd == "/new" {
+        return Some(SlashCommand::New(None));
+    }
+    if let Some(goal) = cmd.strip_prefix("/new ") {
+        let trimmed = goal.trim();
+        return Some(SlashCommand::New(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if cmd == "/mode" {
+        return Some(SlashCommand::Mode(None));
+    }
+    if let Some(arg) = cmd.strip_prefix("/mode ") {
+        let trimmed = arg.trim();
+        return Some(SlashCommand::Mode(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if cmd == "/undo" {
+        return Some(SlashCommand::Undo);
+    }
+    if cmd == "/compact" {
+        return Some(SlashCommand::Compact(None));
+    }
+    if let Some(focus) = cmd.strip_prefix("/compact ") {
+        let trimmed = focus.trim();
+        return Some(SlashCommand::Compact(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    None
+}
+
+fn read_agent_memory_ordered<G: GraphView + ?Sized>(
+    graph: &G,
+    v: &Vocab,
+    agent: ConceptId,
+) -> (String, Vec<(String, String)>) {
+    let goal = match graph.get(agent, v.goal) {
+        Some(Value::Text(s)) => s,
+        _ => String::new(),
+    };
+    let mut rows: Vec<(i64, String, String)> = graph
+        .related(agent, v.rel_memory)
+        .into_iter()
+        .filter_map(|mem_id| {
+            let seq = match graph.get(mem_id, v.mem_seq) {
+                Some(Value::Int(n)) => n,
+                _ => 0,
+            };
+            let kind = match graph.get(mem_id, v.mem_kind)? {
+                Value::Text(k) => k,
+                _ => return None,
+            };
+            let text = match graph.get(mem_id, v.mem_text) {
+                Some(Value::Text(t)) => t,
+                _ => String::new(),
+            };
+            Some((seq, kind, text))
+        })
+        .collect();
+    rows.sort_by_key(|(seq, _, _)| *seq);
+    let mut memory: Vec<(String, String)> = rows.into_iter().map(|(_, k, t)| (k, t)).collect();
+    if let Some(Value::Text(res)) = graph.get(agent, v.result) {
+        if !res.is_empty() {
+            memory.push(("say".to_string(), res));
+        }
+    }
+    (goal, memory)
+}
 
 pub struct CommandSpawnerSystem {
     vocab: Option<Vocab>,
@@ -110,91 +199,106 @@ impl OnyxSystem for CommandSpawnerSystem {
                 continue;
             }
 
-            if cmd == "/new" {
-                self.force_new_agent = true;
-                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                    append_agent_memory(
-                        ctx.graph,
-                        &v,
-                        root_id,
-                        "system",
-                        "[/new] Next prompt will start a fresh agent.",
-                        now,
-                    );
-                }
-                continue;
-            }
-
-            if let Some(goal) = cmd
-                .strip_prefix("/new ")
-                .map(str::trim)
-                .filter(|g| !g.is_empty())
-            {
-                self.force_new_agent = false;
-                let spec = self.spawn_spec(&*ctx.graph, &v, goal.to_string());
-                ctx.outbox.push(spawn_event(&v, &spec, None));
-                continue;
-            }
-
-            if cmd == "/mode" || cmd.starts_with("/mode ") {
-                let arg = cmd.strip_prefix("/mode").unwrap_or("").trim();
-                let next_mode = if arg.is_empty() {
-                    match self.mode_handle.get() {
-                        WorkspaceMode::Build => WorkspaceMode::Plan,
-                        WorkspaceMode::Plan | WorkspaceMode::Explore => WorkspaceMode::Build,
+            if let Some(slash) = parse_slash_command(cmd) {
+                match slash {
+                    SlashCommand::New(None) => {
+                        self.force_new_agent = true;
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(
+                                ctx.graph,
+                                &v,
+                                root_id,
+                                "system",
+                                "[/new] Next prompt will start a fresh agent.",
+                                now,
+                            );
+                        }
                     }
-                } else if let Some(parsed) = WorkspaceMode::parse(arg) {
-                    parsed
-                } else {
-                    if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                        append_agent_memory(
-                            ctx.graph,
-                            &v,
-                            root_id,
-                            "system",
-                            &format!(
-                                "[/mode] Unknown workspace mode `{arg}` (use `plan` or `build`)."
-                            ),
-                            now,
-                        );
+                    SlashCommand::New(Some(goal)) => {
+                        self.force_new_agent = false;
+                        let spec = self.spawn_spec(&*ctx.graph, &v, goal);
+                        ctx.outbox.push(spawn_event(&v, &spec, None));
                     }
-                    continue;
-                };
+                    SlashCommand::Mode(arg_opt) => {
+                        let next_mode = match arg_opt.as_deref() {
+                            None => match self.mode_handle.get() {
+                                WorkspaceMode::Build => WorkspaceMode::Plan,
+                                WorkspaceMode::Plan | WorkspaceMode::Explore => {
+                                    WorkspaceMode::Build
+                                }
+                            },
+                            Some(arg) => match WorkspaceMode::parse(arg) {
+                                Some(parsed) => parsed,
+                                None => {
+                                    if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                        append_agent_memory(
+                                            ctx.graph,
+                                            &v,
+                                            root_id,
+                                            "system",
+                                            &format!(
+                                                "[/mode] Unknown workspace mode `{arg}` (use `plan` or `build`)."
+                                            ),
+                                            now,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            },
+                        };
 
-                self.mode_handle.set(next_mode);
-                if let Some(wv) = self.ws_vocab {
-                    set_workspace_mode(ctx.graph, &wv, next_mode);
-                }
-                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                    append_agent_memory(
-                        ctx.graph,
-                        &v,
-                        root_id,
-                        "system",
-                        &format!(
-                            "[/mode] Switched workspace mode to {}",
-                            next_mode.as_label()
-                        ),
-                        now,
-                    );
-                }
-                continue;
-            }
-
-            if cmd == "/undo" {
-                let Some(wv) = self.ws_vocab else { continue };
-                let note = match mark_latest_effect_undone(ctx.graph, &wv) {
-                    Some(eff) => {
-                        let tree_sha = eff.tree_sha.unwrap_or_default();
-                        format!(
-                            "[/undo] Restored git checkpoint {tree_sha} (reverted {} on `{}` from tick {})",
-                            eff.tool, eff.target, eff.tick
-                        )
+                        self.mode_handle.set(next_mode);
+                        if let Some(wv) = self.ws_vocab {
+                            set_workspace_mode(ctx.graph, &wv, next_mode);
+                        }
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(
+                                ctx.graph,
+                                &v,
+                                root_id,
+                                "system",
+                                &format!(
+                                    "[/mode] Switched workspace mode to {}",
+                                    next_mode.as_label()
+                                ),
+                                now,
+                            );
+                        }
                     }
-                    None => "[/undo] No reversible git checkpoint available.".to_string(),
-                };
-                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                    append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                    SlashCommand::Undo => {
+                        let Some(wv) = self.ws_vocab else { continue };
+                        let note = match mark_latest_effect_undone(ctx.graph, &wv) {
+                            Some(eff) => {
+                                let tree_sha = eff.tree_sha.unwrap_or_default();
+                                format!(
+                                    "[/undo] Restored git checkpoint {tree_sha} (reverted {} on `{}` from tick {})",
+                                    eff.tool, eff.target, eff.tick
+                                )
+                            }
+                            None => "[/undo] No reversible git checkpoint available.".to_string(),
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::Compact(focus) => {
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            let (goal, memory) =
+                                read_agent_memory_ordered(&*ctx.graph, &v, root_id);
+                            let active_plan = self
+                                .ws_vocab
+                                .as_ref()
+                                .and_then(|wv| graph_workspace_plan(&*ctx.graph, wv));
+                            let summary = build_compaction_summary(
+                                &goal,
+                                &memory,
+                                active_plan.as_deref(),
+                                focus.as_deref(),
+                            );
+                            let entry = format!("{COMPACT_MARKER}{summary}");
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &entry, now);
+                        }
+                    }
                 }
                 continue;
             }

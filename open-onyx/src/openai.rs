@@ -17,9 +17,13 @@ use onyx_soul_agents::{
 use onyx_workspace::WorkspaceTools;
 use serde_json::{Value as JsonValue, json};
 
+use crate::context::{
+    ProjectedTurn, SessionTelemetryHandle, TieredContextConfig, extract_openai_usage,
+    project_memory,
+};
 use crate::gemini::{
-    ContextBudget, InFlightGuard, PendingCallQueue, QueuedToolCall, StreamPreviewHandle,
-    find_superseded_reads, next_queued_call, push_queued_calls, system_instruction_text,
+    InFlightGuard, PendingCallQueue, QueuedToolCall, StreamPreviewHandle, next_queued_call,
+    push_queued_calls, system_instruction_text,
 };
 
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
@@ -29,6 +33,8 @@ pub const DEFAULT_OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 struct OpenAiSharedState {
     pending_calls: PendingCallQueue,
     project_instructions: Arc<String>,
+    telemetry: Option<SessionTelemetryHandle>,
+    context_config: TieredContextConfig,
 }
 
 fn tool_call_args_as_string(raw: &JsonValue) -> String {
@@ -48,221 +54,106 @@ fn tool_call_args_as_string(raw: &JsonValue) -> String {
 pub(crate) fn build_openai_request_body(
     req: &AgentView,
     model: &str,
-    budget: ContextBudget,
+    budget: TieredContextConfig,
     project_instructions: &str,
     stream: bool,
 ) -> JsonValue {
-    struct ProjectedEntry {
-        msg: JsonValue,
-        tool_name: String,
-        tool_call_id: String,
-        bytes: usize,
-        is_observe: bool,
-        is_toon: bool,
-        is_superseded: bool,
-    }
-
-    let superseded = find_superseded_reads(&req.memory);
-    let mut entries: Vec<ProjectedEntry> = Vec::with_capacity(req.memory.len() + 1);
-    let goal_text = format!("Goal: {}", req.goal);
-    entries.push(ProjectedEntry {
-        bytes: goal_text.len(),
-        msg: json!({
-            "role": "user",
-            "content": goal_text
-        }),
-        tool_name: String::new(),
-        tool_call_id: String::new(),
-        is_observe: false,
-        is_toon: false,
-        is_superseded: false,
-    });
-
-    let mut last_tool: Option<(String, String)> = None;
-    let mut call_index = 0usize;
-    for (mem_idx, (kind, text)) in req.memory.iter().enumerate() {
-        match kind.as_str() {
-            "user" | "system" => entries.push(ProjectedEntry {
-                bytes: text.len(),
-                msg: json!({
-                    "role": "user",
-                    "content": text
-                }),
-                tool_name: String::new(),
-                tool_call_id: String::new(),
-                is_observe: false,
-                is_toon: false,
-                is_superseded: false,
-            }),
-            "say" => entries.push(ProjectedEntry {
-                bytes: text.len(),
-                msg: json!({
-                    "role": "assistant",
-                    "content": text
-                }),
-                tool_name: String::new(),
-                tool_call_id: String::new(),
-                is_observe: false,
-                is_toon: false,
-                is_superseded: false,
-            }),
-            "call" => {
-                let (tool, args) = match text.split_once(' ') {
-                    Some((t, a)) => (t, a),
-                    None => (text.as_str(), "{}"),
-                };
-                let args_norm = if args.trim().is_empty() { "{}" } else { args };
-                let call_id = format!("call_{call_index}");
-                call_index += 1;
-                last_tool = Some((tool.to_string(), call_id.clone()));
-                entries.push(ProjectedEntry {
-                    bytes: tool.len() + args_norm.len(),
-                    msg: json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tool,
-                                "arguments": args_norm
-                            }
-                        }]
-                    }),
-                    tool_name: tool.to_string(),
-                    tool_call_id: String::new(),
-                    is_observe: false,
-                    is_toon: false,
-                    is_superseded: false,
-                });
-            }
-            "observe" => {
-                if let Some((name, call_id)) = last_tool.take() {
-                    if let Some(sup_path) = superseded.get(&mem_idx) {
-                        let marker = format!(
-                            "[superseded: prior fs_read of `{sup_path}` was invalidated by a subsequent edit]"
-                        );
-                        entries.push(ProjectedEntry {
-                            bytes: marker.len(),
-                            msg: json!({
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "name": name,
-                                "content": marker
-                            }),
-                            tool_name: name,
-                            tool_call_id: call_id,
-                            is_observe: true,
-                            is_toon: false,
-                            is_superseded: true,
-                        });
-                    } else {
-                        let is_toon = text.trim_start().starts_with("@TOON v1");
-                        entries.push(ProjectedEntry {
-                            bytes: text.len(),
-                            msg: json!({
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "name": name,
-                                "content": text
-                            }),
-                            tool_name: name,
-                            tool_call_id: call_id,
-                            is_observe: true,
-                            is_toon,
-                            is_superseded: false,
-                        });
-                    }
-                } else {
-                    entries.push(ProjectedEntry {
-                        bytes: text.len(),
-                        msg: json!({
-                            "role": "user",
-                            "content": text
-                        }),
-                        tool_name: String::new(),
-                        tool_call_id: String::new(),
-                        is_observe: false,
-                        is_toon: false,
-                        is_superseded: false,
-                    });
-                }
-            }
-            "tool_error" | "denied" => {
-                let msg_text = if kind == "denied" {
-                    format!("Tool call denied: {text}. Adjust your plan.")
-                } else {
-                    format!("Tool error: {text}")
-                };
-                if let Some((name, call_id)) = last_tool.take() {
-                    entries.push(ProjectedEntry {
-                        bytes: msg_text.len(),
-                        msg: json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "name": name,
-                            "content": msg_text
-                        }),
-                        tool_name: name,
-                        tool_call_id: call_id,
-                        is_observe: false,
-                        is_toon: false,
-                        is_superseded: false,
-                    });
-                } else {
-                    entries.push(ProjectedEntry {
-                        bytes: msg_text.len(),
-                        msg: json!({
-                            "role": "user",
-                            "content": msg_text
-                        }),
-                        tool_name: String::new(),
-                        tool_call_id: String::new(),
-                        is_observe: false,
-                        is_toon: false,
-                        is_superseded: false,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut total_bytes: usize = entries.iter().map(|e| e.bytes).sum();
-    let keep_tail_from = entries.len().saturating_sub(4);
-    if total_bytes > budget.max_memory_bytes {
-        for pass_toon in [false, true] {
-            for entry in entries.iter_mut().take(keep_tail_from) {
-                if total_bytes <= budget.max_memory_bytes {
-                    break;
-                }
-                if !entry.is_observe || entry.is_superseded || entry.is_toon != pass_toon {
-                    continue;
-                }
-                let marker = format!(
-                    "[trimmed by ContextBudget: prior `{}` output ({} bytes) omitted]",
-                    entry.tool_name, entry.bytes
-                );
-                if marker.len() < entry.bytes {
-                    total_bytes = total_bytes - entry.bytes + marker.len();
-                    entry.bytes = marker.len();
-                    entry.msg = json!({
-                        "role": "tool",
-                        "tool_call_id": entry.tool_call_id,
-                        "name": entry.tool_name,
-                        "content": marker
-                    });
-                }
-            }
-        }
-    }
-
-    let mut messages = Vec::with_capacity(entries.len() + 1);
+    let projected = project_memory(&req.goal, &req.memory, &budget);
+    let mut messages = Vec::with_capacity(projected.turns.len() + 1);
     messages.push(json!({
         "role": "system",
         "content": system_instruction_text(project_instructions)
     }));
-    messages.extend(entries.into_iter().map(|e| e.msg));
+
+    for turn in projected.turns {
+        match turn {
+            ProjectedTurn::User(text) => messages.push(json!({
+                "role": "user",
+                "content": text
+            })),
+            ProjectedTurn::AssistantText(text) => messages.push(json!({
+                "role": "assistant",
+                "content": text
+            })),
+            ProjectedTurn::ToolCall {
+                call_id,
+                name,
+                args_json,
+                ..
+            } => messages.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args_json
+                    }
+                }]
+            })),
+            ProjectedTurn::ToolObserve {
+                call_id,
+                name,
+                content,
+                ..
+            } => {
+                if let Some(cid) = call_id {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "name": name,
+                        "content": content
+                    }));
+                } else {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": content
+                    }));
+                }
+            }
+            ProjectedTurn::ToolError {
+                call_id,
+                name,
+                error,
+            } => {
+                let msg_text = format!("Tool error: {error}");
+                if let Some(cid) = call_id {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "name": name,
+                        "content": msg_text
+                    }));
+                } else {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": msg_text
+                    }));
+                }
+            }
+            ProjectedTurn::ToolDenied {
+                call_id,
+                name,
+                reason,
+            } => {
+                let msg_text = format!("Tool call denied: {reason}. Adjust your plan.");
+                if let Some(cid) = call_id {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "name": name,
+                        "content": msg_text
+                    }));
+                } else {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": msg_text
+                    }));
+                }
+            }
+        }
+    }
 
     let tools: Vec<JsonValue> = WorkspaceTools::schemas_with_subagents(true)
         .into_iter()
@@ -286,6 +177,9 @@ pub(crate) fn build_openai_request_body(
         "messages": messages,
         "stream": stream
     });
+    if stream {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if !tools.is_empty() {
         body["tools"] = JsonValue::Array(tools);
     }
@@ -316,7 +210,13 @@ pub(crate) fn parse_openai_response(
     agent: ConceptId,
     request: u64,
     pending_calls: &PendingCallQueue,
+    telemetry: Option<&SessionTelemetryHandle>,
 ) -> Reply {
+    if let Some(usage) = extract_openai_usage(json) {
+        if let Some(tel) = telemetry {
+            tel.record_turn(usage);
+        }
+    }
     let message = &json["choices"][0]["message"];
     if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
         if !tool_calls.is_empty() {
@@ -364,6 +264,7 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
     let mut text_acc = String::new();
     let mut tool_calls_map: BTreeMap<usize, (String, String)> = BTreeMap::new();
     let mut last_finish_reason: Option<String> = None;
+    let mut last_usage: Option<JsonValue> = None;
     let mut saw_sse_data = false;
     let mut raw_fallback = String::new();
 
@@ -377,6 +278,11 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
             }
             let chunk: JsonValue = serde_json::from_str(data).map_err(|e| e.to_string())?;
             saw_sse_data = true;
+            if let Some(usage) = chunk.get("usage") {
+                if !usage.is_null() {
+                    last_usage = Some(usage.clone());
+                }
+            }
             if let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) {
                 if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                     last_finish_reason = Some(fr.to_string());
@@ -446,12 +352,16 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
                 .collect();
             msg["tool_calls"] = JsonValue::Array(tool_calls);
         }
-        Ok(json!({
+        let mut out = json!({
             "choices": [{
                 "message": msg,
                 "finish_reason": last_finish_reason.unwrap_or_else(|| "stop".to_string())
             }]
-        }))
+        });
+        if let Some(usage) = last_usage {
+            out["usage"] = usage;
+        }
+        Ok(out)
     } else {
         serde_json::from_str(&raw_fallback).map_err(|e| e.to_string())
     }
@@ -496,7 +406,7 @@ fn execute_openai_http(
     body: JsonValue,
     agent: ConceptId,
     request: u64,
-    pending_calls: &PendingCallQueue,
+    shared: &OpenAiSharedState,
 ) -> Reply {
     let resp = match post_openai_json(url, api_key, body, agent, request) {
         Ok(r) => r,
@@ -506,41 +416,65 @@ fn execute_openai_http(
         Ok(v) => v,
         Err(e) => return Reply::fail(agent, request, format!("openai json error: {e}")),
     };
-    parse_openai_response(&json, agent, request, pending_calls)
+    parse_openai_response(
+        &json,
+        agent,
+        request,
+        &shared.pending_calls,
+        shared.telemetry.as_ref(),
+    )
 }
 
-fn execute_openai_stream_http(
-    url: &str,
-    api_key: &str,
-    body: JsonValue,
+struct OpenAiStreamTarget<'a> {
+    url: &'a str,
+    api_key: &'a str,
     agent: ConceptId,
     request: u64,
-    pending_calls: &PendingCallQueue,
-    preview: Option<&StreamPreviewHandle>,
-) -> Reply {
-    let resp = match post_openai_json(url, api_key, body, agent, request) {
+    shared: &'a OpenAiSharedState,
+    preview: Option<&'a StreamPreviewHandle>,
+}
+
+fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -> Reply {
+    let resp = match post_openai_json(
+        target.url,
+        target.api_key,
+        body,
+        target.agent,
+        target.request,
+    ) {
         Ok(r) => r,
         Err(reply) => {
-            if let Some(prev) = preview {
+            if let Some(prev) = target.preview {
                 prev.clear();
             }
             return reply;
         }
     };
     let reader = BufReader::new(resp.into_reader());
-    let json = match accumulate_openai_sse_reader(reader, agent, request, preview) {
-        Ok(v) => v,
-        Err(e) => {
-            if let Some(prev) = preview {
-                prev.clear();
+    let json =
+        match accumulate_openai_sse_reader(reader, target.agent, target.request, target.preview) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(prev) = target.preview {
+                    prev.clear();
+                }
+                return Reply::fail(
+                    target.agent,
+                    target.request,
+                    format!("openai stream error: {e}"),
+                );
             }
-            return Reply::fail(agent, request, format!("openai stream error: {e}"));
-        }
-    };
-    if let Some(prev) = preview {
+        };
+    if let Some(prev) = target.preview {
         prev.clear();
     }
-    parse_openai_response(&json, agent, request, pending_calls)
+    parse_openai_response(
+        &json,
+        target.agent,
+        target.request,
+        &target.shared.pending_calls,
+        target.shared.telemetry.as_ref(),
+    )
 }
 
 /// Adaptador síncrono para endpoints compatibles con OpenAI `/v1/chat/completions`.
@@ -575,6 +509,16 @@ impl OpenAiResponder {
         self.shared.project_instructions = Arc::new(instructions.into());
         self
     }
+
+    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
+        self.shared.telemetry = Some(telemetry);
+        self
+    }
+
+    pub fn with_context_config(mut self, cfg: TieredContextConfig) -> Self {
+        self.shared.context_config = cfg;
+        self
+    }
 }
 
 impl Responder for OpenAiResponder {
@@ -586,7 +530,7 @@ impl Responder for OpenAiResponder {
         let body = build_openai_request_body(
             req,
             &self.model,
-            ContextBudget::default(),
+            self.shared.context_config,
             &self.shared.project_instructions,
             false,
         );
@@ -596,7 +540,7 @@ impl Responder for OpenAiResponder {
             body,
             req.agent,
             req.request,
-            &self.shared.pending_calls,
+            &self.shared,
         ))
     }
 }
@@ -666,6 +610,16 @@ impl AsyncOpenAiDriver {
         self.stream_preview = Some(preview);
         self
     }
+
+    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
+        self.shared.telemetry = Some(telemetry);
+        self
+    }
+
+    pub fn with_context_config(mut self, cfg: TieredContextConfig) -> Self {
+        self.shared.context_config = cfg;
+        self
+    }
 }
 
 impl PlatformDriver for AsyncOpenAiDriver {
@@ -704,12 +658,12 @@ impl PlatformDriver for AsyncOpenAiDriver {
             let body = build_openai_request_body(
                 &req,
                 &self.model,
-                ContextBudget::default(),
+                self.shared.context_config,
                 &self.shared.project_instructions,
                 true,
             );
             let api_key = self.api_key.clone();
-            let pending = Arc::clone(&self.shared.pending_calls);
+            let shared = self.shared.clone();
             let ready_flag = Arc::clone(&self.has_ready);
             let tx = self.tx.clone();
             let preview = self.stream_preview.clone();
@@ -719,13 +673,15 @@ impl PlatformDriver for AsyncOpenAiDriver {
             thread::spawn(move || {
                 let _guard = guard;
                 let reply = execute_openai_stream_http(
-                    &url,
-                    &api_key,
+                    OpenAiStreamTarget {
+                        url: &url,
+                        api_key: &api_key,
+                        agent,
+                        request,
+                        shared: &shared,
+                        preview: preview.as_ref(),
+                    },
                     body,
-                    agent,
-                    request,
-                    &pending,
-                    preview.as_ref(),
                 );
                 if tx.send(reply).is_ok() {
                     ready_flag.store(true, Ordering::Release);
@@ -772,12 +728,13 @@ mod tests {
         let body = build_openai_request_body(
             &req,
             "gpt-4o",
-            ContextBudget::default(),
+            TieredContextConfig::default(),
             "Project notes.",
             true,
         );
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
@@ -796,10 +753,12 @@ mod tests {
     #[test]
     fn openai_sse_reader_accumulates_content_deltas_and_chunked_tool_calls() {
         let preview = StreamPreviewHandle::new();
+        let telemetry = SessionTelemetryHandle::new("gpt-4o", false);
         let text_sse = concat!(
             "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hola \"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"OpenAI!\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":6400,\"completion_tokens\":210,\"prompt_tokens_details\":{\"cached_tokens\":3200}}}\n\n",
             "data: [DONE]\n"
         );
         let pending = PendingCallQueue::default();
@@ -811,8 +770,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preview.get().unwrap().text, "Hola OpenAI!");
-        let reply = parse_openai_response(&json, ConceptId(2), 5, &pending);
+        let reply = parse_openai_response(&json, ConceptId(2), 5, &pending, Some(&telemetry));
         assert_eq!(reply, Reply::done(ConceptId(2), 5, "Hola OpenAI!"));
+        let snap = telemetry.snapshot();
+        assert_eq!(snap.last_turn.input_tokens, 6_400);
+        assert_eq!(snap.last_turn.cached_input_tokens, 3_200);
+        assert_eq!(snap.last_turn.output_tokens, 210);
+        assert!(snap.format_status_bar().contains("cache 3.2k"));
 
         preview.clear();
         let tool_sse = concat!(
@@ -828,7 +792,7 @@ mod tests {
             Some(&preview),
         )
         .unwrap();
-        let r1 = parse_openai_response(&tool_json, ConceptId(2), 6, &pending);
+        let r1 = parse_openai_response(&tool_json, ConceptId(2), 6, &pending, None);
         assert!(format!("{r1:?}").contains("fs_read"), "{r1:?}");
         assert!(format!("{r1:?}").contains("lib.rs"), "{r1:?}");
 

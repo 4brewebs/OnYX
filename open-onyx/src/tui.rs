@@ -31,6 +31,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+use crate::context::{
+    COMPACT_MARKER, SessionTelemetryHandle, TieredContextConfig, ToolOutputTier, project_memory,
+};
 use crate::gemini::StreamPreviewHandle;
 
 struct TuiInner {
@@ -40,6 +43,9 @@ struct TuiInner {
     workspace_root: Option<PathBuf>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
+    telemetry: SessionTelemetryHandle,
+    context_config: TieredContextConfig,
+    seen_compact_count: usize,
     input: String,
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
@@ -65,12 +71,13 @@ impl TuiHandle {
     }
 
     /// Lee entrada de teclado/resize cuando el cerebro está en reposo (`is_settled()`),
-    /// o refresca deltas SSE en vuelo sin avanzar `host.ticks()`.
+    /// o refresca deltas SSE / telemetría en vuelo sin avanzar `host.ticks()`.
     pub fn pump_idle(&self, graph: &dyn GraphView) {
         let mut inner = self.inner.borrow_mut();
         let ui_event = inner.poll_crossterm();
         let stream_dirty = inner.stream_preview.take_dirty();
-        if (ui_event || stream_dirty)
+        let telemetry_dirty = inner.telemetry.take_dirty();
+        if (ui_event || stream_dirty || telemetry_dirty)
             && inner.queued.is_empty()
             && !inner.quit.load(Ordering::Relaxed)
         {
@@ -98,6 +105,9 @@ impl TuiDriver {
                 workspace_root: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
+                telemetry: SessionTelemetryHandle::default(),
+                context_config: TieredContextConfig::default(),
+                seen_compact_count: 0,
                 input: String::new(),
                 queued: Vec::new(),
                 active_approval: None,
@@ -131,6 +141,22 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.stream_preview = stream_preview;
+        }
+        self
+    }
+
+    pub fn with_telemetry(self, telemetry: SessionTelemetryHandle) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.telemetry = telemetry;
+        }
+        self
+    }
+
+    pub fn with_context_config(self, cfg: TieredContextConfig) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.context_config = cfg;
         }
         self
     }
@@ -280,6 +306,8 @@ impl TuiInner {
         let agents = graph.query(&[self.vocab.state]);
         let mut status_line = String::from("idle (enter a goal below)");
         let mut log_lines: Vec<Line<'static>> = Vec::new();
+        let mut latest_agent_memory: Option<(String, Vec<(String, String)>)> = None;
+        let mut compact_count = 0usize;
 
         for id in &agents {
             let name = prop_text(graph, *id, self.vocab.name).unwrap_or_default();
@@ -290,9 +318,13 @@ impl TuiInner {
                 push_multiline_entry(&mut log_lines, "user", Color::LightCyan, &goal);
             }
 
+            let mut mem_pairs: Vec<(String, String)> = Vec::new();
             for mem_id in graph.related(*id, self.vocab.rel_memory) {
                 let kind = prop_text(graph, mem_id, self.vocab.mem_kind).unwrap_or_default();
                 let text = prop_text(graph, mem_id, self.vocab.mem_text).unwrap_or_default();
+                if kind == "system" && text.starts_with(COMPACT_MARKER) {
+                    compact_count += 1;
+                }
                 let color = match kind.as_str() {
                     "call" => Color::Yellow,
                     "observe" => Color::Green,
@@ -302,7 +334,9 @@ impl TuiInner {
                     _ => Color::Cyan,
                 };
                 push_multiline_entry(&mut log_lines, &kind, color, &text);
+                mem_pairs.push((kind, text));
             }
+            latest_agent_memory = Some((goal, mem_pairs));
 
             if let Some(res) = prop_text(graph, *id, self.vocab.result) {
                 if !res.is_empty() {
@@ -324,6 +358,22 @@ impl TuiInner {
             }
         }
 
+        let mut telemetry_bar = self.telemetry.snapshot().format_status_bar();
+        if let Some((goal, mem_pairs)) = latest_agent_memory {
+            let current_snap = self.telemetry.snapshot();
+            let projected = project_memory(&goal, &mem_pairs, &self.context_config);
+            if compact_count != self.seen_compact_count
+                || (current_snap.cumulative.input_tokens == 0 && !mem_pairs.is_empty())
+            {
+                self.telemetry
+                    .sync_estimated_context_bytes(projected.total_bytes);
+                self.seen_compact_count = compact_count;
+                telemetry_bar = self.telemetry.snapshot().format_status_bar();
+            }
+            if projected.highest_tier == ToolOutputTier::Tier2Compacted {
+                telemetry_bar.push_str(" [compacted]");
+            }
+        }
         let input_snapshot = self.input.clone();
         let approval_snapshot = self.active_approval.clone();
         let diff_snapshot = self.approval_diff.clone();
@@ -383,7 +433,7 @@ impl TuiInner {
                 }
                 None => (
                     format!(
-                        " [{mode_label}] Goal / Command (Enter to send, Tab Plan/Build, /undo, /new) "
+                        " [{mode_label}] Goal / Command (Enter send, Tab Plan/Build, /undo, /compact, /new) "
                     ),
                     vec![Line::from(format!("> {input_snapshot}"))],
                     Color::White,
@@ -420,8 +470,18 @@ impl TuiInner {
                 ])
                 .split(f.area());
 
-            let header = Paragraph::new(status_line)
-                .block(Block::default().title(header_title).borders(Borders::ALL));
+            let header = Paragraph::new(status_line).block(
+                Block::default()
+                    .title(header_title)
+                    .title_bottom(
+                        Line::from(Span::styled(
+                            format!(" {telemetry_bar} "),
+                            Style::default().fg(Color::Cyan),
+                        ))
+                        .right_aligned(),
+                    )
+                    .borders(Borders::ALL),
+            );
             f.render_widget(header, chunks[0]);
 
             let (trace_area, plan_area) = match plan_snapshot.as_deref() {
