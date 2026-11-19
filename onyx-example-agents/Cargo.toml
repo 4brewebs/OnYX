@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Multi-agent application built on onyx-soul-agents."
 license = "MIT OR Apache-2.0"
+publish = false
 
 [[bin]]
 name = "onyx-example-agents"

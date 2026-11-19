@@ -5,9 +5,14 @@ edition = "2024"
 rust-version = "1.85"
 description = "Agent harness soul for OnYX. Implements the core ports with agent-oriented semantics."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/4brewebs/OnYX"
+homepage = "https://github.com/4brewebs/OnYX"
+readme = "README.md"
+keywords = ["agents", "deterministic", "replay", "llm", "harness"]
+categories = ["development-tools", "simulation"]
 
 [dependencies]
-onyx-core = { path = "../onyx-core" }
+onyx-core = { version = "0.1.0", path = "../onyx-core" }
 
 [dev-dependencies]
-onyx-core = { path = "../onyx-core", features = ["conformance"] }
+onyx-core = { version = "0.1.0", path = "../onyx-core", features = ["conformance"] }

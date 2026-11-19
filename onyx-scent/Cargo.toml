@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 description = "Deterministic AST indexer, thermal impact distiller, and TOON serializer for OnYX harnesses."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/4brewebs/OnYX"
+homepage = "https://github.com/4brewebs/OnYX"
+readme = "README.md"
+keywords = ["ast", "tree-sitter", "indexer", "agents", "toon"]
+categories = ["development-tools", "parser-implementations"]
 
 [features]
 default = []

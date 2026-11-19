@@ -36,12 +36,18 @@ impl WorkspacePolicy {
     }
 
     pub fn is_ignored(&self, path: &Path) -> bool {
-        path.components().any(|c| {
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
+        rel.components().any(|c| {
             if let Component::Normal(name) = c {
                 let s = name.to_string_lossy();
-                self.ignored_dirs
-                    .iter()
-                    .any(|ignored| ignored == s.as_ref())
+                let s_ref = s.as_ref();
+                self.ignored_dirs.iter().any(|ignored| ignored == s_ref)
+                    || s_ref == "snapshots"
+                    || s_ref.starts_with("snaps_")
+                    || s_ref.ends_with(".tr")
+                    || s_ref.ends_with(".onyxpack")
+                    || s_ref.ends_with(".onyxpack.tmp")
+                    || (s_ref.starts_with("tick-") && s_ref.ends_with(".bin"))
             } else {
                 false
             }

@@ -5,13 +5,18 @@ edition = "2024"
 rust-version = "1.85"
 description = "Workspace capabilities (filesystem, search, edit, shell) with sandbox policy for OnYX agent harnesses."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/4brewebs/OnYX"
+homepage = "https://github.com/4brewebs/OnYX"
+readme = "README.md"
+keywords = ["agents", "workspace", "sandbox", "tools", "onyx"]
+categories = ["development-tools"]
 
 [features]
 default = []
 scent = ["dep:onyx-scent"]
 
 [dependencies]
-onyx-scent = { path = "../onyx-scent", optional = true }
-onyx-soul-agents = { path = "../onyx-soul-agents" }
+onyx-scent = { version = "0.1.0", path = "../onyx-scent", optional = true }
+onyx-soul-agents = { version = "0.1.0", path = "../onyx-soul-agents" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

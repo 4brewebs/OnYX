@@ -4,9 +4,15 @@ name = "onyx-soul"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+description = "Zero-dependency reference soul implementing the OnYX core ports (in-memory EAV graph, priority bus, supervisor, and snapshot store)."
+repository = "https://github.com/4brewebs/OnYX"
+homepage = "https://github.com/4brewebs/OnYX"
+readme = "../README.md"
+keywords = ["deterministic", "eav", "runtime", "onyx"]
+categories = ["data-structures", "simulation"]
 
 [dependencies]
-onyx-core = { path = "../onyx-core" }
+onyx-core = { version = "0.1.0", path = "../onyx-core" }
 
 [dev-dependencies]
-onyx-core = { path = "../onyx-core", features = ["conformance"] }
+onyx-core = { version = "0.1.0", path = "../onyx-core", features = ["conformance"] }
