@@ -6,6 +6,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value as JsonValue;
 
+use crate::sandbox::SandboxConfig;
 use crate::state::WorkspaceMode;
 
 /// Resultado de evaluar las reglas de permisos para una herramienta y sus argumentos.
@@ -194,9 +195,13 @@ impl PermissionRules {
     }
 }
 
-/// Indica si una herramienta realiza mutaciones sobre el workspace o ejecuta comandos de shell.
+/// Indica si una herramienta realiza mutaciones sobre el workspace, ejecuta comandos de shell
+/// o modifica el ciclo de vida de servicios/contenedores (`REQ-08.3`, `REQ-08.4`).
 pub fn is_mutating_tool(tool: &str) -> bool {
-    matches!(tool, "fs_write" | "fs_edit" | "shell_exec")
+    matches!(
+        tool,
+        "fs_write" | "fs_edit" | "shell_exec" | "service_start" | "service_stop" | "service_exec"
+    )
 }
 
 /// Compila un patrón glob (`*`, `**`, `?`, `[abc]`, `{a,b}`) a una `Regex` determinista.
@@ -368,6 +373,35 @@ fn extract_rule_subject(tool: &str, args_json: &str) -> String {
             .map(str::trim)
             .unwrap_or_default()
             .to_string(),
+        "service_start" | "service_stop" => {
+            if parsed.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "all".to_string()
+            } else {
+                parsed
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("all")
+                    .to_string()
+            }
+        }
+        "service_exec" => {
+            let id = parsed
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            let cmd = parsed
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            if id.is_empty() {
+                cmd.to_string()
+            } else {
+                format!("{id}:{cmd}")
+            }
+        }
         "fs_write" | "fs_edit" | "fs_read" | "fs_list" | "glob_files" | "code_search" => {
             let raw = parsed
                 .get("path")
@@ -405,7 +439,7 @@ fn match_permission_rule(rule: &str, tool: &str, subject: &str) -> Option<usize>
         return None;
     }
 
-    let match_slash_for_star = tool == "shell_exec";
+    let match_slash_for_star = matches!(tool, "shell_exec" | "service_exec");
     let re = compile_glob_regex(subject_glob, match_slash_for_star).ok()?;
     if !re.is_match(subject) {
         return None;
@@ -577,6 +611,36 @@ fn parse_toml_string_array(raw: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+pub(crate) fn strip_toml_comment_pub(line: &str) -> &str {
+    strip_toml_comment(line)
+}
+
+pub(crate) fn array_brackets_closed_pub(buf: &str) -> bool {
+    array_brackets_closed(buf)
+}
+
+pub(crate) fn parse_toml_string_array_pub(raw: &str) -> Result<Vec<String>, String> {
+    parse_toml_string_array(raw)
+}
+
+/// Comprueba si una ruta relativa pertenece al *Control Plane* protegido en solo lectura (`REQ-06.4`):
+/// `.onyx/config.toml`, `.git/hooks/**`, `.git/config` y `.env*`.
+pub fn is_control_plane_rel_path(raw: &str) -> bool {
+    let norm = raw.trim().replace('\\', "/");
+    let stripped = norm.trim_start_matches("./").trim_start_matches('/');
+    let lower = stripped.to_ascii_lowercase();
+    if lower == ".onyx/config.toml"
+        || lower.starts_with(".onyx/config.")
+        || lower == ".git/config"
+        || lower == ".git/hooks"
+        || lower.starts_with(".git/hooks/")
+    {
+        return true;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or("");
+    file_name == ".env" || file_name.starts_with(".env.")
+}
+
 fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -593,6 +657,7 @@ pub struct WorkspacePolicy {
     pub command_timeout: Duration,
     pub permissions: PermissionRules,
     pub ignore_deny: bool,
+    pub sandbox: SandboxConfig,
 }
 
 impl WorkspacePolicy {
@@ -611,6 +676,7 @@ impl WorkspacePolicy {
             command_timeout: Duration::from_secs(30),
             permissions: PermissionRules::default(),
             ignore_deny: false,
+            sandbox: SandboxConfig::default(),
         })
     }
 
@@ -619,9 +685,10 @@ impl WorkspacePolicy {
         self
     }
 
-    /// Carga reglas `[permissions]` desde `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml`.
+    /// Carga secciones `[permissions]` y `[sandbox]` desde `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml`.
     pub fn with_loaded_config(mut self) -> Self {
         self.permissions = PermissionRules::load_for_workspace(&self.root);
+        self.sandbox = SandboxConfig::load_for_workspace(&self.root);
         self
     }
 
@@ -631,10 +698,39 @@ impl WorkspacePolicy {
         self
     }
 
+    /// Establece la configuración de sandbox OS explícita (`REQ-06.1`..`REQ-06.5`).
+    pub fn with_sandbox(mut self, sandbox: SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
     /// Permite ignorar reglas `deny` cuando el usuario pasa explícitamente `--ignore-deny`.
     pub fn with_ignore_deny(mut self, ignore_deny: bool) -> Self {
         self.ignore_deny = ignore_deny;
         self
+    }
+
+    /// Indica si `raw` apunta a una ruta del *Control Plane* protegida en solo lectura (`REQ-06.4`).
+    pub fn is_control_plane_path(&self, raw: &str) -> bool {
+        if is_control_plane_rel_path(raw) {
+            return true;
+        }
+        if let Ok(resolved) = self.join_raw(raw) {
+            if let Ok(rel) = resolved.strip_prefix(&self.root) {
+                return is_control_plane_rel_path(&rel.to_string_lossy());
+            }
+        }
+        false
+    }
+
+    /// Rechaza intentos de escritura sobre rutas del *Control Plane* (`REQ-06.4`, `TEST-06.4`).
+    pub fn check_control_plane_write(&self, raw: &str) -> Result<(), String> {
+        if self.is_control_plane_path(raw) {
+            return Err(format!(
+                "blocked by control-plane protection (read-only): `{raw}` cannot be modified by agent tools"
+            ));
+        }
+        Ok(())
     }
 
     /// Evalúa las reglas de permisos configuradas (sin tener en cuenta `WorkspaceMode`).
@@ -642,9 +738,11 @@ impl WorkspacePolicy {
         self.permissions.evaluate(tool, args_json, self.ignore_deny)
     }
 
-    /// Evalúa las reglas de permisos aplicando la invariante de seguridad de `WorkspaceMode`:
-    /// en `Plan` o `Explore`, toda herramienta mutante queda siempre bloqueada (`Deny`),
-    /// incluso si coincide con una regla `allow`.
+    /// Evalúa las reglas de permisos aplicando las invariantes de seguridad:
+    /// 1. En `Plan` o `Explore`, toda herramienta mutante queda siempre bloqueada (`Deny`),
+    ///    incluso si coincide con una regla `allow`.
+    /// 2. Las rutas del *Control Plane* (`.onyx/config.toml`, `.git/hooks/**`, `.git/config`,
+    ///    `.env*`) quedan bloqueadas para `fs_write`/`fs_edit` (`REQ-06.4`).
     pub fn evaluate_permission_in_mode(
         &self,
         mode: WorkspaceMode,
@@ -653,6 +751,12 @@ impl WorkspacePolicy {
     ) -> PermissionDecision {
         if is_mutating_tool(tool) && !mode.allows_mutation() {
             return PermissionDecision::Deny;
+        }
+        if matches!(tool, "fs_write" | "fs_edit") {
+            let subject = extract_rule_subject(tool, args_json);
+            if !subject.is_empty() && self.is_control_plane_path(&subject) {
+                return PermissionDecision::Deny;
+            }
         }
         self.evaluate_permission(tool, args_json)
     }

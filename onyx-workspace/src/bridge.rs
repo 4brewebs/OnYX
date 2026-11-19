@@ -221,9 +221,19 @@ impl PlatformDriver for WorkspaceToolBridge {
                                 "blocked by workspace mode `{:?}`: `{}` is not permitted in read-only mode",
                                 current_mode, pending.tool
                             )
-                        } else {
+                        } else if self
+                            .tools
+                            .policy()
+                            .evaluate_permission(&pending.tool, &pending.args)
+                            == PermissionDecision::Deny
+                        {
                             format!(
                                 "blocked by permission policy (deny rule): `{}`",
+                                pending.tool
+                            )
+                        } else {
+                            format!(
+                                "blocked by control-plane protection (read-only): `{}`",
                                 pending.tool
                             )
                         };

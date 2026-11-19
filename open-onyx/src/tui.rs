@@ -20,8 +20,8 @@ use onyx_soul_agents::{
     Vocab, pending_approvals,
 };
 use onyx_workspace::{
-    PermissionDecision, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceVocab,
-    graph_workspace_plan, preview_tool_diff,
+    PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
+    WorkspaceVocab, graph_workspace_plan, graph_workspace_services, preview_tool_diff,
 };
 use ratatui::{
     Terminal,
@@ -43,6 +43,7 @@ struct TuiInner {
     ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
     policy: Option<WorkspacePolicy>,
+    sprout: Option<SproutSupervisor>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
@@ -106,6 +107,7 @@ impl TuiDriver {
                 ws_vocab: None,
                 workspace_root: None,
                 policy: None,
+                sprout: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
                 telemetry: SessionTelemetryHandle::default(),
@@ -136,6 +138,14 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.policy = Some(policy);
+        }
+        self
+    }
+
+    pub fn with_sprout(self, sprout: SproutSupervisor) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.sprout = Some(sprout);
         }
         self
     }
@@ -402,9 +412,20 @@ impl TuiInner {
             .ws_vocab
             .as_ref()
             .and_then(|wv| graph_workspace_plan(graph, wv));
+        let services_snapshot = self
+            .ws_vocab
+            .as_ref()
+            .and_then(|wv| graph_workspace_services(graph, wv))
+            .or_else(|| self.sprout.as_ref().and_then(|s| s.render_panel_text()));
         let mode_label = self.mode_handle.get().as_label();
-        let header_title =
-            format!(" openOnyx [{mode_label}] — Deterministic Harness (Esc/Ctrl+C to quit) ");
+        let sandbox_badge = self
+            .policy
+            .as_ref()
+            .map(|p| p.sandbox.mode.as_badge())
+            .unwrap_or("workspace");
+        let header_title = format!(
+            " openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}] — Deterministic Harness (Esc/Ctrl+C to quit) "
+        );
         let terminal = &mut self.terminal;
         let scroll_from_bottom = &mut self.scroll_from_bottom;
         let last_viewport_height = &mut self.last_viewport_height;
@@ -454,7 +475,7 @@ impl TuiInner {
                 }
                 None => (
                     format!(
-                        " [{mode_label}] Goal / Command (Enter send, Tab Plan/Build, /undo, /compact, /new) "
+                        " [{mode_label}] Goal / Command (Enter send, Tab Plan/Build, /undo, /compact, /services, /new) "
                     ),
                     vec![Line::from(format!("> {input_snapshot}"))],
                     Color::White,
@@ -505,15 +526,15 @@ impl TuiInner {
             );
             f.render_widget(header, chunks[0]);
 
-            let (trace_area, plan_area) = match plan_snapshot.as_deref() {
-                Some(_) if f.area().width >= 100 => {
-                    let hsplit = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                        .split(chunks[1]);
-                    (hsplit[0], Some(hsplit[1]))
-                }
-                _ => (chunks[1], None),
+            let has_side_panel = plan_snapshot.is_some() || services_snapshot.is_some();
+            let (trace_area, side_area) = if has_side_panel && f.area().width >= 100 {
+                let hsplit = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                    .split(chunks[1]);
+                (hsplit[0], Some(hsplit[1]))
+            } else {
+                (chunks[1], None)
             };
 
             let viewport_height = trace_area.height.saturating_sub(2) as usize;
@@ -539,29 +560,61 @@ impl TuiInner {
                 .block(Block::default().title(trace_title).borders(Borders::ALL));
             f.render_widget(body, trace_area);
 
-            if let (Some(p_area), Some(plan_text)) = (plan_area, plan_snapshot.as_deref()) {
-                let mut plan_lines: Vec<Line<'static>> = Vec::new();
-                for pline in plan_text.lines() {
-                    let trimmed = pline.trim_start();
-                    let style = if trimmed.starts_with("[x]") {
-                        Style::default().fg(Color::Green)
-                    } else if trimmed.starts_with("[>]") {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else if trimmed.starts_with("[ ]") {
-                        Style::default().fg(Color::Gray)
-                    } else {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
+            if let Some(right_area) = side_area {
+                let (plan_area, services_area) =
+                    match (plan_snapshot.as_deref(), services_snapshot.as_deref()) {
+                        (Some(_), Some(_)) => {
+                            let vsplit = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Percentage(50),
+                                    Constraint::Percentage(50),
+                                ])
+                                .split(right_area);
+                            (Some(vsplit[0]), Some(vsplit[1]))
+                        }
+                        (Some(_), None) => (Some(right_area), None),
+                        (None, Some(_)) => (None, Some(right_area)),
+                        (None, None) => (None, None),
                     };
-                    plan_lines.push(Line::from(Span::styled(pline.to_string(), style)));
+
+                if let (Some(p_area), Some(plan_text)) = (plan_area, plan_snapshot.as_deref()) {
+                    let mut plan_lines: Vec<Line<'static>> = Vec::new();
+                    for pline in plan_text.lines() {
+                        let trimmed = pline.trim_start();
+                        let style = if trimmed.starts_with("[x]") {
+                            Style::default().fg(Color::Green)
+                        } else if trimmed.starts_with("[>]") {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else if trimmed.starts_with("[ ]") {
+                            Style::default().fg(Color::Gray)
+                        } else {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        };
+                        plan_lines.push(Line::from(Span::styled(pline.to_string(), style)));
+                    }
+                    let plan_widget = Paragraph::new(plan_lines)
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default().title(" Live Plan ").borders(Borders::ALL));
+                    f.render_widget(plan_widget, p_area);
                 }
-                let plan_widget = Paragraph::new(plan_lines)
-                    .wrap(Wrap { trim: false })
-                    .block(Block::default().title(" Live Plan ").borders(Borders::ALL));
-                f.render_widget(plan_widget, p_area);
+
+                if let (Some(s_area), Some(svc_text)) = (services_area, services_snapshot.as_deref())
+                {
+                    let svc_lines = render_services_lines(svc_text);
+                    let svc_widget = Paragraph::new(svc_lines)
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .title(" Services (Sprout) ")
+                                .borders(Borders::ALL),
+                        );
+                    f.render_widget(svc_widget, s_area);
+                }
             }
 
             let mut bottom = Paragraph::new(bottom_lines)
@@ -578,6 +631,32 @@ impl TuiInner {
             f.render_widget(bottom, chunks[2]);
         });
     }
+}
+
+/// Estiliza cada línea del panel `Services (Sprout)` según su estado (`REQ-08.5`, `TEST-08.5`).
+pub(crate) fn render_services_lines(svc_text: &str) -> Vec<Line<'static>> {
+    svc_text
+        .lines()
+        .map(|sline| {
+            let trimmed = sline.trim_start();
+            let style = if trimmed.starts_with("[READY]") {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("[STARTING]") || trimmed.starts_with("[PENDING]") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("[FAILED]") {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with("[OFF]") {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            Line::from(Span::styled(sline.to_string(), style))
+        })
+        .collect()
 }
 
 fn sanitize_display_line(raw: &str) -> String {

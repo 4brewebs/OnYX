@@ -349,6 +349,41 @@ pub fn summarize_tool_output_tier1(tool_name: &str, call_args: &str, output: &st
                 )
             }
         }
+        "service_status" | "service_start" | "service_stop" => {
+            let id = extract_call_str_arg(call_args, "id").unwrap_or_else(|| "all".to_string());
+            let first = output
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && *l != "@TOON v1" && !l.starts_with('#'))
+                .unwrap_or("ok");
+            format!(
+                "[summary {tool_name} ({id}): {}]",
+                truncate_chars(first, 140)
+            )
+        }
+        "service_logs" => {
+            let id = extract_call_str_arg(call_args, "id").unwrap_or_default();
+            let non_empty: Vec<&str> = output
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            let tail_start = non_empty.len().saturating_sub(4);
+            let tail = truncate_chars(&non_empty[tail_start..].join(" | "), 220);
+            format!(
+                "[summary service_logs '{id}' ({} lines, {bytes}B): {tail}]",
+                non_empty.len()
+            )
+        }
+        "service_exec" => {
+            let id = extract_call_str_arg(call_args, "id").unwrap_or_default();
+            let cmd = extract_call_str_arg(call_args, "command").unwrap_or_default();
+            let exit_code = extract_exit_code(output).unwrap_or_else(|| "?".to_string());
+            format!(
+                "[summary service_exec '{id}' '{}' exit={exit_code} ({bytes}B)]",
+                truncate_chars(&cmd, 64)
+            )
+        }
         "shell_exec" => {
             let cmd = extract_call_str_arg(call_args, "command").unwrap_or_default();
             let exit_code = extract_exit_code(output).unwrap_or_else(|| "?".to_string());

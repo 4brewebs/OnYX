@@ -18,6 +18,18 @@ Patch release updating **`onyx-workspace` (`0.1.1`)** and **`open-onyx` (`0.1.1`
 - **`glob_files` tool**: read-only workspace file discovery with glob patterns (`*`, `**`, `?`, `[...]`, `{a,b}`), deterministic lexicographical ordering (or optional `sort_by_mtime`), ignored-directory filtering, and strict path-traversal rejection.
 - **Granular permissions in `.onyx/config.toml`**: `PermissionRules` / `PermissionDecision` loaded from `~/.onyx/config.toml` and `<workspace>/.onyx/config.toml` (`[permissions]` with `deny`, `allow`, `ask`, precedence `deny > ask > allow`). Global `deny` rules block even under `--auto-approve` (unless explicit `--ignore-deny` is passed), and `WorkspaceMode::Plan` / `Explore` unconditionally block mutations regardless of `allow` rules.
 
+### Added (`onyx-workspace` & `open-onyx` — SDD-06: OS Sandboxing, `env_clear`, Control Plane RO & `ProcessJob`)
+
+- **Shared OS sandbox & RAII `ProcessJob` (`onyx-workspace/src/sandbox.rs`)**: `SandboxMode` (`WorkspaceWrite` default, `StrictContainer`, `Off`), `NetworkPolicy` (`Offline` default, `LocalhostOnly`, `Unrestricted`), `[sandbox]` section loader in `.onyx/config.toml`, strict `env_clear()` environment sanitizer stripping `*_API_KEY`/`*_TOKEN`/`AWS_*`, and cross-platform RAII `ProcessJob` (Win32 Job Objects with `KILL_ON_JOB_CLOSE`, memory/PID limits, and POSIX `PGID` cleanup) ready for reuse by `onyx-sprout` (SDD-08).
+- **Control Plane protection & OS drivers**: read-only protection of `.onyx/config.toml`, `.git/hooks/**`, `.git/config`, and `.env*` across `fs_write`, `fs_edit`, and `shell_exec`; native wrappers for Linux `bwrap`, macOS `sandbox-exec`, Windows Job Objects, and OCI `docker`/`nerdctl`/`podman`.
+- **CLI, TUI & `doctor` integration**: added `--sandbox` and `--sandbox-net` flags, automatic elevation to `workspace-write` + `offline` under `--auto-approve`, `[SANDBOX:workspace|strict|off]` badge in the TUI header, and host sandbox driver reporting in `openonyx doctor`.
+
+### Added (`onyx-workspace` & `open-onyx` — SDD-08: Local Process & Container Orchestrator `onyx-sprout`)
+
+- **Unified `sprout.toml` & DAG supervisor (`onyx-workspace/src/sprout.rs`)**: pure-`std` `SproutSupervisor` (0 `tokio`, MSRV 1.85) supporting both modern `[runtime]`/`[services.<id>]` (`kind = "process" | "container"`, `up`/`logs`/`down`/`container`) and legacy `[global]`/`[[service]]` (`env_wrapper`, `debug_port`, `dir`, `depends_on`), with Kahn topological DAG validation, real probes (`ready_port`, `ready_log`, `ready_cmd`), 2,000-line UTF-8-lossy log ring-buffers, `env_clear()`, and automatic `ProcessJob` teardown on `Drop`.
+- **5 agent tools + deterministic replay (`ONYXTR2`)**: added `service_status`, `service_logs` (read-only), `service_start`, `service_stop`, and `service_exec` (`docker exec` / `nerdctl exec` with `env_clear()`, timeout, `scrub_secrets`, `PermissionRules`, and `Plan`/`Explore` mutation blocking). Recorded sessions replay deterministically via `ReplayBridge` with zero subprocesses spawned.
+- **EAV projection, TUI panel, slash commands & `doctor`**: added `ws.services.text` in `WorkspaceLedgerSystem`, colorized `Services (Sprout)` right-hand panel in `TuiDriver`, `/services` and `/service <start|stop|logs>` commands in `CommandSpawnerSystem`, and `sprout.toml` DAG/runtime/occupied-port auditing in `openonyx doctor`.
+
 ## [0.1.0] - 2026-11-19
 
 Initial public release of the deterministic OnYX agent microkernel, reference souls, AST distiller, sandboxed workspace tools, and the `openonyx` CLI/TUI harness.

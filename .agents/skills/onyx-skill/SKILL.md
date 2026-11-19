@@ -71,8 +71,9 @@ openonyx run "resume la arquitectura de crates" --record run.tr --snapshot-dir s
 
 - `-w, --workspace <dir>`: directorio del proyecto objetivo (default: CWD).
 - `--provider <gemini|openai>` / `--model <name>` / `--api-base <url>`: selección del backend LLM.
-- `--auto-approve`: omite confirmación interactiva para herramientas mutantes (`fs_write`, `fs_edit`, `shell_exec`; las reglas `deny` de `.onyx/config.toml` siguen bloqueando).
+- `--auto-approve`: omite confirmación interactiva para herramientas mutantes (`fs_write`, `fs_edit`, `shell_exec`; las reglas `deny` de `.onyx/config.toml` siguen bloqueando y el sandbox se eleva automáticamente a `workspace-write` + `offline` salvo `--sandbox off`).
 - `--ignore-deny`: desactiva explícitamente las reglas `[permissions].deny` de `.onyx/config.toml`.
+- `--sandbox <off|workspace-write|strict-container>` y `--sandbox-net <offline|localhost|unrestricted>`: perfil de sandbox OS (`env_clear()`, protección RO del Control Plane `.onyx/config.toml`/`.git/hooks/**`/`.git/config`/`.env*` y `ProcessJob` RAII) y política de red para `shell_exec`. El estado se muestra en `[SANDBOX:...]` y se audita en `openonyx doctor`.
 - `--max-steps <n>`: límite de pasos del agente por turno (default: `128` en `chat`, `64` en `run`).
 - `--shell-timeout <secs>`: timeout en segundos por comando `shell_exec` (default de `WorkspacePolicy`: `30s`).
 - `--record <file>` / `--save-transcript <file>`: guarda transcripción determinista `ONYXTR2`.
@@ -102,6 +103,7 @@ openonyx run "resume la arquitectura de crates" --record run.tr --snapshot-dir s
   - `EXPLORE`: exploración de solo lectura.
 - **`/undo`**: revierte el último checkpoint Git reversible (`fs_write` / `fs_edit`) creado en la sesión sin alterar `HEAD` ni el staging index del usuario.
 - **`/compact [focus]`**: compacta determinísticamente el historial del agente en `[session_summary]` (rescatando `files_found` y `focus_matches` relevantes a `[focus]` de turnos previos, con hito `cmd:/compact` en `snapshots.onyxpack`) y preserva los ticks previos para `rewind` y `replay`.
+- **`/services`** y **`/service <start|stop|logs> <id|all> [tail]`**: consulta y controla procesos locales y contenedores Docker/Rancher definidos en `sprout.toml` (panel derecho `Services (Sprout)`, herramientas `service_status`/`service_start`/`service_stop`/`service_logs`/`service_exec` y auditoría en `openonyx doctor`).
 - **`/new`** o **`/new <goal>`**: fuerza que el siguiente prompt cree un agente raíz limpio (o lo lanza de inmediato con `<goal>`).
 - **Telemetría en vivo**: barra en la cabecera con ocupación de contexto (`ctx: <1%` / `XX%`), tokens `in` / `cache` / `out` / `think` y coste estimado (`~$...` o `local`).
 - **Permisos granulares (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`).

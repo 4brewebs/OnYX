@@ -13,6 +13,11 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::policy::{WorkspacePolicy, compile_glob_regex};
+use crate::sandbox::{
+    ProcessJob, clean_process_path, configure_process_isolation, ensure_sandbox_tmp_dir,
+    prepare_sandboxed_shell_command,
+};
+use crate::sprout::SproutSupervisor;
 
 /// Descripción declarativa de una herramienta del workspace para inyectar en LLMs.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,19 +36,31 @@ pub struct WorkspaceTools {
     policy: WorkspacePolicy,
     seen_reads: SeenReadsMap,
     read_seq: Arc<AtomicU64>,
+    sprout: SproutSupervisor,
     #[cfg(feature = "scent")]
     scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
 }
 
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
+        let sprout = SproutSupervisor::new(policy.clone());
         Self {
             policy,
             seen_reads: Arc::new(Mutex::new(BTreeMap::new())),
             read_seq: Arc::new(AtomicU64::new(1)),
+            sprout,
             #[cfg(feature = "scent")]
             scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
         }
+    }
+
+    pub fn with_sprout(mut self, sprout: SproutSupervisor) -> Self {
+        self.sprout = sprout;
+        self
+    }
+
+    pub fn sprout(&self) -> &SproutSupervisor {
+        &self.sprout
     }
 
     pub fn policy(&self) -> &WorkspacePolicy {
@@ -65,6 +82,11 @@ impl WorkspaceTools {
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
                 "scent_outline",
                 "scent_impact",
             ]
@@ -83,6 +105,11 @@ impl WorkspaceTools {
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
             ]
         }
     }
@@ -102,6 +129,11 @@ impl WorkspaceTools {
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
                 "scent_outline",
                 "scent_impact",
                 "spawn_agent",
@@ -121,13 +153,25 @@ impl WorkspaceTools {
                 "load_skill",
                 "plan_update",
                 "shell_exec",
+                "service_status",
+                "service_start",
+                "service_stop",
+                "service_logs",
+                "service_exec",
                 "spawn_agent",
             ]
         }
     }
 
     pub fn approval_required_names() -> &'static [&'static str] {
-        &["fs_write", "fs_edit", "shell_exec"]
+        &[
+            "fs_write",
+            "fs_edit",
+            "shell_exec",
+            "service_start",
+            "service_stop",
+            "service_exec",
+        ]
     }
 
     pub fn subagent_schema() -> ToolSchema {
@@ -325,6 +369,69 @@ impl WorkspaceTools {
                 }),
                 requires_approval: true,
             },
+            ToolSchema {
+                name: "service_status",
+                description: "Return a compact @TOON v1 status table of all local processes and containers declared in `sprout.toml` without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {}
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "service_start",
+                description: "Start a local process or container service (`id`) or all enabled services (`all: true`) from `sprout.toml` in topological DAG order, waiting for readiness probes (`ready_port`, `ready_log`, `ready_cmd`).",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Optional service id from `sprout.toml` (or `\"all\"`)." },
+                        "all": { "type": "BOOLEAN", "description": "Start all enabled services in topological order." },
+                        "wait_ready_secs": { "type": "INTEGER", "description": "Optional readiness wait timeout in seconds (1..=300, default 30)." }
+                    }
+                }),
+                requires_approval: true,
+            },
+            ToolSchema {
+                name: "service_stop",
+                description: "Stop one service (`id`) or all active services (`all: true`) from `sprout.toml`, running `stop_cmd`/`down` and terminating their process trees cleanly.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Optional service id to stop." },
+                        "all": { "type": "BOOLEAN", "description": "Stop all active services in reverse topological order." }
+                    }
+                }),
+                requires_approval: true,
+            },
+            ToolSchema {
+                name: "service_logs",
+                description: "Read recent lines from a service's in-memory log ring-buffer (optionally filtered by literal text or regex, scrubbed for secrets) without requiring approval.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Service id from `sprout.toml`." },
+                        "tail": { "type": "INTEGER", "description": "Optional number of trailing lines to return (1..=500, default 80)." },
+                        "pattern": { "type": "STRING", "description": "Optional substring or regex filter." },
+                        "regex": { "type": "BOOLEAN", "description": "Interpret `pattern` as a regular expression (default false)." }
+                    },
+                    "required": ["id"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "service_exec",
+                description: "Execute a command inside a `kind = \"container\"` service via `docker exec` / `nerdctl exec` with sanitized environment, bounded timeout, and secret scrubbing.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": { "type": "STRING", "description": "Container service id from `sprout.toml`." },
+                        "command": { "type": "STRING", "description": "Shell command to run inside the container." },
+                        "timeout_secs": { "type": "INTEGER", "description": "Optional command timeout in seconds (1..=300, default 30)." }
+                    },
+                    "required": ["id", "command"]
+                }),
+                requires_approval: true,
+            },
         ];
         #[cfg(feature = "scent")]
         {
@@ -426,6 +533,41 @@ impl WorkspaceTools {
                 let args: ShellExecArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid shell_exec args: {e}"))?;
                 self.shell_exec(args)
+            }
+            "service_status" => self.sprout.status_toon(),
+            "service_start" => {
+                let args: ServiceStartArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_start args: {e}"))?;
+                if args.all
+                    || args
+                        .id
+                        .as_deref()
+                        .is_some_and(|s| s.trim().eq_ignore_ascii_case("all"))
+                {
+                    self.sprout.start_all(args.wait_ready_secs)
+                } else if let Some(id) = args.id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                {
+                    self.sprout.start(id, args.wait_ready_secs)
+                } else {
+                    Err("service_start requires `id` or `all: true`".to_string())
+                }
+            }
+            "service_stop" => {
+                let args: ServiceStopArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_stop args: {e}"))?;
+                self.sprout.stop(args.id.as_deref(), args.all)
+            }
+            "service_logs" => {
+                let args: ServiceLogsArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_logs args: {e}"))?;
+                self.sprout
+                    .logs(&args.id, args.tail, args.pattern.as_deref(), args.regex)
+            }
+            "service_exec" => {
+                let args: ServiceExecArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid service_exec args: {e}"))?;
+                self.sprout
+                    .exec_in_container(&args.id, &args.command, args.timeout_secs)
             }
             #[cfg(feature = "scent")]
             "scent_outline" => {
@@ -560,6 +702,7 @@ impl WorkspaceTools {
     }
 
     fn fs_write(&self, args: FsWriteArgs) -> Result<String, String> {
+        self.policy.check_control_plane_write(&args.path)?;
         let path = self.policy.resolve_for_write(&args.path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create parent dir: {e}"))?;
@@ -575,6 +718,7 @@ impl WorkspaceTools {
     }
 
     fn fs_edit(&self, args: FsEditArgs) -> Result<String, String> {
+        self.policy.check_control_plane_write(&args.path)?;
         let hunks = extract_edit_hunks(&args)?;
         let path = self.policy.resolve_existing(&args.path)?;
         let content = fs::read_to_string(&path)
@@ -950,15 +1094,13 @@ impl WorkspaceTools {
         if args.command.trim().is_empty() {
             return Err("command cannot be empty".to_string());
         }
-        let cmd = if cfg!(windows) {
-            let mut c = Command::new("pwsh");
-            c.args(["-NoProfile", "-Command", &args.command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", &args.command]);
-            c
-        };
+        let sandbox_tmp = ensure_sandbox_tmp_dir(&self.policy.root)?;
+        let cmd = prepare_sandboxed_shell_command(
+            &self.policy.sandbox,
+            &self.policy.root,
+            &sandbox_tmp,
+            &args.command,
+        )?;
         let (code, stdout, stderr) = self.exec_bounded_raw(cmd, "shell command")?;
         self.clear_seen_reads();
         let combined = format!("exit_code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -970,18 +1112,15 @@ impl WorkspaceTools {
         mut cmd: Command,
         label: &str,
     ) -> Result<(i32, String, String), String> {
-        cmd.current_dir(&self.policy.root)
+        cmd.current_dir(clean_process_path(&self.policy.root))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        configure_process_isolation(&mut cmd, false);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn {label}: {e}"))?;
+        let mut job = ProcessJob::assign(&child, self.policy.sandbox.limits());
         let out_handle = read_pipe_capped(child.stdout.take(), self.policy.max_output_bytes);
         let err_handle = read_pipe_capped(child.stderr.take(), self.policy.max_output_bytes);
         let deadline = Instant::now() + self.policy.command_timeout;
@@ -991,21 +1130,17 @@ impl WorkspaceTools {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        #[cfg(windows)]
-                        {
-                            let _ = Command::new("taskkill")
-                                .args(["/F", "/T", "/PID", &child.id().to_string()])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status();
-                        }
-                        #[cfg(unix)]
-                        {
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{}", child.id())])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status();
+                        if let Some(ref mut j) = job {
+                            j.terminate();
+                        } else {
+                            #[cfg(windows)]
+                            {
+                                let _ = Command::new("taskkill")
+                                    .args(["/F", "/T", "/PID", &child.id().to_string()])
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status();
+                            }
                         }
                         let _ = child.kill();
                         let _ = child.wait();
@@ -1022,6 +1157,8 @@ impl WorkspaceTools {
             }
         };
 
+        // Soltar `job` limpia cualquier subproceso huérfano que el comando haya dejado en segundo plano.
+        drop(job);
         let stdout = scrub_secrets(&out_handle.join().unwrap_or_default());
         let stderr = scrub_secrets(&err_handle.join().unwrap_or_default());
         Ok((status.code().unwrap_or(-1), stdout, stderr))
@@ -1217,6 +1354,43 @@ struct GlobFilesArgs {
 #[derive(Deserialize)]
 struct ShellExecArgs {
     command: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ServiceStartArgs {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    wait_ready_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct ServiceStopArgs {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize)]
+struct ServiceLogsArgs {
+    id: String,
+    #[serde(default)]
+    tail: Option<usize>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    regex: bool,
+}
+
+#[derive(Deserialize)]
+struct ServiceExecArgs {
+    id: String,
+    command: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]

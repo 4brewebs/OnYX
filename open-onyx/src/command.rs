@@ -6,8 +6,10 @@ use onyx_soul_agents::{
     OnyxSystem, SystemEvent, Value, Vocab, append_agent_memory, continue_agent, spawn_event,
 };
 use onyx_workspace::{
-    WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
-    graph_workspace_plan, mark_latest_effect_undone, set_workspace_mode,
+    SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab,
+    format_services_panel_from_toon, graph_workspace_mode, graph_workspace_plan,
+    graph_workspace_services, mark_latest_effect_undone, set_workspace_mode,
+    set_workspace_services,
 };
 
 use crate::context::{COMPACT_MARKER, build_compaction_summary};
@@ -18,6 +20,8 @@ pub enum SlashCommand {
     Mode(Option<String>),
     Undo,
     Compact(Option<String>),
+    Services,
+    Service(String),
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
@@ -57,6 +61,19 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
         } else {
             Some(trimmed.to_string())
         }));
+    }
+    if cmd == "/services" || cmd == "/service" {
+        return Some(SlashCommand::Services);
+    }
+    if let Some(rest) = cmd
+        .strip_prefix("/service ")
+        .or_else(|| cmd.strip_prefix("/services "))
+    {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(SlashCommand::Service(trimmed.to_string()));
+        }
+        return Some(SlashCommand::Services);
     }
     None
 }
@@ -103,6 +120,7 @@ pub struct CommandSpawnerSystem {
     vocab: Option<Vocab>,
     ws_vocab: Option<WorkspaceVocab>,
     mode_handle: WorkspaceModeHandle,
+    sprout: Option<SproutSupervisor>,
     auto_approve: bool,
     max_steps_per_turn: i64,
     force_new_agent: bool,
@@ -115,6 +133,7 @@ impl CommandSpawnerSystem {
             vocab: None,
             ws_vocab: None,
             mode_handle: WorkspaceModeHandle::default(),
+            sprout: None,
             auto_approve,
             max_steps_per_turn: 128,
             force_new_agent: false,
@@ -129,6 +148,11 @@ impl CommandSpawnerSystem {
 
     pub fn with_mode_handle(mut self, mode_handle: WorkspaceModeHandle) -> Self {
         self.mode_handle = mode_handle;
+        self
+    }
+
+    pub fn with_sprout(mut self, sprout: SproutSupervisor) -> Self {
+        self.sprout = Some(sprout);
         self
     }
 
@@ -297,6 +321,147 @@ impl OnyxSystem for CommandSpawnerSystem {
                             );
                             let entry = format!("{COMPACT_MARKER}{summary}");
                             append_agent_memory(ctx.graph, &v, root_id, "system", &entry, now);
+                        }
+                    }
+                    SlashCommand::Services => {
+                        let note = if let Some(sprout) = &self.sprout {
+                            match sprout.status_toon() {
+                                Ok(toon) => {
+                                    if let Some(wv) = self.ws_vocab {
+                                        let panel = format_services_panel_from_toon(&toon);
+                                        set_workspace_services(ctx.graph, &wv, &panel);
+                                    }
+                                    format!("[/services]\n{toon}")
+                                }
+                                Err(err) => {
+                                    if let Some(wv) = self.ws_vocab {
+                                        if ctx.graph.query(&[wv.services_text]).is_empty() {
+                                            set_workspace_services(ctx.graph, &wv, "");
+                                        }
+                                    }
+                                    format!("[/services] {err}")
+                                }
+                            }
+                        } else {
+                            // Keep EAV concept allocation 100% identical to live `chat` during offline replay:
+                            // if `/services` runs before any agent spawns, reserve the `ws.services.text` singleton node.
+                            if let Some(wv) = self.ws_vocab {
+                                if ctx.graph.query(&[wv.services_text]).is_empty() {
+                                    set_workspace_services(ctx.graph, &wv, "");
+                                }
+                            }
+                            if let Some(existing) = self
+                                .ws_vocab
+                                .as_ref()
+                                .and_then(|wv| graph_workspace_services(&*ctx.graph, wv))
+                            {
+                                format!("[/services]\n{existing}")
+                            } else {
+                                "[/services] No sprout.toml services loaded.".to_string()
+                            }
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::Service(arg) => {
+                        let parts: Vec<&str> = arg.split_whitespace().collect();
+                        let mutates_services =
+                            matches!(parts.as_slice(), ["start", _] | ["stop", _]);
+                        let note = if let Some(sprout) = &self.sprout {
+                            match parts.as_slice() {
+                                ["start", target] => {
+                                    if !self.mode_handle.get().allows_mutation() {
+                                        format!(
+                                            "[/service] Blocked in `{}` mode: switch to BUILD to start `{target}`.",
+                                            self.mode_handle.get().as_label()
+                                        )
+                                    } else {
+                                        let res = if target.eq_ignore_ascii_case("all") {
+                                            sprout.start_all(None)
+                                        } else {
+                                            sprout.start(target, None)
+                                        };
+                                        match res {
+                                            Ok(out) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    let panel =
+                                                        format_services_panel_from_toon(&out);
+                                                    set_workspace_services(ctx.graph, &wv, &panel);
+                                                }
+                                                format!("[/service start {target}]\n{out}")
+                                            }
+                                            Err(err) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    if ctx.graph.query(&[wv.services_text]).is_empty()
+                                                    {
+                                                        set_workspace_services(ctx.graph, &wv, "");
+                                                    }
+                                                }
+                                                format!("[/service start {target}] ERROR: {err}")
+                                            }
+                                        }
+                                    }
+                                }
+                                ["stop", target] => {
+                                    if !self.mode_handle.get().allows_mutation() {
+                                        format!(
+                                            "[/service] Blocked in `{}` mode: switch to BUILD to stop `{target}`.",
+                                            self.mode_handle.get().as_label()
+                                        )
+                                    } else {
+                                        let is_all = target.eq_ignore_ascii_case("all");
+                                        let res = if is_all {
+                                            sprout.stop(None, true)
+                                        } else {
+                                            sprout.stop(Some(target), false)
+                                        };
+                                        match res {
+                                            Ok(out) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    let panel =
+                                                        format_services_panel_from_toon(&out);
+                                                    set_workspace_services(ctx.graph, &wv, &panel);
+                                                }
+                                                format!("[/service stop {target}]\n{out}")
+                                            }
+                                            Err(err) => {
+                                                if let Some(wv) = self.ws_vocab {
+                                                    if ctx.graph.query(&[wv.services_text]).is_empty()
+                                                    {
+                                                        set_workspace_services(ctx.graph, &wv, "");
+                                                    }
+                                                }
+                                                format!("[/service stop {target}] ERROR: {err}")
+                                            }
+                                        }
+                                    }
+                                }
+                                ["logs", id] => match sprout.logs(id, Some(40), None, false) {
+                                    Ok(out) => format!("[/service logs {id}]\n{out}"),
+                                    Err(err) => format!("[/service logs {id}] ERROR: {err}"),
+                                },
+                                ["logs", id, tail_str] => {
+                                    let tail = tail_str.parse::<usize>().ok();
+                                    match sprout.logs(id, tail, None, false) {
+                                        Ok(out) => format!("[/service logs {id}]\n{out}"),
+                                        Err(err) => format!("[/service logs {id}] ERROR: {err}"),
+                                    }
+                                }
+                                _ => "[/service] Usage: /service start <id|all> | /service stop <id|all> | /service logs <id> [tail]".to_string(),
+                            }
+                        } else {
+                            if mutates_services && self.mode_handle.get().allows_mutation() {
+                                if let Some(wv) = self.ws_vocab {
+                                    if ctx.graph.query(&[wv.services_text]).is_empty() {
+                                        set_workspace_services(ctx.graph, &wv, "");
+                                    }
+                                }
+                            }
+                            format!("[/service] {arg} (offline replay)")
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
                         }
                     }
                 }

@@ -10,7 +10,8 @@ use onyx_soul_agents::{
     AgentConfig, AgentGraph, Graph, GraphView, HeadlessDriver, Transcript, Value,
 };
 use onyx_workspace::{
-    RecordedEffect, all_recorded_effects, effects_after_tick, graph_workspace_mode,
+    RecordedEffect, SandboxDriverKind, SandboxMode, WorkspacePolicy, all_recorded_effects,
+    audit_sprout_workspace, detect_sandbox_capabilities, effects_after_tick, graph_workspace_mode,
     graph_workspace_plan, is_effect_undone, restore_git_tree_checkpoint,
 };
 use serde::Serialize;
@@ -465,6 +466,37 @@ pub fn run_doctor(
             "workspace `{}` is not a git worktree",
             workspace.display()
         ));
+    }
+
+    // Auditoría de sandbox OS y capacidades del host (REQ-06.6, TEST-06.5).
+    let sandbox_caps = detect_sandbox_capabilities();
+    let active_sandbox = WorkspacePolicy::new(workspace)
+        .map(|p| p.with_loaded_config().sandbox)
+        .unwrap_or_default();
+    let cli_label = sandbox_caps.container_cli.unwrap_or("none");
+    report.checks.push(format!(
+        "sandbox driver: {} (mode={}, net={}, container_cli={cli_label})",
+        sandbox_caps.native_driver.as_str(),
+        active_sandbox.mode.as_str(),
+        active_sandbox.network.as_str()
+    ));
+    if active_sandbox.mode == SandboxMode::Off {
+        report.warnings.push(
+            "sandbox mode is `off`; `shell_exec` runs without OS sandbox or env_clear isolation"
+                .to_string(),
+        );
+    } else if sandbox_caps.native_driver == SandboxDriverKind::None {
+        report.warnings.push(
+            "no native OS sandbox driver detected on host (only env_clear and timeout apply)"
+                .to_string(),
+        );
+    }
+
+    // Auditoría de `sprout.toml` (sintaxis, DAG acíclico, runtime OCI y puertos ocupados — REQ-08.6).
+    if let Some(sprout_audit) = audit_sprout_workspace(workspace) {
+        report.checks.extend(sprout_audit.checks);
+        report.warnings.extend(sprout_audit.warnings);
+        report.errors.extend(sprout_audit.errors);
     }
 
     if let Ok(entries) = fs::read_dir(workspace) {
