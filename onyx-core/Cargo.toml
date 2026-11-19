@@ -1,15 +1,16 @@
 [package]
-license = "MIT OR Apache-2.0"
 name = "onyx-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Zero-dependency deterministic microkernel contracts (EAV graph, tick bus, DetRng, and system ports) for OnYX."
-repository = "https://github.com/4brewebs/OnYX"
-homepage = "https://github.com/4brewebs/OnYX"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["deterministic", "ecs", "eav", "agent", "microkernel"]
 categories = ["data-structures", "simulation"]
+exclude = ["snapshots/", "snaps*/", "*.tr", "*.onyxpack", "*.onyxpack.tmp"]
 
 [dependencies]
 

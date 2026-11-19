@@ -1,26 +1,27 @@
 [package]
 name = "open-onyx"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "openOnyx — Deterministic coding agent harness built on onyx-soul-agents and onyx-workspace."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/4brewebs/OnYX"
-homepage = "https://github.com/4brewebs/OnYX"
 readme = "README.md"
 keywords = ["ai", "coding-agent", "tui", "deterministic", "onyx"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["snapshots/", "snaps*/", "*.tr", "*.onyxpack", "*.onyxpack.tmp"]
 
 [[bin]]
 name = "openonyx"
 path = "src/main.rs"
 
 [dependencies]
-crossterm = "0.28"
-flate2 = "1"
-onyx-soul-agents = { version = "0.1.0", path = "../onyx-soul-agents" }
-onyx-workspace = { version = "0.1.0", path = "../onyx-workspace", features = ["scent"] }
-ratatui = "0.29"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ureq = { version = "2", features = ["json"] }
+crossterm = { workspace = true }
+flate2 = { workspace = true }
+onyx-soul-agents = { workspace = true }
+onyx-workspace = { workspace = true, features = ["scent"] }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
