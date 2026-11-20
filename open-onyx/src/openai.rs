@@ -9,6 +9,7 @@ use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use onyx_soul_agents::{
     AgentView, ConceptId, EventBus, GraphView, PlatformDriver, Reply, Responder, SurfaceBinding,
@@ -260,6 +261,42 @@ pub(crate) fn parse_openai_response(
     }
 }
 
+const MAX_TRANSIENT_RETRIES: usize = 2;
+const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
+
+fn is_retryable_stream_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("decoding chunks")
+        || lower.contains("unexpected eof")
+        || lower.contains("early eof")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
+}
+
+fn can_accept_partial_sse_eof(
+    saw_sse_data: bool,
+    saw_done_marker: bool,
+    has_finish_reason: bool,
+    text_acc: &str,
+    tool_calls_map: &BTreeMap<usize, (String, String)>,
+) -> bool {
+    if !saw_sse_data {
+        return false;
+    }
+    if !saw_done_marker && !has_finish_reason {
+        return false;
+    }
+    if tool_calls_map.is_empty() {
+        return !text_acc.is_empty();
+    }
+    tool_calls_map.values().all(|(name, args)| {
+        !name.trim().is_empty()
+            && (args.trim().is_empty() || serde_json::from_str::<JsonValue>(args).is_ok())
+    })
+}
+
 pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
     reader: R,
     agent: ConceptId,
@@ -271,14 +308,33 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
     let mut last_finish_reason: Option<String> = None;
     let mut last_usage: Option<JsonValue> = None;
     let mut saw_sse_data = false;
+    let mut saw_done_marker = false;
     let mut raw_fallback = String::new();
 
     for line_res in reader.lines() {
-        let line = line_res.map_err(|e| e.to_string())?;
+        let line = match line_res {
+            Ok(l) => l,
+            Err(err) => {
+                if can_accept_partial_sse_eof(
+                    saw_sse_data,
+                    saw_done_marker,
+                    last_finish_reason.is_some(),
+                    &text_acc,
+                    &tool_calls_map,
+                ) {
+                    break;
+                }
+                return Err(err.to_string());
+            }
+        };
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("data:") {
             let data = rest.trim();
-            if data.is_empty() || data == "[DONE]" {
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                saw_done_marker = true;
                 continue;
             }
             let chunk: JsonValue = serde_json::from_str(data).map_err(|e| e.to_string())?;
@@ -372,36 +428,44 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
     }
 }
 
+struct OpenAiHttpError {
+    reply: Reply,
+    retryable: bool,
+}
+
 fn post_openai_json(
     url: &str,
     api_key: &str,
-    body: JsonValue,
+    body: &JsonValue,
     agent: ConceptId,
     request: u64,
-) -> Result<ureq::Response, Reply> {
+) -> Result<ureq::Response, OpenAiHttpError> {
     let mut req = ureq::post(url);
     if !api_key.trim().is_empty() {
         req = req.set("Authorization", &format!("Bearer {api_key}"));
     }
-    match req.send_json(body) {
+    match req.send_json(body.clone()) {
         Ok(r) => Ok(r),
         Err(ureq::Error::Status(code, r)) => {
             let err_body = r.into_string().unwrap_or_default();
-            Err(Reply::fail(
+            let retryable = matches!(code, 408 | 429 | 500 | 502 | 503 | 504);
+            Err(OpenAiHttpError {
+                reply: Reply::fail(agent, request, format!("openai HTTP {code}: {err_body}")),
+                retryable,
+            })
+        }
+        Err(ureq::Error::Transport(t)) => Err(OpenAiHttpError {
+            reply: Reply::fail(
                 agent,
                 request,
-                format!("openai HTTP {code}: {err_body}"),
-            ))
-        }
-        Err(ureq::Error::Transport(t)) => Err(Reply::fail(
-            agent,
-            request,
-            format!(
-                "openai transport error ({:?}): {}",
-                t.kind(),
-                t.message().unwrap_or("request failed")
+                format!(
+                    "openai transport error ({:?}): {}",
+                    t.kind(),
+                    t.message().unwrap_or("request failed")
+                ),
             ),
-        )),
+            retryable: true,
+        }),
     }
 }
 
@@ -413,21 +477,41 @@ fn execute_openai_http(
     request: u64,
     shared: &OpenAiSharedState,
 ) -> Reply {
-    let resp = match post_openai_json(url, api_key, body, agent, request) {
-        Ok(r) => r,
-        Err(reply) => return reply,
-    };
-    let json: JsonValue = match resp.into_json() {
-        Ok(v) => v,
-        Err(e) => return Reply::fail(agent, request, format!("openai json error: {e}")),
-    };
-    parse_openai_response(
-        &json,
-        agent,
-        request,
-        &shared.pending_calls,
-        shared.telemetry.as_ref(),
-    )
+    for attempt in 0..=MAX_TRANSIENT_RETRIES {
+        let resp = match post_openai_json(url, api_key, &body, agent, request) {
+            Ok(r) => r,
+            Err(err) => {
+                if err.retryable {
+                    if let Some(&delay_ms) = RETRY_BACKOFF_MS.get(attempt) {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue;
+                    }
+                }
+                return err.reply;
+            }
+        };
+        let json: JsonValue = match resp.into_json() {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_retryable_stream_error(&msg) {
+                    if let Some(&delay_ms) = RETRY_BACKOFF_MS.get(attempt) {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue;
+                    }
+                }
+                return Reply::fail(agent, request, format!("openai json error: {msg}"));
+            }
+        };
+        return parse_openai_response(
+            &json,
+            agent,
+            request,
+            &shared.pending_calls,
+            shared.telemetry.as_ref(),
+        );
+    }
+    Reply::fail(agent, request, "openai request exhausted retries")
 }
 
 struct OpenAiStreamTarget<'a> {
@@ -440,28 +524,45 @@ struct OpenAiStreamTarget<'a> {
 }
 
 fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -> Reply {
-    let resp = match post_openai_json(
-        target.url,
-        target.api_key,
-        body,
-        target.agent,
-        target.request,
-    ) {
-        Ok(r) => r,
-        Err(reply) => {
-            if let Some(prev) = target.preview {
-                prev.clear();
+    for attempt in 0..=MAX_TRANSIENT_RETRIES {
+        let resp = match post_openai_json(
+            target.url,
+            target.api_key,
+            &body,
+            target.agent,
+            target.request,
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                if let Some(prev) = target.preview {
+                    prev.clear();
+                }
+                if err.retryable {
+                    if let Some(&delay_ms) = RETRY_BACKOFF_MS.get(attempt) {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue;
+                    }
+                }
+                return err.reply;
             }
-            return reply;
-        }
-    };
-    let reader = BufReader::new(resp.into_reader());
-    let json =
-        match accumulate_openai_sse_reader(reader, target.agent, target.request, target.preview) {
+        };
+        let reader = BufReader::new(resp.into_reader());
+        let json = match accumulate_openai_sse_reader(
+            reader,
+            target.agent,
+            target.request,
+            target.preview,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(prev) = target.preview {
                     prev.clear();
+                }
+                if is_retryable_stream_error(&e) {
+                    if let Some(&delay_ms) = RETRY_BACKOFF_MS.get(attempt) {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        continue;
+                    }
                 }
                 return Reply::fail(
                     target.agent,
@@ -470,15 +571,21 @@ fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -
                 );
             }
         };
-    if let Some(prev) = target.preview {
-        prev.clear();
+        if let Some(prev) = target.preview {
+            prev.clear();
+        }
+        return parse_openai_response(
+            &json,
+            target.agent,
+            target.request,
+            &target.shared.pending_calls,
+            target.shared.telemetry.as_ref(),
+        );
     }
-    parse_openai_response(
-        &json,
+    Reply::fail(
         target.agent,
         target.request,
-        &target.shared.pending_calls,
-        target.shared.telemetry.as_ref(),
+        "openai stream exhausted retries",
     )
 }
 
@@ -817,5 +924,48 @@ mod tests {
 
         let next = next_queued_call(&pending, &dummy_agent_view(2, 7)).unwrap();
         assert!(format!("{next:?}").contains("git_status"), "{next:?}");
+    }
+
+    #[test]
+    fn openai_sse_tolerates_chunk_decode_error_after_finish_reason_and_flags_truncated_streams() {
+        struct ChunkErrorReader {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for ChunkErrorReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos < self.data.len() {
+                    let n = (self.data.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                    self.pos += n;
+                    Ok(n)
+                } else {
+                    Err(std::io::Error::other("Error while decoding chunks"))
+                }
+            }
+        }
+
+        // Complete response followed by abrupt proxy chunk termination must succeed cleanly.
+        let complete = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"42 tildes\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        );
+        let reader_ok = BufReader::new(ChunkErrorReader {
+            data: complete.as_bytes().to_vec(),
+            pos: 0,
+        });
+        let json = accumulate_openai_sse_reader(reader_ok, ConceptId(2), 1, None).unwrap();
+        let reply =
+            parse_openai_response(&json, ConceptId(2), 1, &PendingCallQueue::default(), None);
+        assert_eq!(reply, Reply::done(ConceptId(2), 1, "42 tildes"));
+
+        // Mid-stream truncation before `finish_reason` must return a retryable error.
+        let truncated = "data: {\"choices\":[{\"delta\":{\"content\":\"incompl\"}}]}\n\n";
+        let reader_err = BufReader::new(ChunkErrorReader {
+            data: truncated.as_bytes().to_vec(),
+            pos: 0,
+        });
+        let err = accumulate_openai_sse_reader(reader_err, ConceptId(2), 2, None).unwrap_err();
+        assert!(is_retryable_stream_error(&err), "{err}");
     }
 }

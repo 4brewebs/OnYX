@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
-use command::CommandSpawnerSystem;
+use command::{CommandSpawnerSystem, PendingSessionAction, PendingSystemNotes};
 use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
     AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
@@ -25,14 +25,18 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     NetworkPolicy, PendingCheckpoints, SandboxMode, WorkspaceMode, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
+    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, graph_workspace_mode,
 };
 use openai::{AsyncOpenAiDriver, DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
-use pack::PackSnapshotStore;
+use pack::{
+    PackSnapshotStore, SharedPackStore, default_fork_dir, fork_pack_until_tick,
+    truncate_pack_until_tick,
+};
 use session::{
-    CliApprovalDriver, SessionOptions, StopPolicy, build_host_with_checkpoints,
-    build_host_with_options, make_spec, run_session,
+    CliApprovalDriver, SessionActionContext, SessionOptions, StopPolicy,
+    build_host_with_checkpoints, build_host_with_options, build_host_with_shared_store, make_spec,
+    run_session,
 };
 use tui::TuiDriver;
 
@@ -80,6 +84,10 @@ struct CliArgs {
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
     resume_dir: Option<PathBuf>,
+    resume_tick: Option<u64>,
+    fork_dir: Option<PathBuf>,
+    truncate_future: bool,
+    interactive: bool,
     snapshot_every: Option<u64>,
     max_snapshots: Option<usize>,
 }
@@ -103,6 +111,10 @@ impl CliArgs {
             save_transcript: None,
             snapshot_dir: None,
             resume_dir: None,
+            resume_tick: None,
+            fork_dir: None,
+            truncate_future: false,
+            interactive: false,
             snapshot_every: None,
             max_snapshots: None,
         }
@@ -160,6 +172,9 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut save_transcript = None;
     let mut snapshot_dir = None;
     let mut resume_dir = None;
+    let mut fork_dir = None;
+    let mut truncate_future = false;
+    let mut interactive = false;
     let mut snapshot_every: Option<u64> = None;
     let mut max_snapshots: Option<usize> = None;
     let mut tick_opt: Option<u64> = None;
@@ -287,6 +302,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     .ok_or("--resume requires a snapshot directory path")?;
                 resume_dir = Some(PathBuf::from(p));
             }
+            "--fork-dir" => {
+                let p = args.next().ok_or("--fork-dir requires a directory path")?;
+                fork_dir = Some(PathBuf::from(p));
+            }
+            "--truncate-future" => truncate_future = true,
+            "--interactive" | "--tui" => interactive = true,
             "--tick" => {
                 let t = args.next().ok_or("--tick requires a number")?;
                 tick_opt = Some(t.parse::<u64>().map_err(|_| "--tick must be a u64")?);
@@ -358,6 +379,11 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     if resume_dir.is_some() && snapshot_dir.is_none() {
         snapshot_dir = resume_dir.clone();
     }
+    let resume_tick = if matches!(mode, Mode::Chat) {
+        tick_opt
+    } else {
+        None
+    };
 
     Ok(CliArgs {
         mode,
@@ -376,13 +402,17 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         save_transcript,
         snapshot_dir,
         resume_dir,
+        resume_tick,
+        fork_dir,
+        truncate_future,
+        interactive,
         snapshot_every,
         max_snapshots,
     })
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir>]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -413,8 +443,11 @@ OPTIONS:
       --snapshot-dir <dir> Save compressed milestone snapshots to `<dir>/snapshots.onyxpack`
       --snapshot-every <n> Also capture periodic snapshots every <n> ticks
       --max-snapshots <n>  Opt-in sliding window retention (keeps `init` + latest `n - 1` milestones)
-  -r, --resume <dir>       Resume `chat` from the latest snapshot stored in `<dir>`
-      --tick <n>           Specific tick to inspect (use with `inspect`)
+  -r, --resume <dir>       Resume `chat` from the latest snapshot (or `--tick <n>`) stored in `<dir>`
+      --tick <n>           Specific tick to inspect (`inspect`) or resume/fork from (`chat --resume`)
+      --fork-dir <dir>     Destination snapshot directory when forking via `chat --resume --tick` or `rewind --interactive`
+      --truncate-future    Opt-in: overwrite the source pack in place instead of creating a sibling fork directory
+      --interactive, --tui Open interactive TUI after `rewind <dir> <tick>` instead of running headless
   -l, --list               List all stored snapshot milestones with tags and git checkpoints (use with `inspect`)
       --json               Emit machine-readable JSON output (use with `inspect`)
       --transcript <file>  Replay transcript from rewind point (`rewind`) or validate transcript (`doctor`)
@@ -431,6 +464,8 @@ TUI CONTROLS & SLASH COMMANDS (chat):
                            Scroll the `Memory & Trace` history panel
   /agent [id|name]         Open agent selector or focus a specific agent by ID or name
   /undo                    Revert the latest reversible git checkpoint created during the session
+  /rewind [tick]           List milestones or rewind in-place to `<tick>` (forks snapshots safely + restores git tree)
+  /fork [name]             Branch snapshots up to the current tick into a sibling directory without mutating the original
   /compact [focus]         Compact older turns into a verified session summary (creating a `cmd:/compact` milestone)
   /services                Show @TOON v1 status of local processes & containers from `sprout.toml`
   /service <start|stop|logs> <id|all> [tail]
@@ -586,6 +621,260 @@ fn build_sync_responder(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatResumePlan {
+    target_tick: u64,
+    active_snapshot_dir: PathBuf,
+    branched_from: Option<PathBuf>,
+}
+
+fn prepare_chat_resume(
+    resume_path: &Path,
+    requested_tick: Option<u64>,
+    fork_dir: Option<&Path>,
+    truncate_future: bool,
+    workspace: &Path,
+    config: &AgentConfig,
+    explicit_snapshot_dir: Option<&Path>,
+) -> Result<ChatResumePlan, Box<dyn std::error::Error>> {
+    let store = PackSnapshotStore::new(resume_path);
+    let latest = store
+        .latest_tick()
+        .ok_or_else(|| format!("no snapshots found in `{}`", resume_path.display()))?;
+    let target_tick = match requested_tick {
+        Some(req) => store.resolve_tick_or_floor(req).ok_or_else(|| {
+            format!(
+                "no snapshots found in `{}` at or before tick {req}",
+                resume_path.display()
+            )
+        })?,
+        None => latest,
+    };
+    if let Some(req) = requested_tick {
+        if target_tick != req {
+            println!(
+                "[openOnyx resume] requested tick {req} is not a milestone; resolving to prior milestone tick {target_tick}"
+            );
+        }
+    }
+
+    let has_future = latest > target_tick;
+    if has_future {
+        reconcile_rewind_effects(workspace, resume_path, target_tick, config, false)?;
+    }
+
+    let (active_snapshot_dir, branched_from) = if let Some(fd) = fork_dir {
+        let report = fork_pack_until_tick(resume_path, fd, target_tick)?;
+        println!(
+            "[openOnyx fork] copied {} milestone(s) (<= tick {}) into `{}` (original `{}` preserved)",
+            report.copied_snapshots,
+            report.resolved_tick,
+            report.dest_dir.display(),
+            report.source_dir.display()
+        );
+        (report.dest_dir, Some(resume_path.to_path_buf()))
+    } else if has_future {
+        if truncate_future {
+            let report = truncate_pack_until_tick(resume_path, target_tick)?;
+            println!(
+                "[openOnyx resume --truncate-future] truncated `{}` to {} milestone(s) (<= tick {})",
+                report.dest_dir.display(),
+                report.copied_snapshots,
+                report.resolved_tick
+            );
+            (resume_path.to_path_buf(), None)
+        } else {
+            let dest = default_fork_dir(resume_path, target_tick, None);
+            let report = fork_pack_until_tick(resume_path, &dest, target_tick)?;
+            println!(
+                "[openOnyx fork] branched {} milestone(s) (<= tick {}) into `{}` (original `{}` preserved)",
+                report.copied_snapshots,
+                report.resolved_tick,
+                report.dest_dir.display(),
+                report.source_dir.display()
+            );
+            (report.dest_dir, Some(resume_path.to_path_buf()))
+        }
+    } else {
+        (
+            explicit_snapshot_dir.unwrap_or(resume_path).to_path_buf(),
+            None,
+        )
+    };
+
+    Ok(ChatResumePlan {
+        target_tick,
+        active_snapshot_dir,
+        branched_from,
+    })
+}
+
+fn launch_interactive_chat(
+    cli: &CliArgs,
+    policy: &WorkspacePolicy,
+    tools: WorkspaceTools,
+    base_config: &AgentConfig,
+    base_opts: &SessionOptions,
+    resume_override: Option<(&Path, Option<u64>)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let checkpoints = PendingCheckpoints::default();
+    let chat_config = AgentConfig {
+        default_max_steps: cli.max_steps.unwrap_or(128),
+        default_timeout_ticks: 512,
+        ..base_config.clone()
+    };
+
+    let mut effective_opts = base_opts.clone();
+    let resume_plan = match resume_override {
+        Some((dir, tick)) => {
+            let plan = prepare_chat_resume(
+                dir,
+                tick,
+                cli.fork_dir.as_deref(),
+                cli.truncate_future,
+                &cli.workspace,
+                &chat_config,
+                base_opts.snapshot_dir.as_deref(),
+            )?;
+            effective_opts.snapshot_dir = Some(plan.active_snapshot_dir.clone());
+            effective_opts.save_step_snapshots = true;
+            Some(plan)
+        }
+        None => None,
+    };
+
+    let shared_store = effective_opts
+        .snapshot_dir
+        .as_ref()
+        .map(|d| SharedPackStore::new(d, effective_opts.max_snapshots));
+    let pending_action = PendingSessionAction::new();
+    let pending_notes = PendingSystemNotes::new();
+    let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
+        .with_max_steps(chat_config.default_max_steps)
+        .with_mode_handle(mode_handle.clone())
+        .with_sprout(tools.sprout().clone())
+        .with_pending_action(pending_action.clone())
+        .with_pending_notes(pending_notes.clone());
+    if let Some(store) = shared_store.clone() {
+        spawner = spawner.with_snapshot_store(store);
+    }
+
+    let (mut host, ws_vocab) = build_host_with_shared_store(
+        1,
+        chat_config.clone(),
+        &effective_opts,
+        Some(Box::new(spawner)),
+        Some(checkpoints.clone()),
+        shared_store.clone(),
+    )?;
+
+    if let Some(plan) = &resume_plan {
+        host.request_restore(&plan.target_tick.to_string());
+        host.step(&mut HeadlessDriver::new());
+        host.set_tick(plan.target_tick.saturating_add(1));
+        if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ws_vocab) {
+            mode_handle.set(restored_mode);
+        }
+        if let Some(src) = &plan.branched_from {
+            pending_notes.push(format!(
+                "[resume] Restored milestone tick {} into branch `{}` (source `{}` preserved).",
+                plan.target_tick,
+                plan.active_snapshot_dir.display(),
+                src.display()
+            ));
+        }
+    }
+
+    let llm = resolve_llm_config(cli, &cli.workspace)?;
+    let stream_preview = StreamPreviewHandle::new();
+    let ctx_cfg = TieredContextConfig::for_model(&llm.model);
+    let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
+
+    let tui = TuiDriver::new(host.vocab())?
+        .with_workspace(cli.workspace.clone(), mode_handle.clone())
+        .with_policy(policy.clone())
+        .with_sprout(tools.sprout().clone())
+        .with_workspace_vocab(ws_vocab)
+        .with_stream_preview(stream_preview.clone())
+        .with_telemetry(telemetry.clone())
+        .with_context_config(ctx_cfg)
+        .with_model_info(llm.model.clone(), llm.effort);
+    let tui_handle = tui.handle();
+    let quit = tui.quit_flag();
+    let bridge_ready = Arc::new(AtomicBool::new(false));
+    let action_ctx = SessionActionContext {
+        workspace_root: cli.workspace.clone(),
+        config: chat_config,
+        ws_vocab,
+        mode_handle: mode_handle.clone(),
+        tools: tools.clone(),
+        snapshot_store: shared_store,
+        pending_action,
+        pending_notes,
+    };
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_mode_handle(mode_handle)
+        .with_workspace_vocab(ws_vocab)
+        .sync_existing_undos(host.graph())
+        .with_checkpoints(checkpoints)
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .require_read_before_edit(true)
+        .wrapping(tui);
+    let llm_in_flight = Arc::new(AtomicUsize::new(0));
+    let llm_ready = Arc::new(AtomicBool::new(false));
+    let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
+    let mut driver = match llm.provider {
+        LlmProvider::Gemini => rec_bridge.wrapping(
+            AsyncGeminiDriver::new(
+                host.vocab(),
+                llm.api_key,
+                llm.model,
+                Arc::clone(&llm_in_flight),
+                Arc::clone(&llm_ready),
+            )
+            .with_api_base(llm.api_base)
+            .with_project_instructions(llm.project_instructions)
+            .with_stream_preview(stream_preview)
+            .with_telemetry(telemetry)
+            .with_context_config(ctx_cfg)
+            .with_effort(llm.effort)
+            .wrapping(ws_bridge),
+        ),
+        LlmProvider::OpenAi => rec_bridge.wrapping(
+            AsyncOpenAiDriver::new(
+                host.vocab(),
+                llm.api_key,
+                llm.model,
+                Arc::clone(&llm_in_flight),
+                Arc::clone(&llm_ready),
+            )
+            .with_api_base(llm.api_base)
+            .with_project_instructions(llm.project_instructions)
+            .with_stream_preview(stream_preview)
+            .with_telemetry(telemetry)
+            .with_context_config(ctx_cfg)
+            .with_effort(llm.effort)
+            .wrapping(ws_bridge),
+        ),
+    };
+
+    run_session(
+        &mut host,
+        &mut driver,
+        &effective_opts,
+        StopPolicy::Quit {
+            quit,
+            tui: tui_handle,
+            llm_in_flight,
+            llm_ready,
+            bridge_ready,
+            action_ctx: Some(action_ctx),
+        },
+    )?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = match parse_args() {
         Ok(c) => c,
@@ -685,108 +974,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Mode::Chat => {
-            let checkpoints = PendingCheckpoints::default();
-            let chat_config = AgentConfig {
-                default_max_steps: cli.max_steps.unwrap_or(128),
-                default_timeout_ticks: 512,
-                ..config
-            };
-            let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
-            let spawner = CommandSpawnerSystem::new(cli.auto_approve)
-                .with_max_steps(chat_config.default_max_steps)
-                .with_mode_handle(mode_handle.clone())
-                .with_sprout(tools.sprout().clone());
-            let (mut host, ws_vocab) = build_host_with_options(
-                1,
-                chat_config,
-                &session_opts,
-                Some(Box::new(spawner)),
-                Some(checkpoints.clone()),
-            )?;
-            if let Some(resume_path) = &cli.resume_dir {
-                let store = PackSnapshotStore::new(resume_path);
-                let latest = store
-                    .latest_tick()
-                    .ok_or_else(|| format!("no snapshots found in `{}`", resume_path.display()))?;
-                host.request_restore(&latest.to_string());
-                host.step(&mut HeadlessDriver::new());
-                host.set_tick(latest.saturating_add(1));
-            }
-            let llm = resolve_llm_config(&cli, &cli.workspace)?;
-            let stream_preview = StreamPreviewHandle::new();
-            let ctx_cfg = TieredContextConfig::for_model(&llm.model);
-            let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
-
-            let tui = TuiDriver::new(host.vocab())?
-                .with_workspace(cli.workspace.clone(), mode_handle.clone())
-                .with_policy(policy.clone())
-                .with_sprout(tools.sprout().clone())
-                .with_workspace_vocab(ws_vocab)
-                .with_stream_preview(stream_preview.clone())
-                .with_telemetry(telemetry.clone())
-                .with_context_config(ctx_cfg)
-                .with_model_info(llm.model.clone(), llm.effort);
-            let tui_handle = tui.handle();
-            let quit = tui.quit_flag();
-            let bridge_ready = Arc::new(AtomicBool::new(false));
-            let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
-                .with_mode_handle(mode_handle)
-                .with_workspace_vocab(ws_vocab)
-                .sync_existing_undos(host.graph())
-                .with_checkpoints(checkpoints)
-                .with_ready_flag(Arc::clone(&bridge_ready))
-                .require_read_before_edit(true)
-                .wrapping(tui);
-            let llm_in_flight = Arc::new(AtomicUsize::new(0));
-            let llm_ready = Arc::new(AtomicBool::new(false));
-            let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
-            let mut driver = match llm.provider {
-                LlmProvider::Gemini => rec_bridge.wrapping(
-                    AsyncGeminiDriver::new(
-                        host.vocab(),
-                        llm.api_key,
-                        llm.model,
-                        Arc::clone(&llm_in_flight),
-                        Arc::clone(&llm_ready),
-                    )
-                    .with_api_base(llm.api_base)
-                    .with_project_instructions(llm.project_instructions)
-                    .with_stream_preview(stream_preview)
-                    .with_telemetry(telemetry)
-                    .with_context_config(ctx_cfg)
-                    .with_effort(llm.effort)
-                    .wrapping(ws_bridge),
-                ),
-                LlmProvider::OpenAi => rec_bridge.wrapping(
-                    AsyncOpenAiDriver::new(
-                        host.vocab(),
-                        llm.api_key,
-                        llm.model,
-                        Arc::clone(&llm_in_flight),
-                        Arc::clone(&llm_ready),
-                    )
-                    .with_api_base(llm.api_base)
-                    .with_project_instructions(llm.project_instructions)
-                    .with_stream_preview(stream_preview)
-                    .with_telemetry(telemetry)
-                    .with_context_config(ctx_cfg)
-                    .with_effort(llm.effort)
-                    .wrapping(ws_bridge),
-                ),
-            };
-
-            run_session(
-                &mut host,
-                &mut driver,
-                &session_opts,
-                StopPolicy::Quit {
-                    quit,
-                    tui: tui_handle,
-                    llm_in_flight,
-                    llm_ready,
-                    bridge_ready,
-                },
-            )?;
+            let resume_arg = cli.resume_dir.as_deref().map(|dir| (dir, cli.resume_tick));
+            launch_interactive_chat(&cli, &policy, tools, &config, &session_opts, resume_arg)?;
         }
         Mode::Replay(path) => {
             let bytes = fs::read(path)?;
@@ -842,6 +1031,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick,
             transcript,
         } => {
+            if cli.interactive && !cli.dry_run && transcript.is_none() {
+                launch_interactive_chat(
+                    &cli,
+                    &policy,
+                    tools,
+                    &config,
+                    &session_opts,
+                    Some((dir.as_path(), Some(*tick))),
+                )?;
+                return Ok(());
+            }
             let store = PackSnapshotStore::new(dir);
             let target_tick = store.resolve_tick_or_floor(*tick).ok_or_else(|| {
                 format!(
@@ -2138,5 +2338,290 @@ ready_log = "READY_BUS"
             2,
             "follow-up while WaitingChildren must not spawn duplicate root agent"
         );
+    }
+
+    #[test]
+    fn slash_commands_and_cli_flags_for_rewind_and_fork() {
+        // TEST-03.3: slash command parsing for `/rewind`, `/rewind 15`, `/fork rama-2`, `/compact`, `/agent`.
+        assert_eq!(
+            command::parse_slash_command("/rewind"),
+            Some(command::SlashCommand::Rewind(None))
+        );
+        assert_eq!(
+            command::parse_slash_command("/rewind 15"),
+            Some(command::SlashCommand::Rewind(Some(15)))
+        );
+        assert_eq!(
+            command::parse_slash_command("/rewind nope"),
+            Some(command::SlashCommand::RewindInvalid("nope".to_string()))
+        );
+        assert_eq!(
+            command::parse_slash_command("/fork"),
+            Some(command::SlashCommand::Fork(None))
+        );
+        assert_eq!(
+            command::parse_slash_command("/fork rama-2"),
+            Some(command::SlashCommand::Fork(Some("rama-2".to_string())))
+        );
+        assert_eq!(
+            command::parse_slash_command("/compact enfoque"),
+            Some(command::SlashCommand::Compact(Some("enfoque".to_string())))
+        );
+        assert_eq!(
+            command::parse_slash_command("/agent 2"),
+            Some(command::SlashCommand::Agent(Some("2".to_string())))
+        );
+
+        let chat_cli = parse_args_from(
+            [
+                "chat",
+                "--resume",
+                ".snaps",
+                "--tick",
+                "12",
+                "--fork-dir",
+                ".snaps_alt",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(matches!(chat_cli.mode, Mode::Chat));
+        assert_eq!(chat_cli.resume_dir, Some(PathBuf::from(".snaps")));
+        assert_eq!(chat_cli.resume_tick, Some(12));
+        assert_eq!(chat_cli.fork_dir, Some(PathBuf::from(".snaps_alt")));
+        assert!(!chat_cli.truncate_future);
+
+        let rewind_cli = parse_args_from(
+            [
+                "rewind",
+                ".snaps",
+                "12",
+                "--interactive",
+                "--truncate-future",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(matches!(rewind_cli.mode, Mode::Rewind { tick: 12, .. }));
+        assert!(rewind_cli.interactive);
+        assert!(rewind_cli.truncate_future);
+    }
+
+    #[test]
+    fn chat_resume_at_tick_and_live_fork_rewind_restore_git_and_preserve_origin() {
+        use onyx_soul_agents::Graph;
+
+        // TEST-03.2 + interactive `/fork` & `/rewind <tick>` verification.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-sdd03-b1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git must run");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "core.autocrlf", "false"]);
+        fs::write(dir.join("note.txt"), "v1\n").unwrap();
+        run_git(&["add", "note.txt"]);
+        run_git(&["commit", "-m", "init"]);
+
+        let snap_dir = dir.join("snaps_main");
+        let fork_dir = dir.join("snaps_fork_a");
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_transcript: None,
+            save_step_snapshots: true,
+            snapshot_every: None,
+            max_snapshots: None,
+        };
+        let cfg = AgentConfig {
+            default_max_steps: 16,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy);
+        let checkpoints = PendingCheckpoints::default();
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+        let shared_store = SharedPackStore::new(&snap_dir, None);
+        let pending_action = PendingSessionAction::new();
+        let pending_notes = PendingSystemNotes::new();
+
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_max_steps(16)
+            .with_mode_handle(mode_handle.clone())
+            .with_snapshot_store(shared_store.clone())
+            .with_pending_action(pending_action.clone())
+            .with_pending_notes(pending_notes.clone());
+        let (mut host, ws_vocab) = build_host_with_shared_store(
+            1,
+            cfg.clone(),
+            &opts,
+            Some(Box::new(spawner)),
+            Some(checkpoints.clone()),
+            Some(shared_store.clone()),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "edit note.txt".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools.clone())
+            .with_mode_handle(mode_handle.clone())
+            .with_workspace_vocab(ws_vocab)
+            .with_checkpoints(checkpoints)
+            .require_read_before_edit(true)
+            .wrapping(headless);
+        let mut step = 0usize;
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            step += 1;
+            match step {
+                1 => Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_read",
+                    r#"{"path":"note.txt"}"#,
+                )),
+                2 => Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_edit",
+                    r#"{"path":"note.txt","old_text":"v1","new_text":"v2"}"#,
+                )),
+                _ => Some(Reply::done(req.agent, req.request, "updated to v2")),
+            }
+        })
+        .wrapping(ws_bridge);
+
+        host.step(&mut driver);
+        host.step(&mut driver);
+        assert!(host.run_until_settled(&mut driver, 32));
+        assert_eq!(fs::read_to_string(dir.join("note.txt")).unwrap(), "v2\n");
+        let _ = shared_store.save_milestone(
+            host.ticks().saturating_sub(1),
+            "settled",
+            &host.graph().export(),
+        );
+
+        let orig_pack_bytes = fs::read(snap_dir.join(pack::PACK_FILE_NAME)).unwrap();
+        let orig_store = PackSnapshotStore::new(&snap_dir);
+        let pre_edit_tick = orig_store
+            .entries()
+            .into_iter()
+            .find(|m| m.tag == "tool:fs_read")
+            .map(|m| m.tick)
+            .expect("expected tool:fs_read milestone before fs_edit");
+
+        // 1. Verify `prepare_chat_resume` (TEST-03.2): reconciles git to v1, forks pack, preserves origin.
+        let plan = prepare_chat_resume(
+            &snap_dir,
+            Some(pre_edit_tick),
+            Some(&fork_dir),
+            false,
+            &dir,
+            &cfg,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.target_tick, pre_edit_tick);
+        assert_eq!(plan.active_snapshot_dir, fork_dir);
+        assert_eq!(fs::read_to_string(dir.join("note.txt")).unwrap(), "v1\n");
+        assert_eq!(
+            fs::read(snap_dir.join(pack::PACK_FILE_NAME)).unwrap(),
+            orig_pack_bytes
+        );
+
+        // Resume a fresh host from `fork_dir` at `target_tick + 1` and continue with a new LLM reply.
+        let fork_opts = SessionOptions {
+            snapshot_dir: Some(fork_dir.clone()),
+            save_step_snapshots: true,
+            ..SessionOptions::default()
+        };
+        let (mut resumed_host, _) = build_host_with_options(
+            1,
+            cfg.clone(),
+            &fork_opts,
+            Some(Box::new(CommandSpawnerSystem::new(true).with_max_steps(16))),
+            Some(PendingCheckpoints::default()),
+        )
+        .unwrap();
+        resumed_host.request_restore(&plan.target_tick.to_string());
+        resumed_host.step(&mut HeadlessDriver::new());
+        resumed_host.set_tick(plan.target_tick.saturating_add(1));
+        assert_eq!(resumed_host.ticks(), pre_edit_tick + 1);
+
+        let mut saw_request = false;
+        let mut resumed_driver = RecordingBridge::new(resumed_host.vocab(), |req: &AgentView| {
+            saw_request = true;
+            Some(Reply::done(req.agent, req.request, "alternate branch done"))
+        })
+        .wrapping(HeadlessDriver::new());
+        assert!(resumed_host.run_until_settled(&mut resumed_driver, 16));
+        assert!(saw_request, "resumed host must dispatch new LLM turn");
+        let root_agent = resumed_host.agents()[0];
+        assert_eq!(
+            resumed_host.result(root_agent).as_deref(),
+            Some("alternate branch done")
+        );
+
+        // 2. Verify live `/fork` and `/rewind <tick>` via `apply_session_action` without TTY.
+        // Restore note.txt to v2 so we prove live `/rewind` restores git back to v1.
+        fs::write(dir.join("note.txt"), "v2\n").unwrap();
+        let action_ctx = SessionActionContext {
+            workspace_root: dir.clone(),
+            config: cfg,
+            ws_vocab,
+            mode_handle,
+            tools,
+            snapshot_store: Some(shared_store.clone()),
+            pending_action,
+            pending_notes,
+        };
+        let fork_msg = session::apply_session_action(
+            &mut host,
+            command::SessionAction::Fork {
+                label: Some("exp-live".to_string()),
+            },
+            &action_ctx,
+        );
+        assert!(fork_msg.contains("[/fork] Created branch"), "{fork_msg}");
+        let branched_dir = shared_store.current_dir();
+        assert_ne!(branched_dir, snap_dir);
+        assert!(branched_dir.join(pack::PACK_FILE_NAME).exists());
+
+        let rewind_msg = session::apply_session_action(
+            &mut host,
+            command::SessionAction::Rewind {
+                requested_tick: pre_edit_tick,
+            },
+            &action_ctx,
+        );
+        assert!(
+            rewind_msg.contains(&format!("Restored milestone tick {pre_edit_tick}")),
+            "{rewind_msg}"
+        );
+        assert_eq!(host.ticks(), pre_edit_tick + 1);
+        assert_eq!(fs::read_to_string(dir.join("note.txt")).unwrap(), "v1\n");
+        let root_mem = host.view(host.agents()[0]).memory;
+        assert!(
+            root_mem
+                .iter()
+                .any(|(k, t)| k == "system" && t.contains("[/rewind] Restored milestone tick")),
+            "{root_mem:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1985,3 +1985,55 @@ fn fs_read_rejects_binary_onyx_artifacts_dedups_covered_ranges_and_caches_scent_
         );
     }
 }
+
+#[test]
+fn restore_git_tree_checkpoint_removes_newly_created_untracked_fs_write_target() {
+    let dir = TempDir::new("undo_new_untracked");
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir.0)
+            .output()
+            .expect("git must execute");
+        assert!(out.status.success(), "git {:?} failed", args);
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["config", "user.email", "test@example.com"]);
+    run_git(&["config", "core.autocrlf", "false"]);
+    fs::write(dir.0.join("tracked.txt"), "base\n").unwrap();
+    run_git(&["add", "tracked.txt"]);
+    run_git(&["commit", "-m", "init"]);
+
+    // Pre-existing untracked user file that must NOT be deleted on undo.
+    let user_note = dir.0.join("user_untracked.txt");
+    fs::write(&user_note, "keep me\n").unwrap();
+
+    let (_head, tree_sha) = capture_git_tree_checkpoint(&dir.0).unwrap();
+
+    // Simulate `fs_write` creating a brand new untracked file after checkpoint capture.
+    fs::create_dir_all(dir.0.join("roadmapSDD")).unwrap();
+    let created = dir.0.join("roadmapSDD/SDD-qwen-3.md");
+    fs::write(&created, "# created after checkpoint\n").unwrap();
+    assert!(created.exists());
+
+    onyx_workspace::restore_git_tree_checkpoint_for_targets(
+        &dir.0,
+        &tree_sha,
+        &["roadmapSDD/SDD-qwen-3.md"],
+    )
+    .unwrap();
+
+    assert!(
+        !created.exists(),
+        "newly created untracked fs_write target must be removed on undo"
+    );
+    assert!(
+        user_note.exists(),
+        "unrelated pre-existing untracked user files must be preserved"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.0.join("tracked.txt")).unwrap(),
+        "base\n"
+    );
+}

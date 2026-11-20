@@ -12,7 +12,7 @@ use crate::policy::{PermissionDecision, is_mutating_tool};
 use crate::state::{
     PendingCheckpoints, WorkspaceMode, WorkspaceModeHandle, WorkspaceVocab,
     capture_git_tree_checkpoint, file_read_tick, graph_workspace_mode, is_file_read,
-    normalize_rel_path, restore_git_tree_checkpoint, undone_effects,
+    normalize_rel_path, restore_git_tree_checkpoint_for_targets, undone_effects,
 };
 use crate::tools::WorkspaceTools;
 
@@ -187,7 +187,16 @@ impl PlatformDriver for WorkspaceToolBridge {
             for eff in undone_effects(graph, wv) {
                 if self.applied_undos.insert(eff.id.0) {
                     if let Some(tree_sha) = eff.tree_sha.as_deref() {
-                        let _ = restore_git_tree_checkpoint(&self.tools.policy().root, tree_sha);
+                        let created: Vec<&str> = if eff.tool == "fs_write" {
+                            vec![eff.target.as_str()]
+                        } else {
+                            Vec::new()
+                        };
+                        let _ = restore_git_tree_checkpoint_for_targets(
+                            &self.tools.policy().root,
+                            tree_sha,
+                            &created,
+                        );
                         self.tools.clear_seen_reads();
                     }
                 }

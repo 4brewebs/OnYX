@@ -12,7 +12,7 @@ use onyx_soul_agents::{
 use onyx_workspace::{
     RecordedEffect, SandboxDriverKind, SandboxMode, WorkspacePolicy, all_recorded_effects,
     audit_sprout_workspace, detect_sandbox_capabilities, effects_after_tick, graph_workspace_mode,
-    graph_workspace_plan, is_effect_undone, restore_git_tree_checkpoint,
+    graph_workspace_plan, is_effect_undone, restore_git_tree_checkpoint_for_targets,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -370,20 +370,27 @@ pub fn run_inspect(
     Ok(())
 }
 
-pub fn reconcile_rewind_effects(
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RewindReport {
+    pub orphaned_count: usize,
+    pub restored_tree_sha: Option<String>,
+    pub lines: Vec<String>,
+}
+
+pub fn reconcile_rewind_effects_report(
     workspace: &Path,
     dir: &Path,
     tick: u64,
     config: &AgentConfig,
     dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RewindReport, Box<dyn std::error::Error>> {
     let dir_buf = dir.to_path_buf();
     let store = PackSnapshotStore::new(dir);
     let Some(latest) = store.latest_tick() else {
-        return Ok(());
+        return Ok(RewindReport::default());
     };
     if latest <= tick {
-        return Ok(());
+        return Ok(RewindReport::default());
     }
 
     let (mut probe_host, probe_ws_vocab) = build_host(1, config.clone(), Some(&dir_buf), None)?;
@@ -391,33 +398,60 @@ pub fn reconcile_rewind_effects(
     probe_host.step(&mut HeadlessDriver::new());
     let orphaned = effects_after_tick(probe_host.graph(), &probe_ws_vocab, tick);
     if orphaned.is_empty() {
-        return Ok(());
+        return Ok(RewindReport::default());
     }
 
-    println!(
+    let mut report = RewindReport {
+        orphaned_count: orphaned.len(),
+        restored_tree_sha: None,
+        lines: Vec::with_capacity(orphaned.len() + 2),
+    };
+    report.lines.push(format!(
         "=== [openOnyx rewind] Side-Effect Ledger ({} effects after tick {tick}) ===",
         orphaned.len()
-    );
+    ));
     for eff in &orphaned {
         let ckpt_info = eff
             .tree_sha
             .as_deref()
             .map(|sha| format!(" [tree:{sha}]"))
             .unwrap_or_default();
-        println!(
+        report.lines.push(format!(
             "  - tick={} agent={} [{}] {} -> {} ({}){}",
             eff.tick, eff.agent, eff.reversibility, eff.tool, eff.target, eff.summary, ckpt_info
-        );
+        ));
     }
     if let Some(tree_sha) = orphaned.iter().find_map(|e| e.tree_sha.as_deref()) {
         if dry_run {
-            println!(
+            report.lines.push(format!(
                 "[openOnyx rewind --dry-run] would restore workspace working tree to checkpoint {tree_sha}"
-            );
+            ));
         } else {
-            restore_git_tree_checkpoint(workspace, tree_sha)?;
-            println!("[openOnyx rewind] restored workspace working tree to checkpoint {tree_sha}");
+            let created_targets: Vec<&str> = orphaned
+                .iter()
+                .filter(|e| e.tool == "fs_write")
+                .map(|e| e.target.as_str())
+                .collect();
+            restore_git_tree_checkpoint_for_targets(workspace, tree_sha, &created_targets)?;
+            report.restored_tree_sha = Some(tree_sha.to_string());
+            report.lines.push(format!(
+                "[openOnyx rewind] restored workspace working tree to checkpoint {tree_sha}"
+            ));
         }
+    }
+    Ok(report)
+}
+
+pub fn reconcile_rewind_effects(
+    workspace: &Path,
+    dir: &Path,
+    tick: u64,
+    config: &AgentConfig,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = reconcile_rewind_effects_report(workspace, dir, tick, config, dry_run)?;
+    for line in report.lines {
+        println!("{line}");
     }
     Ok(())
 }
