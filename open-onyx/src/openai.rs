@@ -18,8 +18,8 @@ use onyx_workspace::WorkspaceTools;
 use serde_json::{Value as JsonValue, json};
 
 use crate::context::{
-    ProjectedTurn, SessionTelemetryHandle, TieredContextConfig, extract_openai_usage,
-    project_memory,
+    ProjectedTurn, ReasoningEffort, SessionTelemetryHandle, TieredContextConfig,
+    extract_openai_usage, project_memory,
 };
 use crate::gemini::{
     InFlightGuard, PendingCallQueue, QueuedToolCall, StreamPreviewHandle, next_queued_call,
@@ -35,6 +35,7 @@ struct OpenAiSharedState {
     project_instructions: Arc<String>,
     telemetry: Option<SessionTelemetryHandle>,
     context_config: TieredContextConfig,
+    effort: Option<ReasoningEffort>,
 }
 
 fn tool_call_args_as_string(raw: &JsonValue) -> String {
@@ -56,6 +57,7 @@ pub(crate) fn build_openai_request_body(
     model: &str,
     budget: TieredContextConfig,
     project_instructions: &str,
+    effort: Option<ReasoningEffort>,
     stream: bool,
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
@@ -182,6 +184,9 @@ pub(crate) fn build_openai_request_body(
     }
     if !tools.is_empty() {
         body["tools"] = JsonValue::Array(tools);
+    }
+    if let Some(eff) = effort {
+        body["reasoning_effort"] = json!(eff.as_str());
     }
     body
 }
@@ -519,6 +524,11 @@ impl OpenAiResponder {
         self.shared.context_config = cfg;
         self
     }
+
+    pub fn with_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.shared.effort = effort;
+        self
+    }
 }
 
 impl Responder for OpenAiResponder {
@@ -532,6 +542,7 @@ impl Responder for OpenAiResponder {
             &self.model,
             self.shared.context_config,
             &self.shared.project_instructions,
+            self.shared.effort,
             false,
         );
         Some(execute_openai_http(
@@ -620,6 +631,11 @@ impl AsyncOpenAiDriver {
         self.shared.context_config = cfg;
         self
     }
+
+    pub fn with_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.shared.effort = effort;
+        self
+    }
 }
 
 impl PlatformDriver for AsyncOpenAiDriver {
@@ -660,6 +676,7 @@ impl PlatformDriver for AsyncOpenAiDriver {
                 &self.model,
                 self.shared.context_config,
                 &self.shared.project_instructions,
+                self.shared.effort,
                 true,
             );
             let api_key = self.api_key.clone();
@@ -730,10 +747,12 @@ mod tests {
             "gpt-4o",
             TieredContextConfig::default(),
             "Project notes.",
+            Some(ReasoningEffort::Medium),
             true,
         );
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["reasoning_effort"], "medium");
         assert_eq!(body["stream_options"]["include_usage"], true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");

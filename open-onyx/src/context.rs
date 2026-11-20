@@ -18,6 +18,43 @@ pub const DEFAULT_AUTO_COMPACT_RATIO: f32 = 0.80;
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = DEFAULT_SOFT_CHAR_BUDGET;
 pub const COMPACT_MARKER: &str = "[/compact] ";
 
+/// Nivel de esfuerzo de razonamiento / thinking solicitado al proveedor LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!(
+                "unsupported reasoning effort `{other}` (expected `low`, `medium`, or `high`)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn as_gemini_level(self) -> &'static str {
+        match self {
+            Self::Low => "LOW",
+            Self::Medium => "MEDIUM",
+            Self::High => "HIGH",
+        }
+    }
+}
+
 /// Compatibilidad con la API previa de presupuesto por bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {

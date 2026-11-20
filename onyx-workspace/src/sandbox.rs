@@ -367,19 +367,19 @@ pub fn detect_sandbox_capabilities() -> SandboxCapabilities {
 
     #[cfg(target_os = "linux")]
     let native_driver = {
-        if command_succeeds("bwrap", &["--version"]) {
+        if bwrap_is_usable() {
             notes
                 .push("bubblewrap (`bwrap`) available for filesystem and network isolation".into());
             SandboxDriverKind::Bwrap
         } else if linux_landlock_supported() {
             notes.push(
-                "Linux Landlock LSM active in kernel (install `bwrap` for full --unshare-net)"
+                "Linux Landlock LSM active in kernel (install/enable `bwrap` userns for full --unshare-net)"
                     .into(),
             );
             SandboxDriverKind::Landlock
         } else {
             notes.push(
-                "neither `bwrap` nor Landlock LSM detected; only env_clear and PGID limits apply"
+                "neither usable `bwrap` nor Landlock LSM detected; only env_clear and PGID limits apply"
                     .into(),
             );
             SandboxDriverKind::None
@@ -782,12 +782,13 @@ pub fn prepare_sandboxed_shell_command(
     }
 
     // Capa 3: modo WorkspaceWrite según SO anfitrión.
+    check_offline_network_command(raw_command, config.network)?;
+
     #[cfg(target_os = "linux")]
     {
-        if command_succeeds("bwrap", &["--version"]) {
+        if bwrap_is_usable() {
             return build_bwrap_command(config, workspace_root, sandbox_tmp, raw_command);
         }
-        check_offline_network_command(raw_command, config.network)?;
         let mut cmd = plain_shell_command(raw_command);
         cmd.current_dir(clean_process_path(workspace_root));
         apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
@@ -799,7 +800,6 @@ pub fn prepare_sandboxed_shell_command(
         if Path::new("/usr/bin/sandbox-exec").is_file() {
             return build_seatbelt_command(config, workspace_root, sandbox_tmp, raw_command);
         }
-        check_offline_network_command(raw_command, config.network)?;
         let mut cmd = plain_shell_command(raw_command);
         cmd.current_dir(clean_process_path(workspace_root));
         apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
@@ -808,7 +808,6 @@ pub fn prepare_sandboxed_shell_command(
 
     #[cfg(windows)]
     {
-        check_offline_network_command(raw_command, config.network)?;
         let mut cmd = plain_shell_command(raw_command);
         cmd.current_dir(clean_process_path(workspace_root));
         apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
@@ -817,7 +816,6 @@ pub fn prepare_sandboxed_shell_command(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
-        check_offline_network_command(raw_command, config.network)?;
         let mut cmd = plain_shell_command(raw_command);
         cmd.current_dir(clean_process_path(workspace_root));
         apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
@@ -910,6 +908,31 @@ fn build_container_command(
 }
 
 #[cfg(target_os = "linux")]
+fn bwrap_is_usable() -> bool {
+    use std::sync::OnceLock;
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        // En Ubuntu 24.04 (GitHub Actions) AppArmor puede restringir user namespaces
+        // haciendo que `bwrap --version` funcione pero `bwrap --ro-bind / / ...` falle.
+        command_succeeds(
+            "bwrap",
+            &[
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "true",
+            ],
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn build_bwrap_command(
     config: &SandboxConfig,
     workspace_root: &Path,
@@ -933,16 +956,20 @@ fn build_bwrap_command(
     }
     let ws = workspace_root.to_string_lossy().to_string();
     let tmp = sandbox_tmp.to_string_lossy().to_string();
-    cmd.args([
-        "--bind", &ws, &ws, "--bind", &tmp, &tmp, "--bind", &tmp, "/tmp",
-    ]);
+    // Montar `/tmp` ANTES de `ws` para no ocultar workspaces que vivan bajo `/tmp` (p. ej. TempDir en tests).
+    cmd.args(["--bind", tmp.as_str(), "/tmp"]);
+    if tmp != "/tmp" {
+        cmd.args(["--bind", tmp.as_str(), tmp.as_str()]);
+    }
+    cmd.args(["--bind", ws.as_str(), ws.as_str()]);
 
     // Ocultar credenciales sensibles del usuario en $HOME real.
     if let Some(real_home) = user_home_dir() {
         for sensitive in [".ssh", ".gnupg", ".aws", ".kube"] {
             let p = real_home.join(sensitive);
             if p.exists() {
-                cmd.args(["--tmpfs", &p.to_string_lossy()]);
+                let s = p.to_string_lossy();
+                cmd.args(["--tmpfs", s.as_ref()]);
             }
         }
     }
@@ -950,8 +977,8 @@ fn build_bwrap_command(
     // Rutas de solo lectura adicionales explícitas.
     for extra in &config.allow_read_paths {
         if extra.exists() {
-            let s = extra.to_string_lossy().to_string();
-            cmd.args(["--ro-bind", &s, &s]);
+            let s = extra.to_string_lossy();
+            cmd.args(["--ro-bind", s.as_ref(), s.as_ref()]);
         }
     }
 
@@ -959,12 +986,12 @@ fn build_bwrap_command(
     for rel in [".onyx/config.toml", ".git/hooks", ".git/config", ".env"] {
         let p = workspace_root.join(rel);
         if p.exists() {
-            let s = p.to_string_lossy().to_string();
-            cmd.args(["--ro-bind", &s, &s]);
+            let s = p.to_string_lossy();
+            cmd.args(["--ro-bind", s.as_ref(), s.as_ref()]);
         }
     }
 
-    cmd.args(["--chdir", &ws, "sh", "-c", raw_command]);
+    cmd.args(["--chdir", ws.as_str(), "sh", "-c", raw_command]);
     cmd.current_dir(workspace_root);
     apply_sanitized_env(&mut cmd, config, workspace_root, sandbox_tmp);
     Ok(cmd)

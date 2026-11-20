@@ -1549,9 +1549,9 @@ fn sprout_process_lifecycle_probes_logs_and_clean_drop_teardown() {
     let port = listener.local_addr().unwrap().port();
 
     let cmd_str = if cfg!(windows) {
-        "pwsh -NoProfile -Command \"Write-Output 'Started DemoService'; Write-Output 'Authorization: Bearer secret_sprout_token_9999'; Start-Sleep -Seconds 20\""
+        "pwsh -NoProfile -Command \"Write-Output 'Authorization: Bearer secret_sprout_token_9999'; Write-Output 'Started DemoService'; Start-Sleep -Seconds 20\""
     } else {
-        "echo Started DemoService; echo 'Authorization: Bearer secret_sprout_token_9999'; sleep 20"
+        "echo 'Authorization: Bearer secret_sprout_token_9999'; echo Started DemoService; sleep 20"
     };
     let cmd_escaped = cmd_str.replace('\\', "\\\\").replace('"', "\\\"");
     fs::write(
@@ -1890,4 +1890,98 @@ container = "app-postgres"
     let replayed_panel = graph_workspace_services(replay_host.graph(), &replay_ws_vocab)
         .expect("ws.services.text must replay deterministically");
     assert_eq!(replayed_panel, live_panel);
+}
+
+#[test]
+fn fs_read_rejects_binary_onyx_artifacts_dedups_covered_ranges_and_caches_scent_outline() {
+    let dir = TempDir::new("anti_loop_and_binaries");
+    fs::write(dir.0.join("sample.tr"), b"ONYXTR2\n\x00\xff\xfe").unwrap();
+    fs::write(dir.0.join("legacy.tr"), b"ONYXTR1\n\x00\xff\xfe").unwrap();
+    fs::write(dir.0.join("snapshots.onyxpack"), b"ONYXPK1\x00\xff").unwrap();
+    fs::write(dir.0.join("tick-1.bin"), b"ONYXAG\x00\xff").unwrap();
+    fs::write(
+        dir.0.join("lib.rs"),
+        (1..=25)
+            .map(|i| format!("pub fn f_{i}() -> usize {{ {i} }}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // Binary OnYX artifacts return actionable CLI inspection hints instead of raw UTF-8 errors.
+    let err_tr2 = tools
+        .execute("fs_read", r#"{"path":"sample.tr"}"#)
+        .unwrap_err();
+    assert!(
+        err_tr2.contains("openonyx replay") && err_tr2.contains("doctor --transcript"),
+        "{err_tr2}"
+    );
+    let err_tr1 = tools
+        .execute("fs_read", r#"{"path":"legacy.tr"}"#)
+        .unwrap_err();
+    assert!(err_tr1.contains("openonyx replay"), "{err_tr1}");
+    let err_pk = tools
+        .execute("fs_read", r#"{"path":"snapshots.onyxpack"}"#)
+        .unwrap_err();
+    assert!(err_pk.contains("openonyx inspect"), "{err_pk}");
+    let err_ag = tools
+        .execute("fs_read", r#"{"path":"tick-1.bin"}"#)
+        .unwrap_err();
+    assert!(err_ag.contains("openonyx inspect"), "{err_ag}");
+
+    // Overlapping/subset `fs_read` range is deduplicated until the file changes.
+    let full = tools
+        .execute(
+            "fs_read",
+            r#"{"path":"lib.rs","start_line":1,"end_line":20}"#,
+        )
+        .unwrap();
+    assert!(full.contains("pub fn f_10()"), "{full}");
+    let subset = tools
+        .execute(
+            "fs_read",
+            r#"{"path":"lib.rs","start_line":5,"end_line":12}"#,
+        )
+        .unwrap();
+    assert!(
+        subset.contains("unchanged_since_tick") && subset.contains("covered_by:1-20"),
+        "{subset}"
+    );
+
+    // `scent_outline` caches identical queries and invalidates on `fs_edit`.
+    #[cfg(feature = "scent")]
+    {
+        let first_outline = tools
+            .execute("scent_outline", r#"{"path":"lib.rs"}"#)
+            .unwrap();
+        assert!(
+            !first_outline.contains("[cached scent_outline"),
+            "{first_outline}"
+        );
+        let second_outline = tools
+            .execute("scent_outline", r#"{"path":"lib.rs"}"#)
+            .unwrap();
+        assert!(
+            second_outline.starts_with("[cached scent_outline"),
+            "{second_outline}"
+        );
+
+        tools
+            .execute(
+                "fs_edit",
+                r#"{"path":"lib.rs","old_text":"pub fn f_1() -> usize { 1 }","new_text":"pub fn f_1() -> usize { 100 }"}"#,
+            )
+            .unwrap();
+        let after_edit = tools
+            .execute("scent_outline", r#"{"path":"lib.rs"}"#)
+            .unwrap();
+        assert!(
+            !after_edit.contains("[cached scent_outline"),
+            "cache must be invalidated after fs_edit: {after_edit}"
+        );
+    }
 }

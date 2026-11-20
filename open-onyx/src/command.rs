@@ -22,6 +22,7 @@ pub enum SlashCommand {
     Compact(Option<String>),
     Services,
     Service(String),
+    Agent(Option<String>),
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
@@ -74,6 +75,20 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             return Some(SlashCommand::Service(trimmed.to_string()));
         }
         return Some(SlashCommand::Services);
+    }
+    if cmd == "/agent" || cmd == "/agents" {
+        return Some(SlashCommand::Agent(None));
+    }
+    if let Some(rest) = cmd
+        .strip_prefix("/agent ")
+        .or_else(|| cmd.strip_prefix("/agents "))
+    {
+        let trimmed = rest.trim();
+        return Some(SlashCommand::Agent(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
     }
     None
 }
@@ -464,6 +479,41 @@ impl OnyxSystem for CommandSpawnerSystem {
                             append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
                         }
                     }
+                    SlashCommand::Agent(target) => {
+                        let agents = ctx.graph.query(&[v.state]);
+                        let roster: Vec<String> = agents
+                            .iter()
+                            .map(|id| {
+                                let name = match ctx.graph.get(*id, v.name) {
+                                    Some(Value::Text(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let state = match ctx.graph.get(*id, v.state) {
+                                    Some(Value::Text(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let role = if ctx.graph.related(*id, v.rel_parent).is_empty() {
+                                    "root"
+                                } else {
+                                    "sub"
+                                };
+                                format!("{}:{} [{}] ({})", id.0, name, role, state)
+                            })
+                            .collect();
+                        let note = if roster.is_empty() {
+                            "[/agent] No active agents yet.".to_string()
+                        } else if let Some(t) = target {
+                            format!(
+                                "[/agent] Focus `{t}` is handled by the TUI (F2 / /agent). Agents: {}",
+                                roster.join(" | ")
+                            )
+                        } else {
+                            format!("[/agent] Agents: {}", roster.join(" | "))
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
                 }
                 continue;
             }
@@ -471,6 +521,27 @@ impl OnyxSystem for CommandSpawnerSystem {
             if !self.force_new_agent {
                 if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
                     if continue_agent(ctx.graph, &v, root_id, cmd, self.max_steps_per_turn, now) {
+                        continue;
+                    }
+                    let root_state = match ctx.graph.get(root_id, v.state) {
+                        Some(Value::Text(s)) => s,
+                        _ => String::new(),
+                    };
+                    if matches!(
+                        root_state.as_str(),
+                        "thinking" | "acting" | "waiting_children" | "waiting_approval"
+                    ) {
+                        append_agent_memory(
+                            ctx.graph,
+                            &v,
+                            root_id,
+                            "system",
+                            &format!(
+                                "[system] Root agent #{root} is currently `{root_state}`; wait for completion, press F2 (or `/agent`) to inspect active agents, or use `/new <goal>` to start a separate root agent.",
+                                root = root_id.0
+                            ),
+                            now,
+                        );
                         continue;
                     }
                 }

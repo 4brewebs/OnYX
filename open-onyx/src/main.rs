@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use command::CommandSpawnerSystem;
-use context::{SessionTelemetryHandle, TieredContextConfig};
+use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
     AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
     load_project_instructions,
@@ -58,6 +58,7 @@ struct LlmConfig {
     provider: LlmProvider,
     api_key: String,
     model: String,
+    effort: Option<ReasoningEffort>,
     api_base: Option<String>,
     project_instructions: String,
 }
@@ -67,6 +68,7 @@ struct CliArgs {
     workspace: PathBuf,
     provider: Option<LlmProvider>,
     model: Option<String>,
+    effort: Option<ReasoningEffort>,
     api_base: Option<String>,
     auto_approve: bool,
     ignore_deny: bool,
@@ -89,6 +91,7 @@ impl CliArgs {
             workspace: PathBuf::new(),
             provider: None,
             model: None,
+            effort: None,
             api_base: None,
             auto_approve: false,
             ignore_deny: false,
@@ -145,6 +148,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut workspace = env::current_dir().map_err(|e| e.to_string())?;
     let mut provider: Option<LlmProvider> = None;
     let mut model: Option<String> = None;
+    let mut effort: Option<ReasoningEffort> = None;
     let mut api_base: Option<String> = None;
     let mut auto_approve = false;
     let mut ignore_deny = false;
@@ -182,6 +186,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--model must not be empty".to_string());
                 }
                 model = Some(m);
+            }
+            "--effort" => {
+                let e = args
+                    .next()
+                    .ok_or("--effort requires `low`, `medium`, or `high`")?;
+                effort = Some(ReasoningEffort::parse(&e)?);
             }
             "--api-base" => {
                 let u = args.next().ok_or("--api-base requires a URL")?;
@@ -354,6 +364,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         workspace,
         provider,
         model,
+        effort,
         api_base,
         auto_approve,
         ignore_deny,
@@ -389,6 +400,7 @@ OPTIONS:
   -w, --workspace <dir>    Target workspace directory (default: current working directory)
       --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
       --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
+      --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`)
       --api-base <url>     Custom API base URL (e.g. `http://localhost:11434/v1`; no OPENAI_API_KEY needed when set)
       --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`; `deny` rules in `.onyx/config.toml` still apply and sandbox elevates to `workspace-write` + `offline` unless `--sandbox off`)
       --ignore-deny        Explicitly bypass `[permissions].deny` rules loaded from `.onyx/config.toml`
@@ -413,9 +425,11 @@ OPTIONS:
 TUI CONTROLS & SLASH COMMANDS (chat):
   Enter                    Submit goal, follow-up prompt, or slash command
   Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
+  F2                       Open/close interactive Agent Selector popup (focus root or subagents)
   y / n                    Approve or deny a pending mutating tool diff
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
+  /agent [id|name]         Open agent selector or focus a specific agent by ID or name
   /undo                    Revert the latest reversible git checkpoint created during the session
   /compact [focus]         Compact older turns into a verified session summary (creating a `cmd:/compact` milestone)
   /services                Show @TOON v1 status of local processes & containers from `sprout.toml`
@@ -457,6 +471,26 @@ fn resolve_llm_config(
         },
     };
     let project_instructions = load_project_instructions(workspace);
+    let effort = match cli.effort {
+        Some(e) => Some(e),
+        None => {
+            let env_val = env::var("ONYX_EFFORT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| match provider {
+                    LlmProvider::Gemini => env::var("GEMINI_THINKING_LEVEL")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty()),
+                    LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty()),
+                });
+            match env_val {
+                Some(raw) => Some(ReasoningEffort::parse(&raw)?),
+                None => None,
+            }
+        }
+    };
 
     match provider {
         LlmProvider::Gemini => {
@@ -482,6 +516,7 @@ fn resolve_llm_config(
                 provider,
                 api_key,
                 model,
+                effort,
                 api_base,
                 project_instructions,
             })
@@ -512,6 +547,7 @@ fn resolve_llm_config(
                 provider,
                 api_key,
                 model,
+                effort,
                 api_base,
                 project_instructions,
             })
@@ -529,7 +565,8 @@ fn build_sync_responder(
             let mut r = GeminiResponder::new(llm.api_key.clone(), llm.model.clone())
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
-                .with_context_config(ctx_cfg);
+                .with_context_config(ctx_cfg)
+                .with_effort(llm.effort);
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -539,7 +576,8 @@ fn build_sync_responder(
             let mut r = OpenAiResponder::new(llm.api_key.clone(), llm.model.clone())
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
-                .with_context_config(ctx_cfg);
+                .with_context_config(ctx_cfg)
+                .with_effort(llm.effort);
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -686,7 +724,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_workspace_vocab(ws_vocab)
                 .with_stream_preview(stream_preview.clone())
                 .with_telemetry(telemetry.clone())
-                .with_context_config(ctx_cfg);
+                .with_context_config(ctx_cfg)
+                .with_model_info(llm.model.clone(), llm.effort);
             let tui_handle = tui.handle();
             let quit = tui.quit_flag();
             let bridge_ready = Arc::new(AtomicBool::new(false));
@@ -715,6 +754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_stream_preview(stream_preview)
                     .with_telemetry(telemetry)
                     .with_context_config(ctx_cfg)
+                    .with_effort(llm.effort)
                     .wrapping(ws_bridge),
                 ),
                 LlmProvider::OpenAi => rec_bridge.wrapping(
@@ -730,6 +770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_stream_preview(stream_preview)
                     .with_telemetry(telemetry)
                     .with_context_config(ctx_cfg)
+                    .with_effort(llm.effort)
                     .wrapping(ws_bridge),
                 ),
             };
@@ -2016,5 +2057,86 @@ ready_log = "READY_BUS"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_spawner_blocks_duplicate_root_while_waiting_children_and_caps_subagent_steps() {
+        use onyx_soul_agents::{ConceptId, GraphView};
+
+        // Verify `--effort` CLI parsing and `/agent` slash command parsing.
+        let cli = parse_args_from(
+            ["chat", "--model", "qwen38-27b", "--effort", "high"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(cli.effort, Some(ReasoningEffort::High));
+        assert!(
+            parse_args_from(["chat", "--effort", "ultra"].into_iter().map(String::from)).is_err()
+        );
+        assert_eq!(
+            command::parse_slash_command("/agent"),
+            Some(command::SlashCommand::Agent(None))
+        );
+        assert_eq!(
+            command::parse_slash_command("/agents auditor"),
+            Some(command::SlashCommand::Agent(Some("auditor".to_string())))
+        );
+
+        // Root agent spawns a child subagent and enters `WaitingChildren`.
+        let cfg = AgentConfig {
+            default_max_steps: 128,
+            default_timeout_ticks: 512,
+            ..AgentConfig::default()
+        };
+        let spawner = CommandSpawnerSystem::new(true).with_max_steps(128);
+        let (mut host, _) = build_host(1, cfg, None, Some(Box::new(spawner))).unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "audit repo".to_string(),
+        )));
+        let handle = headless.handle();
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            if req.agent == ConceptId(1) && req.request == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "spawn_agent",
+                    r#"{"name":"auditor","goal":"inspect open-onyx"}"#,
+                ))
+            } else {
+                // Keep child alive (pending) while testing follow-up input protection.
+                None
+            }
+        })
+        .wrapping(headless);
+
+        for _ in 0..5 {
+            host.step(&mut driver);
+        }
+        assert_eq!(host.agents().len(), 2, "expected root + 1 subagent");
+        let root_id = host.agents()[0];
+        let child_id = host.agents()[1];
+        assert_eq!(host.agent_state(root_id), Some(AgentState::WaitingChildren));
+
+        // Subagent max_steps must be capped at DEFAULT_SUBAGENT_MAX_STEPS (32), not 128.
+        let v = host.vocab();
+        assert_eq!(
+            host.graph().get(child_id, v.max_steps),
+            Some(onyx_soul_agents::Value::Int(32))
+        );
+
+        // Sending a follow-up user prompt while root is WaitingChildren must NOT spawn a 2nd root.
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "are you still working?".to_string(),
+        )));
+        host.step(&mut driver);
+        host.step(&mut driver);
+        assert_eq!(
+            host.agents().len(),
+            2,
+            "follow-up while WaitingChildren must not spawn duplicate root agent"
+        );
     }
 }

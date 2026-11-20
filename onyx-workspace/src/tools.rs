@@ -29,6 +29,8 @@ pub struct ToolSchema {
 }
 
 type SeenReadsMap = Arc<Mutex<BTreeMap<(String, usize, usize), (String, u64)>>>;
+#[cfg(feature = "scent")]
+type SeenOutlinesMap = Arc<Mutex<BTreeMap<String, String>>>;
 
 /// Ejecutor de herramientas de código sujeto a `WorkspacePolicy`.
 #[derive(Clone, Debug)]
@@ -39,6 +41,8 @@ pub struct WorkspaceTools {
     sprout: SproutSupervisor,
     #[cfg(feature = "scent")]
     scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
+    #[cfg(feature = "scent")]
+    seen_outlines: SeenOutlinesMap,
 }
 
 impl WorkspaceTools {
@@ -51,6 +55,8 @@ impl WorkspaceTools {
             sprout,
             #[cfg(feature = "scent")]
             scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
+            #[cfg(feature = "scent")]
+            seen_outlines: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -199,6 +205,7 @@ impl WorkspaceTools {
     }
 
     pub fn schemas() -> Vec<ToolSchema> {
+        #[cfg_attr(not(feature = "scent"), allow(unused_mut))]
         let mut out = vec![
             ToolSchema {
                 name: "fs_read",
@@ -592,8 +599,28 @@ impl WorkspaceTools {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+        let raw_bytes =
+            fs::read(&path).map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+        if raw_bytes.starts_with(b"ONYXTR2") || raw_bytes.starts_with(b"ONYXTR1") {
+            return Err(format!(
+                "`{}` is a binary OnYX transcript file; inspect it with `openonyx replay {}` or `openonyx doctor --transcript {}`.",
+                args.path, args.path, args.path
+            ));
+        }
+        if raw_bytes.starts_with(b"ONYXPK1") {
+            return Err(format!(
+                "`{}` is a binary OnYX snapshot pack; inspect it with `openonyx inspect <dir> --list`.",
+                args.path
+            ));
+        }
+        if raw_bytes.starts_with(b"ONYXAG") {
+            return Err(format!(
+                "`{}` is a binary OnYX snapshot file; inspect it with `openonyx inspect <dir> --tick <n>`.",
+                args.path
+            ));
+        }
+        let content = String::from_utf8(raw_bytes)
+            .map_err(|e| format!("failed to read `{}` as UTF-8 text: {e}", args.path))?;
         let digest = fnv1a_hex(content.as_bytes());
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -611,9 +638,19 @@ impl WorkspaceTools {
                 if prev_digest == &digest {
                     let tick_label = tick_hint.unwrap_or(*prev_tick);
                     return Ok(format!(
-                        "@TOON v1\n# cols: subject | predicate | object | meta\n{rel} | unchanged_since_tick:{tick_label} | lines:{start}-{end} | digest:{digest}\n# total: 1\n"
+                        "@TOON v1\n# cols: subject | predicate | object | meta\n{rel} | unchanged_since_tick:{tick_label} | lines:{start}-{end} | digest:{digest}\n# note: already read and unchanged; do not re-read unless edited\n# total: 1\n"
                     ));
                 }
+            }
+            if let Some(((_, prev_s, prev_e), (_, prev_tick))) =
+                guard.iter().find(|((p, ps, pe), (pd, _))| {
+                    p == &rel && pd == &digest && *ps <= start && end <= *pe
+                })
+            {
+                let tick_label = tick_hint.unwrap_or(*prev_tick);
+                return Ok(format!(
+                    "@TOON v1\n# cols: subject | predicate | object | meta\n{rel} | unchanged_since_tick:{tick_label} | lines:{start}-{end} | covered_by:{prev_s}-{prev_e} digest:{digest}\n# note: range already covered by prior read ({prev_s}-{prev_e}); do not re-read unless edited\n# total: 1\n"
+                ));
             }
             let tick_val =
                 tick_hint.unwrap_or_else(|| self.read_seq.fetch_add(1, Ordering::Relaxed));
@@ -640,6 +677,10 @@ impl WorkspaceTools {
         if let Ok(mut guard) = self.seen_reads.lock() {
             guard.clear();
         }
+        #[cfg(feature = "scent")]
+        if let Ok(mut guard) = self.seen_outlines.lock() {
+            guard.clear();
+        }
     }
 
     fn invalidate_seen_file(&self, canonical_path: &Path) {
@@ -650,6 +691,11 @@ impl WorkspaceTools {
             .replace('\\', "/");
         if let Ok(mut guard) = self.seen_reads.lock() {
             guard.retain(|(p, _, _), _| p != &rel);
+        }
+        #[cfg(feature = "scent")]
+        if let Ok(mut guard) = self.seen_outlines.lock() {
+            // Any file edit can invalidate both file-level and directory-level outlines.
+            guard.clear();
         }
     }
 
@@ -1168,12 +1214,6 @@ impl WorkspaceTools {
     fn scent_outline(&self, args: ScentOutlineArgs) -> Result<String, String> {
         let base = args.path.as_deref().unwrap_or(".");
         let resolved = self.policy.resolve_existing(base)?;
-        let mut idx = self
-            .scent_index
-            .lock()
-            .map_err(|_| "scent index lock poisoned".to_string())?;
-        idx.index_target(&self.policy.root, Some(&resolved))
-            .map_err(|e| e.to_string())?;
         let opts = onyx_scent::ToonPageOptions {
             cursor: args.cursor.unwrap_or(0),
             max_rows: args
@@ -1184,10 +1224,32 @@ impl WorkspaceTools {
             exclude_tests: args.exclude_tests.unwrap_or(false),
             ..onyx_scent::ToonPageOptions::default()
         };
-        Ok(truncate_utf8(
-            &idx.outline_toon(opts),
-            self.policy.max_output_bytes,
-        ))
+        let cache_key = format!(
+            "{}:{}:{}:{}:{}",
+            resolved.display(),
+            opts.cursor,
+            opts.max_rows,
+            opts.public_only,
+            opts.exclude_tests
+        );
+        if let Ok(guard) = self.seen_outlines.lock() {
+            if let Some(prev) = guard.get(&cache_key) {
+                return Ok(format!(
+                    "[cached scent_outline — already retrieved above; do not call again without editing files]\n{prev}"
+                ));
+            }
+        }
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_target(&self.policy.root, Some(&resolved))
+            .map_err(|e| e.to_string())?;
+        let out = truncate_utf8(&idx.outline_toon(opts), self.policy.max_output_bytes);
+        if let Ok(mut guard) = self.seen_outlines.lock() {
+            guard.insert(cache_key, out.clone());
+        }
+        Ok(out)
     }
 
     #[cfg(feature = "scent")]
