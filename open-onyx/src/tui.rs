@@ -685,7 +685,7 @@ impl TuiInner {
                 header_lines.push(Line::from(strip_spans));
             } else {
                 header_lines.push(Line::from(Span::styled(
-                    "Tab: Plan/Build · F2: Agents · /services · Esc: quit",
+                    "Tab: Plan/Build · F2: Agents · /rewind · /fork · /services · Esc: quit",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -753,7 +753,7 @@ impl TuiInner {
                 ),
             ]));
             header_lines.push(Line::from(Span::styled(
-                "Tab: Plan/Build · F2: Agents · /services · Esc: quit",
+                "Tab: Plan/Build · F2: Agents · /rewind · /fork · /services · Esc: quit",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -865,7 +865,7 @@ impl TuiInner {
                 }
                 None => (
                     format!(
-                        " [{mode_label}] Goal / Command (Enter send, Tab Plan/Build, F2 Agents, /undo, /compact, /services, /new) "
+                        " [{mode_label}] Goal / Command (Enter send · Tab Plan/Build · F2 Agents · /rewind · /fork · /undo · /compact · /services · /new) "
                     ),
                     vec![Line::from(format!("> {input_snapshot}"))],
                     Color::White,

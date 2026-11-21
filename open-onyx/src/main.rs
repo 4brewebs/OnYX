@@ -459,11 +459,12 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   Enter                    Submit goal, follow-up prompt, or slash command
   Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
   F2                       Open/close interactive Agent Selector popup (focus root or subagents)
+  Ctrl+Tab                 Quick-cycle focused agent (optional terminal-dependent alias for F2 / /agent)
   y / n                    Approve or deny a pending mutating tool diff
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
   /agent [id|name]         Open agent selector or focus a specific agent by ID or name
-  /undo                    Revert the latest reversible git checkpoint created during the session
+  /undo                    Revert the latest reversible git checkpoint (also removes newly created untracked `fs_write` files)
   /rewind [tick]           List milestones or rewind in-place to `<tick>` (forks snapshots safely + restores git tree)
   /fork [name]             Branch snapshots up to the current tick into a sibling directory without mutating the original
   /compact [focus]         Compact older turns into a verified session summary (creating a `cmd:/compact` milestone)
@@ -473,18 +474,20 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
-  Esc / Ctrl+C             Quit cleanly (flushing exit snapshot & transcript if configured)
+  Esc / Ctrl+C             Close popup or quit cleanly (flushing exit snapshot & transcript if configured)
 
-PROJECT INSTRUCTIONS, SKILLS & LIVE PLAN:
-  ONYX.md / AGENTS.md      Loaded from the workspace root into system instructions
+PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
+  ONYX.md / AGENTS.md      Loaded from ~/.onyx/ and the workspace root into system instructions
   .onyx/skills/<name>/SKILL.md (also skills/, ~/.onyx/skills/)
                            Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
-  Live Plan panel          Updated via `plan_update` and shown on the right when terminal width >= 100 columns
+  Live Plan & Services     Right-hand panels (`plan_update` + `sprout.toml`) shown automatically when width >= 100 columns
+  User Manual              Full guide available in `docs/manual/index.md`
 
 ENVIRONMENT VARIABLES:
   GEMINI_API_KEY, OPENAI_API_KEY, ONYX_API_KEY
   ONYX_PROVIDER            Default provider (`gemini` | `openai`)
   ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
+  ONYX_EFFORT              Default reasoning/thinking effort (`low` | `medium` | `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`)
   GEMINI_API_BASE          Custom Gemini API endpoint
   OPENAI_API_BASE / OPENAI_BASE_URL
                            Custom OpenAI-compatible API endpoint"#
@@ -1855,25 +1858,35 @@ mod tests {
             "OPTIONS:",
             "--provider",
             "--model",
+            "--effort",
             "--api-base",
             "--snapshot-dir",
             "--record",
             "--resume",
+            "--fork-dir",
+            "--interactive",
             "TUI CONTROLS & SLASH COMMANDS",
+            "F2",
+            "Ctrl+Tab",
+            "/agent",
             "/undo",
+            "/rewind",
+            "/fork",
             "/compact",
             "/mode",
             "/new",
             "Tab",
             "PgUp",
-            "PROJECT INSTRUCTIONS, SKILLS & LIVE PLAN:",
+            "PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:",
             "SKILL.md",
             "load_skill",
             "Live Plan",
+            "docs/manual/index.md",
             "ENVIRONMENT VARIABLES:",
             "GEMINI_API_KEY",
             "OPENAI_API_KEY",
             "ONYX_PROVIDER",
+            "ONYX_EFFORT",
             "OPENAI_API_BASE",
         ] {
             assert!(help.contains(needle), "help text missing `{needle}`");
