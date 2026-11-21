@@ -2,7 +2,7 @@
 
 > 🇪🇸 **[Leer el manual completo en Español](index.md)**
 
-Welcome to the official manual for **`openonyx`**, the deterministic coding-agent CLI and TUI harness built on the **OnYX** microkernel (`onyx-core` → `onyx-soul-agents` → `onyx-workspace` → `open-onyx`).
+Welcome to the official manual for **`openonyx`**, the deterministic coding-agent **CLI, TUI, and embedded Web PWA** harness built on the **OnYX** microkernel (`onyx-core` → `onyx-soul-agents` → `onyx-workspace` → `open-onyx`).
 
 Unlike conventional terminal coding assistants backed by mutable message arrays, `openonyx` records every decision, read, edit, and command inside a **deterministic EAV graph** featuring:
 
@@ -11,7 +11,8 @@ Unlike conventional terminal coding assistants backed by mutable message arrays,
 - **Non-destructive time-travel & forking** (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`).
 - **Transactional Git checkpoints (`/undo`)** without mutating `HEAD` or your staging index.
 - **100% offline deterministic replay** (`ONYXTR2`, 0 network calls, 0 disk writes).
-- **Defense-in-depth security**: `PLAN` / `BUILD` / `EXPLORE` modes, `.onyx/config.toml` rules (`deny > ask > allow`), OS sandboxing with `env_clear()`, Control Plane RO protection, and RAII `ProcessJob` process-tree teardown.
+- **Defense-in-depth security**: **`blake3` Workspace Trust** (`openonyx trust` / `/trust`), `PLAN` / `BUILD` / `EXPLORE` modes, `.onyx/config.toml` rules (`deny > ask > allow`), *Scent-Heated Approvals*, OS sandboxing with `env_clear()`, Control Plane RO protection, and RAII `ProcessJob` process-tree teardown.
+- **Embedded Web UI / PWA (`openonyx serve`)**: pure-`std` HTTP/1.1 + SSE server (0 `tokio`) ready for desktop browsers, mobile phones, or HTTPS reverse proxies, with `blake3` constant-time auth (`HttpOnly` cookie / `Bearer`) and explicit `--cors-origin` support for external frontends.
 - **Semantic AST navigation** (`onyx-scent`: `scent_outline` + `scent_impact`) and **local process/container orchestration** (`sprout.toml`).
 
 ---

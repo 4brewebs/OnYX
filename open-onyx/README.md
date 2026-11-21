@@ -1,26 +1,31 @@
 # open-onyx (`openonyx`)
 
-**CLI and TUI coding agent harness powered by OnYX (`onyx-soul-agents` + `onyx-workspace`).**
+**CLI, TUI, and embedded Web PWA coding agent harness powered by OnYX (`onyx-soul-agents` + `onyx-workspace`).**
 
-`openonyx` connects an external LLM responder (`GeminiResponder` / `AsyncGeminiDriver` via Google AI Studio SSE/REST API, or `OpenAiResponder` / `AsyncOpenAiDriver` via any OpenAI-compatible `/v1/chat/completions` endpoint such as OpenAI, Ollama, vLLM, or OpenRouter with SSE EOF tolerance and transient retry backoff) and an interactive terminal UI (`TuiDriver` via `ratatui` + `crossterm` with live SSE token streaming `[stream] ...▍`, Braille status emblem, and `F2` multi-agent selector) to OnYX's deterministic `AgentHost` runtime, with multi-turn sessions, configurable reasoning `--effort`, project instruction loading (`ONYX.md` / `AGENTS.md`), declared logical surfaces, `Plan`/`Build` mode toggling, OS sandboxing & Sprout local service orchestration, transactional Git `/undo`, transcript recording (`ONYXTR1` / `ONYXTR2`), milestone graph snapshots stored in compressed append-only `snapshots.onyxpack`, and non-destructive time-travel/forking (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`).
+`openonyx` connects an external LLM responder (`GeminiResponder` / `AsyncGeminiDriver` via Google AI Studio SSE/REST API, or `OpenAiResponder` / `AsyncOpenAiDriver` via any OpenAI-compatible `/v1/chat/completions` endpoint such as OpenAI, Ollama, vLLM, or OpenRouter with SSE EOF tolerance and transient retry backoff) and either an interactive terminal UI (`TuiDriver` via `ratatui` + `crossterm` with live SSE token streaming `[stream] ...▍`, Braille status emblem, and `F2` multi-agent selector) or an embedded mobile-first Web UI (`WebDriver` via `openonyx serve`, pure `std::net` HTTP/1.1 + SSE + Obsidian/Champagne-Gold PWA with zero `tokio`) to OnYX's deterministic `AgentHost` runtime, with multi-turn sessions, configurable reasoning `--effort`, `blake3` Workspace Trust (`openonyx trust` / `/trust`), project instruction loading (`ONYX.md` / `AGENTS.md`), declared logical surfaces, `Plan`/`Build`/`Explore` mode toggling, OS sandboxing & Sprout local service orchestration, transactional Git `/undo`, transcript recording (`ONYXTR1` / `ONYXTR2`), milestone graph snapshots stored in compressed append-only `snapshots.onyxpack`, and non-destructive time-travel/forking (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`).
 
-> **Complete User Manual:** see [`docs/manual/index.md`](../docs/manual/index.md) (quickstart in English & Spanish, daily TUI workflow, permissions & OS sandbox, time-travel & forking, 19-tool reference, Sprout services, and troubleshooting).
+> **Complete User Manual:** see [`docs/manual/index.md`](../docs/manual/index.md) (quickstart in English & Spanish, daily TUI workflow, permissions & OS sandbox, Workspace Trust, `openonyx serve` Web UI, time-travel & forking, 19-tool reference, Sprout services, and troubleshooting).
 
 ## Environment Variables & Multi-Provider Selection
 
 - `ONYX_PROVIDER` — optional default provider (`gemini` or `openai`; defaults to `gemini`, overridden by `--provider`).
-- `GEMINI_API_KEY` (or `ONYX_API_KEY`) — required for `gemini` provider in `run`, `chat`, and live `rewind` (not needed for `replay`, `inspect`, `rewind --dry-run`, `rewind --transcript`, or `doctor`).
+- `GEMINI_API_KEY` (or `ONYX_API_KEY`) — required for `gemini` provider in `run`, `chat`, `serve`, and live `rewind` (not needed for `replay`, `inspect`, `rewind --dry-run`, `rewind --transcript`, `trust`, or `doctor`).
 - `ONYX_MODEL` / `ONYX_GEMINI_MODEL` — optional Gemini model name (defaults to `gemini-4-hydrogen`, overridden by `--model`).
-- `GEMINI_API_BASE` — optional custom Gemini API base URL (overridden by `--api-base`).
+- `GEMINI_API_BASE` — optional custom Gemini API base URL (overridden by `--api-base`; remote hosts require `https://` and `--allow-custom-auth-host` when sending API keys to non-official hosts).
 - `OPENAI_API_KEY` (or `ONYX_API_KEY`) — API key for `--provider openai` (optional when using a custom local `--api-base` / `OPENAI_API_BASE` / `OPENAI_BASE_URL` such as Ollama or vLLM).
 - `ONYX_MODEL` / `OPENAI_MODEL` — optional OpenAI-compatible model name (defaults to `gpt-4o`, overridden by `--model`).
 - `OPENAI_API_BASE` / `OPENAI_BASE_URL` — optional base URL for `--provider openai` (defaults to `https://api.openai.com/v1`, overridden by `--api-base`).
+- `ONYX_ALLOW_CUSTOM_AUTH_HOST` — set to `1`/`true` (or pass `--allow-custom-auth-host`) to explicitly authorize sending LLM API keys to a non-official HTTPS `--api-base` host.
 - `ONYX_EFFORT` — optional reasoning/thinking effort (`low`, `medium`, or `high`; overridden by `--effort`, with provider-specific fallbacks `GEMINI_THINKING_LEVEL` for Gemini and `OPENAI_REASONING_EFFORT` for OpenAI).
 - `ONYX_AUTO_SAVE` — enable `--auto-save` by default (`1`, `true`, `yes`, or `on`), automatically storing snapshots and transcripts together under `<workspace>/.onyx/vault/<session>/`.
+- `ONYX_TRUST_FILE` — optional override path for the `blake3` Workspace Trust store (defaults to `~/.onyx/trusted_workspaces.toml`).
+- `ONYX_WEB_BIND` — default bind address for `openonyx serve` (defaults to `127.0.0.1:8787`, overridden by `--bind`).
+- `ONYX_WEB_API_KEY` — explicit API key for `openonyx serve` (required with `>= 16` characters whenever `--bind` is non-loopback; ephemeral 256-bit OS-CSPRNG key generated automatically on loopback).
+- `ONYX_WEB_CORS_ORIGIN` — optional single allowlisted origin (`http://localhost:5173` or `https://...`, never `*`) for an external frontend (e.g. a Svelte SPA) talking to `openonyx serve`.
 
 ## Project Instructions
 
-On startup (`run`, `chat`, and live `rewind`), `load_project_instructions` loads markdown rules in order from:
+On startup (`run`, `chat`, `serve`, and live `rewind`), `load_project_instructions` loads markdown rules in order from:
 
 1. `~/.onyx/AGENTS.md` and `~/.onyx/ONYX.md`
 2. `<workspace>/AGENTS.md` and `<workspace>/ONYX.md`
@@ -30,11 +35,13 @@ Loaded files are filtered through `scrub_secrets`, combined with the host OS she
 ## Usage
 
 ```text
-openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
-openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
+openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
+openonyx serve [--bind <host:port>] [--api-key <key>] [--cors-origin <origin>] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
+openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
+openonyx trust [add|list|check|revoke] [--workspace <dir>]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
 openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]
-openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]
+openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]
 openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
 openonyx [--help | -h | --version | -V]
 ```
@@ -90,10 +97,28 @@ cargo run -p open-onyx -- rewind snaps_chat 4 --dry-run
 cargo run -p open-onyx -- rewind snaps_chat 4 --transcript chat.tr
 ```
 
-Audit Git worktree health, stray artifacts, `snapshots.onyxpack` integrity (including FNV-1a checksums, `ONYXAG` payloads, and crash-truncated tail detection), legacy `tick-*.bin` snapshots, transcript headers, ledger `tree_sha` objects, OS sandbox capabilities, and `sprout.toml`:
+Audit Git worktree health, Workspace Trust state, stray artifacts, `snapshots.onyxpack` integrity (including FNV-1a checksums, `ONYXAG` payloads, and crash-truncated tail detection), legacy `tick-*.bin` snapshots, transcript headers, ledger `tree_sha` objects, OS sandbox capabilities, and `sprout.toml`:
 
 ```sh
 cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
+```
+
+Manage `blake3` Workspace Trust for repositories with `.onyx/config.toml` or `sprout.toml`:
+
+```sh
+cargo run -p open-onyx -- trust check --workspace .
+cargo run -p open-onyx -- trust add --workspace .
+cargo run -p open-onyx -- trust list
+```
+
+Serve the embedded mobile-first Web UI / PWA over HTTP/1.1 + SSE (loopback generates an ephemeral 256-bit API key; non-loopback requires an explicit `--api-key` `>= 16` chars):
+
+```sh
+# Local browser preview (prints URL + ephemeral API key)
+cargo run -p open-onyx -- serve --workspace . --auto-save
+
+# Remote/proxy bind or external Svelte SPA via explicit CORS origin
+cargo run -p open-onyx -- serve --bind 0.0.0.0:8787 --api-key "your-long-secret-key" --cors-origin http://localhost:5173 --auto-save
 ```
 
 ## Session Vault (`.onyx/vault/`) & `--auto-save`
@@ -118,7 +143,8 @@ When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapsh
 - **`Tab`**: toggle between `[BUILD]` and `[PLAN]` modes by queuing `IngressEvent::Command("/mode plan" | "/mode build")`, persisting `ws.mode` in the EAV graph and recording the switch in `ONYXTR2` transcripts.
 - **`F2` / `Ctrl+Tab` / `/agent [id|name]`**: open the interactive **Agent Selector** popup (or jump directly by ID/name) to inspect and focus the root agent or any delegated `spawn_agent` child (subagents default to a `32`-step cap unless overridden).
 - **`y` / `n`**: approve or deny pending mutating tools (`fs_write`, `fs_edit`, `shell_exec`, `service_*`) when `AgentState::WaitingApproval` is active. The banner identifies `[agent #id name]`, and for `fs_write` / multi-hunk `fs_edit` expands to render a colored unified diff preview (`preview_tool_diff`).
-- **Compact 3-row header, Braille emblem & side panels**: shows an animated Braille spinner (`⠋..⠏`, 90 ms throttle), `[PLAN]`/`[BUILD]`, `[SANDBOX:workspace|strict|off]`, active model + `--effort`, and live telemetry (`ctx: <1%`/`XX% · in / cache / out / think · ~$cost` or `local`) without mutating deterministic ticks. When `plan_update` (`ws.plan.text`) and/or `sprout.toml` (`ws.services.text`) are present and terminal width `>= 100` columns, `TuiDriver` splits the main area (`70%` Memory & Trace / `30%` right pane, vertically split `50%`/`50%` when both are active).
+- **Compact 3-row header, Braille emblem & side panels**: shows an animated Braille spinner (`⠋..⠏`, 90 ms throttle), `[PLAN]`/`[BUILD]`, `[SANDBOX:workspace|env+job|strict|off]`, `[UNTRUSTED]` when project configs are not yet trusted, active model + `--effort`, and live telemetry (`ctx: <1%`/`XX% · in / cache / out / think · ~$cost` or `local`) without mutating deterministic ticks. When `plan_update` (`ws.plan.text`) and/or `sprout.toml` (`ws.services.text`) are present and terminal width `>= 100` columns, `TuiDriver` splits the main area (`70%` Memory & Trace / `30%` right pane, vertically split `50%`/`50%` when both are active).
+- **`/trust [status|revoke]`**: inspect, approve, or revoke `blake3` Workspace Trust for `<workspace>/.onyx/config.toml` and `sprout.toml` live inside the session (hot-unblocking Sprout).
 - **`/services` and `/service <start|stop|logs> <id|all> [tail]`**: inspect and control local processes & Docker/Rancher containers declared in `sprout.toml` directly from the TUI (validated in `openonyx doctor`).
 - **`/undo`**: marks the latest reversible `fs_write`/`fs_edit` checkpoint (`ws.effect.undone`) inside `CommandSpawnerSystem`; `WorkspaceToolBridge::present` restores the Git tree checkpoint on disk (`restore_git_tree_checkpoint_for_targets` + `clear_seen_reads()`), also cleaning up newly created untracked `fs_write` files without deleting unrelated user files, while `ReplayBridge` reproduces the graph state without touching disk.
 - **`/rewind [tick]`**: lists available milestones when called without arguments, or rewinds live in-session to `<tick>` (or nearest prior milestone `<= tick`) when idle, forking snapshots into a sibling directory, reconciling orphaned effects/Git tree on disk, and resuming seamlessly in the TUI.
@@ -136,16 +162,17 @@ When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapsh
 
 - [`src/main.rs`](src/main.rs): CLI parsing (`CliArgs`, `Mode`, `parse_args_from`), `--effort` / resume-fork resolution (`prepare_chat_resume`, `launch_interactive_chat`), driver stack composition, system registration (`SubagentSystem`, `WorkspaceLedgerSystem`, `CommandSpawnerSystem`, `MilestoneSnapshotSystem`), and delegation to `run_session` / `ops`.
 - [`src/context.rs`](src/context.rs): shared `TieredContextConfig` / `ToolOutputTier` projection (Tier 0 full recent outputs, deterministic coordinate-preserving Tier 1 summaries for older outputs, Tier 2 `/compact` and auto-compaction boundaries, prompt-cache-stable prefixes), `ReasoningEffort`, and `TokenUsage` / `SessionTelemetryHandle` extraction for Gemini and OpenAI.
-- [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `SlashCommand` (`/new`, `/mode`, `/agent`, `/undo`, `/rewind`, `/fork`, `/compact`, `/services`, `/service`), `PendingSessionAction` / `PendingSystemNotes`, `on_restore` mode sync, and multi-turn `continue_agent` with active-root protection.
+- [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `SlashCommand` (`/new`, `/mode`, `/agent`, `/trust`, `/undo`, `/rewind`, `/fork`, `/compact`, `/services`, `/service`), `PendingSessionAction` / `PendingSystemNotes`, `on_restore` mode sync, and multi-turn `continue_agent` with active-root protection.
 - [`src/pack.rs`](src/pack.rs): `PackSnapshotStore`, `SharedPackStore` (live branch switching), `fork_pack_until_tick`, `truncate_pack_until_tick`, `default_fork_dir`, `verify_pack_integrity` (zlib-compressed `snapshots.onyxpack` with FNV-1a verification, truncated-tail crash tolerance, opt-in `--max-snapshots` compaction, and legacy `tick-*.bin` fallback), and `MilestoneSnapshotSystem`.
 - [`src/vault.rs`](src/vault.rs): centralized `.onyx/vault/` session storage resolver (`resolve_write_storage`, `resolve_read_snapshot_dir`, `resolve_read_transcript`, `generate_auto_session_id`, `ensure_vault_gitignore`, `audit_vault`) backing `--auto-save` / `ONYX_AUTO_SAVE`.
 - [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`, `SURFACE_PLAN`, `SURFACE_SERVICES` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `apply_session_action` (live `/rewind` and `/fork` orchestration), `build_host` / `build_host_with_shared_store`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
 - [`src/ops.rs`](src/ops.rs): offline snapshot & ledger utilities (`render_inspect` / `run_inspect` with `--list` and `--json`, `reconcile_rewind_effects` & quiet `reconcile_rewind_effects_report` for live TUI rewind, and `run_doctor`).
 - [`src/gemini.rs`](src/gemini.rs): `GeminiResponder` (sync), `AsyncGeminiDriver` (non-blocking `:streamGenerateContent?alt=sse` HTTP worker + `StreamPreviewHandle` + `InFlightGuard`), `load_project_instructions` + OS shell hint + on-demand skills catalog, `thinkingLevel` (`--effort`), *as-of* read `superseded` projection + `ContextBudget` pruning, sequential multi-`functionCall` queueing, `"user"`/`"system"` turn mapping, and `thoughtSignature` inheritance.
 - [`src/openai.rs`](src/openai.rs): OpenAI-compatible `/v1/chat/completions` adapter (`OpenAiResponder` sync and `AsyncOpenAiDriver` SSE streaming with `StreamPreviewHandle`, `reasoning_effort`, completed-SSE EOF tolerance, and transient HTTP/stream retry backoff), supporting OpenAI, OpenRouter, Ollama, vLLM, and LM Studio while reusing `ContextBudget`, `superseded` pruning, and tool call queuing.
-- [`src/tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`ratatui` + `crossterm`) rendering the compact 3-row header (Braille emblem, `[PLAN]`/`[BUILD]`, `[SANDBOX:...]`, model/`--effort`, live telemetry), live SSE token preview (`[stream] ...▍` in `pump_idle`), wrapped history navigation (`visual_row_count` + `apply_scroll_key`), `F2` interactive Agent Selector popup (`render_agent_picker`), optional `70%`/`30%` `Live Plan` + `Services (Sprout)` side panels, colored trace entries, and `[agent #id]` unified diff approval panel. Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` retain 0 external dependencies.
+- [`src/tui.rs`](src/tui.rs): `TuiDriver` + `TuiHandle` (`ratatui` + `crossterm`) rendering the compact 3-row header (Braille emblem, `[PLAN]`/`[BUILD]`, `[SANDBOX:workspace|env+job|strict|off]`, `[UNTRUSTED]`, model/`--effort`, live telemetry), live SSE token preview (`[stream] ...▍` in `pump_idle`), wrapped history navigation (`visual_row_count` + `apply_scroll_key`), `F2` interactive Agent Selector popup (`render_agent_picker`), optional `70%`/`30%` `Live Plan` + `Services (Sprout)` side panels, colored trace entries, and `[agent #id]` unified diff approval panel (with `# impact:` Scent heat banner). Kept in `open-onyx` so `onyx-core` and `onyx-soul-agents` retain 0 external dependencies.
+- [`src/web.rs`](src/web.rs) & [`web/`](web/): `WebDriver` + `WebHandle` implementing `UiIdlePump` over pure `std::net::TcpListener` + `std::thread` + `Condvar` + `blake3` (0 `tokio`), serving `/api/v1/{health,auth/login,auth/logout,state,events,command,approval,focus,queue/clear,files}` with OS CSPRNG sessions, `HttpOnly`/`__Host-` cookies + `Bearer` auth, `Sec-Fetch-Site` CSRF guard, strict CSP (`require-trusted-types-for 'script'`), explicit `--cors-origin`, and the embedded Obsidian/Champagne-Gold PWA (`index.html`, `styles.css`, `app.js`, `logo.jpg`, `icon.svg`, `manifest.webmanifest`) with zero `innerHTML`.
 
 ## Roadmap / TODO (Not Yet Implemented)
 
-- **Input ergonomics & palette (SDD-03 Block 2/3)**: interactive `/` command & `@file` autocomplete popup, command history, queued follow-up prompts, and `F1..F5` / `Ctrl+K` modular TUI views.
+- **Modular TUI views (`F1..F5` / `Ctrl+K`)**: dedicated multi-panel command palette and filterable trace views.
 - **Unified recovery bundle**: bundle graph snapshot, tick `n`, RNG seed, and `Transcript` into a single validated checkpoint artifact for `rewind` and `resume`.
