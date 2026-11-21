@@ -4,6 +4,11 @@ All notable changes to the **OnYX** workspace crates (`onyx-core`, `onyx-soul`, 
 
 ## [Unreleased]
 
+### Added (`open-onyx` — SDD-03 Block 2: TUI Input Ergonomics, `/` & `@` Autocomplete & Follow-Up Queue)
+
+- **UTF-8 cursor editing, prompt history & floating autocomplete (`open-onyx/src/tui_input.rs`)**: added `InputBuffer` (`Left`/`Right`/`Home`/`End`/`Delete` with visible reversed cursor), `InputHistory` (`Alt+Up`/`Alt+Down` and `Ctrl+P`/`Ctrl+N` preserving unsent drafts), and floating `PopupState` triggered by `/` (slash commands with descriptions) and `@` (cached workspace file paths respecting `WorkspacePolicy`, ignoring emails like `user@domain`).
+- **Queued follow-up prompts & subagent badge (`open-onyx/src/tui.rs`)**: typing a follow-up while the root agent is busy queues it cleanly (`queued:N`, previewed in the input bar, clearable via `Ctrl+X`) and dispatches it automatically upon settle without spawning duplicate roots; displays live `subagents:N` and `queued:N` badges in the header.
+
 ### Added (`open-onyx` & `onyx-workspace` — Session Vault `.onyx/vault/` & `--auto-save`)
 
 - **Centralized session vault (`open-onyx/src/vault.rs`)**: short session names for `--snapshot-dir <name>` resolve under `<workspace>/.onyx/vault/<name>/`, co-locating short `--record <file>` transcripts inside the same directory (or under `.onyx/vault/unassigned/<file>` when no snapshot dir is set) while preserving explicit paths verbatim.

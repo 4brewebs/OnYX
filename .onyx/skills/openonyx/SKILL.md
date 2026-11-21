@@ -97,7 +97,9 @@ openonyx run "resume la arquitectura de crates" --auto-save
 
 ### Atajos de teclado
 
-- **`Enter`**: envía objetivo, prompt de seguimiento (reactiva al mismo agente raíz conservando toda su `rel_memory` vía `continue_agent`) o comando slash. Mientras el agente raíz está ocupado (`thinking`, `acting`, `waiting_children` o `waiting_approval`), la TUI impide crear un segundo agente raíz accidental.
+- **`Enter`**: envía objetivo, prompt de seguimiento (reactiva al mismo agente raíz conservando toda su `rel_memory` vía `continue_agent`) o comando slash. Mientras el agente raíz está ocupado (`thinking`, `acting`, `waiting_children` o `waiting_approval`), los prompts enviados se encolan automáticamente (`queued:N`, limpiable con `Ctrl+X`) y se despachan al terminar sin crear un segundo agente raíz.
+- **`/` y `@`**: abre el popup de autocompletado interactivo de comandos slash (`/`) o archivos del workspace (`@`, ignorando `.git`/`target`/`.onyx/vault`, navegable con `↑`/`↓`, `Tab`/`Enter` para aceptar y `Esc` para cerrar).
+- **`Left` / `Right` / `Home` / `End` / `Delete`**: edición UTF-8 con cursor visible; **`Alt+Up` / `Alt+Down`** (`Ctrl+P` / `Ctrl+N`) navega el historial de prompts preservando el borrador.
 - **`Tab`**: alterna en caliente entre `[BUILD]` (edición permitida) y `[PLAN]` (solo lectura).
 - **`F2`**: abre/cierra el popup interactivo **Agent Selector** para inspeccionar y enfocar al agente raíz o cualquiera de sus subagentes (`↑`/`↓`, `Enter`, `Esc`).
 - **`Ctrl+Tab`**: atajo rápido para rotar el agente enfocado (alias dependiente del terminal para `F2` / `/agent`).

@@ -43,6 +43,9 @@ use crate::context::{
 };
 use crate::gemini::StreamPreviewHandle;
 use crate::pack::SharedPackStore;
+use crate::tui_input::{
+    InputBuffer, InputHistory, PopupState, QueuedPrompts, WorkspaceFileIndex, render_input_popup,
+};
 use crate::vault::session_display_label;
 
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(90);
@@ -78,7 +81,12 @@ struct TuiInner {
     session_label: Option<String>,
     snapshot_store: Option<SharedPackStore>,
     seen_compact_count: usize,
-    input: String,
+    input: InputBuffer,
+    history: InputHistory,
+    popup: PopupState,
+    file_index: WorkspaceFileIndex,
+    pending_prompts: QueuedPrompts,
+    root_busy: bool,
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
     approval_diff: Option<String>,
@@ -111,6 +119,7 @@ impl TuiHandle {
     }
 
     /// Reads keyboard/resize input while the brain is settled (`is_settled()`),
+    /// dispatches any queued follow-up prompt once the root agent settles,
     /// or refreshes in-flight SSE deltas, telemetry, and throttled emblem rotation without advancing `host.ticks()`.
     pub fn pump_idle(&self, graph: &dyn GraphView) {
         let mut inner = self.inner.borrow_mut();
@@ -118,6 +127,20 @@ impl TuiHandle {
         let stream_dirty = inner.stream_preview.take_dirty();
         let telemetry_dirty = inner.telemetry.take_dirty();
         let busy = inner.is_any_agent_busy(graph);
+        let root_busy = inner.is_root_agent_busy(graph);
+        inner.root_busy = root_busy;
+        if !root_busy
+            && inner.active_approval.is_none()
+            && inner.queued.is_empty()
+            && !inner.pending_prompts.is_empty()
+        {
+            if let Some(next_prompt) = inner.pending_prompts.pop_front() {
+                inner.scroll_from_bottom = 0;
+                inner
+                    .queued
+                    .push(OnyxEvent::Ingress(IngressEvent::Command(next_prompt)));
+            }
+        }
         let spinner_dirty = inner.advance_spinner_if_due(busy);
         if (ui_event || stream_dirty || telemetry_dirty || spinner_dirty)
             && inner.queued.is_empty()
@@ -156,7 +179,12 @@ impl TuiDriver {
                 session_label: None,
                 snapshot_store: None,
                 seen_compact_count: 0,
-                input: String::new(),
+                input: InputBuffer::default(),
+                history: InputHistory::default(),
+                popup: PopupState::default(),
+                file_index: WorkspaceFileIndex::default(),
+                pending_prompts: QueuedPrompts::default(),
+                root_busy: false,
                 queued: Vec::new(),
                 active_approval: None,
                 approval_diff: None,
@@ -303,6 +331,32 @@ impl TuiInner {
         })
     }
 
+    fn is_root_agent_busy(&self, graph: &dyn GraphView) -> bool {
+        if self.active_approval.is_some() {
+            return true;
+        }
+        let latest_root = graph
+            .query(&[self.vocab.state])
+            .into_iter()
+            .filter(|id| graph.related(*id, self.vocab.rel_parent).is_empty())
+            .last();
+        latest_root.is_some_and(|id| {
+            matches!(
+                prop_text(graph, id, self.vocab.state).as_deref(),
+                Some("thinking" | "acting" | "waiting_children" | "waiting_approval")
+            )
+        })
+    }
+
+    fn sync_popup(&mut self) {
+        self.popup.sync_from_buffer(
+            &self.input,
+            &mut self.file_index,
+            self.workspace_root.as_deref(),
+            self.policy.as_ref(),
+        );
+    }
+
     fn advance_spinner_if_due(&mut self, busy: bool) -> bool {
         if !busy {
             if self.spinner_angle != 0.0 {
@@ -391,10 +445,68 @@ impl TuiInner {
                     }
                     return true;
                 }
+                if self.popup.is_open() && self.active_approval.is_none() {
+                    match code {
+                        CtKeyCode::Esc => {
+                            self.popup.close();
+                            return true;
+                        }
+                        CtKeyCode::Up => {
+                            self.popup.move_up();
+                            return true;
+                        }
+                        CtKeyCode::Down => {
+                            self.popup.move_down();
+                            return true;
+                        }
+                        CtKeyCode::Tab | CtKeyCode::Enter => {
+                            if self.popup.accept_into(&mut self.input) {
+                                self.history.reset_navigation();
+                                self.sync_popup();
+                            }
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
                 if matches!(code, CtKeyCode::Esc) {
                     self.quit.store(true, Ordering::Relaxed);
                 } else if matches!(code, CtKeyCode::F(2)) {
+                    self.popup.close();
                     self.open_agent_picker();
+                } else if self.active_approval.is_none()
+                    && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Up))
+                        || (modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(code, CtKeyCode::Char('p' | 'P'))))
+                {
+                    if let Some(prev) = self.history.prev(self.input.as_str()) {
+                        self.input.set_text(prev);
+                        self.popup.close();
+                    }
+                } else if self.active_approval.is_none()
+                    && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Down))
+                        || (modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(code, CtKeyCode::Char('n' | 'N'))))
+                {
+                    if let Some(next) = self.history.next() {
+                        self.input.set_text(next);
+                        self.popup.close();
+                    }
+                } else if self.active_approval.is_none()
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, CtKeyCode::Char('x' | 'X'))
+                {
+                    self.pending_prompts.clear();
+                } else if self.active_approval.is_none()
+                    && !self.input.is_empty()
+                    && matches!(code, CtKeyCode::Home | CtKeyCode::End)
+                {
+                    if matches!(code, CtKeyCode::Home) {
+                        self.input.move_home();
+                    } else {
+                        self.input.move_end();
+                    }
+                    self.sync_popup();
                 } else if apply_scroll_key(
                     &mut self.scroll_from_bottom,
                     self.last_viewport_height,
@@ -432,14 +544,41 @@ impl TuiInner {
                                 next_cmd.to_string(),
                             )));
                         }
-                        CtKeyCode::Char(c) => self.input.push(c),
+                        CtKeyCode::Left => {
+                            self.input.move_left();
+                            self.sync_popup();
+                        }
+                        CtKeyCode::Right => {
+                            self.input.move_right();
+                            self.sync_popup();
+                        }
+                        CtKeyCode::Char(c)
+                            if !modifiers.contains(KeyModifiers::CONTROL)
+                                && !modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            self.input.insert_char(c);
+                            self.history.reset_navigation();
+                            self.popup.reset_dismiss();
+                            self.sync_popup();
+                        }
                         CtKeyCode::Backspace => {
-                            self.input.pop();
+                            self.input.backspace();
+                            self.history.reset_navigation();
+                            self.popup.reset_dismiss();
+                            self.sync_popup();
+                        }
+                        CtKeyCode::Delete => {
+                            self.input.delete();
+                            self.history.reset_navigation();
+                            self.popup.reset_dismiss();
+                            self.sync_popup();
                         }
                         CtKeyCode::Enter => {
-                            let cmd = self.input.trim().to_string();
+                            let cmd = self.input.as_str().trim().to_string();
                             self.input.clear();
+                            self.popup.close();
                             if !cmd.is_empty() {
+                                self.history.push(cmd.clone());
                                 self.scroll_from_bottom = 0;
                                 if cmd == "/agent" || cmd == "/agents" {
                                     if self.last_agent_ids.len() > 1 {
@@ -458,6 +597,8 @@ impl TuiInner {
                                         self.pending_focus_switch =
                                             Some(FocusSwitch::Target(target.to_string()));
                                     }
+                                } else if self.root_busy && !is_immediate_slash_cmd(&cmd) {
+                                    self.pending_prompts.push(cmd);
                                 } else {
                                     self.queued
                                         .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
@@ -592,6 +733,23 @@ impl TuiInner {
         let any_agent_active = agent_rows
             .iter()
             .any(|r| matches!(r.state.as_str(), "thinking" | "acting" | "waiting_children"));
+        let latest_root_busy = agent_rows.iter().rfind(|r| r.is_root).is_some_and(|r| {
+            matches!(
+                r.state.as_str(),
+                "thinking" | "acting" | "waiting_children" | "waiting_approval"
+            )
+        });
+        self.root_busy = self.active_approval.is_some() || latest_root_busy;
+        let active_subagents = agent_rows
+            .iter()
+            .filter(|r| {
+                !r.is_root
+                    && matches!(
+                        r.state.as_str(),
+                        "thinking" | "acting" | "waiting_children" | "waiting_approval"
+                    )
+            })
+            .count();
 
         let is_busy = self.active_approval.is_none() && any_agent_active;
         let spinner_angle = if is_busy { self.spinner_angle } else { 0.0 };
@@ -655,7 +813,14 @@ impl TuiInner {
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
-            if agent_rows.len() > 1 {
+            if active_subagents > 0 {
+                phase_spans.push(Span::styled(
+                    format!("  [subagents:{active_subagents} · F2]"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if agent_rows.len() > 1 {
                 let active_count = agent_rows
                     .iter()
                     .filter(|r| {
@@ -670,6 +835,14 @@ impl TuiInner {
                         } else {
                             Color::DarkGray
                         })
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !self.pending_prompts.is_empty() {
+                phase_spans.push(Span::styled(
+                    format!("  [queued:{}]", self.pending_prompts.len()),
+                    Style::default()
+                        .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -821,6 +994,10 @@ impl TuiInner {
             }
         }
         let input_snapshot = self.input.clone();
+        let popup_snapshot = self.popup.clone();
+        let queued_count = self.pending_prompts.len();
+        let queued_preview = self.pending_prompts.peek_front().map(str::to_string);
+        let root_busy_snapshot = self.root_busy;
         let approval_snapshot = self.active_approval.clone();
         let approval_agent_label = approval_snapshot.as_ref().map(|(aid, _, _, _)| {
             let name = agent_rows
@@ -909,13 +1086,35 @@ impl TuiInner {
                         Color::Yellow,
                     )
                 }
-                None => (
-                    format!(
-                        " [{mode_label}] Goal / Command (Enter send · Tab Plan/Build · F2 Agents · /rewind · /fork · /undo · /compact · /services · /new) "
-                    ),
-                    vec![Line::from(format!("> {input_snapshot}"))],
-                    Color::White,
-                ),
+                None => {
+                    let queue_tag = if queued_count > 0 {
+                        format!(" · queued:{queued_count} (Ctrl+X clear)")
+                    } else if root_busy_snapshot {
+                        " · typing queues follow-up".to_string()
+                    } else {
+                        String::new()
+                    };
+                    let mut lines = vec![input_snapshot.render_line("> ")];
+                    if input_snapshot.is_empty() {
+                        if let Some(next_q) = &queued_preview {
+                            lines.push(Line::from(Span::styled(
+                                format!("  [queued #1/{queued_count}] {}", sanitize_display_line(next_q)),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
+                    (
+                        format!(
+                            " [{mode_label}{queue_tag}] Goal / Command (/ cmds · @ files · Alt+↑/↓ history · Tab Plan/Build · F2 Agents) "
+                        ),
+                        lines,
+                        if queued_count > 0 {
+                            Color::Cyan
+                        } else {
+                            Color::White
+                        },
+                    )
+                }
             };
 
             let bottom_inner_width = f.area().width.saturating_sub(2);
@@ -1089,9 +1288,23 @@ impl TuiInner {
 
             if picker_open {
                 render_agent_picker(f, f.area(), &agent_rows, active_agent, picker_idx);
+            } else if !is_approval && popup_snapshot.is_open() {
+                render_input_popup(f, f.area(), chunks[2], &popup_snapshot);
             }
         });
     }
+}
+
+/// Returns `true` for slash commands that should execute immediately instead of waiting in the
+/// follow-up prompt queue while the root agent is busy.
+fn is_immediate_slash_cmd(cmd: &str) -> bool {
+    let lower = cmd.trim().to_ascii_lowercase();
+    lower == "/mode"
+        || lower.starts_with("/mode ")
+        || lower == "/services"
+        || lower == "/service"
+        || lower.starts_with("/service ")
+        || lower == "/undo"
 }
 
 /// Formats the non-invasive top header title showing mode, sandbox, model, and reasoning effort.

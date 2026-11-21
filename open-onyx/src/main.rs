@@ -6,6 +6,7 @@ mod ops;
 mod pack;
 mod session;
 mod tui;
+mod tui_input;
 mod vault;
 
 use std::env;
@@ -467,7 +468,13 @@ OPTIONS:
   -V, --version            Print openOnyx version and exit 0
 
 TUI CONTROLS & SLASH COMMANDS (chat):
-  Enter                    Submit goal, follow-up prompt, or slash command
+  Enter                    Submit goal, follow-up prompt (queues while busy), or slash command
+  /  /  @                  Open live autocomplete popup for slash commands (`/`) or workspace files (`@`)
+  Left / Right / Home / End / Delete
+                           Edit prompt text with a visible cursor
+  Alt+Up / Alt+Down (Ctrl+P / Ctrl+N)
+                           Browse prompt input history (preserving unsent draft)
+  Ctrl+X                   Clear queued follow-up prompts
   Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
   F2                       Open/close interactive Agent Selector popup (focus root or subagents)
   Ctrl+Tab                 Quick-cycle focused agent (optional terminal-dependent alias for F2 / /agent)
