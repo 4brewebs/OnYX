@@ -3614,4 +3614,198 @@ ready_log = "READY_BUS"
             _ => panic!("expected Mode::Serve"),
         }
     }
+
+    #[test]
+    fn run_session_quit_advances_spawn_agent_without_waiting_children_deadlock() {
+        use std::sync::atomic::Ordering;
+
+        use onyx_soul_agents::SubagentSystem;
+        use session::UiIdlePump;
+
+        let cfg = AgentConfig {
+            default_max_steps: 16,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+        let mut host = AgentHost::builder(1)
+            .config(cfg.clone())
+            .system(Box::new(SubagentSystem::new(cfg)))
+            .system(Box::new(CommandSpawnerSystem::new(true)))
+            .build()
+            .unwrap();
+
+        let quit = Arc::new(AtomicBool::new(false));
+        let quit_for_ui = Arc::clone(&quit);
+        let idle_pumps = Arc::new(AtomicUsize::new(0));
+        let pumps_for_ui = Arc::clone(&idle_pumps);
+        let vocab = host.vocab();
+
+        struct MockUi {
+            quit: Arc<AtomicBool>,
+            pumps: Arc<AtomicUsize>,
+            initial_cmd_pending: AtomicBool,
+            vocab: onyx_soul_agents::Vocab,
+        }
+        impl UiIdlePump for MockUi {
+            fn render(&self, _graph: &dyn onyx_soul_agents::GraphView) {}
+            fn has_queued_events(&self) -> bool {
+                self.initial_cmd_pending.swap(false, Ordering::AcqRel)
+            }
+            fn pump_idle(&self, graph: &dyn onyx_soul_agents::GraphView) {
+                let n = self.pumps.fetch_add(1, Ordering::AcqRel);
+                let all_done = !graph.query(&[self.vocab.state]).is_empty()
+                    && graph.query(&[self.vocab.state]).into_iter().all(|id| {
+                        matches!(
+                            graph.get(id, self.vocab.state),
+                            Some(onyx_soul_agents::Value::Text(ref s))
+                                if AgentState::parse(s).is_some_and(AgentState::is_terminal)
+                        )
+                    });
+                if all_done || n >= 8 {
+                    self.quit.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        let mut parent_calls = 0usize;
+        let mut driver = RecordingBridge::new(vocab, move |view: &AgentView| {
+            if view.name.starts_with("openonyx") {
+                parent_calls += 1;
+                if parent_calls == 1 {
+                    Some(Reply::call_structured(
+                        view.agent,
+                        view.request,
+                        "spawn_agent",
+                        r#"{"name":"worker","goal":"inspect sub task"}"#,
+                    ))
+                } else {
+                    Some(Reply::done(
+                        view.agent,
+                        view.request,
+                        "parent merged worker result",
+                    ))
+                }
+            } else {
+                Some(Reply::done(view.agent, view.request, "worker finished ok"))
+            }
+        });
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "delegate to worker".into(),
+        )));
+
+        run_session(
+            &mut host,
+            &mut driver,
+            &SessionOptions::default(),
+            StopPolicy::Quit {
+                quit: Arc::clone(&quit),
+                ui: Box::new(MockUi {
+                    quit: quit_for_ui,
+                    pumps: pumps_for_ui,
+                    initial_cmd_pending: AtomicBool::new(true),
+                    vocab,
+                }),
+                llm_in_flight: Arc::new(AtomicUsize::new(0)),
+                llm_ready: Arc::new(AtomicBool::new(false)),
+                bridge_ready: Arc::new(AtomicBool::new(false)),
+                action_ctx: None,
+            },
+        )
+        .unwrap();
+
+        let agents = host.agents();
+        assert_eq!(agents.len(), 2, "expected root + spawned child agent");
+        let root = agents[0];
+        let child = agents[1];
+        assert_eq!(host.agent_state(child), Some(AgentState::Done));
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        assert_eq!(
+            host.result(root).as_deref(),
+            Some("parent merged worker result")
+        );
+        assert!(
+            idle_pumps.load(Ordering::Acquire) < 8,
+            "session must not deadlock in WaitingChildren"
+        );
+    }
+
+    #[test]
+    fn cancel_command_stops_active_subagent_returning_control_and_interrupts_root() {
+        use onyx_soul_agents::SubagentSystem;
+
+        let cfg = AgentConfig {
+            default_max_steps: 16,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+        let mut host = AgentHost::builder(1)
+            .config(cfg.clone())
+            .system(Box::new(SubagentSystem::new(cfg)))
+            .system(Box::new(CommandSpawnerSystem::new(true)))
+            .build()
+            .unwrap();
+
+        // Child never replies (simulating a hung/slow subagent).
+        let mut parent_turns = 0usize;
+        let mut driver = RecordingBridge::new(host.vocab(), move |view: &AgentView| {
+            if view.name.starts_with("openonyx") {
+                parent_turns += 1;
+                match parent_turns {
+                    1 => Some(Reply::call_structured(
+                        view.agent,
+                        view.request,
+                        "spawn_agent",
+                        r#"{"name":"stuck-child","goal":"slow task"}"#,
+                    )),
+                    2 => {
+                        // Parent received cancellation error and stays thinking until cancelled too.
+                        None
+                    }
+                    _ => Some(Reply::done(
+                        view.agent,
+                        view.request,
+                        "recovered after cancel",
+                    )),
+                }
+            } else {
+                None
+            }
+        });
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("start".into())));
+        // Step until child is spawned and parent is WaitingChildren.
+        for _ in 0..8 {
+            host.step(&mut driver);
+            if host.agents().len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(host.agents().len(), 2);
+        let root = host.agents()[0];
+        let child = host.agents()[1];
+        assert_eq!(host.agent_state(root), Some(AgentState::WaitingChildren));
+        assert_eq!(host.agent_state(child), Some(AgentState::Thinking));
+
+        // 1. `/cancel` cancels the stuck subagent and wakes the parent!
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("/cancel".into())));
+        host.step(&mut driver);
+        assert_eq!(host.agent_state(child), Some(AgentState::Failed));
+        // Advance 2 ticks: SubagentSystem emits tool_result -> AgentRuntime wakes parent to Thinking.
+        host.step(&mut driver);
+        host.step(&mut driver);
+        assert_eq!(host.agent_state(root), Some(AgentState::Thinking));
+
+        // 2. Second `/cancel` interrupts the active root turn cleanly back to Done.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("/cancel".into())));
+        host.step(&mut driver);
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+
+        // 3. Follow-up user prompt continues the same root cleanly!
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "fresh follow-up".into(),
+        )));
+        assert!(host.run_until_settled(&mut driver, 12));
+        assert_eq!(host.result(root).as_deref(), Some("recovered after cancel"));
+    }
 }

@@ -5,6 +5,8 @@
   'use strict';
 
   const SLASH_HINTS = [
+    { key: '/cancel', desc: 'Stop active subagent or interrupt current turn' },
+    { key: '/cancel all', desc: 'Interrupt both subagents and root turn' },
     { key: '/mode plan', desc: 'Switch to read-only PLAN mode' },
     { key: '/mode build', desc: 'Switch to BUILD mode (edits enabled)' },
     { key: '/undo', desc: 'Revert latest reversible Git checkpoint' },
@@ -42,6 +44,7 @@
     agentBusyProgress: document.getElementById('agent-busy-progress'),
     agentBannerName: document.getElementById('agent-banner-name'),
     agentBannerGoal: document.getElementById('agent-banner-goal'),
+    stopBtn: document.getElementById('stop-btn'),
     traceModeBtn: document.getElementById('trace-mode-btn'),
     quickUndoBtn: document.getElementById('quick-undo-btn'),
     quickCompactBtn: document.getElementById('quick-compact-btn'),
@@ -365,6 +368,7 @@
     sendCommand(next).catch(() => {});
   });
 
+  dom.stopBtn.addEventListener('click', () => sendCommand('/cancel').catch(() => {}));
   dom.quickUndoBtn.addEventListener('click', () => sendCommand('/undo').catch(() => {}));
   dom.quickCompactBtn.addEventListener('click', () => sendCommand('/compact').catch(() => {}));
   dom.quickForkBtn.addEventListener('click', () => sendCommand('/fork').catch(() => {}));
@@ -646,11 +650,19 @@
       : `Agent #${focused ? focused.id : 1}`;
 
     // Any agent busy rotates the real orbital openOnyx emblem (like the TUI!)
+    const anyActive = agents.some((a) =>
+      ['thinking', 'acting', 'waiting_children', 'waiting_approval'].includes(a.state)
+    );
     const anyBusy = !s.pending_approval && agents.some((a) =>
       ['thinking', 'acting', 'waiting_children'].includes(a.state)
     );
     dom.brandLogo.classList.toggle('onyx-spinning', anyBusy);
     dom.brandOrbitBtn.classList.toggle('is-busy', anyBusy);
+    dom.stopBtn.classList.toggle('hidden', !anyActive);
+    const hasSubActive = agents.some((a) =>
+      !a.is_root && ['thinking', 'acting', 'waiting_children', 'waiting_approval'].includes(a.state)
+    );
+    dom.stopBtn.textContent = hasSubActive ? 'Stop sub' : 'Stop';
 
     // Context telemetry
     const tel = s.telemetry || {};

@@ -367,6 +367,16 @@ impl WebHub {
             guard.queued_prompts.push_back(cmd.to_string());
             guard.state_dirty = true;
         } else {
+            let lower = cmd.to_ascii_lowercase();
+            if lower == "/cancel"
+                || lower.starts_with("/cancel ")
+                || lower == "/stop"
+                || lower.starts_with("/stop ")
+            {
+                guard.queued_prompts.clear();
+                guard.active_approval = None;
+                guard.state_dirty = true;
+            }
             guard
                 .incoming_events
                 .push_back(OnyxEvent::Ingress(IngressEvent::Command(cmd.to_string())));
@@ -455,11 +465,16 @@ fn is_immediate_web_slash(cmd: &str) -> bool {
     lower == "/mode"
         || lower.starts_with("/mode ")
         || lower == "/services"
+        || lower.starts_with("/services ")
         || lower == "/service"
         || lower.starts_with("/service ")
         || lower == "/trust"
         || lower.starts_with("/trust ")
         || lower == "/undo"
+        || lower == "/cancel"
+        || lower.starts_with("/cancel ")
+        || lower == "/stop"
+        || lower.starts_with("/stop ")
 }
 
 // ---------------------------------------------------------------------------

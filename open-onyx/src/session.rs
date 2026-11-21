@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSpec, AgentState, EventBus, Graph, GraphView, HeadlessDriver,
-    OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder, SubagentSystem,
-    SurfaceBinding, SurfaceId, Vocab, pending_approvals,
+    AgentConfig, AgentHost, AgentSpec, AgentState, ConceptId, EventBus, Graph, GraphView,
+    HeadlessDriver, OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder,
+    SubagentSystem, SurfaceBinding, SurfaceId, Vocab, pending_approvals,
 };
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
@@ -515,24 +515,42 @@ pub fn all_live_waiting_approval(graph: &dyn GraphView, v: &Vocab) -> bool {
 }
 
 pub fn all_live_agents_blocked(graph: &dyn GraphView, v: &Vocab, llm_in_flight: usize) -> bool {
-    let mut any_live = false;
-    for id in graph.query(&[v.state]) {
-        if let Some(onyx_soul_agents::Value::Text(s)) = graph.get(id, v.state) {
-            if let Some(state) = AgentState::parse(&s) {
-                if !state.is_terminal() {
-                    any_live = true;
-                    let blocked = matches!(
-                        state,
-                        AgentState::WaitingApproval | AgentState::WaitingChildren
-                    ) || (state == AgentState::Thinking && llm_in_flight > 0);
-                    if !blocked {
-                        return false;
-                    }
-                }
+    let live_ids: Vec<(ConceptId, AgentState)> = graph
+        .query(&[v.state])
+        .into_iter()
+        .filter_map(|id| {
+            let s = match graph.get(id, v.state) {
+                Some(onyx_soul_agents::Value::Text(s)) => s,
+                _ => return None,
+            };
+            let state = AgentState::parse(&s)?;
+            (!state.is_terminal()).then_some((id, state))
+        })
+        .collect();
+
+    if live_ids.is_empty() {
+        return false;
+    }
+
+    for &(id, state) in &live_ids {
+        let blocked = match state {
+            AgentState::WaitingApproval => true,
+            AgentState::WaitingChildren => {
+                // Solo bloqueamos si existe al menos un subagente vivo en el grafo.
+                // Si hay 0 hijos vivos, hay un `ev_spawn`, `ev_rejected` o `ev_tool_result`
+                // en el EventBus esperando el siguiente tick para crear al hijo o despertar al padre.
+                live_ids.iter().any(|(child, _)| {
+                    *child != id && graph.related(*child, v.rel_parent).contains(&id)
+                })
             }
+            AgentState::Thinking => llm_in_flight > 0,
+            _ => false,
+        };
+        if !blocked {
+            return false;
         }
     }
-    any_live
+    true
 }
 
 pub fn build_host(

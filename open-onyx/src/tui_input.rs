@@ -37,6 +37,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Open agent selector or focus `<id|name>`",
     },
     SlashCommandHint {
+        command: "/cancel",
+        insert: "/cancel",
+        description: "Stop active subagent or interrupt current turn (`/cancel all`)",
+    },
+    SlashCommandHint {
         command: "/compact",
         insert: "/compact ",
         description: "Compact older turns into summary (`[focus]`)",

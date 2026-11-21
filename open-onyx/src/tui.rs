@@ -629,6 +629,15 @@ impl TuiInner {
                                 } else if self.root_busy && !is_immediate_slash_cmd(&cmd) {
                                     self.pending_prompts.push(cmd);
                                 } else {
+                                    let lower = cmd.trim().to_ascii_lowercase();
+                                    if lower == "/cancel"
+                                        || lower.starts_with("/cancel ")
+                                        || lower == "/stop"
+                                        || lower.starts_with("/stop ")
+                                    {
+                                        self.pending_prompts.clear();
+                                        self.active_approval = None;
+                                    }
                                     self.queued
                                         .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
                                 }
@@ -1385,11 +1394,16 @@ fn is_immediate_slash_cmd(cmd: &str) -> bool {
     lower == "/mode"
         || lower.starts_with("/mode ")
         || lower == "/services"
+        || lower.starts_with("/services ")
         || lower == "/service"
         || lower.starts_with("/service ")
         || lower == "/trust"
         || lower.starts_with("/trust ")
         || lower == "/undo"
+        || lower == "/cancel"
+        || lower.starts_with("/cancel ")
+        || lower == "/stop"
+        || lower.starts_with("/stop ")
 }
 
 fn cached_sandbox_driver() -> onyx_workspace::SandboxDriverKind {
