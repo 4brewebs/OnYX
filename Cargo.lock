@@ -646,6 +646,7 @@ dependencies = [
 name = "onyx-workspace"
 version = "0.1.1"
 dependencies = [
+ "blake3",
  "onyx-scent",
  "onyx-soul-agents",
  "regex",
@@ -657,6 +658,7 @@ dependencies = [
 name = "open-onyx"
 version = "0.1.1"
 dependencies = [
+ "blake3",
  "crossterm",
  "flate2",
  "onyx-soul-agents",

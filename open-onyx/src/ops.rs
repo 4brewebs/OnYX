@@ -520,14 +520,22 @@ pub fn run_doctor(
 
     // Auditoría de sandbox OS y capacidades del host (REQ-06.6, TEST-06.5).
     let sandbox_caps = detect_sandbox_capabilities();
-    let active_sandbox = WorkspacePolicy::new(workspace)
-        .map(|p| p.with_loaded_config().sandbox)
+    let loaded_policy = WorkspacePolicy::new(workspace)
+        .map(|p| p.with_loaded_config())
+        .ok();
+    let active_sandbox = loaded_policy
+        .as_ref()
+        .map(|p| p.sandbox.clone())
         .unwrap_or_default();
     let cli_label = sandbox_caps.container_cli.unwrap_or("none");
+    let effective_badge = active_sandbox
+        .mode
+        .effective_badge(sandbox_caps.native_driver);
     report.checks.push(format!(
-        "sandbox driver: {} (mode={}, net={}, container_cli={cli_label})",
+        "sandbox driver: {} (mode={}, badge={}, net={}, container_cli={cli_label})",
         sandbox_caps.native_driver.as_str(),
         active_sandbox.mode.as_str(),
+        effective_badge,
         active_sandbox.network.as_str()
     ));
     if active_sandbox.mode == SandboxMode::Off {
@@ -535,11 +543,47 @@ pub fn run_doctor(
             "sandbox mode is `off`; `shell_exec` runs without OS sandbox or env_clear isolation"
                 .to_string(),
         );
+    } else if active_sandbox.mode == SandboxMode::WorkspaceWrite
+        && sandbox_caps.native_driver == SandboxDriverKind::Win32Job
+    {
+        report.warnings.push(
+            "Windows `workspace-write` runs as `env+job` (env_clear + Win32 Job Objects + best-effort network filter, no kernel FS/network namespace isolation); use `--sandbox strict-container` for untrusted workloads"
+                .to_string(),
+        );
     } else if sandbox_caps.native_driver == SandboxDriverKind::None {
         report.warnings.push(
             "no native OS sandbox driver detected on host (only env_clear and timeout apply)"
                 .to_string(),
         );
+    }
+
+    // Auditoría de Workspace Trust (`~/.onyx/trusted_workspaces.toml`, hashes `blake3`).
+    let trust = onyx_workspace::evaluate_workspace_trust(workspace, None);
+    let cfg_short = trust
+        .config_blake3
+        .as_deref()
+        .map(|h| &h[..h.len().min(12)])
+        .unwrap_or("none");
+    let sprout_short = trust
+        .sprout_blake3
+        .as_deref()
+        .map(|h| &h[..h.len().min(12)])
+        .unwrap_or("none");
+    if trust.is_fully_trusted() {
+        report.checks.push(format!(
+            "workspace trust: {} (config={cfg_short}, sprout={sprout_short})",
+            trust.status_label()
+        ));
+    } else {
+        report.warnings.push(format!(
+            "workspace trust: {} (config={cfg_short}, sprout={sprout_short}) — project allow/sandbox relaxations ignored and sprout.toml blocked; inspect files and run `openonyx trust` to approve",
+            trust.status_label()
+        ));
+    }
+    if let Some(ref pol) = loaded_policy {
+        for warn in &pol.trust_warnings {
+            report.warnings.push(warn.clone());
+        }
     }
 
     // Auditoría de `sprout.toml` (sintaxis, DAG acíclico, runtime OCI y puertos ocupados — REQ-08.6).

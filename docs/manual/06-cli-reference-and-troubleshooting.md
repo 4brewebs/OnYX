@@ -15,6 +15,8 @@ openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snaps
 openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--dry-run] [OPTIONS]
 openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
+openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]
+openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [OPTIONS]
 openonyx [--help | -h | --version | -V]
 ```
 
@@ -28,7 +30,12 @@ openonyx [--help | -h | --version | -V]
 | `--provider <gemini\|openai>` | `chat`, `run`, `rewind` | LLM backend (`gemini` default; `openai` for OpenAI/OpenRouter/Ollama/vLLM/LM Studio). |
 | `--model <name>` | `chat`, `run`, `rewind` | Model name (defaults: `gemini-4-hydrogen` on Gemini, `gpt-4o` on OpenAI). |
 | `--effort <low\|medium\|high>` | `chat`, `run`, `rewind` | Reasoning/thinking effort (`thinkingLevel` / `reasoning_effort`). |
-| `--api-base <url>` | `chat`, `run`, `rewind` | Custom API base URL (e.g. `http://localhost:11434/v1`; `OPENAI_API_KEY` not required when set). |
+| `--api-base <url>` | `chat`, `run`, `rewind` | Custom API base URL (`http://` allowed only on loopback `localhost`/`127.0.0.1`/`[::1]`; remote hosts require `https://`). |
+| `--allow-custom-auth-host` | `chat`, `run`, `rewind` | Explicit opt-in to send API keys to non-official remote HTTPS endpoints (or `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`). |
+| `--trust-workspace` | `chat`, `run`, `rewind`, `serve` | Trust the current workspace in memory for this run (without writing `~/.onyx/trusted_workspaces.toml`). |
+| `--bind <ip:port>` | `serve` | HTTP/SSE bind address (default: `127.0.0.1:8787`; non-loopback requires explicit `--api-key` `>= 16` chars). |
+| `--api-key <key>` | `serve` | API key for authentication (`HttpOnly` cookie or `Authorization: Bearer`; randomly generated on loopback if omitted). |
+| `--cors-origin <url>` | `serve` | Explicit allowed browser origin for external SPAs (e.g. Svelte dev server `http://localhost:5173`; never `*`). |
 | `--sandbox <off\|workspace-write\|strict-container>` | `chat`, `run`, `rewind` | OS sandbox profile for `shell_exec` (default: `workspace-write`). |
 | `--sandbox-net <offline\|localhost\|unrestricted>` | `chat`, `run`, `rewind` | Sandbox network policy (default: `offline`). |
 | `--auto-approve` | `chat`, `run`, `rewind` | Skip interactive approvals for mutating tools (`deny` rules still apply; sandbox elevates `off` → `workspace-write` + `offline` unless `--sandbox off`). |

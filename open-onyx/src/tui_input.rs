@@ -72,6 +72,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Show status of `sprout.toml` services",
     },
     SlashCommandHint {
+        command: "/trust",
+        insert: "/trust",
+        description: "Approve workspace config/sprout (`status|revoke`)",
+    },
+    SlashCommandHint {
         command: "/undo",
         insert: "/undo",
         description: "Revert latest reversible Git checkpoint",

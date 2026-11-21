@@ -17,6 +17,7 @@ default = []
 scent = ["dep:onyx-scent"]
 
 [dependencies]
+blake3 = { workspace = true }
 onyx-scent = { workspace = true, optional = true }
 onyx-soul-agents = { workspace = true }
 regex = { workspace = true }

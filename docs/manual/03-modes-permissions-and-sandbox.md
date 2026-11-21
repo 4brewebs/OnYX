@@ -90,6 +90,18 @@ hard_ask_bp = 8000    # hard threshold for any high-fanout symbol
 
 ---
 
+## 2.5. Workspace Trust (`~/.onyx/trusted_workspaces.toml`)
+
+To defend against malicious cloned repositories or untrusted PRs (*Indirect Prompt Injection* + `allow = ["shell_exec(*)"]` or arbitrary `sprout.toml` commands), `openOnyx` pins `blake3` hashes of `.onyx/config.toml` and `sprout.toml` per workspace in `~/.onyx/trusted_workspaces.toml`:
+
+- **Clean repository (no `.onyx/config.toml` or `sprout.toml`):** zero friction (`no-project-config`).
+- **Untrusted or modified repository (`untrusted` / `modified`, `[UNTRUSTED]` badge in TUI):**
+  - Project `.onyx/config.toml` can **only tighten** policy (`deny`/`ask`, stricter sandbox/impact); project `allow` rules, `env_passthrough`, `allow_read_paths`, `container_image`, and any `[sandbox]`/`[impact]` relaxations are ignored.
+  - `sprout.toml` blocks service execution (`service_start`, `service_exec`, `stop_cmd`) until explicitly approved.
+- **Trust commands:** `openonyx trust` (approve current workspace), `openonyx trust check`, `openonyx trust list`, `openonyx trust revoke`, per-run `--trust-workspace`, or `/trust [status|revoke]` inside the TUI.
+
+---
+
 ## 3. Read-Only Control Plane Protection
 
 Even in `BUILD` mode with `--auto-approve`, `onyx-workspace` protects sensitive control-plane paths as **read-only**:
@@ -110,7 +122,7 @@ Every `shell_exec` call (and Sprout local process) runs on top of the shared `on
 ### Sandbox Profiles (`--sandbox`)
 | Mode | TUI Badge | Behavior |
 | --- | --- | --- |
-| `workspace-write` *(default)* | `[SANDBOX:workspace]` | `env_clear()`, OS write confinement to workspace + session temp dir, memory/PID limits, and `offline` network by default. |
+| `workspace-write` *(default)* | `[SANDBOX:workspace]` (Linux `bwrap` / macOS `sandbox-exec`), `[SANDBOX:env+job]` (Windows), or `[SANDBOX:env+pgid]` | `env_clear()`, OS write confinement (Linux/macOS), Win32 Job Objects / PGID, memory/PID limits, and `offline` network by default. On Windows, use `strict-container` for hard kernel FS/network isolation. |
 | `strict-container` | `[SANDBOX:strict]` | Executes commands inside an OCI container (`docker`, `nerdctl`, or `podman`) mounting the workspace. Ideal for unattended automation. |
 | `off` | `[SANDBOX:off]` | Disables OS sandbox wrapper (`WorkspacePolicy`, timeout, process cleanup, and Control Plane RO remain active). |
 

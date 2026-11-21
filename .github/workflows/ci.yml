@@ -24,6 +24,7 @@ jobs:
           rustc --version
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --all-targets --locked
+      - run: cargo check -p onyx-workspace --no-default-features --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --release --locked
@@ -31,3 +32,16 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo Audit (RustSec advisories)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cargo Deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --locked check advisories licenses bans sources

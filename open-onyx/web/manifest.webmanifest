@@ -1,0 +1,23 @@
+{
+  "name": "openOnyx — Deterministic Coding Agent",
+  "short_name": "openOnyx",
+  "description": "Deterministic coding agent harness with Scent impact analysis, Sprout services, and time-travel snapshots.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#060608",
+  "theme_color": "#060608",
+  "icons": [
+    {
+      "src": "/logo.jpg",
+      "sizes": "400x400",
+      "type": "image/jpeg",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

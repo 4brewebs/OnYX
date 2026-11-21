@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use crate::impact::ImpactConfig;
 use crate::sandbox::SandboxConfig;
 use crate::state::WorkspaceMode;
+use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
 
 /// Resultado de evaluar las reglas de permisos para una herramienta y sus argumentos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +120,18 @@ impl PermissionRules {
         global_path: Option<&Path>,
         project_path: Option<&Path>,
     ) -> Result<Self, String> {
+        let (rules, _) = Self::load_from_paths_with_trust(global_path, project_path, true)?;
+        Ok(rules)
+    }
+
+    /// Carga y fusiona `global` y `project` respetando Workspace Trust:
+    /// si `trust_project == false`, solo se aplican `deny` y `ask` del proyecto y se descartan
+    /// todas sus reglas `allow`, devolviendo cuántas reglas `allow` fueron ignoradas.
+    pub fn load_from_paths_with_trust(
+        global_path: Option<&Path>,
+        project_path: Option<&Path>,
+        trust_project: bool,
+    ) -> Result<(Self, usize), String> {
         let mut merged = Self::default();
         if let Some(gp) = global_path {
             if gp.is_file() {
@@ -128,15 +141,20 @@ impl PermissionRules {
                 merged.merge(global);
             }
         }
+        let mut ignored_allow = 0usize;
         if let Some(pp) = project_path {
             if pp.is_file() {
                 let raw = fs::read_to_string(pp)
                     .map_err(|e| format!("failed to read `{}`: {e}", pp.display()))?;
                 let project = Self::parse_toml(&raw)?;
-                merged.merge(project);
+                if trust_project {
+                    merged.merge(project);
+                } else {
+                    ignored_allow = merged.merge_restrictive(project);
+                }
             }
         }
-        Ok(merged)
+        Ok((merged, ignored_allow))
     }
 
     /// Combina otras reglas preservando todas las reglas `deny` existentes.
@@ -144,6 +162,14 @@ impl PermissionRules {
         self.deny.extend(other.deny);
         self.allow.extend(other.allow);
         self.ask.extend(other.ask);
+    }
+
+    /// Combina reglas de un repositorio NO confiado: aplica `deny` y `ask`, pero descarta
+    /// todas las reglas `allow` (devuelve el número de reglas `allow` ignoradas).
+    pub fn merge_restrictive(&mut self, other: Self) -> usize {
+        self.deny.extend(other.deny);
+        self.ask.extend(other.ask);
+        other.allow.len()
     }
 
     /// Evalúa una llamada de herramienta frente a `deny`, `ask` y `allow`.
@@ -662,6 +688,8 @@ pub struct WorkspacePolicy {
     pub ignore_deny: bool,
     pub sandbox: SandboxConfig,
     pub impact: ImpactConfig,
+    pub trust: WorkspaceTrustReport,
+    pub trust_warnings: Vec<String>,
 }
 
 impl WorkspacePolicy {
@@ -682,6 +710,8 @@ impl WorkspacePolicy {
             ignore_deny: false,
             sandbox: SandboxConfig::default(),
             impact: ImpactConfig::default(),
+            trust: WorkspaceTrustReport::no_project_config(),
+            trust_warnings: Vec::new(),
         })
     }
 
@@ -690,11 +720,84 @@ impl WorkspacePolicy {
         self
     }
 
-    /// Carga secciones `[permissions]`, `[sandbox]` e `[impact]` desde `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml`.
-    pub fn with_loaded_config(mut self) -> Self {
-        self.permissions = PermissionRules::load_for_workspace(&self.root);
-        self.sandbox = SandboxConfig::load_for_workspace(&self.root);
-        self.impact = ImpactConfig::load_for_workspace(&self.root);
+    /// Carga secciones `[permissions]`, `[sandbox]` e `[impact]` desde `~/.onyx/config.toml` y
+    /// `<workspace>/.onyx/config.toml` aplicando **Workspace Trust** (`~/.onyx/trusted_workspaces.toml`):
+    /// si el repositorio no está confiado o cambió de hash `blake3`, `.onyx/config.toml` solo
+    /// puede restringir (nunca ampliar `allow` ni relajar `[sandbox]`/`[impact]`).
+    pub fn with_loaded_config(self) -> Self {
+        self.with_loaded_config_from_store(None, false)
+    }
+
+    /// Carga configuración del workspace permitiendo forzar confianza explícita en memoria
+    /// (p. ej. `--trust-workspace` o tests unitarios de precedencia).
+    pub fn with_loaded_config_trusted(self, force_trust: bool) -> Self {
+        self.with_loaded_config_from_store(None, force_trust)
+    }
+
+    /// Carga configuración usando una ruta explícita de almacén de confianza (útil en tests herméticos).
+    pub fn with_loaded_config_from_store(
+        mut self,
+        trust_store_path: Option<&Path>,
+        force_trust: bool,
+    ) -> Self {
+        let trust = if force_trust {
+            WorkspaceTrustReport::trusted_override(&self.root)
+        } else {
+            evaluate_workspace_trust(&self.root, trust_store_path)
+        };
+        let trust_project = trust.config_trusted;
+        let global_path = user_home_dir().map(|h| h.join(".onyx").join("config.toml"));
+        let project_path = self.root.join(".onyx").join("config.toml");
+
+        let mut warnings = Vec::new();
+        match PermissionRules::load_from_paths_with_trust(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((perms, ignored_allow)) => {
+                self.permissions = perms;
+                if ignored_allow > 0 {
+                    warnings.push(format!(
+                        "untrusted project `.onyx/config.toml`: ignored {ignored_allow} `allow` rule(s); run `openonyx trust` or `/trust` to approve"
+                    ));
+                }
+            }
+            Err(err) => warnings.push(format!("failed to parse `[permissions]`: {err}")),
+        }
+
+        match SandboxConfig::load_from_paths_with_trust(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((sb, sb_warns)) => {
+                self.sandbox = sb;
+                warnings.extend(sb_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[sandbox]`: {err}")),
+        }
+
+        match ImpactConfig::load_from_paths_with_trust(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((imp, imp_warns)) => {
+                self.impact = imp;
+                warnings.extend(imp_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[impact]`: {err}")),
+        }
+
+        self.trust = trust;
+        self.trust_warnings = warnings;
+        self
+    }
+
+    /// Fija un informe de confianza explícito (p. ej. tras aprobar en caliente o en tests).
+    pub fn with_trust_report(mut self, trust: WorkspaceTrustReport) -> Self {
+        self.trust = trust;
         self
     }
 

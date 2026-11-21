@@ -23,7 +23,15 @@ use crate::pack::{
     MilestoneSnapshotSystem, PackSnapshotStore, SharedPackStore, default_fork_dir,
     fork_pack_until_tick,
 };
-use crate::tui::TuiHandle;
+
+/// Interfaz mínima de bombeo UI compartida entre `TuiHandle` (`openonyx chat`) y
+/// `WebHandle` (`openonyx serve`) para que ambos corran sobre el mismo bucle determinista
+/// `run_session` sin fugas de ticks.
+pub trait UiIdlePump {
+    fn render(&self, graph: &dyn GraphView);
+    fn has_queued_events(&self) -> bool;
+    fn pump_idle(&self, graph: &dyn GraphView);
+}
 
 pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
 pub const SURFACE_TRACE: SurfaceId = SurfaceId(2);
@@ -120,7 +128,7 @@ pub enum StopPolicy {
     },
     Quit {
         quit: Arc<AtomicBool>,
-        tui: TuiHandle,
+        ui: Box<dyn UiIdlePump>,
         llm_in_flight: Arc<AtomicUsize>,
         llm_ready: Arc<AtomicBool>,
         bridge_ready: Arc<AtomicBool>,
@@ -161,18 +169,18 @@ pub fn run_session<D: SessionDriver>(
         }
         StopPolicy::Quit {
             quit,
-            tui,
+            ui,
             llm_in_flight,
             llm_ready,
             bridge_ready,
             action_ctx,
         } => {
-            tui.render(host.graph());
+            ui.render(host.graph());
             let mut needs_follow_up_tick = false;
             let mut stepped_in_session = false;
             let shared_store = action_ctx.as_ref().and_then(|c| c.snapshot_store.clone());
             while !quit.load(Ordering::Relaxed) {
-                let ui_queued = tui.has_queued_events();
+                let ui_queued = ui.has_queued_events();
                 let ready =
                     llm_ready.load(Ordering::Acquire) || bridge_ready.load(Ordering::Acquire);
                 let all_blocked = all_live_agents_blocked(
@@ -205,7 +213,7 @@ pub fn run_session<D: SessionDriver>(
                                 let _ = apply_session_action(host, action, ctx);
                                 needs_follow_up_tick = false;
                             }
-                            tui.render(host.graph());
+                            ui.render(host.graph());
                         }
                     }
 
@@ -214,7 +222,7 @@ pub fn run_session<D: SessionDriver>(
                         let _ = save_transcript_if_configured(opts, driver);
                     }
                 } else {
-                    tui.pump_idle(host.graph());
+                    ui.pump_idle(host.graph());
                 }
             }
             if stepped_in_session {
