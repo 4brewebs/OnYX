@@ -47,9 +47,9 @@ pub struct ParsedFile {
 
 fn language_grammar(lang: SupportedLang) -> Language {
     match lang {
-        SupportedLang::Rust => tree_sitter_rust::language(),
-        SupportedLang::Python => tree_sitter_python::language(),
-        SupportedLang::Java => tree_sitter_java::language(),
+        SupportedLang::Rust => tree_sitter_rust::LANGUAGE.into(),
+        SupportedLang::Python => tree_sitter_python::LANGUAGE.into(),
+        SupportedLang::Java => tree_sitter_java::LANGUAGE.into(),
     }
 }
 
@@ -71,8 +71,9 @@ pub fn parse_source(
     blake3_hash: [u8; 32],
 ) -> Result<ParsedFile, ScentError> {
     let mut parser = Parser::new();
+    let language = language_grammar(lang);
     parser
-        .set_language(language_grammar(lang))
+        .set_language(&language)
         .map_err(|e| ScentError::Parse {
             path: path.to_string(),
             message: format!("failed to configure tree-sitter grammar: {e}"),

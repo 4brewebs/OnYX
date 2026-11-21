@@ -35,6 +35,9 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     env:
       # Override rust-toolchain.toml (MSRV 1.85.1): cargo-audit 0.23+ requires rustc >= 1.88
       # and only parses Cargo.lock / Cargo.toml without compiling the workspace.
