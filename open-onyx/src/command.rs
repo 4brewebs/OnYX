@@ -1,6 +1,7 @@
 //! Sistema determinista que procesa `IngressEvent::Command` en sesiones interactivas:
 //! `/new`, `/mode`, `/undo`, `/compact`, `/services`, `/agent`, `/rewind`, `/fork` y continuación multi-turno.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use onyx_soul_agents::{
@@ -9,9 +10,9 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab,
-    format_services_panel_from_toon, graph_workspace_mode, graph_workspace_plan,
-    graph_workspace_services, mark_latest_effect_undone, set_workspace_mode,
-    set_workspace_services,
+    evaluate_workspace_trust, format_services_panel_from_toon, graph_workspace_mode,
+    graph_workspace_plan, graph_workspace_services, mark_latest_effect_undone,
+    revoke_workspace_trust, set_workspace_mode, set_workspace_services, trust_workspace,
 };
 
 use crate::context::{COMPACT_MARKER, build_compaction_summary};
@@ -80,6 +81,7 @@ pub enum SlashCommand {
     Rewind(Option<u64>),
     RewindInvalid(String),
     Fork(Option<String>),
+    Trust(Option<String>),
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
@@ -171,6 +173,17 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             Some(trimmed.to_string())
         }));
     }
+    if cmd == "/trust" {
+        return Some(SlashCommand::Trust(None));
+    }
+    if let Some(rest) = cmd.strip_prefix("/trust ") {
+        let trimmed = rest.trim();
+        return Some(SlashCommand::Trust(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
     None
 }
 
@@ -217,6 +230,7 @@ pub struct CommandSpawnerSystem {
     ws_vocab: Option<WorkspaceVocab>,
     mode_handle: WorkspaceModeHandle,
     sprout: Option<SproutSupervisor>,
+    workspace_root: Option<PathBuf>,
     snapshot_store: Option<SharedPackStore>,
     pending_action: PendingSessionAction,
     pending_notes: PendingSystemNotes,
@@ -233,6 +247,7 @@ impl CommandSpawnerSystem {
             ws_vocab: None,
             mode_handle: WorkspaceModeHandle::default(),
             sprout: None,
+            workspace_root: None,
             snapshot_store: None,
             pending_action: PendingSessionAction::new(),
             pending_notes: PendingSystemNotes::new(),
@@ -255,6 +270,11 @@ impl CommandSpawnerSystem {
 
     pub fn with_sprout(mut self, sprout: SproutSupervisor) -> Self {
         self.sprout = Some(sprout);
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
+        self.workspace_root = Some(root);
         self
     }
 
@@ -722,6 +742,88 @@ impl OnyxSystem for CommandSpawnerSystem {
                             }
                         } else {
                             self.pending_action.set(SessionAction::Fork { label });
+                        }
+                    }
+                    SlashCommand::Trust(arg) => {
+                        let action = arg
+                            .as_deref()
+                            .map(|s| s.trim().to_ascii_lowercase())
+                            .unwrap_or_default();
+                        let note = match &self.workspace_root {
+                            None => {
+                                "[/trust] Workspace trust is unavailable in offline replay mode."
+                                    .to_string()
+                            }
+                            Some(root) => match action.as_str() {
+                                "status" | "check" => {
+                                    let rep = evaluate_workspace_trust(root, None);
+                                    format!(
+                                        "[/trust] status={} (config={}, sprout={})",
+                                        rep.status_label(),
+                                        rep.config_blake3
+                                            .as_deref()
+                                            .map(|h| &h[..h.len().min(12)])
+                                            .unwrap_or("none"),
+                                        rep.sprout_blake3
+                                            .as_deref()
+                                            .map(|h| &h[..h.len().min(12)])
+                                            .unwrap_or("none"),
+                                    )
+                                }
+                                "revoke" => match revoke_workspace_trust(root, None) {
+                                    Ok(removed) => {
+                                        let rep = evaluate_workspace_trust(root, None);
+                                        if let Some(sprout) = &self.sprout {
+                                            sprout.set_trust_state(
+                                                rep.sprout_trusted,
+                                                rep.status.clone(),
+                                            );
+                                            if let Some(wv) = self.ws_vocab {
+                                                if let Some(panel) = sprout.render_panel_text() {
+                                                    set_workspace_services(ctx.graph, &wv, &panel);
+                                                }
+                                            }
+                                        }
+                                        if removed {
+                                            "[/trust] Workspace trust revoked. Project `allow` rules and `sprout.toml` execution are blocked until re-approved.".to_string()
+                                        } else {
+                                            "[/trust] Workspace was not in trusted_workspaces.toml."
+                                                .to_string()
+                                        }
+                                    }
+                                    Err(e) => format!("[/trust] ERROR: {e}"),
+                                },
+                                "" | "add" | "approve" => match trust_workspace(root, None) {
+                                    Ok(rep) => {
+                                        if let Some(sprout) = &self.sprout {
+                                            sprout.set_trust_state(true, rep.status.clone());
+                                            if let Some(wv) = self.ws_vocab {
+                                                if let Some(panel) = sprout.render_panel_text() {
+                                                    set_workspace_services(ctx.graph, &wv, &panel);
+                                                }
+                                            }
+                                        }
+                                        format!(
+                                            "[/trust] Workspace trusted (config={}, sprout={}). Sprout is now enabled; restart `chat` to reload project `[permissions].allow` / `[sandbox]` overrides.",
+                                            rep.config_blake3
+                                                .as_deref()
+                                                .map(|h| &h[..h.len().min(12)])
+                                                .unwrap_or("none"),
+                                            rep.sprout_blake3
+                                                .as_deref()
+                                                .map(|h| &h[..h.len().min(12)])
+                                                .unwrap_or("none"),
+                                        )
+                                    }
+                                    Err(e) => format!("[/trust] ERROR: {e}"),
+                                },
+                                other => format!(
+                                    "[/trust] Unknown action `{other}` (usage: `/trust`, `/trust status`, or `/trust revoke`)."
+                                ),
+                            },
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
                         }
                     }
                 }

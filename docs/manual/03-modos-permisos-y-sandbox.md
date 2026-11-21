@@ -90,6 +90,18 @@ hard_ask_bp = 8000    # umbral duro para cualquier símbolo con alto fan-out
 
 ---
 
+## 2.5. Workspace Trust (`~/.onyx/trusted_workspaces.toml`)
+
+Para proteger frente a repositorios clonados o PRs externos con configuraciones maliciosas (*Indirect Prompt Injection* + `allow = ["shell_exec(*)"]` o `sprout.toml` arbitrario), `openOnyx` fija los hashes `blake3` de `.onyx/config.toml` y `sprout.toml` por workspace en `~/.onyx/trusted_workspaces.toml`:
+
+- **Repositorio limpio (sin `.onyx/config.toml` ni `sprout.toml`):** sin fricción (`no-project-config`).
+- **Repositorio no confiado o modificado (`untrusted` / `modified`, badge `[UNTRUSTED]` en TUI):**
+  - `.onyx/config.toml` del proyecto **solo puede restringir** (`deny`/`ask`, sandbox/impact más estrictos); se ignoran sus reglas `allow`, `env_passthrough`, `allow_read_paths`, `container_image` y cualquier relajación de `[sandbox]`/`[impact]`.
+  - `sprout.toml` bloquea la ejecución de servicios (`service_start`, `service_exec`, `stop_cmd`) hasta aprobación explícita.
+- **Comandos de confianza:** `openonyx trust` (aprueba el workspace actual), `openonyx trust check`, `openonyx trust list`, `openonyx trust revoke`, flag de sesión `--trust-workspace` o `/trust [status|revoke]` en la TUI.
+
+---
+
 ## 3. Protección Read-Only del Control Plane
 
 Incluso en modo `BUILD` y con `--auto-approve`, `onyx-workspace` protege como **solo lectura** los archivos críticos del plano de control del agente y del repositorio:
@@ -110,7 +122,7 @@ Toda ejecución de `shell_exec` (y los procesos locales de Sprout) pasa por la i
 ### Perfiles de sandbox (`--sandbox`)
 | Modo | Badge TUI | Comportamiento |
 | --- | --- | --- |
-| `workspace-write` *(default)* | `[SANDBOX:workspace]` | `env_clear()`, aislamiento nativo de escritura acotado al workspace y temp de sesión, límites de memoria/PIDs y red `offline` por defecto. |
+| `workspace-write` *(default)* | `[SANDBOX:workspace]` (Linux `bwrap` / macOS `sandbox-exec`), `[SANDBOX:env+job]` (Windows) o `[SANDBOX:env+pgid]` | `env_clear()`, aislamiento nativo de escritura (en Linux/macOS), Win32 Job Objects / PGID, límites de memoria/PIDs y red `offline` por defecto. En Windows, usa `strict-container` para aislamiento fuerte de FS/red. |
 | `strict-container` | `[SANDBOX:strict]` | Ejecuta el comando dentro de un contenedor OCI (`docker`, `nerdctl` o `podman`) montando el workspace. Ideal para automatización desatendida. |
 | `off` | `[SANDBOX:off]` | Desactiva el wrapper de sandbox OS (siguen activos `WorkspacePolicy`, timeout, limpieza de procesos y Control Plane RO). |
 

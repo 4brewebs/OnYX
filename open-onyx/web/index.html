@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#060608">
+  <title>openOnyx — Deterministic Agent Harness</title>
+  <link rel="icon" type="image/jpeg" href="/logo.jpg">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="topbar-brand">
+        <button
+          id="brand-orbit-btn"
+          type="button"
+          class="brand-orbit-btn"
+          aria-label="Pause logo rotation"
+          title="openOnyx — click to pause/resume emblem rotation when busy"
+        >
+          <img
+            id="brand-logo"
+            class="brand-logo"
+            src="/logo.jpg"
+            alt="openOnyx emblem"
+            width="36"
+            height="36"
+            fetchpriority="high"
+            decoding="async"
+          >
+        </button>
+        <div class="brand-meta">
+          <div class="brand-title-row">
+            <h1 class="brand-title">openOnyx</h1>
+            <span id="conn-pill" class="pill pill-muted" title="SSE connection status">Connecting</span>
+          </div>
+          <p id="model-subtitle" class="brand-subtitle">Initializing session…</p>
+        </div>
+      </div>
+
+      <div class="topbar-badges toolbar" aria-label="Session status controls">
+        <button id="mode-btn" type="button" class="pill pill-mode" title="Toggle PLAN / BUILD mode">BUILD</button>
+        <span id="sandbox-pill" class="pill pill-sandbox" title="Active OS sandbox profile">SANDBOX:workspace</span>
+        <button id="trust-pill" type="button" class="pill pill-danger hidden" title="Workspace Trust restricted">UNTRUSTED</button>
+        <button id="agents-btn" type="button" class="pill pill-interactive" title="Select active agent">Agent #1</button>
+        <span id="tick-pill" class="pill pill-mono" title="Deterministic graph tick">tick 0</span>
+        <span id="vault-pill" class="pill pill-mono hidden" title="Active Session Vault">vault</span>
+        <div class="ctx-meter" title="Context window usage">
+          <div class="ctx-bar-track" aria-hidden="true">
+            <div id="ctx-bar-fill" class="ctx-bar-fill"></div>
+          </div>
+          <span id="ctx-label" class="ctx-label">ctx 0%</span>
+        </div>
+        <button id="theme-btn" type="button" class="icon-btn" aria-label="Cycle color theme" title="Theme: Auto / Dark / Light">◐</button>
+        <button id="logout-btn" type="button" class="icon-btn" aria-label="Sign out" title="Sign out">⎋</button>
+      </div>
+    </header>
+
+    <nav class="mobile-tabs" aria-label="Workspace views">
+      <button type="button" class="mobile-tab is-active" data-tab="chat">Chat</button>
+      <button type="button" class="mobile-tab" data-tab="plan">Plan</button>
+      <button type="button" class="mobile-tab" data-tab="services">Services</button>
+    </nav>
+
+    <main id="workspace-shell" class="workspace-shell" data-active-tab="chat">
+      <section class="chat-column" aria-label="Conversation and trace">
+        <div id="agent-banner" class="agent-banner">
+          <div class="agent-banner-main">
+            <span id="agent-emblem-wrap" class="agent-emblem-wrap" aria-hidden="true">
+              <img
+                id="agent-emblem"
+                class="agent-emblem"
+                src="/logo.jpg"
+                alt=""
+                width="22"
+                height="22"
+                decoding="async"
+              >
+            </span>
+            <progress id="agent-busy-progress" class="sr-only hidden" aria-label="Agent is working"></progress>
+            <span id="agent-banner-name" class="agent-banner-name">Ready</span>
+            <span id="agent-banner-goal" class="agent-banner-goal">Type a goal or slash command below.</span>
+          </div>
+          <div class="agent-banner-actions">
+            <button id="quick-undo-btn" type="button" class="chip-btn" title="Revert latest Git checkpoint (/undo)">/undo</button>
+            <button id="quick-compact-btn" type="button" class="chip-btn" title="Compact older turns (/compact)">/compact</button>
+            <button id="quick-fork-btn" type="button" class="chip-btn" title="Branch snapshots (/fork)">/fork</button>
+          </div>
+        </div>
+
+        <div id="messages" class="messages" aria-live="polite" aria-relevant="additions"></div>
+
+        <section id="approval-dock" class="approval-dock hidden" aria-label="Pending approval">
+          <div class="approval-card">
+            <div class="approval-header">
+              <div class="approval-heading">
+                <span class="approval-kicker">Approval Required</span>
+                <strong id="approval-tool" class="approval-tool">fs_edit</strong>
+                <span id="approval-agent" class="pill pill-mono">agent #1</span>
+              </div>
+              <div class="approval-actions">
+                <button id="approve-btn" type="button" class="btn btn-approve">Approve</button>
+                <button id="deny-btn" type="button" class="btn btn-deny">Deny</button>
+              </div>
+            </div>
+            <div id="approval-impact" class="impact-banner hidden"></div>
+            <div id="approval-args" class="approval-args"></div>
+            <div id="approval-diff" class="diff-viewer hidden" tabindex="0" role="region" aria-label="Proposed file diff"></div>
+          </div>
+        </section>
+
+        <footer class="composer-wrap">
+          <div id="queue-bar" class="queue-bar hidden">
+            <span id="queue-label" class="queue-label">queued: 0</span>
+            <button id="queue-clear-btn" type="button" class="chip-btn">Clear queue</button>
+          </div>
+
+          <div id="autocomplete" class="autocomplete hidden" role="listbox" aria-label="Autocomplete suggestions"></div>
+
+          <form id="composer-form" class="composer-form" autocomplete="off">
+            <label class="sr-only" for="prompt-input">Message or slash command</label>
+            <textarea
+              id="prompt-input"
+              class="prompt-input"
+              rows="1"
+              placeholder="Ask openOnyx, type / for commands, or @ for workspace files…"
+            ></textarea>
+            <button id="send-btn" type="submit" class="btn btn-primary" aria-label="Send message">Send</button>
+          </form>
+        </footer>
+      </section>
+
+      <aside class="side-column" aria-label="Live Plan and Sprout Services">
+        <section class="side-card side-plan" data-panel="plan">
+          <div class="side-card-header">
+            <h2>Live Plan</h2>
+            <span id="plan-badge" class="pill pill-muted">Idle</span>
+          </div>
+          <div id="plan-body" class="side-card-body">
+            <p class="empty-note">No active steps yet. Plans emitted via <code>plan_update</code> appear here in real time.</p>
+          </div>
+        </section>
+
+        <section class="side-card side-services" data-panel="services">
+          <div class="side-card-header">
+            <h2>Services (Sprout)</h2>
+            <div class="side-card-tools">
+              <button id="svc-start-all" type="button" class="chip-btn" title="Start all services">Start all</button>
+              <button id="svc-stop-all" type="button" class="chip-btn" title="Stop all services">Stop</button>
+            </div>
+          </div>
+          <div id="services-body" class="side-card-body">
+            <p class="empty-note">No <code>sprout.toml</code> services loaded.</p>
+          </div>
+        </section>
+
+        <section class="side-card side-telemetry">
+          <div class="side-card-header">
+            <h2>Telemetry</h2>
+            <span id="cost-badge" class="pill pill-mono">$0.0000</span>
+          </div>
+          <dl class="telemetry-grid">
+            <div><dt>Input</dt><dd id="tel-in">0</dd></div>
+            <div><dt>Cached</dt><dd id="tel-cache">0</dd></div>
+            <div><dt>Output</dt><dd id="tel-out">0</dd></div>
+            <div><dt>Thinking</dt><dd id="tel-think">0</dd></div>
+          </dl>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Native modal dialog: API Key authentication (no redundant role/aria-modal per modern-web-guidance) -->
+  <dialog id="login-dialog" closedby="none" aria-labelledby="login-title">
+    <form id="login-form" class="dialog-body">
+      <div class="dialog-head">
+        <img
+          class="dialog-logo"
+          src="/logo.jpg"
+          alt=""
+          aria-hidden="true"
+          width="42"
+          height="42"
+          fetchpriority="low"
+          decoding="async"
+        >
+        <div>
+          <h2 id="login-title">Unlock openOnyx</h2>
+          <p class="dialog-sub">Enter the session API key printed in your server console or configured via <code>ONYX_WEB_API_KEY</code>.</p>
+        </div>
+      </div>
+      <label class="field-label" for="api-key-input">API Key</label>
+      <input
+        id="api-key-input"
+        class="text-input"
+        type="password"
+        name="api_key"
+        placeholder="onyx_..."
+        autocomplete="current-password"
+        required
+        autofocus
+      >
+      <p id="login-error" class="form-error" aria-live="assertive"></p>
+      <div class="dialog-footer">
+        <button id="login-submit" type="submit" class="btn btn-primary">Sign in</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Native modal dialog: Agent Selector -->
+  <dialog id="agent-dialog" closedby="any" aria-labelledby="agent-dialog-title">
+    <div class="dialog-body">
+      <div class="dialog-head-row">
+        <h2 id="agent-dialog-title">Active Agents</h2>
+        <button id="agent-dialog-close" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <div id="agent-list" class="agent-list"></div>
+    </div>
+  </dialog>
+
+  <!-- Native modal dialog: Workspace Trust -->
+  <dialog id="trust-dialog" closedby="any" aria-labelledby="trust-dialog-title">
+    <div class="dialog-body">
+      <div class="dialog-head-row">
+        <h2 id="trust-dialog-title">Workspace Trust</h2>
+        <button id="trust-dialog-close" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="dialog-sub">
+        This workspace contains local <code>.onyx/config.toml</code> or <code>sprout.toml</code> rules that have not been approved yet (or changed since last approval). Project <code>allow</code> rules and Sprout services are blocked until trusted.
+      </p>
+      <div class="dialog-footer">
+        <button id="trust-cancel-btn" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="trust-approve-btn" type="button" class="btn btn-approve">Trust Workspace (/trust)</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

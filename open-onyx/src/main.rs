@@ -8,6 +8,7 @@ mod session;
 mod tui;
 mod tui_input;
 mod vault;
+mod web;
 
 use std::env;
 use std::fs;
@@ -27,7 +28,8 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     NetworkPolicy, PendingCheckpoints, SandboxMode, WorkspaceMode, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, graph_workspace_mode,
+    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, evaluate_workspace_trust,
+    graph_workspace_mode, list_trusted_workspaces, revoke_workspace_trust, trust_workspace,
 };
 use openai::{AsyncOpenAiDriver, DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
@@ -45,6 +47,7 @@ use vault::{
     auto_save_from_env, ensure_vault_gitignore, resolve_fork_dir, resolve_read_snapshot_dir,
     resolve_read_transcript, resolve_write_storage, session_display_label,
 };
+use web::{DEFAULT_WEB_BIND, WebDriver, WebServerConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LlmProvider {
@@ -80,6 +83,8 @@ struct CliArgs {
     model: Option<String>,
     effort: Option<ReasoningEffort>,
     api_base: Option<String>,
+    allow_custom_auth_host: bool,
+    trust_workspace: bool,
     auto_approve: bool,
     ignore_deny: bool,
     sandbox_mode: Option<SandboxMode>,
@@ -108,6 +113,8 @@ impl CliArgs {
             model: None,
             effort: None,
             api_base: None,
+            allow_custom_auth_host: false,
+            trust_workspace: false,
             auto_approve: false,
             ignore_deny: false,
             sandbox_mode: None,
@@ -150,6 +157,16 @@ enum Mode {
         snapshot_dir: Option<PathBuf>,
         transcript: Option<PathBuf>,
     },
+    Trust {
+        list: bool,
+        revoke: bool,
+        check: bool,
+    },
+    Serve {
+        bind: String,
+        api_key: Option<String>,
+        cors_origin: Option<String>,
+    },
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -170,6 +187,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut model: Option<String> = None;
     let mut effort: Option<ReasoningEffort> = None;
     let mut api_base: Option<String> = None;
+    let mut allow_custom_auth_host = false;
+    let mut trust_workspace_flag = false;
     let mut auto_approve = false;
     let mut ignore_deny = false;
     let mut sandbox_mode: Option<SandboxMode> = None;
@@ -190,6 +209,11 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut transcript_opt: Option<PathBuf> = None;
     let mut list = false;
     let mut json = false;
+    let mut revoke = false;
+    let mut check_only = false;
+    let mut web_bind: Option<String> = None;
+    let mut web_api_key: Option<String> = None;
+    let mut web_cors_origin: Option<String> = None;
     let mut positional = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -223,6 +247,31 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--api-base must not be empty".to_string());
                 }
                 api_base = Some(u);
+            }
+            "--allow-custom-auth-host" => allow_custom_auth_host = true,
+            "--trust-workspace" => trust_workspace_flag = true,
+            "--revoke" => revoke = true,
+            "--check" => check_only = true,
+            "--bind" => {
+                let b = args.next().ok_or("--bind requires an `ip:port` address")?;
+                if b.trim().is_empty() {
+                    return Err("--bind must not be empty".to_string());
+                }
+                web_bind = Some(b);
+            }
+            "--api-key" => {
+                let k = args.next().ok_or("--api-key requires a key string")?;
+                if k.trim().is_empty() {
+                    return Err("--api-key must not be empty".to_string());
+                }
+                web_api_key = Some(k);
+            }
+            "--cors-origin" => {
+                let o = args.next().ok_or("--cors-origin requires an origin URL")?;
+                if o.trim().is_empty() {
+                    return Err("--cors-origin must not be empty".to_string());
+                }
+                web_cors_origin = Some(o);
             }
             "--auto-approve" => auto_approve = true,
             "--ignore-deny" => ignore_deny = true,
@@ -383,13 +432,52 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 .or_else(|| positional.into_iter().next().map(PathBuf::from)),
             transcript: transcript_opt,
         },
+        "trust" => {
+            if let Some(sub) = positional.first().map(|s| s.trim().to_ascii_lowercase()) {
+                match sub.as_str() {
+                    "list" => list = true,
+                    "revoke" => revoke = true,
+                    "check" | "status" => check_only = true,
+                    "add" | "approve" => {}
+                    other => {
+                        return Err(format!(
+                            "unknown `trust` action `{other}` (expected `add`, `list`, `check`, or `revoke`)"
+                        ));
+                    }
+                }
+            }
+            Mode::Trust {
+                list,
+                revoke,
+                check: check_only,
+            }
+        }
+        "serve" => Mode::Serve {
+            bind: web_bind
+                .or_else(|| {
+                    env::var("ONYX_WEB_BIND")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .unwrap_or_else(|| DEFAULT_WEB_BIND.to_string()),
+            api_key: web_api_key.or_else(|| {
+                env::var("ONYX_WEB_API_KEY")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            }),
+            cors_origin: web_cors_origin.or_else(|| {
+                env::var("ONYX_WEB_CORS_ORIGIN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            }),
+        },
         _ => return Err(usage()),
     };
 
     if resume_dir.is_some() && snapshot_dir.is_none() {
         snapshot_dir = resume_dir.clone();
     }
-    let resume_tick = if matches!(mode, Mode::Chat) {
+    let resume_tick = if matches!(mode, Mode::Chat | Mode::Serve { .. }) {
         tick_opt
     } else {
         None
@@ -402,6 +490,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         model,
         effort,
         api_base,
+        allow_custom_auth_host,
+        trust_workspace: trust_workspace_flag,
         auto_approve,
         ignore_deny,
         sandbox_mode,
@@ -423,7 +513,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -435,14 +525,22 @@ fn help_text() -> String {
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
   rewind <dir> <tick>      Restore git checkpoints to <tick> (or prior milestone) and replay/continue
-  doctor                   Verify workspace git repository, snapshot packs, and transcript integrity
+  doctor                   Verify workspace git repository, sandbox, Workspace Trust, snapshot packs, and transcripts
+  trust                    Approve, check, list, or revoke Workspace Trust hashes (`~/.onyx/trusted_workspaces.toml`)
+  serve                    Serve embedded mobile-first PWA + JSON/SSE API (`/api/v1/...`) over HTTP/1.1 (0 tokio)
 
 OPTIONS:
   -w, --workspace <dir>    Target workspace directory (default: current working directory)
       --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
       --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
       --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`)
-      --api-base <url>     Custom API base URL (e.g. `http://localhost:11434/v1`; no OPENAI_API_KEY needed when set)
+      --api-base <url>     Custom API base URL (`http://` allowed on loopback only; remote hosts require `https://`)
+      --allow-custom-auth-host
+                           Explicit opt-in to send API keys to non-official remote HTTPS `--api-base` hosts (or `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`)
+      --trust-workspace    Trust the current workspace's `.onyx/config.toml` and `sprout.toml` in memory for this run
+      --bind <ip:port>     HTTP/SSE bind address for `serve` (default: `127.0.0.1:8787`; non-loopback requires explicit `--api-key`)
+      --api-key <key>      API key for `serve` (Bearer token / login modal; generated randomly on loopback if omitted)
+      --cors-origin <url>  Allow one explicit browser origin for external SPAs (e.g. Svelte dev server; never `*`)
       --auto-approve       Skip interactive approval prompts for mutating tools (`fs_write`, `fs_edit`, `shell_exec`; `deny` rules in `.onyx/config.toml` still apply and sandbox elevates to `workspace-write` + `offline` unless `--sandbox off`)
       --ignore-deny        Explicitly bypass `[permissions].deny` rules loaded from `.onyx/config.toml`
       --sandbox <mode>     OS sandbox profile for `shell_exec`: `workspace-write` (default), `strict-container`, or `off`
@@ -460,7 +558,9 @@ OPTIONS:
       --fork-dir <dir>     Destination snapshot directory when forking via `chat --resume --tick` or `rewind --interactive`
       --truncate-future    Opt-in: overwrite the source pack in place instead of creating a sibling fork directory
       --interactive, --tui Open interactive TUI after `rewind <dir> <tick>` instead of running headless
-  -l, --list               List all stored snapshot milestones with tags and git checkpoints (use with `inspect`)
+  -l, --list               List snapshot milestones (`inspect`) or trusted workspaces (`trust`)
+      --check              Check Workspace Trust status without modifying `~/.onyx/trusted_workspaces.toml` (`trust`)
+      --revoke             Revoke Workspace Trust for `--workspace` (`trust`)
       --json               Emit machine-readable JSON output (use with `inspect`)
       --transcript <file>  Replay transcript from rewind point (`rewind`) or validate transcript (`doctor`)
       --dry-run            Preview orphaned effects and git rollback plan in `rewind` without modifying files
@@ -489,6 +589,7 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /services                Show @TOON v1 status of local processes & containers from `sprout.toml`
   /service <start|stop|logs> <id|all> [tail]
                            Control Sprout services interactively from the TUI
+  /trust [status|revoke]   Approve, inspect, or revoke Workspace Trust for the current workspace
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
@@ -508,6 +609,12 @@ ENVIRONMENT VARIABLES:
   ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
   ONYX_EFFORT              Default reasoning/thinking effort (`low` | `medium` | `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`)
   ONYX_AUTO_SAVE           Enable `--auto-save` by default (`1` | `true` | `yes` | `on`)
+  ONYX_ALLOW_CUSTOM_AUTH_HOST
+                           Allow sending API keys to custom remote HTTPS `--api-base` hosts (`1` | `true`)
+  ONYX_TRUST_FILE          Optional override path for `trusted_workspaces.toml`
+  ONYX_WEB_BIND            Default bind address for `openonyx serve` (default: `127.0.0.1:8787`)
+  ONYX_WEB_API_KEY         Explicit API key for `openonyx serve` (required when binding non-loopback addresses)
+  ONYX_WEB_CORS_ORIGIN     Optional allowed browser origin for external SPAs (e.g. `http://localhost:5173`)
   GEMINI_API_BASE          Custom Gemini API endpoint
   OPENAI_API_BASE / OPENAI_BASE_URL
                            Custom OpenAI-compatible API endpoint"#
@@ -515,6 +622,111 @@ ENVIRONMENT VARIABLES:
         .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL);
 
     format!("openOnyx {version} — Deterministic Coding Agent Harness\n\n{usage_str}\n\n{body}")
+}
+
+fn allow_custom_auth_host_from_env() -> bool {
+    env::var("ONYX_ALLOW_CUSTOM_AUTH_HOST")
+        .ok()
+        .is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower.ends_with(".localhost")
+}
+
+fn is_official_provider_host(provider: LlmProvider, host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    match provider {
+        LlmProvider::Gemini => lower == "generativelanguage.googleapis.com",
+        LlmProvider::OpenAi => lower == "api.openai.com",
+    }
+}
+
+/// Valida `--api-base` (y variables `*_API_BASE`):
+/// - Permite `http://` **solo** en loopback (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`).
+/// - Exige `https://` para cualquier host remoto.
+/// - Bloquea envío de credenciales (`api_key` no vacía) a hosts remotos no oficiales salvo
+///   opt-in explícito (`--allow-custom-auth-host` o `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`).
+fn validate_api_base(
+    provider: LlmProvider,
+    raw_url: &str,
+    has_api_key: bool,
+    allow_custom_auth_host: bool,
+) -> Result<String, String> {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("--api-base must not be empty".to_string());
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "invalid --api-base `{trimmed}`: whitespace/control characters not allowed"
+        ));
+    }
+
+    let (is_https, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err(format!(
+            "invalid --api-base `{trimmed}`: scheme must be `https://` (or `http://` for loopback hosts)"
+        ));
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(format!("invalid --api-base `{trimmed}`: missing host"));
+    }
+    if authority.contains('@') {
+        return Err(format!(
+            "invalid --api-base `{trimmed}`: embedded credentials (`user:pass@host`) are not allowed"
+        ));
+    }
+
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((ipv6, tail)) = bracketed.split_once(']') else {
+            return Err(format!(
+                "invalid --api-base `{trimmed}`: unclosed IPv6 bracket"
+            ));
+        };
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return Err(format!(
+                "invalid --api-base `{trimmed}`: invalid authority after `]`"
+            ));
+        }
+        ipv6
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+
+    if host.is_empty() {
+        return Err(format!("invalid --api-base `{trimmed}`: empty host"));
+    }
+
+    let loopback = is_loopback_host(host);
+    if !is_https && !loopback {
+        return Err(format!(
+            "refusing insecure `http://` --api-base for remote host `{host}`: use `https://` (`http://` is only permitted for loopback hosts like `localhost`, `127.0.0.1`, or `[::1]`)"
+        ));
+    }
+
+    if !loopback
+        && !is_official_provider_host(provider, host)
+        && has_api_key
+        && !allow_custom_auth_host
+    {
+        return Err(format!(
+            "refusing to send API key to non-official remote host `{host}`: pass `--allow-custom-auth-host` (or set `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`) to explicitly authorize sending credentials to this endpoint"
+        ));
+    }
+
+    Ok(trimmed.to_string())
 }
 
 fn resolve_llm_config(
@@ -550,6 +762,8 @@ fn resolve_llm_config(
         }
     };
 
+    let allow_custom_auth_host = cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+
     match provider {
         LlmProvider::Gemini => {
             let api_key = env::var("GEMINI_API_KEY")
@@ -565,11 +779,20 @@ fn resolve_llm_config(
                         .filter(|s| !s.trim().is_empty())
                 })
                 .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
-            let api_base = cli
+            let raw_api_base = cli
                 .api_base
                 .clone()
                 .or_else(|| env::var("GEMINI_API_BASE").ok())
                 .filter(|s| !s.trim().is_empty());
+            let api_base = match raw_api_base {
+                Some(raw) => Some(validate_api_base(
+                    provider,
+                    &raw,
+                    !api_key.trim().is_empty(),
+                    allow_custom_auth_host,
+                )?),
+                None => None,
+            };
             Ok(LlmConfig {
                 provider,
                 api_key,
@@ -580,7 +803,7 @@ fn resolve_llm_config(
             })
         }
         LlmProvider::OpenAi => {
-            let api_base = cli
+            let raw_api_base = cli
                 .api_base
                 .clone()
                 .or_else(|| env::var("OPENAI_API_BASE").ok())
@@ -588,8 +811,17 @@ fn resolve_llm_config(
                 .filter(|s| !s.trim().is_empty());
             let api_key = match env::var("OPENAI_API_KEY").or_else(|_| env::var("ONYX_API_KEY")) {
                 Ok(k) => k,
-                Err(_) if api_base.is_some() => String::new(),
+                Err(_) if raw_api_base.is_some() => String::new(),
                 Err(_) => return Err("OPENAI_API_KEY environment variable is not set".into()),
+            };
+            let api_base = match raw_api_base {
+                Some(raw) => Some(validate_api_base(
+                    provider,
+                    &raw,
+                    !api_key.trim().is_empty(),
+                    allow_custom_auth_host,
+                )?),
+                None => None,
             };
             let model = cli
                 .model
@@ -856,8 +1088,19 @@ fn launch_interactive_chat(
         .with_max_steps(chat_config.default_max_steps)
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
+        .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
         .with_pending_notes(pending_notes.clone());
+    if !policy.trust.is_fully_trusted() {
+        let mut msg = format!(
+            "[Workspace Trust: {}] Project `allow` rules, `[sandbox]`/`[impact]` relaxations, and `sprout.toml` execution are blocked until you run `/trust` or `openonyx trust`.",
+            policy.trust.status_label()
+        );
+        if cli.workspace.join("ONYX.md").is_file() || cli.workspace.join("AGENTS.md").is_file() {
+            msg.push_str(" Note: workspace ONYX.md/AGENTS.md instructions are active while mutations remain gated.");
+        }
+        pending_notes.push(msg);
+    }
     if let Some(store) = shared_store.clone() {
         spawner = spawner.with_snapshot_store(store);
     }
@@ -968,7 +1211,7 @@ fn launch_interactive_chat(
         &effective_opts,
         StopPolicy::Quit {
             quit,
-            tui: tui_handle,
+            ui: Box::new(tui_handle),
             llm_in_flight,
             llm_ready,
             bridge_ready,
@@ -977,6 +1220,323 @@ fn launch_interactive_chat(
     )?;
     drop(driver);
     print_vault_summary(&cli.workspace, &effective_opts, shared_store.as_ref());
+    Ok(())
+}
+
+fn launch_web_serve(
+    cli: &CliArgs,
+    policy: &WorkspacePolicy,
+    tools: WorkspaceTools,
+    base_config: &AgentConfig,
+    base_opts: &SessionOptions,
+    web_cfg: WebServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let llm = resolve_llm_config(cli, &cli.workspace)?;
+    let checkpoints = PendingCheckpoints::default();
+    let serve_config = AgentConfig {
+        default_max_steps: cli.max_steps.unwrap_or(128),
+        default_timeout_ticks: 512,
+        ..base_config.clone()
+    };
+
+    let resolved_fork_dir = cli
+        .fork_dir
+        .as_deref()
+        .map(|fd| resolve_fork_dir(&cli.workspace, fd));
+    let explicit_snap_resolved = cli.snapshot_dir.as_deref().map(|d| {
+        if vault::is_explicit_path(d) {
+            d.to_path_buf()
+        } else {
+            vault::vault_root(&cli.workspace).join(d)
+        }
+    });
+
+    let mut effective_opts = base_opts.clone();
+    let resume_plan = match cli.resume_dir.as_deref() {
+        Some(raw_dir) => {
+            let resolved_dir = resolve_read_snapshot_dir(&cli.workspace, raw_dir);
+            if resolved_fork_dir
+                .as_deref()
+                .is_some_and(|p| p.starts_with(vault::vault_root(&cli.workspace)))
+                || resolved_dir.starts_with(vault::vault_root(&cli.workspace))
+            {
+                ensure_vault_gitignore(&cli.workspace)?;
+            }
+            let plan = prepare_chat_resume(
+                &resolved_dir,
+                cli.resume_tick,
+                resolved_fork_dir.as_deref(),
+                cli.truncate_future,
+                &cli.workspace,
+                &serve_config,
+                explicit_snap_resolved.as_deref(),
+            )?;
+            effective_opts.snapshot_dir = Some(plan.active_snapshot_dir.clone());
+            effective_opts.save_step_snapshots = true;
+            Some(plan)
+        }
+        None => None,
+    };
+
+    let auto_save = cli.auto_save || auto_save_from_env();
+    let resolved_storage = resolve_write_storage(
+        &cli.workspace,
+        if resume_plan.is_some() {
+            None
+        } else {
+            cli.snapshot_dir.as_deref()
+        },
+        cli.save_transcript.as_deref(),
+        resume_plan
+            .as_ref()
+            .map(|p| p.active_snapshot_dir.as_path()),
+        auto_save,
+        Some(&llm.model),
+        None,
+        SystemTime::now(),
+    );
+    if resolved_storage.uses_vault {
+        ensure_vault_gitignore(&cli.workspace)?;
+    }
+    effective_opts.snapshot_dir = resolved_storage.snapshot_dir.clone();
+    effective_opts.save_transcript = resolved_storage.save_transcript.clone();
+    effective_opts.save_step_snapshots = effective_opts.snapshot_dir.is_some();
+
+    let shared_store = effective_opts
+        .snapshot_dir
+        .as_ref()
+        .map(|d| SharedPackStore::new(d, effective_opts.max_snapshots));
+    let pending_action = PendingSessionAction::new();
+    let pending_notes = PendingSystemNotes::new();
+    let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
+        .with_max_steps(serve_config.default_max_steps)
+        .with_mode_handle(mode_handle.clone())
+        .with_sprout(tools.sprout().clone())
+        .with_workspace_root(cli.workspace.clone())
+        .with_pending_action(pending_action.clone())
+        .with_pending_notes(pending_notes.clone());
+    if !policy.trust.is_fully_trusted() {
+        pending_notes.push(format!(
+            "[Workspace Trust: {}] Project `allow` rules, `[sandbox]`/`[impact]` relaxations, and `sprout.toml` execution are blocked until you run `/trust` or `openonyx trust`.",
+            policy.trust.status_label()
+        ));
+    }
+    if let Some(store) = shared_store.clone() {
+        spawner = spawner.with_snapshot_store(store);
+    }
+
+    let (mut host, ws_vocab) = build_host_with_shared_store(
+        1,
+        serve_config.clone(),
+        &effective_opts,
+        Some(Box::new(spawner)),
+        Some(checkpoints.clone()),
+        shared_store.clone(),
+    )?;
+
+    if let Some(plan) = &resume_plan {
+        host.request_restore(&plan.target_tick.to_string());
+        host.step(&mut HeadlessDriver::new());
+        host.set_tick(plan.target_tick.saturating_add(1));
+        if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ws_vocab) {
+            mode_handle.set(restored_mode);
+        }
+    }
+
+    let stream_preview = StreamPreviewHandle::new();
+    let ctx_cfg = TieredContextConfig::for_model(&llm.model);
+    let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
+
+    let web_driver = WebDriver::start(
+        host.vocab(),
+        &web_cfg,
+        Some(cli.workspace.clone()),
+        Some(policy.clone()),
+    )?
+    .with_mode_handle(mode_handle.clone())
+    .with_tools(tools.clone())
+    .with_sprout(tools.sprout().clone())
+    .with_workspace_vocab(ws_vocab)
+    .with_stream_preview(stream_preview.clone())
+    .with_telemetry(telemetry.clone())
+    .with_model_info(llm.model.clone(), llm.effort)
+    .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone());
+
+    let bound = web_driver.local_addr();
+    let web_handle = web_driver.handle();
+    let quit = web_driver.quit_flag();
+
+    println!("=== openOnyx Web UI (`serve`) ===");
+    println!("  URL:        http://{bound}/");
+    println!("  Workspace:  {}", cli.workspace.display());
+    println!(
+        "  Model:      {} (effort: {})",
+        llm.model,
+        llm.effort.map(ReasoningEffort::as_str).unwrap_or("auto")
+    );
+    println!("  Trust:      {}", policy.trust.status_label());
+    if web_cfg.generated_key {
+        println!(
+            "  API Key:    {} (generated for this session)",
+            web_cfg.api_key
+        );
+    } else {
+        println!("  API Key:    (configured via --api-key / ONYX_WEB_API_KEY)");
+    }
+    if let Some(ref cors) = web_cfg.cors_origin {
+        println!("  CORS Allow: {cors}");
+    }
+    println!("  API State:  GET http://{bound}/api/v1/state (Authorization: Bearer <key>)");
+    println!("  Press Ctrl+C to stop cleanly.");
+
+    let bridge_ready = Arc::new(AtomicBool::new(false));
+    let action_ctx = SessionActionContext {
+        workspace_root: cli.workspace.clone(),
+        config: serve_config,
+        ws_vocab,
+        mode_handle: mode_handle.clone(),
+        tools: tools.clone(),
+        snapshot_store: shared_store.clone(),
+        pending_action,
+        pending_notes,
+    };
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_mode_handle(mode_handle)
+        .with_workspace_vocab(ws_vocab)
+        .sync_existing_undos(host.graph())
+        .with_checkpoints(checkpoints)
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .require_read_before_edit(true)
+        .wrapping(web_driver);
+    let llm_in_flight = Arc::new(AtomicUsize::new(0));
+    let llm_ready = Arc::new(AtomicBool::new(false));
+    let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
+    let mut driver = match llm.provider {
+        LlmProvider::Gemini => rec_bridge.wrapping(
+            AsyncGeminiDriver::new(
+                host.vocab(),
+                llm.api_key,
+                llm.model,
+                Arc::clone(&llm_in_flight),
+                Arc::clone(&llm_ready),
+            )
+            .with_api_base(llm.api_base)
+            .with_project_instructions(llm.project_instructions)
+            .with_stream_preview(stream_preview)
+            .with_telemetry(telemetry)
+            .with_context_config(ctx_cfg)
+            .with_effort(llm.effort)
+            .wrapping(ws_bridge),
+        ),
+        LlmProvider::OpenAi => rec_bridge.wrapping(
+            AsyncOpenAiDriver::new(
+                host.vocab(),
+                llm.api_key,
+                llm.model,
+                Arc::clone(&llm_in_flight),
+                Arc::clone(&llm_ready),
+            )
+            .with_api_base(llm.api_base)
+            .with_project_instructions(llm.project_instructions)
+            .with_stream_preview(stream_preview)
+            .with_telemetry(telemetry)
+            .with_context_config(ctx_cfg)
+            .with_effort(llm.effort)
+            .wrapping(ws_bridge),
+        ),
+    };
+
+    run_session(
+        &mut host,
+        &mut driver,
+        &effective_opts,
+        StopPolicy::Quit {
+            quit,
+            ui: Box::new(web_handle),
+            llm_in_flight,
+            llm_ready,
+            bridge_ready,
+            action_ctx: Some(action_ctx),
+        },
+    )?;
+    drop(driver);
+    print_vault_summary(&cli.workspace, &effective_opts, shared_store.as_ref());
+    Ok(())
+}
+
+fn run_trust_command(
+    workspace: &Path,
+    list: bool,
+    revoke: bool,
+    check: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if list {
+        let records = list_trusted_workspaces(None)?;
+        if records.is_empty() {
+            println!("No trusted workspaces recorded in trusted_workspaces.toml.");
+        } else {
+            println!("=== openOnyx Trusted Workspaces ({}) ===", records.len());
+            for rec in records {
+                let cfg = rec
+                    .config_blake3
+                    .as_deref()
+                    .map(|h| &h[..h.len().min(12)])
+                    .unwrap_or("none");
+                let spr = rec
+                    .sprout_blake3
+                    .as_deref()
+                    .map(|h| &h[..h.len().min(12)])
+                    .unwrap_or("none");
+                println!(
+                    "  {}  (config={cfg}, sprout={spr}, ts={})",
+                    rec.root, rec.trusted_at
+                );
+            }
+        }
+        return Ok(());
+    }
+    if revoke {
+        let removed = revoke_workspace_trust(workspace, None)?;
+        if removed {
+            println!("Revoked workspace trust for `{}`.", workspace.display());
+        } else {
+            println!(
+                "Workspace `{}` was not present in trusted_workspaces.toml.",
+                workspace.display()
+            );
+        }
+        return Ok(());
+    }
+    if check {
+        let rep = evaluate_workspace_trust(workspace, None);
+        println!(
+            "Workspace `{}` trust status: {} (config={}, sprout={})",
+            workspace.display(),
+            rep.status_label(),
+            rep.config_blake3.as_deref().unwrap_or("none"),
+            rep.sprout_blake3.as_deref().unwrap_or("none"),
+        );
+        if !rep.is_fully_trusted() {
+            return Err("workspace is not trusted".into());
+        }
+        return Ok(());
+    }
+
+    let rep = trust_workspace(workspace, None)?;
+    println!(
+        "Trusted workspace `{}` (status={}):",
+        workspace.display(),
+        rep.status_label()
+    );
+    println!(
+        "  .onyx/config.toml blake3: {}",
+        rep.config_blake3.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  sprout.toml       blake3: {}",
+        rep.sprout_blake3.as_deref().unwrap_or("none")
+    );
     Ok(())
 }
 
@@ -998,10 +1558,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("openOnyx {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Mode::Trust {
+            list,
+            revoke,
+            check,
+        } => {
+            run_trust_command(&cli.workspace, *list, *revoke, *check)?;
+            return Ok(());
+        }
         _ => {}
     }
 
-    let mut policy = WorkspacePolicy::new(&cli.workspace)?.with_loaded_config();
+    let mut policy =
+        WorkspacePolicy::new(&cli.workspace)?.with_loaded_config_trusted(cli.trust_workspace);
+    if !policy.trust.is_fully_trusted() && matches!(cli.mode, Mode::Run(_)) {
+        eprintln!(
+            "[openOnyx trust] workspace `{}` is {} — project allow/sandbox relaxations ignored and sprout.toml blocked (run `openonyx trust` after reviewing).",
+            cli.workspace.display(),
+            policy.trust.status_label()
+        );
+    }
     if let Some(secs) = cli.shell_timeout_secs {
         policy = policy.with_command_timeout(Duration::from_secs(secs));
     }
@@ -1299,7 +1875,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("doctor detected {} error(s)", report.errors.len()).into());
             }
         }
-        Mode::Help | Mode::Version => unreachable!(),
+        Mode::Serve {
+            bind,
+            api_key,
+            cors_origin,
+        } => {
+            let web_cfg = WebServerConfig::resolve(bind, api_key.clone(), cors_origin.clone())?;
+            launch_web_serve(&cli, &policy, tools, &config, &session_opts, web_cfg)?;
+        }
+        Mode::Help | Mode::Version | Mode::Trust { .. } => unreachable!(),
     }
 
     Ok(())
@@ -2817,5 +3401,217 @@ ready_log = "READY_BUS"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_api_base_enforces_loopback_https_and_custom_auth_host_opt_in() {
+        // Loopback hosts permit plain HTTP without any extra flag (Ollama, vLLM, LM Studio).
+        assert_eq!(
+            validate_api_base(
+                LlmProvider::OpenAi,
+                "http://localhost:11434/v1/",
+                false,
+                false
+            )
+            .unwrap(),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            validate_api_base(LlmProvider::OpenAi, "http://127.0.0.1:8000/v1", true, false)
+                .unwrap(),
+            "http://127.0.0.1:8000/v1"
+        );
+        assert_eq!(
+            validate_api_base(LlmProvider::OpenAi, "http://[::1]:11434/v1", true, false).unwrap(),
+            "http://[::1]:11434/v1"
+        );
+
+        // Remote non-loopback HTTP MUST be rejected.
+        let http_err = validate_api_base(
+            LlmProvider::OpenAi,
+            "http://evil.example.com/v1",
+            false,
+            true,
+        )
+        .expect_err("remote http:// must be rejected");
+        assert!(http_err.contains("https://"), "{http_err}");
+
+        // Embedded userinfo credentials and non-http(s) schemes MUST be rejected.
+        assert!(
+            validate_api_base(
+                LlmProvider::OpenAi,
+                "https://u:p@api.openai.com/v1",
+                true,
+                true
+            )
+            .is_err()
+        );
+        assert!(validate_api_base(LlmProvider::OpenAi, "file:///etc/passwd", false, true).is_err());
+
+        // Official provider hosts work with API key without extra opt-in.
+        assert!(
+            validate_api_base(
+                LlmProvider::OpenAi,
+                "https://api.openai.com/v1",
+                true,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_api_base(
+                LlmProvider::Gemini,
+                "https://generativelanguage.googleapis.com/v1beta",
+                true,
+                false
+            )
+            .is_ok()
+        );
+
+        // Non-official remote HTTPS host with an API key MUST require `--allow-custom-auth-host`.
+        let exfil_err = validate_api_base(
+            LlmProvider::OpenAi,
+            "https://openrouter.ai/api/v1",
+            true,
+            false,
+        )
+        .expect_err("custom remote host with key must require explicit opt-in");
+        assert!(
+            exfil_err.contains("--allow-custom-auth-host"),
+            "{exfil_err}"
+        );
+
+        // Explicit opt-in authorizes the custom remote HTTPS host.
+        assert_eq!(
+            validate_api_base(
+                LlmProvider::OpenAi,
+                "https://openrouter.ai/api/v1",
+                true,
+                true
+            )
+            .unwrap(),
+            "https://openrouter.ai/api/v1"
+        );
+        // Without an API key, remote HTTPS is allowed without the credential opt-in.
+        assert!(
+            validate_api_base(
+                LlmProvider::OpenAi,
+                "https://public.example.com/v1",
+                false,
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_args_supports_trust_subcommand_and_security_flags() {
+        let parsed = parse_args_from(
+            [
+                "chat",
+                "--trust-workspace",
+                "--allow-custom-auth-host",
+                "--api-base",
+                "https://openrouter.ai/api/v1",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(parsed.trust_workspace);
+        assert!(parsed.allow_custom_auth_host);
+
+        let trust_check =
+            parse_args_from(["trust", "check"].into_iter().map(String::from)).unwrap();
+        assert!(matches!(
+            trust_check.mode,
+            Mode::Trust {
+                list: false,
+                revoke: false,
+                check: true
+            }
+        ));
+
+        let trust_revoke =
+            parse_args_from(["trust", "--revoke"].into_iter().map(String::from)).unwrap();
+        assert!(matches!(
+            trust_revoke.mode,
+            Mode::Trust {
+                list: false,
+                revoke: true,
+                check: false
+            }
+        ));
+
+        let trust_list = parse_args_from(["trust", "list"].into_iter().map(String::from)).unwrap();
+        assert!(matches!(
+            trust_list.mode,
+            Mode::Trust {
+                list: true,
+                revoke: false,
+                check: false
+            }
+        ));
+    }
+
+    #[test]
+    fn doctor_reports_untrusted_workspace_and_honest_windows_sandbox_warning() {
+        let dir = env::temp_dir().join(format!("openonyx_doctor_trust_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".onyx")).unwrap();
+        fs::write(
+            dir.join(".onyx/config.toml"),
+            "[permissions]\nallow = [\"shell_exec(*)\"]\n",
+        )
+        .unwrap();
+
+        let report = run_doctor(&dir, None, None);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("workspace trust: untrusted")),
+            "expected untrusted warning in doctor: {:?}",
+            report.warnings
+        );
+        if cfg!(windows) {
+            assert!(
+                report.warnings.iter().any(|w| w.contains("env+job")),
+                "expected honest Windows env+job warning in doctor: {:?}",
+                report.warnings
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_args_supports_serve_subcommand_and_flags() {
+        let serve_parsed = parse_args_from(
+            [
+                "serve",
+                "--bind",
+                "127.0.0.1:9090",
+                "--api-key",
+                "my-serve-secret-key-2026",
+                "--cors-origin",
+                "http://localhost:5173",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        match serve_parsed.mode {
+            Mode::Serve {
+                bind,
+                api_key,
+                cors_origin,
+            } => {
+                assert_eq!(bind, "127.0.0.1:9090");
+                assert_eq!(api_key.as_deref(), Some("my-serve-secret-key-2026"));
+                assert_eq!(cors_origin.as_deref(), Some("http://localhost:5173"));
+            }
+            _ => panic!("expected Mode::Serve"),
+        }
     }
 }

@@ -69,6 +69,51 @@ impl ImpactConfig {
         }
     }
 
+    /// Aplica un parche proveniente de un repositorio NO confiado: solo permite endurecer
+    /// (`enabled` nunca pasa de `true` a `false`, umbrales solo pueden bajar, `max_hops` solo puede subir).
+    pub fn apply_patch_restrictive(&mut self, patch: ImpactPatch) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(enabled) = patch.enabled {
+            if enabled {
+                self.enabled = true;
+            } else if self.enabled {
+                warnings.push(
+                    "untrusted project `.onyx/config.toml` cannot disable `[impact].enabled`"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(hops) = patch.max_hops {
+            let clamped = hops.clamp(1, 4);
+            if clamped > self.max_hops {
+                self.max_hops = clamped;
+            }
+        }
+        if let Some(ask) = patch.ask_heat_bp {
+            let clamped = ask.min(10_000);
+            match clamped.cmp(&self.ask_heat_bp) {
+                std::cmp::Ordering::Less => self.ask_heat_bp = clamped,
+                std::cmp::Ordering::Greater => warnings.push(
+                    "untrusted project `.onyx/config.toml` cannot raise `[impact].ask_heat_bp`"
+                        .to_string(),
+                ),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        if let Some(hard) = patch.hard_ask_bp {
+            let clamped = hard.min(10_000);
+            match clamped.cmp(&self.hard_ask_bp) {
+                std::cmp::Ordering::Less => self.hard_ask_bp = clamped,
+                std::cmp::Ordering::Greater => warnings.push(
+                    "untrusted project `.onyx/config.toml` cannot raise `[impact].hard_ask_bp`"
+                        .to_string(),
+                ),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        warnings
+    }
+
     /// Parsea la sección `[impact]` de un texto TOML ignorando el resto de secciones.
     pub fn parse_toml(input: &str) -> Result<ImpactPatch, String> {
         let mut patch = ImpactPatch::default();
@@ -154,7 +199,17 @@ impl ImpactConfig {
         global_path: Option<&Path>,
         project_path: Option<&Path>,
     ) -> Result<Self, String> {
+        let (cfg, _) = Self::load_from_paths_with_trust(global_path, project_path, true)?;
+        Ok(cfg)
+    }
+
+    pub fn load_from_paths_with_trust(
+        global_path: Option<&Path>,
+        project_path: Option<&Path>,
+        trust_project: bool,
+    ) -> Result<(Self, Vec<String>), String> {
         let mut cfg = Self::default();
+        let mut warnings = Vec::new();
         if let Some(gp) = global_path {
             if gp.is_file() {
                 let raw = fs::read_to_string(gp)
@@ -166,10 +221,15 @@ impl ImpactConfig {
             if pp.is_file() {
                 let raw = fs::read_to_string(pp)
                     .map_err(|e| format!("failed to read `{}`: {e}", pp.display()))?;
-                cfg.apply_patch(Self::parse_toml(&raw)?);
+                let patch = Self::parse_toml(&raw)?;
+                if trust_project {
+                    cfg.apply_patch(patch);
+                } else {
+                    warnings.extend(cfg.apply_patch_restrictive(patch));
+                }
             }
         }
-        Ok(cfg)
+        Ok((cfg, warnings))
     }
 }
 

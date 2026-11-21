@@ -22,11 +22,12 @@ use crate::policy::{
     WorkspacePolicy, array_brackets_closed_pub, parse_toml_string_array_pub, strip_toml_comment_pub,
 };
 use crate::sandbox::{
-    ProcessJob, SandboxMode, apply_sanitized_env, check_control_plane_shell_write,
+    ContainerCli, ProcessJob, SandboxMode, apply_sanitized_env, check_control_plane_shell_write,
     check_offline_network_command, clean_process_path, configure_process_isolation,
     detect_container_cli, ensure_sandbox_tmp_dir,
 };
 use crate::tools::scrub_secrets;
+use crate::trust::WorkspaceTrustStatus;
 
 pub const DEFAULT_LOG_CAPACITY: usize = 2_000;
 pub const DEFAULT_WAIT_READY_SECS: u64 = 30;
@@ -98,6 +99,73 @@ impl ServiceStatus {
     }
 }
 
+/// Valida el nombre de un contenedor OCI en `sprout.toml` (`container = "..."`),
+/// rechazando flags (`--privileged`, `-u root`), espacios y metacaracteres (cierra R-4).
+pub fn validate_container_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("container name cannot be empty".to_string());
+    }
+    if trimmed.len() > 128 {
+        return Err("container name exceeds 128 characters".to_string());
+    }
+    let bytes = trimmed.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return Err(format!(
+            "invalid container name `{trimmed}`: must start with an ASCII letter or digit (cannot start with `-`)"
+        ));
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err(format!(
+            "invalid container name `{trimmed}`: only `[A-Za-z0-9_.-]` allowed"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Valida el campo opcional `exec_user` (`"nobody"`, `"1000"`, `"1000:1000"`) en `sprout.toml`
+/// (R-5 opt-in, evitando inyección de flags).
+pub fn validate_exec_user(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("exec_user cannot be empty".to_string());
+    }
+    if trimmed.len() > 129 {
+        return Err("exec_user exceeds 129 characters".to_string());
+    }
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    if parts.len() > 2 {
+        return Err(format!(
+            "invalid exec_user `{trimmed}`: expected `<user>` or `<user>:<group>`"
+        ));
+    }
+    for part in parts {
+        if part.is_empty() || part.len() > 64 {
+            return Err(format!(
+                "invalid exec_user `{trimmed}`: empty or overly long segment"
+            ));
+        }
+        let bytes = part.as_bytes();
+        if !(bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_') {
+            return Err(format!(
+                "invalid exec_user `{trimmed}`: segments must start with `[A-Za-z0-9_]`"
+            ));
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        {
+            return Err(format!(
+                "invalid exec_user `{trimmed}`: only `[A-Za-z0-9_.-]` allowed in user/group"
+            ));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Especificación declarativa de un servicio en `sprout.toml` (`REQ-08.1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SproutServiceSpec {
@@ -110,6 +178,8 @@ pub struct SproutServiceSpec {
     pub stop_cmd: Option<String>,
     pub logs_cmd: Option<String>,
     pub container: Option<String>,
+    /// Usuario opcional para `service_exec` (`docker exec --user <exec_user>`, R-5 opt-in).
+    pub exec_user: Option<String>,
     pub debug_port: Option<u16>,
     pub ready_port: Option<u16>,
     pub ready_log: Option<String>,
@@ -122,7 +192,7 @@ pub struct SproutServiceSpec {
 /// Configuración completa de `sprout.toml` con DAG validado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SproutConfig {
-    pub container_cli: Option<String>,
+    pub container_cli: Option<ContainerCli>,
     pub env_wrapper: Option<String>,
     pub services: BTreeMap<String, SproutServiceSpec>,
 }
@@ -157,7 +227,7 @@ impl SproutConfig {
             Other,
         }
 
-        let mut container_cli: Option<String> = None;
+        let mut container_cli: Option<ContainerCli> = None;
         let mut env_wrapper: Option<String> = None;
         let mut named_svcs: BTreeMap<String, RawSvcRecord> = BTreeMap::new();
         let mut array_svcs: Vec<RawSvcRecord> = Vec::new();
@@ -233,7 +303,12 @@ impl SproutConfig {
                         let s = parse_toml_string(&val_buf)
                             .map_err(|e| format!("sprout.toml line {line_no} (`{key}`): {e}"))?;
                         if !s.trim().is_empty() {
-                            container_cli = Some(s);
+                            let parsed = ContainerCli::parse(&s).ok_or_else(|| {
+                                format!(
+                                    "sprout.toml line {line_no} (`container_cli`): unsupported runtime `{s}` (expected `docker`, `nerdctl`, or `podman`)"
+                                )
+                            })?;
+                            container_cli = Some(parsed);
                         }
                     }
                     "env_wrapper" => {
@@ -310,6 +385,20 @@ impl SproutConfig {
             let stop_cmd = raw.stop_cmd.or(raw.down);
             let raw_cwd = raw.cwd.unwrap_or_else(|| ".".to_string());
             let cwd = resolve_service_cwd(&id, &raw_cwd, workspace_root, policy)?;
+            let container = match raw.container {
+                Some(ref raw_c) if !raw_c.trim().is_empty() => Some(
+                    validate_container_name(raw_c)
+                        .map_err(|e| format!("service `{id}` invalid `container`: {e}"))?,
+                ),
+                _ => None,
+            };
+            let exec_user = match raw.exec_user {
+                Some(ref raw_u) if !raw_u.trim().is_empty() => Some(
+                    validate_exec_user(raw_u)
+                        .map_err(|e| format!("service `{id}` invalid `exec_user`: {e}"))?,
+                ),
+                _ => None,
+            };
             let name = raw.name.unwrap_or_else(|| id.clone());
             services.insert(
                 id.clone(),
@@ -322,7 +411,8 @@ impl SproutConfig {
                     cmd,
                     stop_cmd,
                     logs_cmd: raw.logs_cmd,
-                    container: raw.container,
+                    container,
+                    exec_user,
                     debug_port: raw.debug_port,
                     ready_port: raw.ready_port,
                     ready_log: raw.ready_log,
@@ -440,7 +530,7 @@ impl SproutConfig {
 
     pub fn effective_container_cli(&self) -> Option<String> {
         self.container_cli
-            .clone()
+            .map(|c| c.as_str().to_string())
             .or_else(|| detect_container_cli().map(str::to_string))
     }
 }
@@ -503,6 +593,9 @@ fn apply_service_field(
         "container" => {
             svc.set_container(parse_toml_string(val_buf).map_err(|e| fmt_err(line_no, key, e))?)
         }
+        "exec_user" => {
+            svc.set_exec_user(parse_toml_string(val_buf).map_err(|e| fmt_err(line_no, key, e))?)
+        }
         "debug_port" => {
             let port = val_buf
                 .trim()
@@ -552,6 +645,7 @@ trait ServiceFieldTarget {
     fn set_down(&mut self, v: String);
     fn set_logs_cmd(&mut self, v: String);
     fn set_container(&mut self, v: String);
+    fn set_exec_user(&mut self, v: String);
     fn set_debug_port(&mut self, v: u16);
     fn set_ready_port(&mut self, v: u16);
     fn set_ready_log(&mut self, v: String);
@@ -621,6 +715,7 @@ struct RawSvcRecord {
     down: Option<String>,
     logs_cmd: Option<String>,
     container: Option<String>,
+    exec_user: Option<String>,
     debug_port: Option<u16>,
     ready_port: Option<u16>,
     ready_log: Option<String>,
@@ -660,6 +755,9 @@ impl ServiceFieldTarget for RawSvcRecord {
     }
     fn set_container(&mut self, v: String) {
         self.container = Some(v);
+    }
+    fn set_exec_user(&mut self, v: String) {
+        self.exec_user = Some(v);
     }
     fn set_debug_port(&mut self, v: u16) {
         self.debug_port = Some(v);
@@ -747,6 +845,9 @@ impl ManagedService {
 struct SproutState {
     config: Option<SproutConfig>,
     services: BTreeMap<String, ManagedService>,
+    cli_override: Option<String>,
+    sprout_trusted: bool,
+    trust_status: WorkspaceTrustStatus,
 }
 
 struct SproutInner {
@@ -779,12 +880,17 @@ impl std::fmt::Debug for SproutSupervisor {
 
 impl SproutSupervisor {
     pub fn new(policy: WorkspacePolicy) -> Self {
+        let sprout_trusted = policy.trust.sprout_trusted;
+        let trust_status = policy.trust.status.clone();
         Self {
             inner: Arc::new(SproutInner {
                 policy,
                 state: Mutex::new(SproutState {
                     config: None,
                     services: BTreeMap::new(),
+                    cli_override: None,
+                    sprout_trusted,
+                    trust_status,
                 }),
             }),
         }
@@ -802,9 +908,50 @@ impl SproutSupervisor {
                 state: Mutex::new(SproutState {
                     config: Some(config),
                     services,
+                    cli_override: None,
+                    sprout_trusted: true,
+                    trust_status: WorkspaceTrustStatus::Trusted,
                 }),
             }),
         }
+    }
+
+    /// Permite fijar un ejecutable CLI de contenedor solo desde código Rust (nunca desde `sprout.toml`),
+    /// útil para stubs herméticos en tests sin depender de Docker instalado en el host.
+    pub fn with_container_cli_override(self, cli_bin: impl Into<String>) -> Self {
+        if let Ok(mut guard) = self.inner.state.lock() {
+            guard.cli_override = Some(cli_bin.into());
+        }
+        self
+    }
+
+    /// Actualiza en caliente el estado de confianza de `sprout.toml` (p. ej. tras `/trust` en TUI).
+    pub fn set_trust_state(&self, trusted: bool, status: WorkspaceTrustStatus) {
+        if let Ok(mut guard) = self.inner.state.lock() {
+            guard.sprout_trusted = trusted;
+            guard.trust_status = status;
+        }
+    }
+
+    fn ensure_sprout_trusted(&self) -> Result<(), String> {
+        let guard = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| "sprout state lock poisoned".to_string())?;
+        if guard.sprout_trusted {
+            return Ok(());
+        }
+        let reason = match &guard.trust_status {
+            WorkspaceTrustStatus::Modified {
+                sprout_changed: true,
+                ..
+            } => "`sprout.toml` changed since last approval (blake3 hash mismatch)",
+            _ => "`sprout.toml` is in an untrusted workspace",
+        };
+        Err(format!(
+            "blocked by Workspace Trust: {reason}; review `sprout.toml` and run `openonyx trust` or `/trust` before executing services"
+        ))
     }
 
     /// Garantiza que `sprout.toml` está cargado en memoria si existe en el workspace.
@@ -843,7 +990,13 @@ impl SproutSupervisor {
             .state
             .lock()
             .map_err(|_| "sprout state lock poisoned".to_string())?;
-        Ok(format_status_toon_locked(&guard))
+        let mut toon = format_status_toon_locked(&guard);
+        if !guard.sprout_trusted {
+            toon = format!(
+                "# UNTRUSTED sprout.toml — run `openonyx trust` or `/trust` to enable start/exec\n{toon}"
+            );
+        }
+        Ok(toon)
     }
 
     /// Devuelve texto compacto para el panel lateral `Services (Sprout)` de la TUI si hay `sprout.toml`.
@@ -854,8 +1007,14 @@ impl SproutSupervisor {
             return None;
         }
         let toon = format_status_toon_locked(&guard);
-        let panel = format_services_panel_from_toon(&toon);
-        (!panel.is_empty()).then_some(panel)
+        let mut panel = format_services_panel_from_toon(&toon);
+        if panel.is_empty() {
+            return None;
+        }
+        if !guard.sprout_trusted {
+            panel = format!("[UNTRUSTED — run /trust]\n{panel}");
+        }
+        Some(panel)
     }
 
     /// Arranca `id` (o todos los servicios habilitados si `id == "all"`) y sus dependencias
@@ -865,6 +1024,7 @@ impl SproutSupervisor {
             return self.start_all(wait_ready_secs);
         }
         self.ensure_loaded()?;
+        self.ensure_sprout_trusted()?;
         let wait_secs = wait_ready_secs
             .unwrap_or(DEFAULT_WAIT_READY_SECS)
             .clamp(1, MAX_WAIT_READY_SECS);
@@ -888,6 +1048,7 @@ impl SproutSupervisor {
     /// Arranca todos los servicios habilitados de `sprout.toml` en orden topológico DAG.
     pub fn start_all(&self, wait_ready_secs: Option<u64>) -> Result<String, String> {
         self.ensure_loaded()?;
+        self.ensure_sprout_trusted()?;
         let wait_secs = wait_ready_secs
             .unwrap_or(DEFAULT_WAIT_READY_SECS)
             .clamp(1, MAX_WAIT_READY_SECS);
@@ -952,10 +1113,12 @@ impl SproutSupervisor {
                     .services
                     .get(svc_id)
                     .ok_or_else(|| format!("unknown service `{svc_id}`"))?;
-                let cli = guard
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.effective_container_cli());
+                let cli = guard.cli_override.clone().or_else(|| {
+                    guard
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.effective_container_cli())
+                });
                 (svc.spec.kind, cli)
             };
 
@@ -999,6 +1162,7 @@ impl SproutSupervisor {
     /// Detiene un servicio concreto (`id`) o todos los activos (`all = true`) en orden topológico inverso.
     pub fn stop(&self, id: Option<&str>, all: bool) -> Result<String, String> {
         self.ensure_loaded()?;
+        self.ensure_sprout_trusted()?;
         let targets = if all || id.is_none() {
             let guard = self
                 .inner
@@ -1109,8 +1273,9 @@ impl SproutSupervisor {
             return Err("command cannot be empty".to_string());
         }
         self.ensure_loaded()?;
+        self.ensure_sprout_trusted()?;
 
-        let (container_name, container_cli) = {
+        let (container_name, container_cli, exec_user) = {
             let guard = self
                 .inner
                 .state
@@ -1126,18 +1291,28 @@ impl SproutSupervisor {
                     svc.spec.kind.as_str()
                 ));
             }
-            let cname = svc.spec.container.clone().ok_or_else(|| {
+            let raw_cname = svc.spec.container.clone().ok_or_else(|| {
                 format!("service `{id}` does not declare `container = \"<name>\"` in sprout.toml")
             })?;
+            let cname = validate_container_name(&raw_cname)?;
+            let user = match svc.spec.exec_user.as_deref() {
+                Some(raw_u) => Some(validate_exec_user(raw_u)?),
+                None => None,
+            };
             let cli = guard
-                .config
-                .as_ref()
-                .and_then(|c| c.effective_container_cli())
+                .cli_override
+                .clone()
+                .or_else(|| {
+                    guard
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.effective_container_cli())
+                })
                 .ok_or_else(|| {
                     "no container CLI (`docker`, `nerdctl`, or `podman`) available on PATH"
                         .to_string()
                 })?;
-            (cname, cli)
+            (cname, cli, user)
         };
 
         if self.inner.policy.sandbox.mode != SandboxMode::Off {
@@ -1149,7 +1324,11 @@ impl SproutSupervisor {
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
 
         let mut cmd = Command::new(&container_cli);
-        cmd.args(["exec", &container_name, "sh", "-c", command])
+        cmd.arg("exec");
+        if let Some(ref user) = exec_user {
+            cmd.args(["--user", user]);
+        }
+        cmd.args([&container_name, "sh", "-c", command])
             .current_dir(clean_process_path(&self.inner.policy.root))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

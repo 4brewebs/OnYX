@@ -55,6 +55,31 @@ impl SandboxMode {
             Self::StrictContainer => "strict",
         }
     }
+
+    /// Etiqueta honesta del badge `[SANDBOX:<label>]` teniendo en cuenta el driver real del host:
+    /// - En Linux (`bwrap`) y macOS (`sandbox-exec`), `WorkspaceWrite` ofrece aislamiento FS/red (`workspace`).
+    /// - En Windows (`Win32Job`), `WorkspaceWrite` ofrece `env_clear` + Job Objects (`env+job`), sin
+    ///   aislamiento de filesystem/red a nivel kernel.
+    /// - Sin driver nativo de FS/red (`Landlock` sin `bwrap` o `None`), muestra `env+pgid`.
+    pub fn effective_badge(self, driver: SandboxDriverKind) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::StrictContainer => "strict",
+            Self::WorkspaceWrite => match driver {
+                SandboxDriverKind::Bwrap | SandboxDriverKind::SandboxExec => "workspace",
+                SandboxDriverKind::Win32Job => "env+job",
+                SandboxDriverKind::Landlock | SandboxDriverKind::None => "env+pgid",
+            },
+        }
+    }
+
+    fn strictness_rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::WorkspaceWrite => 1,
+            Self::StrictContainer => 2,
+        }
+    }
 }
 
 /// Política de acceso a red para subprocesos bajo sandbox (`REQ-06.3`).
@@ -86,6 +111,122 @@ impl NetworkPolicy {
             Self::Unrestricted => "unrestricted",
         }
     }
+
+    fn strictness_rank(self) -> u8 {
+        match self {
+            Self::Unrestricted => 0,
+            Self::LocalhostOnly => 1,
+            Self::Offline => 2,
+        }
+    }
+}
+
+/// Runtime de contenedores OCI cerrado (`docker`, `nerdctl` o `podman`).
+/// Nunca acepta rutas arbitrarias ni argumentos desde `sprout.toml` (cierra R-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerCli {
+    Docker,
+    Nerdctl,
+    Podman,
+}
+
+impl ContainerCli {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "docker" => Some(Self::Docker),
+            "nerdctl" => Some(Self::Nerdctl),
+            "podman" => Some(Self::Podman),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Nerdctl => "nerdctl",
+            Self::Podman => "podman",
+        }
+    }
+}
+
+/// Valida una referencia de imagen OCI (`[registry[:port]/]name[:tag][@sha256:<64hex>]`)
+/// rechazando inyección de flags (`--privileged`), espacios y caracteres shell (cierra R-4).
+pub fn validate_oci_image_ref(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("container_image cannot be empty".to_string());
+    }
+    if trimmed.len() > 256 {
+        return Err("container_image exceeds 256 characters".to_string());
+    }
+    if trimmed.starts_with('-') || trimmed.starts_with('/') || trimmed.ends_with('/') {
+        return Err(format!(
+            "invalid container_image `{trimmed}`: cannot start with `-` or start/end with `/`"
+        ));
+    }
+    if trimmed.contains("..") || trimmed.contains("//") {
+        return Err(format!(
+            "invalid container_image `{trimmed}`: contains disallowed `..` or `//`"
+        ));
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b':' | b'@' | b'-'))
+    {
+        return Err(format!(
+            "invalid container_image `{trimmed}`: only ASCII `[A-Za-z0-9._/:@-]` allowed (no spaces or shell characters)"
+        ));
+    }
+    let (name_and_tag, digest_opt) = match trimmed.split_once('@') {
+        Some((left, right)) => (left, Some(right)),
+        None => (trimmed, None),
+    };
+    if name_and_tag.is_empty() {
+        return Err(format!(
+            "invalid container_image `{trimmed}`: missing image name"
+        ));
+    }
+    if let Some(digest) = digest_opt {
+        let Some(hex) = digest.strip_prefix("sha256:") else {
+            return Err(format!(
+                "invalid container_image `{trimmed}`: digest must start with `sha256:`"
+            ));
+        };
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "invalid container_image `{trimmed}`: sha256 digest must be 64 hex chars"
+            ));
+        }
+    }
+    // El último segmento (repo[:tag]) no puede empezar ni terminar en `:` ni empezar por `.`/`-`.
+    let last_seg = name_and_tag.rsplit('/').next().unwrap_or("");
+    let (repo_leaf, tag_opt) = match last_seg.split_once(':') {
+        Some((r, t)) => (r, Some(t)),
+        None => (last_seg, None),
+    };
+    if repo_leaf.is_empty()
+        || !repo_leaf
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(format!(
+            "invalid container_image `{trimmed}`: repository segment must start with an alphanumeric character"
+        ));
+    }
+    if let Some(tag) = tag_opt {
+        if tag.is_empty()
+            || tag.len() > 128
+            || tag.starts_with('-')
+            || tag.starts_with('.')
+            || tag.contains(':')
+        {
+            return Err(format!(
+                "invalid container_image `{trimmed}`: invalid tag `{tag}`"
+            ));
+        }
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Driver de sandbox detectado en el sistema anfitrión (`TEST-06.5`).
@@ -116,6 +257,20 @@ pub struct SandboxCapabilities {
     pub native_driver: SandboxDriverKind,
     pub container_cli: Option<&'static str>,
     pub notes: Vec<String>,
+}
+
+impl SandboxCapabilities {
+    /// Indica si `mode` proporciona aislamiento fuerte de filesystem y red a nivel de SO/contenedor.
+    pub fn is_hard_fs_net_isolated(&self, mode: SandboxMode) -> bool {
+        match mode {
+            SandboxMode::Off => false,
+            SandboxMode::StrictContainer => self.container_cli.is_some(),
+            SandboxMode::WorkspaceWrite => matches!(
+                self.native_driver,
+                SandboxDriverKind::Bwrap | SandboxDriverKind::SandboxExec
+            ),
+        }
+    }
 }
 
 /// Límites de recursos aplicables a un [`ProcessJob`].
@@ -198,6 +353,74 @@ impl SandboxConfig {
         if let Some(img) = patch.container_image {
             self.container_image = Some(img);
         }
+    }
+
+    /// Aplica un parche proveniente de un repositorio NO confiado: solo permite endurecer
+    /// (`mode` y `network` más restrictivos, límites de memoria/PID menores); ignora con aviso
+    /// `env_passthrough`, `allow_read_paths`, `container_image` y cualquier relajación.
+    pub fn apply_patch_restrictive(&mut self, patch: SandboxPatch) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(m) = patch.mode {
+            match m.strictness_rank().cmp(&self.mode.strictness_rank()) {
+                std::cmp::Ordering::Greater => self.mode = m,
+                std::cmp::Ordering::Less => warnings.push(format!(
+                    "untrusted project `.onyx/config.toml` cannot relax `[sandbox].mode` from `{}` to `{}`",
+                    self.mode.as_str(),
+                    m.as_str()
+                )),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        if let Some(n) = patch.network {
+            match n.strictness_rank().cmp(&self.network.strictness_rank()) {
+                std::cmp::Ordering::Greater => self.network = n,
+                std::cmp::Ordering::Less => warnings.push(format!(
+                    "untrusted project `.onyx/config.toml` cannot relax `[sandbox].network` from `{}` to `{}`",
+                    self.network.as_str(),
+                    n.as_str()
+                )),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        if !patch.allow_read_paths.is_empty() {
+            warnings.push(
+                "untrusted project `.onyx/config.toml` cannot add `[sandbox].allow_read_paths`"
+                    .to_string(),
+            );
+        }
+        if !patch.env_passthrough.is_empty() {
+            warnings.push(
+                "untrusted project `.onyx/config.toml` cannot add `[sandbox].env_passthrough`"
+                    .to_string(),
+            );
+        }
+        if let Some(mem) = patch.max_memory_mb {
+            match self.max_memory_mb {
+                Some(cur) if mem < cur => self.max_memory_mb = Some(mem),
+                None => self.max_memory_mb = Some(mem),
+                _ => warnings.push(
+                    "untrusted project `.onyx/config.toml` cannot raise `[sandbox].max_memory_mb`"
+                        .to_string(),
+                ),
+            }
+        }
+        if let Some(pids) = patch.max_pids {
+            match self.max_pids {
+                Some(cur) if pids < cur => self.max_pids = Some(pids),
+                None => self.max_pids = Some(pids),
+                _ => warnings.push(
+                    "untrusted project `.onyx/config.toml` cannot raise `[sandbox].max_pids`"
+                        .to_string(),
+                ),
+            }
+        }
+        if patch.container_image.is_some() {
+            warnings.push(
+                "untrusted project `.onyx/config.toml` cannot override `[sandbox].container_image`"
+                    .to_string(),
+            );
+        }
+        warnings
     }
 
     /// Elevación automática de seguridad para `--auto-approve` (`REQ-06.5`):
@@ -314,7 +537,10 @@ impl SandboxConfig {
                         format!("config.toml line {line_no} (`container_image`): {e}")
                     })?;
                     if !s.trim().is_empty() {
-                        patch.container_image = Some(s);
+                        let validated = validate_oci_image_ref(&s).map_err(|e| {
+                            format!("config.toml line {line_no} (`container_image`): {e}")
+                        })?;
+                        patch.container_image = Some(validated);
                     }
                 }
                 other => {
@@ -341,7 +567,17 @@ impl SandboxConfig {
         global_path: Option<&Path>,
         project_path: Option<&Path>,
     ) -> Result<Self, String> {
+        let (cfg, _) = Self::load_from_paths_with_trust(global_path, project_path, true)?;
+        Ok(cfg)
+    }
+
+    pub fn load_from_paths_with_trust(
+        global_path: Option<&Path>,
+        project_path: Option<&Path>,
+        trust_project: bool,
+    ) -> Result<(Self, Vec<String>), String> {
         let mut cfg = Self::default();
+        let mut warnings = Vec::new();
         if let Some(gp) = global_path {
             if gp.is_file() {
                 let raw = fs::read_to_string(gp)
@@ -353,10 +589,15 @@ impl SandboxConfig {
             if pp.is_file() {
                 let raw = fs::read_to_string(pp)
                     .map_err(|e| format!("failed to read `{}`: {e}", pp.display()))?;
-                cfg.apply_patch(Self::parse_toml_patch(&raw)?);
+                let patch = Self::parse_toml_patch(&raw)?;
+                if trust_project {
+                    cfg.apply_patch(patch);
+                } else {
+                    warnings.extend(cfg.apply_patch_restrictive(patch));
+                }
             }
         }
-        Ok(cfg)
+        Ok((cfg, warnings))
     }
 }
 
@@ -405,7 +646,7 @@ pub fn detect_sandbox_capabilities() -> SandboxCapabilities {
     let native_driver = {
         if win::probe_job_object_available() {
             notes.push(
-                "Win32 Job Objects (`KILL_ON_JOB_CLOSE`, memory/PID limits) + env_clear active"
+                "Win32 Job Objects (`KILL_ON_JOB_CLOSE`, memory/PID limits) + env_clear active (no kernel FS/network namespace isolation; use `--sandbox strict-container` for hard isolation)"
                     .into(),
             );
             SandboxDriverKind::Win32Job
@@ -863,7 +1104,10 @@ fn build_container_command(
         "strict-container sandbox requested, but neither `docker`, `nerdctl`, nor `podman` was found on PATH"
             .to_string()
     })?;
-    let image = config.container_image.as_deref().unwrap_or("alpine:latest");
+    let image = match config.container_image.as_deref() {
+        Some(raw_img) => validate_oci_image_ref(raw_img)?,
+        None => "alpine:latest".to_string(),
+    };
     let mut cmd = Command::new(cli);
     cmd.args(["run", "--rm", "-i", "--workdir", "/workspace"]);
 
@@ -902,7 +1146,7 @@ fn build_container_command(
             cmd.args(["-e", &format!("{key}={val}")]);
         }
     }
-    cmd.args([image, "sh", "-c", raw_command]);
+    cmd.args([image.as_str(), "sh", "-c", raw_command]);
     cmd.current_dir(workspace_root);
     Ok(cmd)
 }

@@ -7,6 +7,7 @@ pub mod sandbox;
 pub mod sprout;
 pub mod state;
 pub mod tools;
+pub mod trust;
 
 pub use bridge::WorkspaceToolBridge;
 pub use impact::{ImpactAssessment, ImpactConfig, ImpactPatch, apply_impact_escalation};
@@ -15,14 +16,16 @@ pub use policy::{
     is_control_plane_rel_path, is_mutating_tool,
 };
 pub use sandbox::{
-    NetworkPolicy, ProcessJob, ProcessLimits, SandboxCapabilities, SandboxConfig,
+    ContainerCli, NetworkPolicy, ProcessJob, ProcessLimits, SandboxCapabilities, SandboxConfig,
     SandboxDriverKind, SandboxMode, SandboxPatch, apply_sanitized_env, clean_process_path,
     configure_process_isolation, detect_container_cli, detect_sandbox_capabilities,
     ensure_sandbox_tmp_dir, is_sensitive_env_key, prepare_sandboxed_shell_command,
+    validate_oci_image_ref,
 };
 pub use sprout::{
     ServiceKind, ServiceStatus, SproutAudit, SproutConfig, SproutServiceSpec, SproutSupervisor,
-    audit_sprout_workspace, format_services_panel_from_toon,
+    audit_sprout_workspace, format_services_panel_from_toon, validate_container_name,
+    validate_exec_user,
 };
 pub use state::{
     EffectReversibility, PendingCheckpoints, RecordedEffect, WorkspaceLedgerSystem, WorkspaceMode,
@@ -35,4 +38,9 @@ pub use state::{
 pub use tools::{
     FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,
     format_plan_steps, preview_tool_diff,
+};
+pub use trust::{
+    ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,
+    default_trust_store_path, evaluate_workspace_trust, hash_file_blake3, list_trusted_workspaces,
+    normalize_workspace_key, revoke_workspace_trust, trust_workspace,
 };

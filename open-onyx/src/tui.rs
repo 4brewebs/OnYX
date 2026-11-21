@@ -154,6 +154,20 @@ impl TuiHandle {
     }
 }
 
+impl crate::session::UiIdlePump for TuiHandle {
+    fn render(&self, graph: &dyn GraphView) {
+        TuiHandle::render(self, graph);
+    }
+
+    fn has_queued_events(&self) -> bool {
+        TuiHandle::has_queued_events(self)
+    }
+
+    fn pump_idle(&self, graph: &dyn GraphView) {
+        TuiHandle::pump_idle(self, graph);
+    }
+}
+
 pub struct TuiDriver {
     inner: Rc<RefCell<TuiInner>>,
 }
@@ -1049,14 +1063,20 @@ impl TuiInner {
             .and_then(|wv| graph_workspace_services(graph, wv))
             .or_else(|| self.sprout.as_ref().and_then(|s| s.render_panel_text()));
         let mode_label = self.mode_handle.get().as_label();
+        let native_driver = cached_sandbox_driver();
         let sandbox_badge = self
             .policy
             .as_ref()
-            .map(|p| p.sandbox.mode.as_badge())
+            .map(|p| p.sandbox.mode.effective_badge(native_driver))
             .unwrap_or("workspace");
-        let header_title = format_header_title(
+        let untrusted = self
+            .policy
+            .as_ref()
+            .is_some_and(|p| !p.trust.is_fully_trusted());
+        let header_title = format_header_title_with_trust(
             mode_label,
             sandbox_badge,
+            untrusted,
             &model_display,
             self.reasoning_effort,
         );
@@ -1367,23 +1387,44 @@ fn is_immediate_slash_cmd(cmd: &str) -> bool {
         || lower == "/services"
         || lower == "/service"
         || lower.starts_with("/service ")
+        || lower == "/trust"
+        || lower.starts_with("/trust ")
         || lower == "/undo"
 }
 
+fn cached_sandbox_driver() -> onyx_workspace::SandboxDriverKind {
+    use std::sync::OnceLock;
+    static DRIVER: OnceLock<onyx_workspace::SandboxDriverKind> = OnceLock::new();
+    *DRIVER.get_or_init(|| onyx_workspace::detect_sandbox_capabilities().native_driver)
+}
+
 /// Formats the non-invasive top header title showing mode, sandbox, model, and reasoning effort.
+#[allow(dead_code)]
 pub(crate) fn format_header_title(
     mode_label: &str,
     sandbox_badge: &str,
     model_name: &str,
     effort: Option<ReasoningEffort>,
 ) -> String {
+    format_header_title_with_trust(mode_label, sandbox_badge, false, model_name, effort)
+}
+
+/// Formats the top header title including `[UNTRUSTED]` when Workspace Trust restricts local config.
+pub(crate) fn format_header_title_with_trust(
+    mode_label: &str,
+    sandbox_badge: &str,
+    untrusted: bool,
+    model_name: &str,
+    effort: Option<ReasoningEffort>,
+) -> String {
+    let trust_tag = if untrusted { " [UNTRUSTED]" } else { "" };
     let model = model_name.trim();
     if model.is_empty() {
-        format!(" openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}] ")
+        format!(" openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}]{trust_tag} ")
     } else {
         let effort_label = effort.map(ReasoningEffort::as_str).unwrap_or("auto");
         format!(
-            " openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}] · {model} (effort:{effort_label}) "
+            " openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}]{trust_tag} · {model} (effort:{effort_label}) "
         )
     }
 }
@@ -1798,6 +1839,10 @@ mod tests {
         assert_eq!(
             format_header_title("BUILD", "off", "", None),
             " openOnyx [BUILD] [SANDBOX:off] "
+        );
+        assert_eq!(
+            format_header_title_with_trust("BUILD", "env+job", true, "qwen38-27b", None),
+            " openOnyx [BUILD] [SANDBOX:env+job] [UNTRUSTED] · qwen38-27b (effort:auto) "
         );
     }
 
