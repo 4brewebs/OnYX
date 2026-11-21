@@ -1,8 +1,20 @@
+[![CI](https://github.com/4brewebs/OnYX/actions/workflows/ci.yml/badge.svg)](https://github.com/4brewebs/OnYX/actions/workflows/ci.yml)                             [![crates.io](https://img.shields.io/crates/v/open-onyx.svg)](https://crates.io/crates/open-onyx)                                                                   [![downloads](https://img.shields.io/crates/d/open-onyx.svg)](https://crates.io/crates/open-onyx)                                                                   [![docs.rs](https://docs.rs/onyx-core/badge.svg)](https://docs.rs/onyx-core)                  [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://www.rust-lang.org)         [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT) 
 # OnYX
 
 [![User Manual](https://img.shields.io/badge/docs-User%20Manual-1f6feb?style=for-the-badge)](https://4brewebs.github.io/OnYX/index-en.html)
+[![User Manual](https://img.shields.io/badge/docs-User%20Manual-1f6feb?style=for-the-badge)](https://4brewebs.github.io/OnYX/)
 [![Quickstart EN](https://img.shields.io/badge/quickstart-English-2da44e?style=for-the-badge)](docs/manual/01-first-steps.md)
 [![Primeros Pasos ES](https://img.shields.io/badge/gu%C3%ADa-Espa%C3%B1ol-e36209?style=for-the-badge)](docs/manual/01-primeros-pasos.md)
+
+
+| Crate | crates.io | docs.rs | Descripción |
+| --- | :---: | :---: | --- |
+| [`open-onyx`](open-onyx) |[![crates.io](https://img.shields.io/crates/v/open-onyx.svg)](https://crates.io/crates/open-onyx) | [![manual](https://img.shields.io/badge/docs-User%20Manual-1f6feb.svg)](https://4brewebs.github.io/OnYX/) | Harness CLI/TUI (`cargo install open-onyx`) |             
+| [`onyx-workspace`](onyx-workspace) |[![crates.io](https://img.shields.io/crates/v/onyx-workspace.svg)](https://crates.io/crates/onyx-workspace) | [![docs.rs](https://docs.rs/onyx-workspace/badge.svg)](https://docs.rs/onyx-workspace) |Herramientas de código, sandbox OS, Sprout y checkpoints Git |
+| [`onyx-scent`](onyx-scent) |[![crates.io](https://img.shields.io/crates/v/onyx-scent.svg)](https://crates.io/crates/onyx-scent) | [![docs.rs](https://docs.rs/onyx-scent/badge.svg)](https://docs.rs/onyx-scent) | Destilador AST (`tree-sitter`) + caché `blake3` + `@TOON v1` |
+| [`onyx-soul-agents`](onyx-soul-agents) | [![crates.io](https://img.shields.io/crates/v/onyx-soul-agents.svg)](https://crates.io/crates/onyx-soul-agents) |[![docs.rs](https://docs.rs/onyx-soul-agents/badge.svg)](https://docs.rs/onyx-soul-agents) | Soul multi-agente determinista · **0 deps externas** |
+| [`onyx-soul`](onyx-soul) | [![crates.io](https://img.shields.io/crates/v/onyx-soul.svg)](https://crates.io/crates/onyx-soul) | [![docs.rs](https://docs.rs/onyx-soul/badge.svg)](https://docs.rs/onyx-soul) | Soul de referencia · **0 deps externas** |
+| [`onyx-core`](onyx-core) | [![crates.io](https://img.shields.io/crates/v/onyx-core.svg)](https://crates.io/crates/onyx-core) | [![docs.rs](https://docs.rs/onyx-core/badge.svg)](https://docs.rs/onyx-core) | Contratos del microkernel + `tick` + `DetRng` · **0 deps** |
 
 **A Lego of brains, not a closed solution.**
 
