@@ -624,13 +624,15 @@ pub(crate) fn parse_toml_string_array_pub(raw: &str) -> Result<Vec<String>, Stri
 }
 
 /// Comprueba si una ruta relativa pertenece al *Control Plane* protegido en solo lectura (`REQ-06.4`):
-/// `.onyx/config.toml`, `.git/hooks/**`, `.git/config` y `.env*`.
+/// `.onyx/config.toml`, `.onyx/vault/**`, `.git/hooks/**`, `.git/config` y `.env*`.
 pub fn is_control_plane_rel_path(raw: &str) -> bool {
     let norm = raw.trim().replace('\\', "/");
     let stripped = norm.trim_start_matches("./").trim_start_matches('/');
     let lower = stripped.to_ascii_lowercase();
     if lower == ".onyx/config.toml"
         || lower.starts_with(".onyx/config.")
+        || lower == ".onyx/vault"
+        || lower.starts_with(".onyx/vault/")
         || lower == ".git/config"
         || lower == ".git/hooks"
         || lower.starts_with(".git/hooks/")
@@ -763,11 +765,15 @@ impl WorkspacePolicy {
 
     pub fn is_ignored(&self, path: &Path) -> bool {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
+        let mut prev_is_onyx = false;
         rel.components().any(|c| {
             if let Component::Normal(name) = c {
                 let s = name.to_string_lossy();
                 let s_ref = s.as_ref();
-                self.ignored_dirs.iter().any(|ignored| ignored == s_ref)
+                let is_vault_under_onyx = prev_is_onyx && s_ref.eq_ignore_ascii_case("vault");
+                prev_is_onyx = s_ref.eq_ignore_ascii_case(".onyx");
+                is_vault_under_onyx
+                    || self.ignored_dirs.iter().any(|ignored| ignored == s_ref)
                     || s_ref == "snapshots"
                     || s_ref.starts_with("snaps_")
                     || s_ref.ends_with(".tr")
@@ -775,6 +781,7 @@ impl WorkspacePolicy {
                     || s_ref.ends_with(".onyxpack.tmp")
                     || (s_ref.starts_with("tick-") && s_ref.ends_with(".bin"))
             } else {
+                prev_is_onyx = false;
                 false
             }
         })

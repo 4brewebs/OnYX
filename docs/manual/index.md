@@ -1,5 +1,7 @@
 # Manual de Usuario de openOnyx (`openonyx`)
 
+> 🇬🇧 **[Read the full User Manual in English](index-en.md)**
+
 Bienvenido al manual oficial de **`openonyx`**, el harness de agente de programación determinista (CLI y TUI) construido sobre el microkernel **OnYX** (`onyx-core` → `onyx-soul-agents` → `onyx-workspace` → `open-onyx`).
 
 A diferencia de otros asistentes de terminal que mezclan estado en memoria volátil, `openonyx` registra cada decisión, lectura, edición y comando en un **grafo EAV determinista** con:
@@ -15,15 +17,14 @@ A diferencia de otros asistentes de terminal que mezclan estado en memoria volá
 
 ## Índice del Manual
 
-| Capítulo | Contenido | Idioma |
+| Capítulo | Español | English |
 | --- | --- | --- |
-| **[01. Primeros Pasos](01-primeros-pasos.md)** | Instalación, compilación, configuración con Gemini / OpenAI / Ollama / vLLM, primera sesión TUI paso a paso hasta `Settled`, aprobar diffs y `/undo`. | Español |
-| **[01. First Steps (Quickstart)](01-first-steps.md)** | Step-by-step quickstart in English: build, configure Gemini / OpenAI / local LLMs, first interactive session, diff approvals, `Tab` Plan/Build, and `/undo`. | English |
-| **[02. Interfaz TUI y Flujo Diario](02-interfaz-tui-y-flujo-diario.md)** | Anatomía de la TUI (cabecera de 3 filas, emblema Braille, modelo/`--effort`, telemetría en vivo, `Memory & Trace`, paneles `Live Plan` y `Services`), contexto escalonado, `/compact [focus]`, `/new`, y trabajo multi-agente (`spawn_agent`, `F2` Agent Selector, `/agent`, `Ctrl+Tab`). | Español |
-| **[03. Modos, Permisos y Sandbox OS](03-modos-permisos-y-sandbox.md)** | Modos `PLAN`, `BUILD` y `EXPLORE`; configuración declarativa `.onyx/config.toml` (`[permissions]` y `[sandbox]`), `deny > ask > allow`, `--ignore-deny`, `--auto-approve`, protección RO del Control Plane, `env_clear()`, `ProcessJob` RAII y drivers Linux (`bwrap` + fallback AppArmor) / macOS / Windows. | Español |
-| **[04. Time-Travel, Snapshots y Forking](04-time-travel-snapshots-y-forking.md)** | Cómo funciona `snapshots.onyxpack`, etiquetas de hito automáticas, `/undo` (incluyendo limpieza de archivos nuevos `fs_write`), `/rewind [tick]` y `/fork [name]` en vivo, `chat --resume --tick`, `rewind --interactive`, `replay` offline (`ONYXTR2`), `inspect` y `doctor`. | Español |
-| **[05. Herramientas, Scent, Sprout y Skills](05-herramientas-scent-sprout-y-skills.md)** | Catálogo completo de las 19 herramientas del agente, navegación AST (`scent_outline`, caché `seen_outlines`, `@TOON v1`, `scent_impact`), orquestación de procesos y contenedores con `sprout.toml`, reglas `ONYX.md`/`AGENTS.md`, creación de skills propias y automatización headless (`openonyx run`). | Español |
-| **[06. Referencia CLI y Solución de Problemas](06-referencia-cli-y-troubleshooting.md)** | Referencia completa de subcomandos, flags, variables de entorno, resiliencia SSE / reintentos OpenAI/vLLM, lista de chequeo con `openonyx doctor` y soluciones a los problemas más habituales en Windows, Linux y macOS. | Español |
+| **01. Primeros Pasos / First Steps** | [01. Primeros Pasos](01-primeros-pasos.md) | [01. First Steps](01-first-steps.md) |
+| **02. TUI y Flujo Diario / Daily Workflow** | [02. Interfaz TUI y Flujo Diario](02-interfaz-tui-y-flujo-diario.md) | [02. TUI & Daily Workflow](02-tui-and-daily-workflow.md) |
+| **03. Modos, Permisos y Sandbox** | [03. Modos, Permisos y Sandbox OS](03-modos-permisos-y-sandbox.md) | [03. Modes, Permissions & OS Sandbox](03-modes-permissions-and-sandbox.md) |
+| **04. Time-Travel, Vault y Forking** | [04. Time-Travel, Snapshots y Forking](04-time-travel-snapshots-y-forking.md) | [04. Time-Travel, Snapshots & Forking](04-time-travel-snapshots-and-forking.md) |
+| **05. Herramientas, Scent, Sprout y Skills** | [05. Herramientas, Scent, Sprout y Skills](05-herramientas-scent-sprout-y-skills.md) | [05. Tools, Scent, Sprout & Skills](05-tools-scent-sprout-and-skills.md) |
+| **06. Referencia CLI y Troubleshooting** | [06. Referencia CLI y Troubleshooting](06-referencia-cli-y-troubleshooting.md) | [06. CLI Reference & Troubleshooting](06-cli-reference-and-troubleshooting.md) |
 
 ---
 

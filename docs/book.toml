@@ -1,6 +1,6 @@
 [book]
-title = "openOnyx — Manual de Usuario"
-description = "Guía completa del harness de agente determinista openOnyx (CLI, TUI, sandbox OS, time-travel, forking, Scent y Sprout)."
+title = "openOnyx — Manual de Usuario / User Manual"
+description = "Complete bilingual guide (ES/EN) for the deterministic openOnyx coding-agent harness (CLI, TUI, vault, sandbox, time-travel, forking, Scent & Sprout)."
 authors = ["OnYX"]
 language = "es"
 src = "manual"

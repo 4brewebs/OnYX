@@ -19,6 +19,7 @@ use serde_json::json;
 
 use crate::pack::{PackSnapshotStore, SnapshotSource};
 use crate::session::build_host;
+use crate::vault::audit_vault;
 
 #[derive(Serialize)]
 struct InspectGitCheckpointJson {
@@ -533,6 +534,21 @@ pub fn run_doctor(
         report.errors.extend(sprout_audit.errors);
     }
 
+    // Auditoría del vault de sesiones `.onyx/vault/`.
+    let vault_audit = audit_vault(workspace);
+    if vault_audit.exists {
+        report.checks.push(format!(
+            "session vault `.onyx/vault` ready ({} session dir(s), {} unassigned transcript(s))",
+            vault_audit.session_dirs, vault_audit.unassigned_transcripts
+        ));
+        if !vault_audit.gitignore_present {
+            report.warnings.push(
+                "`.onyx/vault/.gitignore` is missing; add `*` so git checkpoints never index session snapshots"
+                    .to_string(),
+            );
+        }
+    }
+
     if let Ok(entries) = fs::read_dir(workspace) {
         let mut temp_artifacts = Vec::new();
         for entry in entries.flatten() {
@@ -548,7 +564,7 @@ pub fn run_doctor(
                 .push("no stray *.tr or snaps* artifacts in workspace root".to_string());
         } else {
             report.warnings.push(format!(
-                "temporary artifacts in workspace root: {}",
+                "temporary artifacts in workspace root: {} (consider using `--auto-save` or `.onyx/vault/`)",
                 temp_artifacts.join(", ")
             ));
         }

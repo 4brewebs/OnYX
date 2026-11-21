@@ -1,5 +1,7 @@
 # 03. Modos de Trabajo, Permisos y Sandbox OS
 
+> 🇬🇧 **[Read this chapter in English](03-modes-permissions-and-sandbox.md)**
+
 `openonyx` aplica **defensa en profundidad** sobre todo lo que hace el agente: modos de workspace, reglas declarativas `.onyx/config.toml`, protección del *Control Plane*, sanitización de entorno (`env_clear()`), aislamiento a nivel de sistema operativo y supervisión RAII de procesos.
 
 ---
@@ -84,6 +86,7 @@ max_pids = 128
 Incluso en modo `BUILD` y con `--auto-approve`, `onyx-workspace` protege como **solo lectura** los archivos críticos del plano de control del agente y del repositorio:
 
 - `.onyx/config.toml` (evita que un agente se auto-conceda permisos o desactive el sandbox).
+- `.onyx/vault/**` (evita que un agente borre o corrompa los snapshots y transcripciones de la bóveda de sesiones).
 - `.git/hooks/**` y `.git/config` (evita inyección de código al ejecutar comandos Git).
 - `.env` y `.env.*` (evita exfiltración o corrupción de secretos locales).
 

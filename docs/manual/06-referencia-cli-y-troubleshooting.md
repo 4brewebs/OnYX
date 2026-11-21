@@ -1,5 +1,7 @@
 # 06. Referencia CLI Completa y Solución de Problemas
 
+> 🇬🇧 **[Read this chapter in English](06-cli-reference-and-troubleshooting.md)**
+
 Referencia rápida de todos los subcomandos, flags, variables de entorno, resiliencia HTTP/SSE y soluciones a incidencias reales en Windows, Linux y macOS.
 
 ---
@@ -33,8 +35,9 @@ openonyx [--help | -h | --version | -V]
 | `--ignore-deny` | `chat`, `run`, `rewind` | Desactiva explícitamente las reglas `[permissions].deny` de `.onyx/config.toml`. |
 | `--max-steps <n>` | `chat`, `run` | Límite de pasos por turno del agente raíz (default: `128` en `chat`, `64` en `run`; subagentes `32` por defecto). |
 | `--shell-timeout <secs>` | `chat`, `run` | Timeout en segundos por comando `shell_exec` (default: `30s`). |
-| `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Guarda transcripción determinista `ONYXTR2`. |
-| `--snapshot-dir <dir>` | `chat`, `run`, `replay`, `doctor` | Directorio para `snapshots.onyxpack`. |
+| `--auto-save` | `chat`, `run` | Crea automáticamente `.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama\|goal>]/` con `snapshots.onyxpack` + `.tr` juntos (o `ONYX_AUTO_SAVE=1`). |
+| `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Guarda transcripción determinista `ONYXTR2` (nombres cortos van dentro de `--snapshot-dir`, o en `.onyx/vault/unassigned/` si no hay snapshot dir). |
+| `--snapshot-dir <dir>` | `chat`, `run`, `replay`, `doctor` | Directorio para `snapshots.onyxpack` (nombres cortos se resuelven en `.onyx/vault/<dir>/`). |
 | `--snapshot-every <n>` | `chat`, `run`, `replay` | Captura además un hito `periodic` cada `<n>` ticks. |
 | `--max-snapshots <n>` | `chat`, `run`, `replay` | Retención opt-in por ventana deslizante (`init` + últimos `n - 1` hitos). |
 | `-r, --resume <dir>` | `chat` | Reanuda desde el último hito (o `--tick <n>`) guardado en `<dir>`. |
@@ -60,6 +63,7 @@ openonyx [--help | -h | --version | -V]
 | `ONYX_API_KEY` | Ambos | Clave compartida de fallback si no se define la específica del proveedor. |
 | `ONYX_MODEL` | Ambos | Modelo por defecto (fallbacks: `ONYX_GEMINI_MODEL` para Gemini, `OPENAI_MODEL` para OpenAI). |
 | `ONYX_EFFORT` | Ambos | Esfuerzo por defecto (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`). |
+| `ONYX_AUTO_SAVE` | Ambos | Activa `--auto-save` por defecto (`1` \| `true` \| `yes` \| `on`) guardando en `.onyx/vault/`. |
 | `GEMINI_API_BASE` | Gemini | Endpoint personalizado para Gemini. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Endpoint compatible con OpenAI (default: `https://api.openai.com/v1`). |
 

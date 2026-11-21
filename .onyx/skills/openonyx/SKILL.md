@@ -33,23 +33,27 @@ cargo run -p open-onyx -- <subcomando> [opciones]
 | `ONYX_MODEL` / `OPENAI_MODEL` | Modelo para backend OpenAI | `gpt-4o` (sobrescrito por `--model`) |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | Endpoint compatible OpenAI | `https://api.openai.com/v1` |
 | `ONYX_EFFORT` | Esfuerzo de razonamiento (`low` \| `medium` \| `high`) | Sobrescrito por `--effort`; fallbacks: `GEMINI_THINKING_LEVEL` (Gemini) y `OPENAI_REASONING_EFFORT` (OpenAI) |
+| `ONYX_AUTO_SAVE` | Activa `--auto-save` por defecto (`1` \| `true` \| `yes` \| `on`) | Guarda automáticamente snapshots + `.tr` en `.onyx/vault/<id>/` |
 
 > **Nota:** `replay`, `inspect`, `rewind --dry-run`, `rewind --transcript` y `doctor` funcionan sin API key ni llamadas de red.
 
 ### Ejemplos de arranque rápido
 
 ```sh
-# TUI interactiva con Gemini + esfuerzo alto + snapshots + transcripción
-openonyx chat --effort high --snapshot-dir snaps_chat --record chat.tr
+# TUI interactiva con guardado automático en .onyx/vault/ (snapshots + .tr)
+openonyx chat --effort high --auto-save
+
+# TUI con nombre de sesión corto en .onyx/vault/mi-feat/ (snapshots + chat.tr juntos)
+openonyx chat --snapshot-dir mi-feat --record chat.tr
 
 # TUI con OpenAI / OpenRouter
-openonyx chat --provider openai --model gpt-4o --effort medium --snapshot-dir snaps_openai
+openonyx chat --provider openai --model gpt-4o --effort medium --auto-save
 
 # TUI con modelo local en Ollama / vLLM / LM Studio (sin API key requerida)
-openonyx chat --provider openai --api-base http://localhost:11434/v1 --model qwen2.5-coder:14b --effort low
+openonyx chat --provider openai --api-base http://localhost:11434/v1 --model qwen2.5-coder:14b --effort low --auto-save
 
-# Turno único headless
-openonyx run "resume la arquitectura de crates" --record run.tr --snapshot-dir snaps_run
+# Turno único headless con guardado automático
+openonyx run "resume la arquitectura de crates" --auto-save
 ```
 
 ---
@@ -80,8 +84,9 @@ openonyx run "resume la arquitectura de crates" --record run.tr --snapshot-dir s
 - `--sandbox <off|workspace-write|strict-container>` y `--sandbox-net <offline|localhost|unrestricted>`: perfil de sandbox OS (`env_clear()`, protección RO del Control Plane `.onyx/config.toml`/`.git/hooks/**`/`.git/config`/`.env*`, `ProcessJob` RAII, y fallback automático de `bwrap` en Linux con AppArmor restrictivo) y política de red para `shell_exec`. El estado se muestra en `[SANDBOX:...]` y se audita en `openonyx doctor`.
 - `--max-steps <n>`: límite de pasos del agente raíz por turno (default: `128` en `chat`, `64` en `run`; los subagentes lanzados con `spawn_agent` heredan un techo por defecto de `32` pasos salvo override explícito `max_steps` en los argumentos).
 - `--shell-timeout <secs>`: timeout en segundos por comando `shell_exec` (default de `WorkspacePolicy`: `30s`).
-- `--record <file>` / `--save-transcript <file>`: guarda transcripción determinista `ONYXTR2`.
-- `--snapshot-dir <dir>`: guarda hitos comprimidos en `<dir>/snapshots.onyxpack`.
+- `--auto-save`: genera automáticamente una carpeta descriptiva en `<workspace>/.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama|goal>]/` guardando juntos `snapshots.onyxpack` y `<id>.tr` (activable por defecto con `ONYX_AUTO_SAVE=1`). Crea `.onyx/vault/.gitignore` (`*`) automáticamente para no ensuciar Git ni los checkpoints de `/undo`.
+- `--record <file>` / `--save-transcript <file>`: guarda transcripción determinista `ONYXTR2`. Los nombres cortos sin separador de ruta se guardan dentro de `--snapshot-dir` si existe, o en `.onyx/vault/unassigned/<file>` si no hay directorio de snapshots (rutas explícitas con `/` o `\` se respetan tal cual).
+- `--snapshot-dir <dir>`: guarda hitos comprimidos en `<dir>/snapshots.onyxpack` (nombres cortos sin separador se resuelven dentro de `.onyx/vault/<dir>/`; rutas explícitas se respetan tal cual). Al leer (`--resume`, `inspect`, `rewind`, `replay`, `doctor`), los nombres cortos también se resuelven automáticamente en `.onyx/vault/`.
 - `--snapshot-every <n>`: fuerza snapshots periódicos adicionales cada `<n>` ticks.
 - `--max-snapshots <n>`: retención opt-in por ventana deslizante (conserva `init` + últimos `n - 1` hitos).
 - `-r, --resume <dir>` *(solo `chat`)*: reanuda desde el último hito guardado en `<dir>`, o desde un tick específico combinándolo con `--tick <n>` (crea fork hermano seguro por defecto; personalizable con `--fork-dir <dir>` o destructivo opt-in con `--truncate-future`).

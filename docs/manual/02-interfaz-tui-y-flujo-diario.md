@@ -1,5 +1,7 @@
 # 02. Interfaz TUI y Flujo de Trabajo Diario
 
+> 🇬🇧 **[Read this chapter in English](02-tui-and-daily-workflow.md)**
+
 Este capítulo detalla cada componente visual de `openonyx chat`, cómo controlar el esfuerzo de razonamiento (`--effort`), cómo funciona la memoria multi-turno y el contexto escalonado (`/compact`), y cómo supervisar subagentes con `F2` / `/agent`.
 
 ---
@@ -32,7 +34,7 @@ Al ejecutar `openonyx chat`, la pantalla se organiza en cuatro zonas bien defini
   - **Emblema Braille animado** (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, actualizado con *throttle* de 90 ms) cuando hay actividad en curso (`thinking`, `acting`, `waiting_children`, streaming SSE).
   - **Badge de modo**: `[BUILD]`, `[PLAN]` o `[EXPLORE]`.
   - **Badge de sandbox**: `[SANDBOX:workspace]`, `[SANDBOX:strict]` o `[SANDBOX:off]`.
-  - **Estado del agente enfocado**: ID, nombre, estado y tick determinista actual.
+  - **Estado del agente enfocado y vault**: ID, nombre, estado, tick determinista actual y, si el guardado en sesión está activo (`--auto-save` o `--snapshot-dir`), la etiqueta viva `vault:<sesion>` (que se actualiza automáticamente al crear ramas con `/fork` o `/rewind`).
   - **Atajos rápidos**: recordatorio compacto (`Tab: Plan/Build · F2: Agents · /rewind · /fork · /services · Esc: quit`).
 - **Borde inferior (Telemetría en vivo)**:
   - Ocupación aproximada de ventana de contexto (`ctx: <1%` o `XX%`).
