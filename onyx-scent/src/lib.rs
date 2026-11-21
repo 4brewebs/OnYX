@@ -5,8 +5,11 @@ pub mod ontology;
 pub mod toon;
 
 pub use distiller::{DistillerConfig, ImpactHit, MAX_TEMPERATURE_BP, distill_heat};
-pub use index::{IndexStats, WorkspaceIndex};
-pub use ontology::{Edge, Entity, EntityKind, RelationKind, ScentArena, ScentError, SupportedLang};
+pub use index::{IndexStats, RangeImpactSummary, WorkspaceIndex};
+pub use ontology::{
+    Edge, Entity, EntityKind, RelationKind, ScentArena, ScentError, SupportedLang,
+    compute_signature_hash,
+};
 pub use toon::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, TOON_HEADER, ToonPageOptions, ToonRow, decode_toon,
     encode_row, render_toon,
@@ -392,5 +395,151 @@ public class Runner {
             .unwrap();
         assert!(impact.contains("mod.rs::pong"), "{impact}");
         assert!(impact.contains("temp_bp:10000"), "{impact}");
+    }
+
+    #[test]
+    fn impact_for_line_ranges_is_pure_and_never_grows_arena() {
+        let dir = TempDir::new("range_impact");
+        fs::create_dir_all(dir.0.join("src")).unwrap();
+        fs::write(
+            dir.0.join("src/core.rs"),
+            r#"pub fn hot_api(x: i32) -> i32 {
+    x + 1
+}
+
+fn isolated_helper() -> i32 {
+    99
+}
+
+pub fn caller_a() -> i32 {
+    hot_api(1)
+}
+
+pub fn caller_b() -> i32 {
+    hot_api(2)
+}
+
+pub fn caller_c() -> i32 {
+    caller_a() + caller_b()
+}
+"#,
+        )
+        .unwrap();
+
+        let mut index = WorkspaceIndex::new();
+        index.index_workspace(&dir.0).unwrap();
+        let nodes_before = index.arena.nodes.len();
+        let edges_before = index.arena.edges.len();
+
+        let cfg = DistillerConfig {
+            iterations: 2,
+            ..DistillerConfig::default()
+        };
+
+        // 1. Editing `hot_api` (lines 1..=3) detects public src + callers across 2 hops.
+        let summary = index
+            .impact_for_line_ranges(&[("src/core.rs".to_string(), 1, 3)], &cfg)
+            .expect("hot_api range must intersect");
+        assert!(summary.touches_public_src);
+        assert!(summary.callers >= 2, "{summary:?}");
+        assert!(summary.max_heat_bp >= 2_500, "{summary:?}");
+        assert_eq!(summary.epicenters, vec!["src/core.rs::hot_api".to_string()]);
+
+        // 2. Editing `isolated_helper` (lines 5..=7) has 0 callers and 0 heat.
+        let iso = index
+            .impact_for_line_ranges(&[("src/core.rs".to_string(), 5, 7)], &cfg)
+            .expect("isolated_helper range must intersect");
+        assert_eq!(iso.callers, 0, "{iso:?}");
+        assert_eq!(iso.max_heat_bp, 0, "{iso:?}");
+        assert!(!iso.touches_public_src, "{iso:?}");
+
+        // 3. L3 derived-not-stored invariant: 50 repeated queries do not mutate arena size.
+        for _ in 0..50 {
+            let _ = index.impact_for_line_ranges(&[("src/core.rs".to_string(), 1, 3)], &cfg);
+        }
+        assert_eq!(index.arena.nodes.len(), nodes_before);
+        assert_eq!(index.arena.edges.len(), edges_before);
+    }
+
+    #[test]
+    fn signature_hash_ignores_line_shifts_and_reports_stale_callers_on_contract_change() {
+        let dir = TempDir::new("sig_hash");
+        fs::create_dir_all(dir.0.join("src")).unwrap();
+        let src_path = dir.0.join("src/lib.rs");
+        fs::write(
+            &src_path,
+            r#"pub fn compute(a: i32) -> i32 {
+    a * 2
+}
+
+pub fn mid(v: i32) -> i32 {
+    compute(v)
+}
+
+pub fn top() -> i32 {
+    mid(5)
+}
+"#,
+        )
+        .unwrap();
+
+        let mut index = WorkspaceIndex::new();
+        index.index_workspace(&dir.0).unwrap();
+        let snap1 = index.signature_snapshot();
+
+        // Moving functions down by blank lines must NOT change signature_hash.
+        fs::write(
+            &src_path,
+            r#"
+
+
+pub fn compute(a: i32) -> i32 {
+    a * 2
+}
+
+pub fn mid(v: i32) -> i32 {
+    compute(v)
+}
+
+pub fn top() -> i32 {
+    mid(5)
+}
+"#,
+        )
+        .unwrap();
+        index.index_workspace(&dir.0).unwrap();
+        assert!(
+            index.diff_changed_signatures(&snap1).is_empty(),
+            "line shift alone must not invalidate signature_hash"
+        );
+
+        // Changing `compute` signature changes its hash and flags transitive callers (`mid`, `top`).
+        fs::write(
+            &src_path,
+            r#"pub fn compute(a: i32, b: i32) -> i32 {
+    a * b
+}
+
+pub fn mid(v: i32) -> i32 {
+    compute(v, 2)
+}
+
+pub fn top() -> i32 {
+    mid(5)
+}
+"#,
+        )
+        .unwrap();
+        index.index_workspace(&dir.0).unwrap();
+        let changed = index.diff_changed_signatures(&snap1);
+        assert_eq!(changed, vec!["src/lib.rs::compute".to_string()]);
+
+        let stale = index.stale_callers_for_changed_signatures(&changed, 2);
+        assert!(stale.contains(&"src/lib.rs::mid".to_string()), "{stale:?}");
+        assert!(stale.contains(&"src/lib.rs::top".to_string()), "{stale:?}");
+        assert!(
+            !stale.contains(&"src/lib.rs::compute".to_string()),
+            "{stale:?}"
+        );
     }
 }

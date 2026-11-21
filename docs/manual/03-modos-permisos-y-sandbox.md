@@ -77,7 +77,16 @@ max_memory_mb = 4096
 max_pids = 128
 # Imagen OCI cuando mode = "strict-container" (opcional)
 # container_image = "rust:1.85-slim"
+
+[impact]
+# Scent-Heated Approval: escala Allow -> Ask si un diff toca símbolos públicos con callers
+enabled = true
+max_hops = 2          # acotado 1..=4
+ask_heat_bp = 2500    # umbral para símbolos pub scope:src (basis points 0..=10000)
+hard_ask_bp = 8000    # umbral duro para cualquier símbolo con alto fan-out
 ```
+
+> **Monotonía de *Scent-Heated Approval*:** `[impact]` solo puede **subir** una decisión `Allow → Ask` y mostrar la línea `# impact: N callers, H hops, scope:src(pub) [heat Xbp]` sobre el diff en TUI/CLI. Nunca anula un `deny`, nunca baja un `ask` a `allow`, y degrada limpiamente a política estática si el archivo no está indexado o `enabled = false`.
 
 ---
 

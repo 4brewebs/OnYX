@@ -6,6 +6,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value as JsonValue;
 
+use crate::impact::ImpactConfig;
 use crate::sandbox::SandboxConfig;
 use crate::state::WorkspaceMode;
 
@@ -660,6 +661,7 @@ pub struct WorkspacePolicy {
     pub permissions: PermissionRules,
     pub ignore_deny: bool,
     pub sandbox: SandboxConfig,
+    pub impact: ImpactConfig,
 }
 
 impl WorkspacePolicy {
@@ -679,6 +681,7 @@ impl WorkspacePolicy {
             permissions: PermissionRules::default(),
             ignore_deny: false,
             sandbox: SandboxConfig::default(),
+            impact: ImpactConfig::default(),
         })
     }
 
@@ -687,10 +690,17 @@ impl WorkspacePolicy {
         self
     }
 
-    /// Carga secciones `[permissions]` y `[sandbox]` desde `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml`.
+    /// Carga secciones `[permissions]`, `[sandbox]` e `[impact]` desde `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml`.
     pub fn with_loaded_config(mut self) -> Self {
         self.permissions = PermissionRules::load_for_workspace(&self.root);
         self.sandbox = SandboxConfig::load_for_workspace(&self.root);
+        self.impact = ImpactConfig::load_for_workspace(&self.root);
+        self
+    }
+
+    /// Establece la configuración `[impact]` explícita (*Scent-Heated Approval*).
+    pub fn with_impact(mut self, impact: ImpactConfig) -> Self {
+        self.impact = impact;
         self
     }
 

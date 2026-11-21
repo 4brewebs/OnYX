@@ -4,6 +4,12 @@ All notable changes to the **OnYX** workspace crates (`onyx-core`, `onyx-soul`, 
 
 ## [Unreleased]
 
+### Added (`onyx-scent`, `onyx-workspace` & `open-onyx` — `SDD-mix-1` Wave A: Scent-Heated Approval, `signature_hash` & Symbol Provenance)
+
+- **On-demand range impact & signature hashing (`onyx-scent`)**: added deterministic line-invariant `Entity.signature_hash` (`compute_signature_hash`), immutable `WorkspaceIndex::impact_for_line_ranges` (`RangeImpactSummary`, L3 derived-not-stored), and `signature_snapshot` / `diff_changed_signatures` / `stale_callers_for_changed_signatures`.
+- **Monotonic Scent-Heated Approval (`onyx-workspace/src/impact.rs`, `tools.rs`, `bridge.rs`, `policy.rs`)**: parses `[impact]` (`enabled`, `max_hops`, `ask_heat_bp`, `hard_ask_bp`) from `.onyx/config.toml`; monotonically escalates `Allow → Ask` when `fs_edit`/`fs_write` touches high-heat public `scope:src` symbols or exceeds `hard_ask_bp` (never weakening `Deny` or `Ask`, degrading cleanly when unindexed or disabled).
+- **Symbol provenance & enriched approval banners (`onyx-workspace/src/state.rs`, `open-onyx/src/{tui.rs, session.rs, ops.rs}`)**: persists touched epicenters as `ws.effect.symbols` (`RecordedEffect.symbols`, tagged inline for deterministic `ONYXTR2` replay and shown in `inspect`/`rewind`) and displays `# impact: N callers, H hops, scope:src(pub) [heat Xbp]` right above the unified diff in `TuiDriver` and `CliApprovalDriver`.
+
 ### Added (`open-onyx` — SDD-03 Block 2: TUI Input Ergonomics, `/` & `@` Autocomplete & Follow-Up Queue)
 
 - **UTF-8 cursor editing, prompt history & floating autocomplete (`open-onyx/src/tui_input.rs`)**: added `InputBuffer` (`Left`/`Right`/`Home`/`End`/`Delete` with visible reversed cursor), `InputHistory` (`Alt+Up`/`Alt+Down` and `Ctrl+P`/`Ctrl+N` preserving unsent drafts), and floating `PopupState` triggered by `/` (slash commands with descriptions) and `@` (cached workspace file paths respecting `WorkspacePolicy`, ignoring emails like `user@domain`).

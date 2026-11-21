@@ -895,6 +895,7 @@ fn launch_interactive_chat(
     let tui = TuiDriver::new(host.vocab())?
         .with_workspace(cli.workspace.clone(), mode_handle.clone())
         .with_policy(policy.clone())
+        .with_tools(tools.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_vocab(ws_vocab)
         .with_stream_preview(stream_preview.clone())
@@ -1069,7 +1070,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host.spawn(&make_spec(goal, cli.auto_approve));
 
             let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
-                .with_policy(policy.clone());
+                .with_policy(policy.clone())
+                .with_tools(tools.clone());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode(WorkspaceMode::Build)
                 .with_workspace_vocab(ws_vocab)
@@ -1250,7 +1252,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let llm = resolve_llm_config(&cli, &cli.workspace)?;
                 let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
-                    .with_policy(policy.clone());
+                    .with_policy(policy.clone())
+                    .with_tools(tools.clone());
                 let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                     .with_mode(WorkspaceMode::Build)
                     .with_workspace_vocab(ws_vocab)

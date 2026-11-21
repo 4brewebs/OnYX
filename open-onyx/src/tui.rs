@@ -21,8 +21,9 @@ use onyx_soul_agents::{
     Vocab, pending_approvals,
 };
 use onyx_workspace::{
-    PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
-    WorkspaceVocab, graph_workspace_plan, graph_workspace_services, preview_tool_diff,
+    ImpactAssessment, PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle,
+    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_plan,
+    graph_workspace_services, preview_tool_diff,
 };
 use ratatui::{
     Frame, Terminal,
@@ -71,6 +72,7 @@ struct TuiInner {
     ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
     policy: Option<WorkspacePolicy>,
+    tools: Option<WorkspaceTools>,
     sprout: Option<SproutSupervisor>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
@@ -90,6 +92,7 @@ struct TuiInner {
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
     approval_diff: Option<String>,
+    approval_impact: Option<ImpactAssessment>,
     seen_approvals: BTreeSet<(u64, u64)>,
     focused_agent: Option<ConceptId>,
     last_known_root: Option<ConceptId>,
@@ -169,6 +172,7 @@ impl TuiDriver {
                 ws_vocab: None,
                 workspace_root: None,
                 policy: None,
+                tools: None,
                 sprout: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
@@ -188,6 +192,7 @@ impl TuiDriver {
                 queued: Vec::new(),
                 active_approval: None,
                 approval_diff: None,
+                approval_impact: None,
                 seen_approvals: BTreeSet::new(),
                 focused_agent: None,
                 last_known_root: None,
@@ -217,6 +222,14 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.policy = Some(policy);
+        }
+        self
+    }
+
+    pub fn with_tools(self, tools: WorkspaceTools) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.tools = Some(tools);
         }
         self
     }
@@ -520,12 +533,14 @@ impl TuiInner {
                             self.queued.push(Reply::approve(agent, req).to_event());
                             self.active_approval = None;
                             self.approval_diff = None;
+                            self.approval_impact = None;
                         }
                         CtKeyCode::Char('n') | CtKeyCode::Char('N') => {
                             self.queued
                                 .push(Reply::deny(agent, req, "denied by user in TUI").to_event());
                             self.active_approval = None;
                             self.approval_diff = None;
+                            self.approval_impact = None;
                         }
                         _ => {}
                     }
@@ -649,19 +664,30 @@ impl TuiInner {
                 let Some(p) = &a.pending_approval else {
                     continue;
                 };
-                if let Some(policy) = &self.policy {
-                    if policy.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
-                        != PermissionDecision::Ask
-                    {
-                        // Auto-approved or auto-denied by `WorkspaceToolBridge` per policy.
+                let impact_assessment = if let Some(tools) = &self.tools {
+                    let (decision, impact) =
+                        tools.evaluate_permission_with_impact(current_mode, &p.tool, &p.args);
+                    if decision != PermissionDecision::Ask {
+                        // Auto-approved or auto-denied by `WorkspaceToolBridge` per policy + impact.
                         continue;
                     }
-                }
+                    impact
+                } else {
+                    if let Some(policy) = &self.policy {
+                        if policy.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                            != PermissionDecision::Ask
+                        {
+                            continue;
+                        }
+                    }
+                    None
+                };
                 if self.seen_approvals.insert((a.agent.0, a.request)) {
                     self.approval_diff = self
                         .workspace_root
                         .as_deref()
                         .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
+                    self.approval_impact = impact_assessment;
                     self.active_approval =
                         Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
                     break;
@@ -1012,6 +1038,7 @@ impl TuiInner {
             }
         });
         let diff_snapshot = self.approval_diff.clone();
+        let impact_snapshot = self.approval_impact.clone();
         let plan_snapshot = self
             .ws_vocab
             .as_ref()
@@ -1042,48 +1069,28 @@ impl TuiInner {
             let is_approval = approval_snapshot.is_some();
             let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
                 Some((_, _, tool, args)) => {
-                    let args_preview = if diff_snapshot.is_some() && args.len() > 100 {
-                        let mut cut = 100;
-                        while !args.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        format!("{}...", &args[..cut])
-                    } else {
-                        args.clone()
-                    };
-                    let mut lines = vec![Line::from(vec![
-                        Span::styled(
-                            format!("{tool}: "),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(args_preview),
-                    ])];
-                    if let Some(diff) = &diff_snapshot {
-                        for dline in diff.lines() {
-                            let style = if dline.starts_with("+++") || dline.starts_with("---") {
-                                Style::default().fg(Color::DarkGray)
-                            } else if dline.starts_with("@@") {
-                                Style::default().fg(Color::Cyan)
-                            } else if dline.starts_with('+') {
-                                Style::default().fg(Color::Green)
-                            } else if dline.starts_with('-') {
-                                Style::default().fg(Color::Red)
-                            } else {
-                                Style::default()
-                            };
-                            lines.push(Line::from(Span::styled(dline.to_string(), style)));
-                        }
-                    }
+                    let lines = build_approval_lines(
+                        tool,
+                        args,
+                        diff_snapshot.as_deref(),
+                        impact_snapshot.as_ref(),
+                    );
                     let agent_tag = approval_agent_label
                         .as_deref()
                         .map(|lbl| format!(" [agent {lbl}]"))
                         .unwrap_or_default();
+                    let box_color = if impact_snapshot
+                        .as_ref()
+                        .is_some_and(|imp| imp.hard_threshold_hit)
+                    {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    };
                     (
                         format!(" Approval Required{agent_tag} ([y] Approve / [n] Deny) "),
                         lines,
-                        Color::Yellow,
+                        box_color,
                     )
                 }
                 None => {
@@ -1293,6 +1300,62 @@ impl TuiInner {
             }
         });
     }
+}
+
+/// Builds the approval banner lines, prepending any Scent-Heated `# impact: ...` summary above
+/// the tool summary and colorized unified diff (`REQ-MIX1.3`, `TEST-MIX1.6`).
+pub(crate) fn build_approval_lines(
+    tool: &str,
+    args: &str,
+    diff: Option<&str>,
+    impact: Option<&ImpactAssessment>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(imp) = impact {
+        let style = if imp.hard_threshold_hit {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(Span::styled(imp.summary_line.clone(), style)));
+    }
+    let args_preview = if diff.is_some() && args.len() > 100 {
+        let mut cut = 100;
+        while !args.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &args[..cut])
+    } else {
+        args.to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{tool}: "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(args_preview),
+    ]));
+    if let Some(diff_text) = diff {
+        for dline in diff_text.lines() {
+            let style = if dline.starts_with("+++") || dline.starts_with("---") {
+                Style::default().fg(Color::DarkGray)
+            } else if dline.starts_with("@@") {
+                Style::default().fg(Color::Cyan)
+            } else if dline.starts_with('+') {
+                Style::default().fg(Color::Green)
+            } else if dline.starts_with('-') {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(dline.to_string(), style)));
+        }
+    }
+    lines
 }
 
 /// Returns `true` for slash commands that should execute immediately instead of waiting in the
@@ -2003,5 +2066,54 @@ mod tests {
                 "width={width}: scrolling by max_scroll + 1 should clear last row, got: {over_rows:#?}"
             );
         }
+    }
+
+    #[test]
+    fn approval_banner_renders_scent_impact_line_with_diff_in_test_backend() {
+        let impact = ImpactAssessment {
+            max_heat_bp: 6_750,
+            callers: 4,
+            hops: 2,
+            touches_public_src: true,
+            hard_threshold_hit: false,
+            escalates_allow_to_ask: true,
+            epicenters: vec!["src/engine.rs::Engine::tick".to_string()],
+            summary_line:
+                "# impact: 4 callers, 2 hops, scope:src(pub) [heat 6750bp] (epicenters: Engine::tick)"
+                    .to_string(),
+        };
+        let diff = "--- a/src/engine.rs\n+++ b/src/engine.rs\n@@ -1 +1 @@\n-old\n+new";
+        let lines = build_approval_lines(
+            "fs_edit",
+            r#"{"path":"src/engine.rs"}"#,
+            Some(diff),
+            Some(&impact),
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let block = Block::default()
+                    .title(" Approval Required [agent #1 root] ([y] Approve / [n] Deny) ")
+                    .borders(Borders::ALL);
+                let widget = Paragraph::new(lines).block(block);
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("[agent #1 root]"), "{rendered}");
+        assert!(
+            rendered.contains("# impact: 4 callers, 2 hops, scope:src(pub) [heat 6750bp]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("+new"), "{rendered}");
     }
 }

@@ -121,7 +121,7 @@ openonyx run "resume la arquitectura de crates" --auto-save
 - **`/compact [focus]`**: compacta determinísticamente el historial de conversación del agente en un `[session_summary]` (rescatando `files_found` y `focus_matches` relevantes a `[focus]` de turnos previos), crea el hito `cmd:/compact` en `snapshots.onyxpack` y conserva intacta la traza en el grafo para `rewind` y `replay`.
 - **`/services`** y **`/service <start|stop|logs> <id|all> [tail]`**: consulta y controla procesos locales y contenedores Docker/Rancher definidos en `sprout.toml` (reflejados en el panel derecho `Services (Sprout)` y auditados en `openonyx doctor`).
 - **`/new`** o **`/new <goal>`**: fuerza que el siguiente prompt cree un agente raíz limpio (o lo lanza de inmediato con `<goal>`, enfocando automáticamente la vista en el nuevo agente raíz).
-- **Permisos granulares (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`) y `[sandbox]`.
+- **Permisos granulares e impacto AST (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`), `[sandbox]` e `[impact]` (*Scent-Heated Approval* monótono: escala `Allow → Ask` cuando `fs_edit`/`fs_write` toca símbolos con callers y muestra `# impact: ...` sobre el diff, guardando además `ws.effect.symbols` en el ledger).
 
 ---
 
