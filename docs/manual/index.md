@@ -51,8 +51,8 @@ A diferencia de otros asistentes de terminal que mezclan estado en memoria volá
 
 ## Otros Documentos del Repositorio
 
-- [README del repositorio (EN)](../../README.md) · [README en español](../../README_es.md)
-- [README técnico de `open-onyx`](../../open-onyx/README.md)
-- [README técnico de `onyx-workspace`](../../onyx-workspace/README.md)
-- [Guía rápida operativa para agentes (`SKILL.md`)](../../.onyx/skills/openonyx/SKILL.md)
-- [Historial de cambios (`CHANGELOG.md`)](../../CHANGELOG.md)
+- [README del repositorio (EN)](https://github.com/4brewebs/OnYX/blob/main/README.md) · [README en español](https://github.com/4brewebs/OnYX/blob/main/README_es.md)
+- [README técnico de `open-onyx`](https://github.com/4brewebs/OnYX/blob/main/open-onyx/README.md)
+- [README técnico de `onyx-workspace`](https://github.com/4brewebs/OnYX/blob/main/onyx-workspace/README.md)
+- [Guía rápida operativa para agentes (`SKILL.md`)](https://github.com/4brewebs/OnYX/blob/main/.onyx/skills/openonyx/SKILL.md)
+- [Historial de cambios (`CHANGELOG.md`)](https://github.com/4brewebs/OnYX/blob/main/CHANGELOG.md)
