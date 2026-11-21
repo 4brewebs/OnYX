@@ -76,6 +76,8 @@ struct InspectRecordedCheckpointJson {
     summary: String,
     head_sha: Option<String>,
     tree_sha: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    symbols: Vec<String>,
     undone: bool,
 }
 
@@ -187,6 +189,7 @@ pub fn render_inspect(
                     summary: eff.summary,
                     head_sha: eff.head_sha,
                     tree_sha: eff.tree_sha,
+                    symbols: eff.symbols,
                     undone,
                 }
             })
@@ -417,9 +420,21 @@ pub fn reconcile_rewind_effects_report(
             .as_deref()
             .map(|sha| format!(" [tree:{sha}]"))
             .unwrap_or_default();
+        let sym_info = if eff.symbols.is_empty() {
+            String::new()
+        } else {
+            format!(" [symbols:{}]", eff.symbols.join(","))
+        };
         report.lines.push(format!(
-            "  - tick={} agent={} [{}] {} -> {} ({}){}",
-            eff.tick, eff.agent, eff.reversibility, eff.tool, eff.target, eff.summary, ckpt_info
+            "  - tick={} agent={} [{}] {} -> {} ({}){}{}",
+            eff.tick,
+            eff.agent,
+            eff.reversibility,
+            eff.tool,
+            eff.target,
+            eff.summary,
+            ckpt_info,
+            sym_info
         ));
     }
     if let Some(tree_sha) = orphaned.iter().find_map(|e| e.tree_sha.as_deref()) {

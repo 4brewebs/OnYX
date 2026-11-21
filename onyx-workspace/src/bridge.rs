@@ -203,14 +203,15 @@ impl PlatformDriver for WorkspaceToolBridge {
             }
         }
 
-        // Evalúa aprobaciones pendientes frente a `WorkspaceMode` y `PermissionRules`
-        // (`deny > ask > allow`) antes de delegar la interacción humana al driver interno.
+        // Evalúa aprobaciones pendientes frente a `WorkspaceMode`, `PermissionRules`
+        // (`deny > ask > allow`) y escalado monótono *Scent-Heated Approval* (`Allow -> Ask`)
+        // antes de delegar la interacción humana al driver interno.
         let current_mode = self.current_mode(graph);
         for view in pending_approvals(graph, &self.vocab) {
             let Some(pending) = &view.pending_approval else {
                 continue;
             };
-            let decision = self.tools.policy().evaluate_permission_in_mode(
+            let (decision, _impact) = self.tools.evaluate_permission_with_impact(
                 current_mode,
                 &pending.tool,
                 &pending.args,
@@ -295,11 +296,23 @@ impl PlatformDriver for WorkspaceToolBridge {
                     } else {
                         None
                     };
+                    let captured_symbols =
+                        if matches!(pending.tool.as_str(), "fs_write" | "fs_edit") {
+                            self.tools
+                                .assess_mutation_impact(&pending.tool, &pending.args)
+                                .map(|a| a.epicenters)
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                     self.tools
                         .execute_with_tick(&pending.tool, &pending.args, tick_hint)
                         .map(|mut out| {
                             if let Some((head, tree)) = captured_ckpt {
                                 out.push_str(&format!(" [checkpoint:{head}:{tree}]"));
+                            }
+                            if !captured_symbols.is_empty() {
+                                out.push_str(&format!(" [symbols:{}]", captured_symbols.join(",")));
                             }
                             out
                         })

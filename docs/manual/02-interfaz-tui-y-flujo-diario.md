@@ -85,8 +85,14 @@ export ONYX_EFFORT=medium
 ### Continuación automática (`continue_agent`)
 Al terminar un turno (`Settled`), escribir un nuevo mensaje y pulsar `Enter` **no crea un agente amnésico**: `openonyx` reactiva al mismo agente raíz mediante `continue_agent`, conservando toda su `rel_memory` con contador de pasos monótono.
 
-### Protección contra duplicado de agente raíz
-Si el agente raíz todavía está trabajando (`thinking`, `acting`, `waiting_children` o `waiting_approval`), la TUI **bloquea la creación accidental de un segundo agente raíz** al pulsar `Enter` con texto normal, evitando que dos raíces compitan por el mismo workspace. Espera a que termine, aprueba/rechaza la acción pendiente o usa los comandos de inspección (`F2`, `/agent`, `/services`).
+### Cola de seguimiento mientras el agente trabaja (`queued:N`)
+Si el agente raíz está ocupado (`thinking`, `acting`, `waiting_children` o `waiting_approval`), puedes escribir tu siguiente instrucción y pulsar `Enter`: en lugar de crear un segundo agente raíz que compita por el workspace, la TUI la **encola automáticamente** (`queued:N` en cabecera y borde inferior, previsualizada si la entrada está vacía, y limpiable en cualquier momento con **`Ctrl+X`**) y la despacha al instante en cuanto el turno termina. Los comandos inmediatos (`/agent`, `/mode`, `/services`, `/service`, `/undo`) siguen ejecutándose al momento.
+
+### Autocompletado `/`, `@archivo`, cursor e historial de entrada
+- **Cursor UTF-8 visible**: muévete dentro del prompt con `Left`, `Right`, `Home`, `End`, `Backspace` y `Delete`.
+- **Historial de prompts**: navega tus prompts anteriores con **`Alt+Up` / `Alt+Down`** (o **`Ctrl+P` / `Ctrl+N`**), conservando automáticamente tu borrador si vuelves abajo.
+- **Popup `/`**: al empezar con `/`, aparece un menú flotante con todos los comandos slash y su descripción (`↑`/`↓`, `Tab`/`Enter` para aceptar, `Esc` para cerrar).
+- **Popup `@`**: al escribir `@` al inicio de una palabra (p. ej. `revisa @tui`), se filtran en tiempo real las rutas del workspace (ignorando `.git`, `target`, `node_modules` y `.onyx/vault`) y al pulsar `Tab`/`Enter` se inserta la ruta relativa limpia.
 
 ### Empezar una conversación limpia (`/new`)
 - `/new`: marca que el siguiente prompt creará un agente raíz limpio desde cero (sin arrastrar historial de la tarea anterior).

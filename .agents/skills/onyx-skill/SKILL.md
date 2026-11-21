@@ -97,7 +97,9 @@ openonyx run "resume la arquitectura de crates" --auto-save
 
 ### Atajos de teclado
 
-- **`Enter`**: envía objetivo, prompt de seguimiento (reactiva al mismo agente raíz conservando toda su `rel_memory` vía `continue_agent`) o comando slash. Mientras el agente raíz está ocupado (`thinking`, `acting`, `waiting_children` o `waiting_approval`), la TUI impide crear un segundo agente raíz accidental.
+- **`Enter`**: envía objetivo, prompt de seguimiento (reactiva al mismo agente raíz conservando toda su `rel_memory` vía `continue_agent`) o comando slash. Mientras el agente raíz está ocupado (`thinking`, `acting`, `waiting_children` o `waiting_approval`), los prompts enviados se encolan automáticamente (`queued:N`, limpiable con `Ctrl+X`) y se despachan al terminar sin crear un segundo agente raíz.
+- **`/` y `@`**: abre el popup de autocompletado interactivo de comandos slash (`/`) o archivos del workspace (`@`, ignorando `.git`/`target`/`.onyx/vault`, navegable con `↑`/`↓`, `Tab`/`Enter` para aceptar y `Esc` para cerrar).
+- **`Left` / `Right` / `Home` / `End` / `Delete`**: edición UTF-8 con cursor visible; **`Alt+Up` / `Alt+Down`** (`Ctrl+P` / `Ctrl+N`) navega el historial de prompts preservando el borrador.
 - **`Tab`**: alterna en caliente entre `[BUILD]` (edición permitida) y `[PLAN]` (solo lectura).
 - **`F2`**: abre/cierra el popup interactivo **Agent Selector** para inspeccionar y enfocar al agente raíz o cualquiera de sus subagentes (`↑`/`↓`, `Enter`, `Esc`).
 - **`Ctrl+Tab`**: atajo rápido para rotar el agente enfocado (alias dependiente del terminal para `F2` / `/agent`).
@@ -119,7 +121,7 @@ openonyx run "resume la arquitectura de crates" --auto-save
 - **`/compact [focus]`**: compacta determinísticamente el historial de conversación del agente en un `[session_summary]` (rescatando `files_found` y `focus_matches` relevantes a `[focus]` de turnos previos), crea el hito `cmd:/compact` en `snapshots.onyxpack` y conserva intacta la traza en el grafo para `rewind` y `replay`.
 - **`/services`** y **`/service <start|stop|logs> <id|all> [tail]`**: consulta y controla procesos locales y contenedores Docker/Rancher definidos en `sprout.toml` (reflejados en el panel derecho `Services (Sprout)` y auditados en `openonyx doctor`).
 - **`/new`** o **`/new <goal>`**: fuerza que el siguiente prompt cree un agente raíz limpio (o lo lanza de inmediato con `<goal>`, enfocando automáticamente la vista en el nuevo agente raíz).
-- **Permisos granulares (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`) y `[sandbox]`.
+- **Permisos granulares e impacto AST (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`), `[sandbox]` e `[impact]` (*Scent-Heated Approval* monótono: escala `Allow → Ask` cuando `fs_edit`/`fs_write` toca símbolos con callers y muestra `# impact: ...` sobre el diff, guardando además `ws.effect.symbols` en el ledger).
 
 ---
 

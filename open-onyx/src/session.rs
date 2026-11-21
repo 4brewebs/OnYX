@@ -13,7 +13,7 @@ use onyx_soul_agents::{
     SurfaceBinding, SurfaceId, Vocab, pending_approvals,
 };
 use onyx_workspace::{
-    PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
+    ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
     WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
 };
 
@@ -408,6 +408,7 @@ fn save_transcript_if_configured<D: SessionDriver>(
 pub struct CliApprovalDriver {
     vocab: Vocab,
     policy: Option<WorkspacePolicy>,
+    tools: Option<WorkspaceTools>,
     inner: Box<dyn PlatformDriver>,
     seen: BTreeSet<(u64, u64)>,
     queued: Vec<Reply>,
@@ -418,6 +419,7 @@ impl CliApprovalDriver {
         Self {
             vocab,
             policy: None,
+            tools: None,
             inner: Box::new(inner),
             seen: BTreeSet::new(),
             queued: Vec::new(),
@@ -426,6 +428,11 @@ impl CliApprovalDriver {
 
     pub fn with_policy(mut self, policy: WorkspacePolicy) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    pub fn with_tools(mut self, tools: WorkspaceTools) -> Self {
+        self.tools = Some(tools);
         self
     }
 }
@@ -444,20 +451,33 @@ impl PlatformDriver for CliApprovalDriver {
             let Some(pending) = &view.pending_approval else {
                 continue;
             };
-            if let Some(policy) = &self.policy {
-                if policy.evaluate_permission_in_mode(
+            let impact = if let Some(tools) = &self.tools {
+                let (decision, imp) = tools.evaluate_permission_with_impact(
                     WorkspaceMode::Build,
                     &pending.tool,
                     &pending.args,
-                ) != PermissionDecision::Ask
-                {
+                );
+                if decision != PermissionDecision::Ask {
                     continue;
                 }
-            }
+                imp
+            } else {
+                if let Some(policy) = &self.policy {
+                    if policy.evaluate_permission_in_mode(
+                        WorkspaceMode::Build,
+                        &pending.tool,
+                        &pending.args,
+                    ) != PermissionDecision::Ask
+                    {
+                        continue;
+                    }
+                }
+                None
+            };
             if !self.seen.insert((view.agent.0, view.request)) {
                 continue;
             }
-            let reply = if prompt_approval(&pending.tool, &pending.args) {
+            let reply = if prompt_approval(&pending.tool, &pending.args, impact.as_ref()) {
                 Reply::approve(view.agent, view.request)
             } else {
                 Reply::deny(view.agent, view.request, "denied by user")
@@ -467,8 +487,11 @@ impl PlatformDriver for CliApprovalDriver {
     }
 }
 
-fn prompt_approval(tool: &str, args: &str) -> bool {
+fn prompt_approval(tool: &str, args: &str, impact: Option<&ImpactAssessment>) -> bool {
     println!("\n[openOnyx] Approval required for `{tool}`:");
+    if let Some(imp) = impact {
+        println!("  {}", imp.summary_line);
+    }
     println!("  args: {args}");
     print!("Approve? [y/N]: ");
     let _ = io::stdout().flush();

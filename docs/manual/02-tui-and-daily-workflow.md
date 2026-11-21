@@ -84,8 +84,14 @@ export ONYX_EFFORT=medium
 ### Automatic Continuation (`continue_agent`)
 Once a turn finishes (`Settled`), submitting a follow-up prompt **reactivates the same root agent** via `continue_agent`, preserving its entire `rel_memory` with monotonic step counts rather than spawning an amnesic agent.
 
-### Duplicate-Root Guard
-While the root agent is actively working (`thinking`, `acting`, `waiting_children`, or `waiting_approval`), the TUI **blocks accidental spawning of a second root agent** on plain text submission so two roots never race over the same workspace. Wait for completion, respond to the pending approval, or inspect agents with `F2` / `/agent`.
+### Follow-Up Prompt Queue While Busy (`queued:N`)
+While the root agent is actively working (`thinking`, `acting`, `waiting_children`, or `waiting_approval`), you can type your next follow-up and press `Enter`: instead of racing a second root agent over the workspace, the TUI **queues it automatically** (`queued:N` shown in the header and input border, previewed when the input is empty, and clearable anytime with **`Ctrl+X`**) and dispatches it the moment the current turn settles. Immediate commands (`/agent`, `/mode`, `/services`, `/service`, `/undo`) still execute right away.
+
+### `/` & `@file` Autocomplete, Cursor Editing & Input History
+- **Visible UTF-8 cursor**: edit anywhere inside the prompt using `Left`, `Right`, `Home`, `End`, `Backspace`, and `Delete`.
+- **Prompt history**: cycle previous prompts with **`Alt+Up` / `Alt+Down`** (or **`Ctrl+P` / `Ctrl+N`**), restoring your unsent draft when returning to the bottom.
+- **`/` popup**: typing `/` at the start of the line opens a floating command menu with short descriptions (`↑`/`↓`, `Tab`/`Enter` to accept, `Esc` to dismiss).
+- **`@` popup**: typing `@` at the start of a word (e.g. `review @tui`) fuzzy-filters cached workspace paths (respecting ignored directories and `.onyx/vault`) and inserts the clean relative path on `Tab`/`Enter`.
 
 ### Starting Fresh (`/new`)
 - `/new`: marks the next prompt to spawn a clean root agent with fresh memory.

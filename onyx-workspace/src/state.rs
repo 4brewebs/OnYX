@@ -133,6 +133,7 @@ pub struct WorkspaceVocab {
     pub effect_head_sha: Attr,
     pub effect_tree_sha: Attr,
     pub effect_undone: Attr,
+    pub effect_symbols: Attr,
 }
 
 impl WorkspaceVocab {
@@ -158,6 +159,7 @@ impl WorkspaceVocab {
             effect_head_sha: reg("ws.effect.head_sha"),
             effect_tree_sha: reg("ws.effect.tree_sha"),
             effect_undone: reg("ws.effect.undone"),
+            effect_symbols: reg("ws.effect.symbols"),
         }
     }
 }
@@ -174,6 +176,7 @@ pub struct RecordedEffect {
     pub summary: String,
     pub head_sha: Option<String>,
     pub tree_sha: Option<String>,
+    pub symbols: Vec<String>,
 }
 
 /// Mapa compartido entre `WorkspaceToolBridge` (que captura `git write-tree`
@@ -272,6 +275,23 @@ pub(crate) fn parse_inline_checkpoint(obs_text: &str) -> Option<(String, String)
         return None;
     }
     Some((head.to_string(), tree.to_string()))
+}
+
+pub(crate) fn parse_inline_symbols(obs_text: &str) -> Vec<String> {
+    let marker = " [symbols:";
+    let Some(pos) = obs_text.rfind(marker) else {
+        return Vec::new();
+    };
+    let rest = &obs_text[pos + marker.len()..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    rest[..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Restaura el árbol de trabajo en `root` al estado exacto capturado en `tree_sha`
@@ -374,6 +394,15 @@ fn read_recorded_effect<G: GraphView + ?Sized>(
     let summary = prop_text(graph, id, ws.effect_summary).unwrap_or_default();
     let head_sha = prop_text(graph, id, ws.effect_head_sha).filter(|s| !s.is_empty());
     let tree_sha = prop_text(graph, id, ws.effect_tree_sha).filter(|s| !s.is_empty());
+    let symbols = prop_text(graph, id, ws.effect_symbols)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     Some(RecordedEffect {
         id,
         tick,
@@ -384,6 +413,7 @@ fn read_recorded_effect<G: GraphView + ?Sized>(
         summary,
         head_sha,
         tree_sha,
+        symbols,
     })
 }
 
@@ -745,6 +775,14 @@ fn record_tool_observation(
                 if !tree_sha.is_empty() {
                     graph.set(eff, wv.effect_tree_sha, Value::Text(tree_sha));
                 }
+            }
+            let touched_symbols = parse_inline_symbols(obs.obs_text);
+            if !touched_symbols.is_empty() {
+                graph.set(
+                    eff,
+                    wv.effect_symbols,
+                    Value::Text(touched_symbols.join(",")),
+                );
             }
         }
         "plan_update" => {

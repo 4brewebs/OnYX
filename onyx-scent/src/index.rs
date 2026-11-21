@@ -1,9 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::distiller::{DistillerConfig, MAX_TEMPERATURE_BP, distill_heat};
 use crate::lang::{ParsedFile, RawCall, RawTypeRef, parse_source};
-use crate::ontology::{Edge, Entity, RelationKind, ScentArena, ScentError, SupportedLang};
+use crate::ontology::{
+    Edge, Entity, RelationKind, ScentArena, ScentError, SupportedLang, compute_signature_hash,
+};
 
 const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
 const MAX_MULTI_TARGET_MATCHES: usize = 6;
@@ -16,6 +19,24 @@ pub struct IndexStats {
     pub reparsed_files: usize,
     pub total_entities: usize,
     pub total_edges: usize,
+}
+
+/// Aggregated semantic impact summary derived on demand (L3, never stored) for one or more
+/// edited line ranges `(rel_path, line_start, line_end)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeImpactSummary {
+    /// Maximum risk heat observed across non-epicenter callers/dependents (basis points `0..=10_000`).
+    /// Returns `0` when the touched symbols have no external callers/dependents.
+    pub max_heat_bp: u32,
+    /// Number of unique non-epicenter callers/dependents reached within `cfg.iterations` hops.
+    pub callers: usize,
+    /// Maximum hop distance observed across reached non-epicenter dependents.
+    pub hops: usize,
+    /// `true` if any touched epicenter or reached dependent belongs to `scope:src` (`!is_test`)
+    /// with public visibility.
+    pub touches_public_src: bool,
+    /// Qualified names of epicenter symbols whose line ranges intersected the edited hunks.
+    pub epicenters: Vec<String>,
 }
 
 /// Incremental deterministic AST index across a multi-file workspace.
@@ -163,6 +184,8 @@ impl WorkspaceIndex {
                 };
 
                 let id = self.arena.nodes.len();
+                let signature_hash =
+                    compute_signature_hash(ent.kind, ent.is_public, &ent.signature);
                 self.arena.nodes.push(Entity {
                     id,
                     qualified_name,
@@ -172,6 +195,7 @@ impl WorkspaceIndex {
                     lang: parsed.lang,
                     kind: ent.kind,
                     signature: ent.signature.clone(),
+                    signature_hash,
                     is_public: ent.is_public,
                     is_test: ent.is_test,
                     start_line: ent.start_line,
@@ -353,6 +377,181 @@ impl WorkspaceIndex {
             .filter(|n| n.short_name == trimmed)
             .map(|n| n.id)
             .collect()
+    }
+
+    /// Computes on-demand semantic impact (L3 derived, never stored) for one or more
+    /// 1-based inclusive line ranges `(rel_path, line_start, line_end)`.
+    ///
+    /// Returns `None` when no indexed entity intersects any range (graceful degradation).
+    pub fn impact_for_line_ranges(
+        &self,
+        ranges: &[(String, usize, usize)],
+        cfg: &DistillerConfig,
+    ) -> Option<RangeImpactSummary> {
+        if ranges.is_empty() || self.arena.nodes.is_empty() {
+            return None;
+        }
+        let norm_ranges: Vec<(String, usize, usize)> = ranges
+            .iter()
+            .map(|(p, s, e)| {
+                let norm = p.trim().replace('\\', "/");
+                let clean = norm
+                    .trim_start_matches("./")
+                    .trim_start_matches('/')
+                    .to_string();
+                let start = (*s).min(*e);
+                let end = (*s).max(*e);
+                (clean, start, end)
+            })
+            .collect();
+
+        let mut epicenter_ids: Vec<usize> = Vec::new();
+        let mut epicenters: Vec<String> = Vec::new();
+        let mut touches_public_src = false;
+
+        for node in &self.arena.nodes {
+            let intersects = norm_ranges.iter().any(|(path, start, end)| {
+                node.file == *path && node.start_line <= *end && node.end_line >= *start
+            });
+            if intersects {
+                epicenter_ids.push(node.id);
+                epicenters.push(node.qualified_name.clone());
+                if node.is_public && !node.is_test {
+                    touches_public_src = true;
+                }
+            }
+        }
+
+        if epicenter_ids.is_empty() {
+            return None;
+        }
+
+        // Run thermal diffusion strictly over immutable `&self.arena` (L3 never stored).
+        // For mutation blast-radius, count upstream/dependent callers (`CalledBy`, `UsedByType`, `Implements`)
+        // as well as all non-epicenter hits reached within `cfg.iterations`.
+        let hits = distill_heat(&self.arena, &epicenter_ids, cfg);
+
+        let mut base_max_heat: u32 = 0;
+        let mut callers: usize = 0;
+        let mut max_hop: usize = 0;
+
+        for hit in &hits {
+            if hit.min_hop == 0 {
+                continue;
+            }
+            // Only treat reverse-impact relations (callers / type users / implementors) as risk callers.
+            let is_dependent = matches!(
+                hit.dominant_relation,
+                Some(RelationKind::CalledBy | RelationKind::UsedByType | RelationKind::Implements)
+            );
+            if !is_dependent {
+                continue;
+            }
+            callers += 1;
+            max_hop = max_hop.max(usize::from(hit.min_hop));
+            base_max_heat = base_max_heat.max(u32::from(hit.temperature_bp));
+            if let Some(node) = self.arena.nodes.get(hit.node_id) {
+                if node.is_public && !node.is_test {
+                    touches_public_src = true;
+                }
+            }
+        }
+
+        // Aggregate via max (not sum) with bounded fan-out boost so hubs with many callers
+        // escalate cleanly while isolated 0-caller helpers stay at 0bp.
+        let max_heat_bp = if callers == 0 {
+            0
+        } else {
+            let fanout_bonus = (callers.saturating_sub(1) as u32)
+                .saturating_mul(400)
+                .min(3_250);
+            base_max_heat
+                .saturating_add(fanout_bonus)
+                .min(u32::from(MAX_TEMPERATURE_BP))
+        };
+
+        Some(RangeImpactSummary {
+            max_heat_bp,
+            callers,
+            hops: max_hop,
+            touches_public_src,
+            epicenters,
+        })
+    }
+
+    /// Captures a deterministic snapshot of `qualified_name -> signature_hash` for all indexed symbols.
+    pub fn signature_snapshot(&self) -> BTreeMap<String, u64> {
+        self.arena
+            .nodes
+            .iter()
+            .map(|n| (n.qualified_name.clone(), n.signature_hash))
+            .collect()
+    }
+
+    /// Returns all symbols whose `signature_hash` changed relative to `previous` (sorted deterministically).
+    pub fn diff_changed_signatures(&self, previous: &BTreeMap<String, u64>) -> Vec<String> {
+        let mut changed = Vec::new();
+        for node in &self.arena.nodes {
+            if let Some(&old_hash) = previous.get(&node.qualified_name) {
+                if old_hash != node.signature_hash {
+                    changed.push(node.qualified_name.clone());
+                }
+            }
+        }
+        changed.sort();
+        changed.dedup();
+        changed
+    }
+
+    /// Walks reverse dependency edges (`CalledBy`, `UsedByType`, `Implements`) from `changed_symbols`
+    /// up to `max_hops` (`1..=6`), returning sorted unique caller/dependent qualified names.
+    pub fn stale_callers_for_changed_signatures(
+        &self,
+        changed_symbols: &[String],
+        max_hops: usize,
+    ) -> Vec<String> {
+        if changed_symbols.is_empty() || self.arena.nodes.is_empty() {
+            return Vec::new();
+        }
+        let max_h = max_hops.clamp(1, 6);
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for sym in changed_symbols {
+            for id in self.resolve_targets(sym) {
+                seeds.insert(id);
+            }
+        }
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+
+        let mut visited: BTreeSet<usize> = seeds.clone();
+        let mut queue: VecDeque<(usize, usize)> = seeds.iter().map(|&id| (id, 0)).collect();
+        let mut stale: BTreeSet<String> = BTreeSet::new();
+
+        while let Some((cur, depth)) = queue.pop_front() {
+            if depth >= max_h {
+                continue;
+            }
+            for edge in &self.arena.edges {
+                if edge.source_id != cur {
+                    continue;
+                }
+                if !matches!(
+                    edge.kind,
+                    RelationKind::CalledBy | RelationKind::UsedByType | RelationKind::Implements
+                ) {
+                    continue;
+                }
+                if visited.insert(edge.target_id) {
+                    if let Some(node) = self.arena.nodes.get(edge.target_id) {
+                        stale.insert(node.qualified_name.clone());
+                    }
+                    queue.push_back((edge.target_id, depth + 1));
+                }
+            }
+        }
+
+        stale.into_iter().collect()
     }
 }
 

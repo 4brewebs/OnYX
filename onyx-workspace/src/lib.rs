@@ -1,6 +1,7 @@
 //! Capacidades de código, estado en grafo EAV y sandbox de workspace para harnesses sobre `onyx-soul-agents`.
 
 pub mod bridge;
+pub mod impact;
 pub mod policy;
 pub mod sandbox;
 pub mod sprout;
@@ -8,6 +9,7 @@ pub mod state;
 pub mod tools;
 
 pub use bridge::WorkspaceToolBridge;
+pub use impact::{ImpactAssessment, ImpactConfig, ImpactPatch, apply_impact_escalation};
 pub use policy::{
     PermissionDecision, PermissionRules, WorkspacePolicy, compile_glob_regex,
     is_control_plane_rel_path, is_mutating_tool,

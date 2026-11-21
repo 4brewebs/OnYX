@@ -21,8 +21,9 @@ use onyx_soul_agents::{
     Vocab, pending_approvals,
 };
 use onyx_workspace::{
-    PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
-    WorkspaceVocab, graph_workspace_plan, graph_workspace_services, preview_tool_diff,
+    ImpactAssessment, PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle,
+    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_plan,
+    graph_workspace_services, preview_tool_diff,
 };
 use ratatui::{
     Frame, Terminal,
@@ -43,6 +44,9 @@ use crate::context::{
 };
 use crate::gemini::StreamPreviewHandle;
 use crate::pack::SharedPackStore;
+use crate::tui_input::{
+    InputBuffer, InputHistory, PopupState, QueuedPrompts, WorkspaceFileIndex, render_input_popup,
+};
 use crate::vault::session_display_label;
 
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(90);
@@ -68,6 +72,7 @@ struct TuiInner {
     ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
     policy: Option<WorkspacePolicy>,
+    tools: Option<WorkspaceTools>,
     sprout: Option<SproutSupervisor>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
@@ -78,10 +83,16 @@ struct TuiInner {
     session_label: Option<String>,
     snapshot_store: Option<SharedPackStore>,
     seen_compact_count: usize,
-    input: String,
+    input: InputBuffer,
+    history: InputHistory,
+    popup: PopupState,
+    file_index: WorkspaceFileIndex,
+    pending_prompts: QueuedPrompts,
+    root_busy: bool,
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
     approval_diff: Option<String>,
+    approval_impact: Option<ImpactAssessment>,
     seen_approvals: BTreeSet<(u64, u64)>,
     focused_agent: Option<ConceptId>,
     last_known_root: Option<ConceptId>,
@@ -111,6 +122,7 @@ impl TuiHandle {
     }
 
     /// Reads keyboard/resize input while the brain is settled (`is_settled()`),
+    /// dispatches any queued follow-up prompt once the root agent settles,
     /// or refreshes in-flight SSE deltas, telemetry, and throttled emblem rotation without advancing `host.ticks()`.
     pub fn pump_idle(&self, graph: &dyn GraphView) {
         let mut inner = self.inner.borrow_mut();
@@ -118,6 +130,20 @@ impl TuiHandle {
         let stream_dirty = inner.stream_preview.take_dirty();
         let telemetry_dirty = inner.telemetry.take_dirty();
         let busy = inner.is_any_agent_busy(graph);
+        let root_busy = inner.is_root_agent_busy(graph);
+        inner.root_busy = root_busy;
+        if !root_busy
+            && inner.active_approval.is_none()
+            && inner.queued.is_empty()
+            && !inner.pending_prompts.is_empty()
+        {
+            if let Some(next_prompt) = inner.pending_prompts.pop_front() {
+                inner.scroll_from_bottom = 0;
+                inner
+                    .queued
+                    .push(OnyxEvent::Ingress(IngressEvent::Command(next_prompt)));
+            }
+        }
         let spinner_dirty = inner.advance_spinner_if_due(busy);
         if (ui_event || stream_dirty || telemetry_dirty || spinner_dirty)
             && inner.queued.is_empty()
@@ -146,6 +172,7 @@ impl TuiDriver {
                 ws_vocab: None,
                 workspace_root: None,
                 policy: None,
+                tools: None,
                 sprout: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
@@ -156,10 +183,16 @@ impl TuiDriver {
                 session_label: None,
                 snapshot_store: None,
                 seen_compact_count: 0,
-                input: String::new(),
+                input: InputBuffer::default(),
+                history: InputHistory::default(),
+                popup: PopupState::default(),
+                file_index: WorkspaceFileIndex::default(),
+                pending_prompts: QueuedPrompts::default(),
+                root_busy: false,
                 queued: Vec::new(),
                 active_approval: None,
                 approval_diff: None,
+                approval_impact: None,
                 seen_approvals: BTreeSet::new(),
                 focused_agent: None,
                 last_known_root: None,
@@ -189,6 +222,14 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.policy = Some(policy);
+        }
+        self
+    }
+
+    pub fn with_tools(self, tools: WorkspaceTools) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.tools = Some(tools);
         }
         self
     }
@@ -303,6 +344,32 @@ impl TuiInner {
         })
     }
 
+    fn is_root_agent_busy(&self, graph: &dyn GraphView) -> bool {
+        if self.active_approval.is_some() {
+            return true;
+        }
+        let latest_root = graph
+            .query(&[self.vocab.state])
+            .into_iter()
+            .filter(|id| graph.related(*id, self.vocab.rel_parent).is_empty())
+            .last();
+        latest_root.is_some_and(|id| {
+            matches!(
+                prop_text(graph, id, self.vocab.state).as_deref(),
+                Some("thinking" | "acting" | "waiting_children" | "waiting_approval")
+            )
+        })
+    }
+
+    fn sync_popup(&mut self) {
+        self.popup.sync_from_buffer(
+            &self.input,
+            &mut self.file_index,
+            self.workspace_root.as_deref(),
+            self.policy.as_ref(),
+        );
+    }
+
     fn advance_spinner_if_due(&mut self, busy: bool) -> bool {
         if !busy {
             if self.spinner_angle != 0.0 {
@@ -391,10 +458,68 @@ impl TuiInner {
                     }
                     return true;
                 }
+                if self.popup.is_open() && self.active_approval.is_none() {
+                    match code {
+                        CtKeyCode::Esc => {
+                            self.popup.close();
+                            return true;
+                        }
+                        CtKeyCode::Up => {
+                            self.popup.move_up();
+                            return true;
+                        }
+                        CtKeyCode::Down => {
+                            self.popup.move_down();
+                            return true;
+                        }
+                        CtKeyCode::Tab | CtKeyCode::Enter => {
+                            if self.popup.accept_into(&mut self.input) {
+                                self.history.reset_navigation();
+                                self.sync_popup();
+                            }
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
                 if matches!(code, CtKeyCode::Esc) {
                     self.quit.store(true, Ordering::Relaxed);
                 } else if matches!(code, CtKeyCode::F(2)) {
+                    self.popup.close();
                     self.open_agent_picker();
+                } else if self.active_approval.is_none()
+                    && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Up))
+                        || (modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(code, CtKeyCode::Char('p' | 'P'))))
+                {
+                    if let Some(prev) = self.history.prev(self.input.as_str()) {
+                        self.input.set_text(prev);
+                        self.popup.close();
+                    }
+                } else if self.active_approval.is_none()
+                    && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Down))
+                        || (modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(code, CtKeyCode::Char('n' | 'N'))))
+                {
+                    if let Some(next) = self.history.next() {
+                        self.input.set_text(next);
+                        self.popup.close();
+                    }
+                } else if self.active_approval.is_none()
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, CtKeyCode::Char('x' | 'X'))
+                {
+                    self.pending_prompts.clear();
+                } else if self.active_approval.is_none()
+                    && !self.input.is_empty()
+                    && matches!(code, CtKeyCode::Home | CtKeyCode::End)
+                {
+                    if matches!(code, CtKeyCode::Home) {
+                        self.input.move_home();
+                    } else {
+                        self.input.move_end();
+                    }
+                    self.sync_popup();
                 } else if apply_scroll_key(
                     &mut self.scroll_from_bottom,
                     self.last_viewport_height,
@@ -408,12 +533,14 @@ impl TuiInner {
                             self.queued.push(Reply::approve(agent, req).to_event());
                             self.active_approval = None;
                             self.approval_diff = None;
+                            self.approval_impact = None;
                         }
                         CtKeyCode::Char('n') | CtKeyCode::Char('N') => {
                             self.queued
                                 .push(Reply::deny(agent, req, "denied by user in TUI").to_event());
                             self.active_approval = None;
                             self.approval_diff = None;
+                            self.approval_impact = None;
                         }
                         _ => {}
                     }
@@ -432,14 +559,41 @@ impl TuiInner {
                                 next_cmd.to_string(),
                             )));
                         }
-                        CtKeyCode::Char(c) => self.input.push(c),
+                        CtKeyCode::Left => {
+                            self.input.move_left();
+                            self.sync_popup();
+                        }
+                        CtKeyCode::Right => {
+                            self.input.move_right();
+                            self.sync_popup();
+                        }
+                        CtKeyCode::Char(c)
+                            if !modifiers.contains(KeyModifiers::CONTROL)
+                                && !modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            self.input.insert_char(c);
+                            self.history.reset_navigation();
+                            self.popup.reset_dismiss();
+                            self.sync_popup();
+                        }
                         CtKeyCode::Backspace => {
-                            self.input.pop();
+                            self.input.backspace();
+                            self.history.reset_navigation();
+                            self.popup.reset_dismiss();
+                            self.sync_popup();
+                        }
+                        CtKeyCode::Delete => {
+                            self.input.delete();
+                            self.history.reset_navigation();
+                            self.popup.reset_dismiss();
+                            self.sync_popup();
                         }
                         CtKeyCode::Enter => {
-                            let cmd = self.input.trim().to_string();
+                            let cmd = self.input.as_str().trim().to_string();
                             self.input.clear();
+                            self.popup.close();
                             if !cmd.is_empty() {
+                                self.history.push(cmd.clone());
                                 self.scroll_from_bottom = 0;
                                 if cmd == "/agent" || cmd == "/agents" {
                                     if self.last_agent_ids.len() > 1 {
@@ -458,6 +612,8 @@ impl TuiInner {
                                         self.pending_focus_switch =
                                             Some(FocusSwitch::Target(target.to_string()));
                                     }
+                                } else if self.root_busy && !is_immediate_slash_cmd(&cmd) {
+                                    self.pending_prompts.push(cmd);
                                 } else {
                                     self.queued
                                         .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
@@ -508,19 +664,30 @@ impl TuiInner {
                 let Some(p) = &a.pending_approval else {
                     continue;
                 };
-                if let Some(policy) = &self.policy {
-                    if policy.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
-                        != PermissionDecision::Ask
-                    {
-                        // Auto-approved or auto-denied by `WorkspaceToolBridge` per policy.
+                let impact_assessment = if let Some(tools) = &self.tools {
+                    let (decision, impact) =
+                        tools.evaluate_permission_with_impact(current_mode, &p.tool, &p.args);
+                    if decision != PermissionDecision::Ask {
+                        // Auto-approved or auto-denied by `WorkspaceToolBridge` per policy + impact.
                         continue;
                     }
-                }
+                    impact
+                } else {
+                    if let Some(policy) = &self.policy {
+                        if policy.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                            != PermissionDecision::Ask
+                        {
+                            continue;
+                        }
+                    }
+                    None
+                };
                 if self.seen_approvals.insert((a.agent.0, a.request)) {
                     self.approval_diff = self
                         .workspace_root
                         .as_deref()
                         .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
+                    self.approval_impact = impact_assessment;
                     self.active_approval =
                         Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
                     break;
@@ -592,6 +759,23 @@ impl TuiInner {
         let any_agent_active = agent_rows
             .iter()
             .any(|r| matches!(r.state.as_str(), "thinking" | "acting" | "waiting_children"));
+        let latest_root_busy = agent_rows.iter().rfind(|r| r.is_root).is_some_and(|r| {
+            matches!(
+                r.state.as_str(),
+                "thinking" | "acting" | "waiting_children" | "waiting_approval"
+            )
+        });
+        self.root_busy = self.active_approval.is_some() || latest_root_busy;
+        let active_subagents = agent_rows
+            .iter()
+            .filter(|r| {
+                !r.is_root
+                    && matches!(
+                        r.state.as_str(),
+                        "thinking" | "acting" | "waiting_children" | "waiting_approval"
+                    )
+            })
+            .count();
 
         let is_busy = self.active_approval.is_none() && any_agent_active;
         let spinner_angle = if is_busy { self.spinner_angle } else { 0.0 };
@@ -655,7 +839,14 @@ impl TuiInner {
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
-            if agent_rows.len() > 1 {
+            if active_subagents > 0 {
+                phase_spans.push(Span::styled(
+                    format!("  [subagents:{active_subagents} · F2]"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if agent_rows.len() > 1 {
                 let active_count = agent_rows
                     .iter()
                     .filter(|r| {
@@ -670,6 +861,14 @@ impl TuiInner {
                         } else {
                             Color::DarkGray
                         })
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !self.pending_prompts.is_empty() {
+                phase_spans.push(Span::styled(
+                    format!("  [queued:{}]", self.pending_prompts.len()),
+                    Style::default()
+                        .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -821,6 +1020,10 @@ impl TuiInner {
             }
         }
         let input_snapshot = self.input.clone();
+        let popup_snapshot = self.popup.clone();
+        let queued_count = self.pending_prompts.len();
+        let queued_preview = self.pending_prompts.peek_front().map(str::to_string);
+        let root_busy_snapshot = self.root_busy;
         let approval_snapshot = self.active_approval.clone();
         let approval_agent_label = approval_snapshot.as_ref().map(|(aid, _, _, _)| {
             let name = agent_rows
@@ -835,6 +1038,7 @@ impl TuiInner {
             }
         });
         let diff_snapshot = self.approval_diff.clone();
+        let impact_snapshot = self.approval_impact.clone();
         let plan_snapshot = self
             .ws_vocab
             .as_ref()
@@ -865,57 +1069,59 @@ impl TuiInner {
             let is_approval = approval_snapshot.is_some();
             let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
                 Some((_, _, tool, args)) => {
-                    let args_preview = if diff_snapshot.is_some() && args.len() > 100 {
-                        let mut cut = 100;
-                        while !args.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        format!("{}...", &args[..cut])
-                    } else {
-                        args.clone()
-                    };
-                    let mut lines = vec![Line::from(vec![
-                        Span::styled(
-                            format!("{tool}: "),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(args_preview),
-                    ])];
-                    if let Some(diff) = &diff_snapshot {
-                        for dline in diff.lines() {
-                            let style = if dline.starts_with("+++") || dline.starts_with("---") {
-                                Style::default().fg(Color::DarkGray)
-                            } else if dline.starts_with("@@") {
-                                Style::default().fg(Color::Cyan)
-                            } else if dline.starts_with('+') {
-                                Style::default().fg(Color::Green)
-                            } else if dline.starts_with('-') {
-                                Style::default().fg(Color::Red)
-                            } else {
-                                Style::default()
-                            };
-                            lines.push(Line::from(Span::styled(dline.to_string(), style)));
-                        }
-                    }
+                    let lines = build_approval_lines(
+                        tool,
+                        args,
+                        diff_snapshot.as_deref(),
+                        impact_snapshot.as_ref(),
+                    );
                     let agent_tag = approval_agent_label
                         .as_deref()
                         .map(|lbl| format!(" [agent {lbl}]"))
                         .unwrap_or_default();
+                    let box_color = if impact_snapshot
+                        .as_ref()
+                        .is_some_and(|imp| imp.hard_threshold_hit)
+                    {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    };
                     (
                         format!(" Approval Required{agent_tag} ([y] Approve / [n] Deny) "),
                         lines,
-                        Color::Yellow,
+                        box_color,
                     )
                 }
-                None => (
-                    format!(
-                        " [{mode_label}] Goal / Command (Enter send · Tab Plan/Build · F2 Agents · /rewind · /fork · /undo · /compact · /services · /new) "
-                    ),
-                    vec![Line::from(format!("> {input_snapshot}"))],
-                    Color::White,
-                ),
+                None => {
+                    let queue_tag = if queued_count > 0 {
+                        format!(" · queued:{queued_count} (Ctrl+X clear)")
+                    } else if root_busy_snapshot {
+                        " · typing queues follow-up".to_string()
+                    } else {
+                        String::new()
+                    };
+                    let mut lines = vec![input_snapshot.render_line("> ")];
+                    if input_snapshot.is_empty() {
+                        if let Some(next_q) = &queued_preview {
+                            lines.push(Line::from(Span::styled(
+                                format!("  [queued #1/{queued_count}] {}", sanitize_display_line(next_q)),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
+                    (
+                        format!(
+                            " [{mode_label}{queue_tag}] Goal / Command (/ cmds · @ files · Alt+↑/↓ history · Tab Plan/Build · F2 Agents) "
+                        ),
+                        lines,
+                        if queued_count > 0 {
+                            Color::Cyan
+                        } else {
+                            Color::White
+                        },
+                    )
+                }
             };
 
             let bottom_inner_width = f.area().width.saturating_sub(2);
@@ -1089,9 +1295,79 @@ impl TuiInner {
 
             if picker_open {
                 render_agent_picker(f, f.area(), &agent_rows, active_agent, picker_idx);
+            } else if !is_approval && popup_snapshot.is_open() {
+                render_input_popup(f, f.area(), chunks[2], &popup_snapshot);
             }
         });
     }
+}
+
+/// Builds the approval banner lines, prepending any Scent-Heated `# impact: ...` summary above
+/// the tool summary and colorized unified diff (`REQ-MIX1.3`, `TEST-MIX1.6`).
+pub(crate) fn build_approval_lines(
+    tool: &str,
+    args: &str,
+    diff: Option<&str>,
+    impact: Option<&ImpactAssessment>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(imp) = impact {
+        let style = if imp.hard_threshold_hit {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(Span::styled(imp.summary_line.clone(), style)));
+    }
+    let args_preview = if diff.is_some() && args.len() > 100 {
+        let mut cut = 100;
+        while !args.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &args[..cut])
+    } else {
+        args.to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{tool}: "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(args_preview),
+    ]));
+    if let Some(diff_text) = diff {
+        for dline in diff_text.lines() {
+            let style = if dline.starts_with("+++") || dline.starts_with("---") {
+                Style::default().fg(Color::DarkGray)
+            } else if dline.starts_with("@@") {
+                Style::default().fg(Color::Cyan)
+            } else if dline.starts_with('+') {
+                Style::default().fg(Color::Green)
+            } else if dline.starts_with('-') {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(dline.to_string(), style)));
+        }
+    }
+    lines
+}
+
+/// Returns `true` for slash commands that should execute immediately instead of waiting in the
+/// follow-up prompt queue while the root agent is busy.
+fn is_immediate_slash_cmd(cmd: &str) -> bool {
+    let lower = cmd.trim().to_ascii_lowercase();
+    lower == "/mode"
+        || lower.starts_with("/mode ")
+        || lower == "/services"
+        || lower == "/service"
+        || lower.starts_with("/service ")
+        || lower == "/undo"
 }
 
 /// Formats the non-invasive top header title showing mode, sandbox, model, and reasoning effort.
@@ -1790,5 +2066,54 @@ mod tests {
                 "width={width}: scrolling by max_scroll + 1 should clear last row, got: {over_rows:#?}"
             );
         }
+    }
+
+    #[test]
+    fn approval_banner_renders_scent_impact_line_with_diff_in_test_backend() {
+        let impact = ImpactAssessment {
+            max_heat_bp: 6_750,
+            callers: 4,
+            hops: 2,
+            touches_public_src: true,
+            hard_threshold_hit: false,
+            escalates_allow_to_ask: true,
+            epicenters: vec!["src/engine.rs::Engine::tick".to_string()],
+            summary_line:
+                "# impact: 4 callers, 2 hops, scope:src(pub) [heat 6750bp] (epicenters: Engine::tick)"
+                    .to_string(),
+        };
+        let diff = "--- a/src/engine.rs\n+++ b/src/engine.rs\n@@ -1 +1 @@\n-old\n+new";
+        let lines = build_approval_lines(
+            "fs_edit",
+            r#"{"path":"src/engine.rs"}"#,
+            Some(diff),
+            Some(&impact),
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let block = Block::default()
+                    .title(" Approval Required [agent #1 root] ([y] Approve / [n] Deny) ")
+                    .borders(Borders::ALL);
+                let widget = Paragraph::new(lines).block(block);
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("[agent #1 root]"), "{rendered}");
+        assert!(
+            rendered.contains("# impact: 4 callers, 2 hops, scope:src(pub) [heat 6750bp]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("+new"), "{rendered}");
     }
 }

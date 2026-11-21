@@ -12,12 +12,14 @@ use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use crate::policy::{WorkspacePolicy, compile_glob_regex};
+use crate::impact::{ImpactAssessment, apply_impact_escalation, evaluate_mutation_impact};
+use crate::policy::{PermissionDecision, WorkspacePolicy, compile_glob_regex};
 use crate::sandbox::{
     ProcessJob, clean_process_path, configure_process_isolation, ensure_sandbox_tmp_dir,
     prepare_sandboxed_shell_command,
 };
 use crate::sprout::SproutSupervisor;
+use crate::state::WorkspaceMode;
 
 /// Descripción declarativa de una herramienta del workspace para inyectar en LLMs.
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +73,37 @@ impl WorkspaceTools {
 
     pub fn policy(&self) -> &WorkspacePolicy {
         &self.policy
+    }
+
+    /// Evalúa en best-effort el impacto AST de una mutación `fs_edit`/`fs_write` (`REQ-MIX1.2`).
+    pub fn assess_mutation_impact(&self, tool: &str, args_json: &str) -> Option<ImpactAssessment> {
+        #[cfg(feature = "scent")]
+        {
+            evaluate_mutation_impact(&self.policy, tool, args_json, &self.scent_index)
+        }
+        #[cfg(not(feature = "scent"))]
+        {
+            evaluate_mutation_impact(&self.policy, tool, args_json)
+        }
+    }
+
+    /// Evalúa `WorkspaceMode` + `PermissionRules` estáticas + escalado monótono *Scent-Heated Approval*
+    /// (`Allow → Ask`, nunca debilitando `Deny` ni `Ask`).
+    pub fn evaluate_permission_with_impact(
+        &self,
+        mode: WorkspaceMode,
+        tool: &str,
+        args_json: &str,
+    ) -> (PermissionDecision, Option<ImpactAssessment>) {
+        let static_decision = self
+            .policy
+            .evaluate_permission_in_mode(mode, tool, args_json);
+        if static_decision == PermissionDecision::Deny {
+            return (PermissionDecision::Deny, None);
+        }
+        let assessment = self.assess_mutation_impact(tool, args_json);
+        let final_decision = apply_impact_escalation(static_decision, assessment.as_ref());
+        (final_decision, assessment)
     }
 
     pub fn all_tool_names() -> &'static [&'static str] {

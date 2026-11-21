@@ -2081,3 +2081,197 @@ fn vault_dir_is_ignored_and_control_plane_protected() {
         "agent writes into .onyx/vault must be blocked"
     );
 }
+
+#[cfg(feature = "scent")]
+#[test]
+fn scent_heated_approval_escalates_allow_to_ask_monotonically_and_records_symbol_provenance() {
+    use onyx_workspace::{
+        ImpactConfig, PermissionDecision, PermissionRules, WorkspaceLedgerSystem,
+        WorkspaceToolBridge, all_recorded_effects, apply_impact_escalation,
+    };
+
+    let dir = TempDir::new("scent_heated");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::write(
+        dir.0.join("src/engine.rs"),
+        r#"pub fn critical_tick(x: i32) -> i32 {
+    x + 1
+}
+
+fn isolated_private() -> i32 {
+    7
+}
+
+pub fn caller_one() -> i32 {
+    critical_tick(1)
+}
+
+pub fn caller_two() -> i32 {
+    critical_tick(2)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(dir.0.join("notes.txt"), "plain text unindexed\n").unwrap();
+
+    // Parse `[impact]` section from `.onyx/config.toml` and verify workspace override.
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::write(
+        dir.0.join(".onyx/config.toml"),
+        r#"
+[permissions]
+allow = ["fs_edit(src/**)", "fs_edit(notes.txt)"]
+deny = ["fs_write(.env*)"]
+
+[impact]
+enabled = true
+max_hops = 2
+ask_heat_bp = 2500
+hard_ask_bp = 8000
+"#,
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap().with_loaded_config();
+    assert!(policy.impact.enabled);
+    assert_eq!(policy.impact.max_hops, 2);
+    assert_eq!(policy.impact.ask_heat_bp, 2_500);
+    assert_eq!(policy.impact.hard_ask_bp, 8_000);
+
+    let tools = WorkspaceTools::new(policy.clone());
+
+    // 1. TEST-MIX1.2: static `Allow` on public symbol with callers escalates `Allow -> Ask`
+    //    and emits `# impact: ...`.
+    let hot_args = r#"{"path":"src/engine.rs","old_text":"    x + 1","new_text":"    x + 2"}"#;
+    let (hot_decision, hot_impact) =
+        tools.evaluate_permission_with_impact(WorkspaceMode::Build, "fs_edit", hot_args);
+    assert_eq!(hot_decision, PermissionDecision::Ask);
+    let imp = hot_impact.expect("hot edit must return ImpactAssessment");
+    assert!(imp.escalates_allow_to_ask, "{imp:?}");
+    assert!(imp.touches_public_src, "{imp:?}");
+    assert!(imp.callers >= 2, "{imp:?}");
+    assert!(
+        imp.summary_line.starts_with("# impact:") && imp.summary_line.contains("critical_tick"),
+        "{}",
+        imp.summary_line
+    );
+
+    // 2. TEST-MIX1.3 (Monotonicity & graceful degradation):
+    //    - Isolated 0-caller private fn stays `Allow`.
+    let cold_args = r#"{"path":"src/engine.rs","old_text":"    7","new_text":"    8"}"#;
+    let (cold_decision, cold_impact) =
+        tools.evaluate_permission_with_impact(WorkspaceMode::Build, "fs_edit", cold_args);
+    assert_eq!(cold_decision, PermissionDecision::Allow);
+    assert_eq!(cold_impact.as_ref().map(|a| a.callers), Some(0));
+
+    //    - Unindexed plain text file degrades cleanly to static `Allow`.
+    let txt_args = r#"{"path":"notes.txt","old_text":"plain text unindexed","new_text":"updated"}"#;
+    let (txt_decision, txt_impact) =
+        tools.evaluate_permission_with_impact(WorkspaceMode::Build, "fs_edit", txt_args);
+    assert_eq!(txt_decision, PermissionDecision::Allow);
+    assert!(txt_impact.is_none());
+
+    //    - Static `Deny` stays `Deny` even when heat is high; static `Ask` never drops to `Allow`.
+    assert_eq!(
+        apply_impact_escalation(PermissionDecision::Deny, Some(&imp)),
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        apply_impact_escalation(PermissionDecision::Ask, cold_impact.as_ref()),
+        PermissionDecision::Ask
+    );
+
+    //    - Plan mode unconditionally blocks mutations regardless of `allow` or `[impact]`.
+    let (plan_decision, _) =
+        tools.evaluate_permission_with_impact(WorkspaceMode::Plan, "fs_edit", cold_args);
+    assert_eq!(plan_decision, PermissionDecision::Deny);
+
+    //    - `[impact].enabled = false` preserves pure static `Allow`.
+    let disabled_policy = policy.clone().with_impact(ImpactConfig {
+        enabled: false,
+        ..ImpactConfig::default()
+    });
+    let disabled_tools = WorkspaceTools::new(disabled_policy);
+    let (off_decision, off_impact) =
+        disabled_tools.evaluate_permission_with_impact(WorkspaceMode::Build, "fs_edit", hot_args);
+    assert_eq!(off_decision, PermissionDecision::Allow);
+    assert!(off_impact.is_none());
+
+    // 3. TEST-MIX1.4: WorkspaceToolBridge + WorkspaceLedgerSystem persist `ws.effect.symbols`
+    //    on the EAV graph without touching `onyx-core`.
+    use onyx_soul_agents::AgentState;
+
+    let allow_all_policy = WorkspacePolicy::new(&dir.0)
+        .unwrap()
+        .with_permissions(PermissionRules {
+            allow: vec!["fs_edit(*)".to_string()],
+            ..PermissionRules::default()
+        })
+        .with_impact(ImpactConfig {
+            enabled: true,
+            max_hops: 2,
+            ask_heat_bp: 10_000, // keep auto-approved in this headless test so edit executes
+            hard_ask_bp: 10_000,
+        });
+    let bridge_tools = WorkspaceTools::new(allow_all_policy);
+    let mut host = AgentHost::builder(1)
+        .system(Box::new(WorkspaceLedgerSystem::new()))
+        .build()
+        .unwrap();
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
+    let vocab = host.vocab();
+
+    let mut spec = AgentSpec::new("editor", "edit critical_tick")
+        .with_tools(WorkspaceTools::all_tool_names().iter().copied())
+        .with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
+    spec.max_steps = Some(8);
+    host.spawn(&spec);
+
+    let responder = |view: &AgentView| -> Option<Reply> {
+        let obs_count = view.memory.iter().filter(|(k, _)| k == "observe").count();
+        let call_count = view.memory.iter().filter(|(k, _)| k == "call").count();
+        if obs_count >= 2 {
+            Some(Reply::done(view.agent, view.request, "done"))
+        } else if obs_count == 1 && call_count == 1 {
+            Some(Reply::call_structured(
+                view.agent,
+                view.request,
+                "fs_edit",
+                r#"{"path":"src/engine.rs","old_text":"    x + 1","new_text":"    x + 42"}"#,
+            ))
+        } else if call_count == 0 {
+            Some(Reply::call_structured(
+                view.agent,
+                view.request,
+                "fs_read",
+                r#"{"path":"src/engine.rs"}"#,
+            ))
+        } else {
+            None
+        }
+    };
+    let ws_bridge = WorkspaceToolBridge::new(vocab, bridge_tools)
+        .with_mode(WorkspaceMode::Build)
+        .with_workspace_vocab(ws_vocab)
+        .require_read_before_edit(true)
+        .wrapping(HeadlessDriver::new());
+    let mut driver = RecordingBridge::new(vocab, responder).wrapping(ws_bridge);
+
+    assert!(host.run_until_settled(&mut driver, 32));
+    let aid = host.agents()[0];
+    assert_eq!(host.agent_state(aid), Some(AgentState::Done));
+
+    let effects = all_recorded_effects(host.graph(), &ws_vocab);
+    let edit_eff = effects
+        .iter()
+        .find(|e| e.tool == "fs_edit")
+        .expect("fs_edit effect recorded in ledger");
+    assert!(
+        edit_eff
+            .symbols
+            .iter()
+            .any(|s| s == "src/engine.rs::critical_tick"),
+        "expected ws.effect.symbols to contain critical_tick, got: {:?}",
+        edit_eff.symbols
+    );
+}

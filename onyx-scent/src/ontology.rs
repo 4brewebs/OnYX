@@ -116,6 +116,27 @@ impl RelationKind {
     }
 }
 
+/// Computes a deterministic 64-bit FNV-1a hash of a symbol's semantic signature
+/// `(kind, visibility, signature)`, intentionally excluding line numbers so moving
+/// code without changing its contract never causes false-positive stale invalidation.
+pub fn compute_signature_hash(kind: EntityKind, is_public: bool, signature: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    feed(kind.as_str().as_bytes());
+    feed(if is_public { b"pub" } else { b"priv" });
+    feed(signature.trim().as_bytes());
+    hash
+}
+
 /// Single AST symbol stored in the contiguous workspace arena.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entity {
@@ -127,6 +148,8 @@ pub struct Entity {
     pub lang: SupportedLang,
     pub kind: EntityKind,
     pub signature: String,
+    /// Deterministic FNV-1a hash over `(kind, is_public, signature)` (line-number invariant).
+    pub signature_hash: u64,
     pub is_public: bool,
     pub is_test: bool,
     pub start_line: usize,

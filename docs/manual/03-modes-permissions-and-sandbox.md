@@ -77,7 +77,16 @@ max_memory_mb = 4096
 max_pids = 128
 # OCI image when mode = "strict-container" (optional)
 # container_image = "rust:1.85-slim"
+
+[impact]
+# Scent-Heated Approval: escalates Allow -> Ask when a diff touches public symbols with callers
+enabled = true
+max_hops = 2          # clamped 1..=4
+ask_heat_bp = 2500    # threshold for public scope:src symbols (basis points 0..=10000)
+hard_ask_bp = 8000    # hard threshold for any high-fanout symbol
 ```
+
+> **Monotonicity of *Scent-Heated Approval*:** `[impact]` can only **escalate** `Allow → Ask` and display `# impact: N callers, H hops, scope:src(pub) [heat Xbp]` above the diff in TUI/CLI. It never overrides `deny`, never relaxes `ask` to `allow`, and degrades gracefully to static rules when unindexed or `enabled = false`.
 
 ---
 
