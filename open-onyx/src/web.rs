@@ -43,6 +43,8 @@ pub const MIN_EXPLICIT_API_KEY_LEN: usize = 16;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_CLIENTS: usize = 32;
+const STREAM_SSE_THROTTLE_MS: u64 = 120;
+const MAX_STREAM_THOUGHT_BYTES: usize = 4 * 1024;
 
 const ASSET_INDEX_HTML: &str = include_str!("../web/index.html");
 const ASSET_STYLES_CSS: &str = include_str!("../web/styles.css");
@@ -190,6 +192,8 @@ fn derive_session_cookie_token(api_key: &str, salt: &[u8; 32]) -> String {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WebMemoryEntry {
+    pub seq: i64,
+    pub tick: i64,
     pub kind: String,
     pub text: String,
 }
@@ -201,6 +205,8 @@ pub struct WebAgentSnapshot {
     pub is_root: bool,
     pub state: String,
     pub goal: String,
+    pub steps: i64,
+    pub max_steps: i64,
     pub memory: Vec<WebMemoryEntry>,
 }
 
@@ -208,6 +214,8 @@ pub struct WebAgentSnapshot {
 pub struct WebStreamPreview {
     pub agent_id: u64,
     pub text: String,
+    pub thought: String,
+    pub thought_chars: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -268,6 +276,9 @@ pub struct WebStateSnapshot {
 struct HubState {
     version: u64,
     snapshot_json: String,
+    stream_version: u64,
+    stream_json: String,
+    state_dirty: bool,
     incoming_events: VecDeque<OnyxEvent>,
     queued_prompts: VecDeque<String>,
     focused_agent_id: Option<u64>,
@@ -310,6 +321,9 @@ impl WebHub {
             state: Mutex::new(HubState {
                 version: 0,
                 snapshot_json: "{}".to_string(),
+                stream_version: 0,
+                stream_json: "null".to_string(),
+                state_dirty: false,
                 incoming_events: VecDeque::new(),
                 queued_prompts: VecDeque::new(),
                 focused_agent_id: None,
@@ -323,6 +337,13 @@ impl WebHub {
             quit: Arc::new(AtomicBool::new(false)),
             sse_clients: AtomicUsize::new(0),
         }))
+    }
+
+    fn take_state_dirty(&self) -> bool {
+        self.state
+            .lock()
+            .map(|mut g| std::mem::replace(&mut g.state_dirty, false))
+            .unwrap_or(false)
     }
 
     fn verify_api_key(&self, candidate: &str) -> bool {
@@ -344,8 +365,7 @@ impl WebHub {
             .map_err(|_| "web hub lock poisoned".to_string())?;
         if guard.root_busy && !is_immediate_web_slash(cmd) {
             guard.queued_prompts.push_back(cmd.to_string());
-            guard.version = guard.version.saturating_add(1);
-            self.state_cv.notify_all();
+            guard.state_dirty = true;
         } else {
             guard
                 .incoming_events
@@ -397,6 +417,7 @@ impl WebHub {
             .lock()
             .map_err(|_| "web hub lock poisoned".to_string())?;
         guard.focused_agent_id = Some(agent_id);
+        guard.state_dirty = true;
         self.input_cv.notify_all();
         Ok(())
     }
@@ -407,6 +428,7 @@ impl WebHub {
             .lock()
             .map_err(|_| "web hub lock poisoned".to_string())?;
         guard.queued_prompts.clear();
+        guard.state_dirty = true;
         self.input_cv.notify_all();
         Ok(())
     }
@@ -463,6 +485,8 @@ struct WebRuntimeInner {
     cached_approval_diff: Option<String>,
     cached_approval_impact: Option<ImpactAssessment>,
     cached_approval_key: Option<(ConceptId, u64)>,
+    stream_pending: bool,
+    last_stream_emit: Instant,
 }
 
 /// Handle ligero implementado para `UiIdlePump` (usado por `run_session` en `StopPolicy::Quit`).
@@ -501,8 +525,26 @@ impl UiIdlePump for WebHandle {
         if let Ok(mut inner) = self.inner.lock() {
             let stream_dirty = inner.stream_preview.take_dirty();
             let telemetry_dirty = inner.telemetry.take_dirty();
-            inner.dispatch_queued_if_idle(graph);
-            inner.publish_snapshot(graph, stream_dirty || telemetry_dirty);
+            let dispatched = inner.dispatch_queued_if_idle(graph);
+            let hub_dirty = self.hub.take_state_dirty();
+
+            // Solo serializamos y difundimos `event: state` completo cuando realmente cambió
+            // el estado de sesión/telemetría/cola (0 trabajo de grafo en reposo o durante streaming).
+            if telemetry_dirty || dispatched || hub_dirty {
+                inner.publish_snapshot(graph, true);
+            }
+
+            // Los deltas de streaming/pensamiento viajan por `event: stream` ligero con throttle (~120 ms).
+            if stream_dirty {
+                inner.stream_pending = true;
+            }
+            if inner.stream_pending
+                && inner.last_stream_emit.elapsed() >= Duration::from_millis(STREAM_SSE_THROTTLE_MS)
+            {
+                inner.stream_pending = false;
+                inner.last_stream_emit = Instant::now();
+                inner.publish_stream_preview(graph);
+            }
         }
     }
 }
@@ -551,6 +593,10 @@ impl WebDriver {
             cached_approval_diff: None,
             cached_approval_impact: None,
             cached_approval_key: None,
+            stream_pending: false,
+            last_stream_emit: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
         }));
 
         let accept_hub = Arc::clone(&hub);
@@ -686,7 +732,7 @@ impl WebRuntimeInner {
             .or_else(|| self.session_label.clone())
     }
 
-    fn dispatch_queued_if_idle(&self, graph: &dyn GraphView) {
+    fn dispatch_queued_if_idle(&self, graph: &dyn GraphView) -> bool {
         let root_busy = is_root_agent_busy(graph, &self.vocab);
         if let Ok(mut guard) = self.hub.state.lock() {
             guard.root_busy = root_busy || guard.active_approval.is_some();
@@ -695,7 +741,39 @@ impl WebRuntimeInner {
                     guard
                         .incoming_events
                         .push_back(OnyxEvent::Ingress(IngressEvent::Command(next_prompt)));
+                    return true;
                 }
+            }
+        }
+        false
+    }
+
+    /// Difunde solo el delta ligero `event: stream` (~0.5-4 KB) sin recorrer ni serializar
+    /// todo el grafo EAV en cada token de streaming o pensamiento.
+    fn publish_stream_preview(&self, graph: &dyn GraphView) {
+        let preview = self.stream_preview.get().and_then(|sp| {
+            let state = prop_text(graph, ConceptId(sp.agent), self.vocab.state);
+            if state.as_deref() == Some("thinking")
+                && (!sp.text.is_empty() || !sp.thought.is_empty())
+            {
+                Some(WebStreamPreview {
+                    agent_id: sp.agent,
+                    text: sp.text,
+                    thought_chars: sp.thought.chars().count(),
+                    thought: tail_utf8(&sp.thought, MAX_STREAM_THOUGHT_BYTES),
+                })
+            } else {
+                None
+            }
+        });
+        let Ok(json) = serde_json::to_string(&preview) else {
+            return;
+        };
+        if let Ok(mut guard) = self.hub.state.lock() {
+            if guard.stream_json != json {
+                guard.stream_json = json;
+                guard.stream_version = guard.stream_version.saturating_add(1);
+                self.hub.state_cv.notify_all();
             }
         }
     }
@@ -781,10 +859,23 @@ impl WebRuntimeInner {
             .or_else(|| self.sprout.as_ref().and_then(|s| s.render_panel_text()));
 
         let tel = self.telemetry.snapshot();
-        let stream_preview = self.stream_preview.get().map(|sp| WebStreamPreview {
-            agent_id: sp.agent,
-            text: sp.text,
+        let stream_preview = self.stream_preview.get().and_then(|sp| {
+            let is_thinking = agents
+                .iter()
+                .any(|a| a.id == sp.agent && a.state == "thinking");
+            if is_thinking && (!sp.text.is_empty() || !sp.thought.is_empty()) {
+                Some(WebStreamPreview {
+                    agent_id: sp.agent,
+                    text: sp.text,
+                    thought_chars: sp.thought.chars().count(),
+                    thought: tail_utf8(&sp.thought, MAX_STREAM_THOUGHT_BYTES),
+                })
+            } else {
+                None
+            }
         });
+        let stream_json_now =
+            serde_json::to_string(&stream_preview).unwrap_or_else(|_| "null".to_string());
         let sandbox_badge = self
             .policy
             .as_ref()
@@ -801,6 +892,10 @@ impl WebRuntimeInner {
         };
         guard.active_approval = active_approval_tuple;
         guard.root_busy = root_busy || guard.active_approval.is_some();
+        if guard.stream_json != stream_json_now {
+            guard.stream_json = stream_json_now;
+            guard.stream_version = guard.stream_version.saturating_add(1);
+        }
 
         // Resolución de agente enfocado (sigue nuevos root agents sin dejar que subagentes roben foco).
         let latest_root = agents.iter().rfind(|a| a.is_root).map(|a| a.id);
@@ -867,6 +962,17 @@ fn strip_version(json: &str) -> &str {
     }
 }
 
+fn tail_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len().saturating_sub(max_bytes);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
 fn prop_text(graph: &dyn GraphView, id: ConceptId, attr: onyx_soul_agents::Attr) -> Option<String> {
     match graph.get(id, attr) {
         Some(Value::Text(s)) => Some(s),
@@ -897,9 +1003,17 @@ fn collect_agents(graph: &dyn GraphView, vocab: &Vocab) -> Vec<WebAgentSnapshot>
                 prop_text(graph, id, vocab.name).unwrap_or_else(|| format!("agent-{}", id.0));
             let state = prop_text(graph, id, vocab.state).unwrap_or_default();
             let goal = prop_text(graph, id, vocab.goal).unwrap_or_default();
+            let steps = match graph.get(id, vocab.steps) {
+                Some(Value::Int(n)) => n,
+                _ => 0,
+            };
+            let max_steps = match graph.get(id, vocab.max_steps) {
+                Some(Value::Int(n)) => n,
+                _ => 0,
+            };
             let is_root = graph.related(id, vocab.rel_parent).is_empty();
 
-            let mut mem_rows: Vec<(i64, String, String)> = graph
+            let mut mem_rows: Vec<(i64, i64, String, String)> = graph
                 .related(id, vocab.rel_memory)
                 .into_iter()
                 .filter_map(|m| {
@@ -907,20 +1021,33 @@ fn collect_agents(graph: &dyn GraphView, vocab: &Vocab) -> Vec<WebAgentSnapshot>
                         Some(Value::Int(n)) => n,
                         _ => return None,
                     };
+                    let tick = match graph.get(m, vocab.mem_tick) {
+                        Some(Value::Int(n)) => n,
+                        _ => 0,
+                    };
                     let kind = prop_text(graph, m, vocab.mem_kind).unwrap_or_default();
                     let text = prop_text(graph, m, vocab.mem_text).unwrap_or_default();
-                    Some((seq, kind, text))
+                    Some((seq, tick, kind, text))
                 })
                 .collect();
-            mem_rows.sort_by_key(|(seq, _, _)| *seq);
+            mem_rows.sort_by_key(|(seq, _, _, _)| *seq);
 
             let mut memory: Vec<WebMemoryEntry> = mem_rows
                 .into_iter()
-                .map(|(_, kind, text)| WebMemoryEntry { kind, text })
+                .map(|(seq, tick, kind, text)| WebMemoryEntry {
+                    seq,
+                    tick,
+                    kind,
+                    text,
+                })
                 .collect();
             if let Some(res) = prop_text(graph, id, vocab.result) {
                 if !res.is_empty() && memory.last().map(|m| m.text.as_str()) != Some(res.as_str()) {
+                    let next_seq = memory.last().map(|m| m.seq.saturating_add(1)).unwrap_or(1);
+                    let last_tick = memory.last().map(|m| m.tick).unwrap_or(0);
                     memory.push(WebMemoryEntry {
+                        seq: next_seq,
+                        tick: last_tick,
                         kind: "say".to_string(),
                         text: res,
                     });
@@ -933,6 +1060,8 @@ fn collect_agents(graph: &dyn GraphView, vocab: &Vocab) -> Vec<WebAgentSnapshot>
                 is_root,
                 state,
                 goal,
+                steps,
+                max_steps,
                 memory,
             }
         })
@@ -971,6 +1100,11 @@ fn accept_loop(listener: TcpListener, hub: Arc<WebHub>) {
 }
 
 fn handle_connection(mut stream: TcpStream, hub: Arc<WebHub>) -> io::Result<()> {
+    // En Windows (Winsock2) y BSD/macOS, los sockets aceptados heredan el modo no bloqueante
+    // de `TcpListener::set_nonblocking(true)`. Sin desactivarlo aquí, `read_line()` falla al
+    // instante con `WSAEWOULDBLOCK` antes de que lleguen los bytes HTTP del navegador.
+    stream.set_nonblocking(false)?;
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
@@ -980,6 +1114,7 @@ fn handle_connection(mut stream: TcpStream, hub: Arc<WebHub>) -> io::Result<()> 
     if let Some(sse_extra) = dispatch_http_request(&req, &hub, &mut stream)? {
         return handle_sse_stream(stream, hub, &sse_extra);
     }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
 
@@ -1086,6 +1221,10 @@ fn dispatch_http_request<W: Write>(
             }
             "/logo.jpg" => {
                 write_http_response(out, 200, "OK", "image/jpeg", ASSET_LOGO_JPG, &base_extra)?;
+                return Ok(None);
+            }
+            "/favicon.ico" => {
+                write_http_response(out, 204, "No Content", "image/x-icon", b"", &base_extra)?;
                 return Ok(None);
             }
             "/api/v1/health" => {
@@ -1411,30 +1550,47 @@ fn handle_sse_stream(
     stream.flush()?;
 
     let mut last_ver = 0u64;
+    let mut last_stream_ver = 0u64;
     let mut last_ping = Instant::now();
 
     while !hub.quit.load(Ordering::Relaxed) {
-        let payload = {
+        let (state_payload, stream_payload) = {
             let Ok(mut guard) = hub.state.lock() else {
                 break;
             };
-            if guard.version == last_ver {
+            if guard.version == last_ver && guard.stream_version == last_stream_ver {
                 let (next_guard, _) = hub
                     .state_cv
                     .wait_timeout(guard, Duration::from_millis(500))
                     .unwrap_or_else(|p| p.into_inner());
                 guard = next_guard;
             }
-            if guard.version != last_ver {
+            let st = if guard.version != last_ver {
                 last_ver = guard.version;
+                // `event: state` already includes `stream_preview`, so advance `last_stream_ver`
+                // in lockstep to avoid sending a redundant immediate `event: stream` frame.
+                last_stream_ver = guard.stream_version;
                 Some(guard.snapshot_json.clone())
             } else {
                 None
-            }
+            };
+            let sp = if st.is_none() && guard.stream_version != last_stream_ver {
+                last_stream_ver = guard.stream_version;
+                Some(guard.stream_json.clone())
+            } else {
+                None
+            };
+            (st, sp)
         };
 
-        if let Some(json) = payload {
+        if let Some(json) = state_payload {
             let frame = format!("event: state\ndata: {json}\n\n");
+            if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
+                break;
+            }
+            last_ping = Instant::now();
+        } else if let Some(json) = stream_payload {
+            let frame = format!("event: stream\ndata: {json}\n\n");
             if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
                 break;
             }
@@ -1535,7 +1691,9 @@ fn extract_bearer_token(req: &HttpRequest) -> Option<&str> {
 fn extract_session_cookie(req: &HttpRequest) -> Option<&str> {
     let raw = req.headers.get("cookie")?;
     for pair in raw.split(';') {
-        let (k, v) = pair.trim().split_once('=')?;
+        let Some((k, v)) = pair.trim().split_once('=') else {
+            continue;
+        };
         let name = k.trim();
         if name == "__Host-onyx_session" || name == "onyx_session" {
             let val = v.trim();
@@ -1725,6 +1883,11 @@ mod tests {
             root.contains("<progress id=\"agent-busy-progress\""),
             "{root}"
         );
+        assert!(root.contains("id=\"trace-mode-btn\""), "{root}");
+        assert!(
+            ASSET_STYLES_CSS.contains("flex-shrink: 0"),
+            "styles.css must prevent flexbox from collapsing trace cards to 0px"
+        );
         assert!(
             !ASSET_APP_JS.contains("innerHTML"),
             "app.js must never use innerHTML"
@@ -1911,8 +2074,22 @@ mod tests {
             "authenticated GET /api/v1/events must upgrade to SSE"
         );
 
-        // When loopback sockets are allowed by the host OS/sandbox, also verify live TCP + SSE.
+        // When loopback sockets are allowed by the host OS/sandbox, also verify delayed TCP GET
+        // (regression guard for Windows Winsock2 non-blocking accept inheritance) and live SSE.
         web_handle.render(host.graph());
+        if let Ok(mut delayed_stream) = TcpStream::connect(addr) {
+            delayed_stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            thread::sleep(Duration::from_millis(60));
+            delayed_stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+            let mut html_buf = [0u8; 512];
+            let n = delayed_stream.read(&mut html_buf).unwrap();
+            let html_head = String::from_utf8_lossy(&html_buf[..n]);
+            assert!(html_head.starts_with("HTTP/1.1 200 OK"), "{html_head}");
+        }
         if let Ok(mut sse_stream) = TcpStream::connect(addr) {
             sse_stream
                 .set_read_timeout(Some(Duration::from_secs(3)))

@@ -42,6 +42,7 @@
     agentBusyProgress: document.getElementById('agent-busy-progress'),
     agentBannerName: document.getElementById('agent-banner-name'),
     agentBannerGoal: document.getElementById('agent-banner-goal'),
+    traceModeBtn: document.getElementById('trace-mode-btn'),
     quickUndoBtn: document.getElementById('quick-undo-btn'),
     quickCompactBtn: document.getElementById('quick-compact-btn'),
     quickForkBtn: document.getElementById('quick-fork-btn'),
@@ -83,14 +84,38 @@
     trustDialogClose: document.getElementById('trust-dialog-close'),
     trustCancelBtn: document.getElementById('trust-cancel-btn'),
     trustApproveBtn: document.getElementById('trust-approve-btn'),
+    goalDialog: document.getElementById('goal-dialog'),
+    goalDialogClose: document.getElementById('goal-dialog-close'),
+    goalDialogText: document.getElementById('goal-dialog-text'),
   };
 
   let state = null;
+  let liveStream = null;
+  let focusedGoalFull = '';
   let eventSource = null;
   let acItems = [];
   let acSelected = 0;
   let acTriggerKind = null;
   let acQueryTimer = null;
+  let traceMode = 'compact'; // 'compact' (default: crisp tags, no thought wall) | 'full' (all expanded + live thoughts)
+  let lastHistoryKey = '';
+  const traceOpenOverrides = new Map(); // key `${agentId}:${seq}` -> boolean
+
+  const historyContainer = document.createElement('div');
+  historyContainer.className = 'messages-history';
+  const liveSlot = document.createElement('div');
+  liveSlot.className = 'live-activity-slot';
+  dom.messages.append(historyContainer, liveSlot);
+
+  // Reusable live activity nodes so the orbital logo never resets animation during stream ticks
+  const liveCard = {
+    root: null,
+    phaseLabel: null,
+    meta: null,
+    thoughtPre: null,
+    body: null,
+    lastStreamText: '',
+  };
 
   // Fallback for light-dismiss on browsers lacking native <dialog closedby="any">
   if (!('closedBy' in HTMLDialogElement.prototype)) {
@@ -107,7 +132,7 @@
     }
   }
 
-  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog]) {
+  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog]) {
     dlg.addEventListener('close', () => { dlg.returnValue = ''; });
   }
 
@@ -130,6 +155,27 @@
   dom.brandOrbitBtn.addEventListener('click', () => {
     const isPaused = document.documentElement.getAttribute('data-motion') === 'paused';
     applyMotionPaused(!isPaused);
+  });
+
+  // Trace visibility mode (Compact by default -> Full on click)
+  function applyTraceMode(mode, clearOverrides) {
+    traceMode = mode === 'full' ? 'full' : 'compact';
+    dom.traceModeBtn.textContent = traceMode === 'full' ? 'Trace: Full' : 'Trace: Compact';
+    dom.traceModeBtn.classList.toggle('is-active', traceMode === 'full');
+    if (clearOverrides) traceOpenOverrides.clear();
+    try { localStorage.setItem('onyx_trace_mode', traceMode); } catch (_) {}
+    if (state) {
+      lastHistoryKey = '';
+      renderState(state);
+    }
+  }
+
+  let savedTraceMode = 'compact';
+  try { savedTraceMode = localStorage.getItem('onyx_trace_mode') || 'compact'; } catch (_) {}
+  applyTraceMode(savedTraceMode, false);
+
+  dom.traceModeBtn.addEventListener('click', () => {
+    applyTraceMode(traceMode === 'compact' ? 'full' : 'compact', true);
   });
 
   // Theme management (Auto -> Dark -> Light)
@@ -217,7 +263,22 @@
       try {
         const next = JSON.parse(evt.data);
         state = next;
+        liveStream = next.stream_preview || null;
         renderState(next);
+      } catch (_) {}
+    });
+
+    es.addEventListener('stream', (evt) => {
+      try {
+        liveStream = JSON.parse(evt.data);
+        if (!state) return;
+        const agents = state.agents || [];
+        const focused = agents.find((a) => a.id === state.focused_agent_id) || agents[0] || null;
+        const wasNearBottom = (dom.messages.scrollHeight - dom.messages.scrollTop - dom.messages.clientHeight) < 88;
+        renderLiveActivity(focused, liveStream, state.tick || 0);
+        if (wasNearBottom) {
+          dom.messages.scrollTop = dom.messages.scrollHeight;
+        }
       } catch (_) {}
     });
 
@@ -236,6 +297,7 @@
     try {
       const initial = await apiJson('/api/v1/state', { method: 'GET' });
       state = initial;
+      liveStream = initial.stream_preview || null;
       renderState(initial);
       connectSse();
     } catch (_) {
@@ -346,6 +408,14 @@
     dom.trustDialog.close();
     sendCommand('/trust').catch(() => {});
   });
+
+  // Full Goal Inspection Dialog (strict 1-line banner, expands only on intentional click)
+  dom.agentBannerGoal.addEventListener('click', () => {
+    if (!focusedGoalFull) return;
+    dom.goalDialogText.textContent = focusedGoalFull;
+    dom.goalDialog.showModal();
+  });
+  dom.goalDialogClose.addEventListener('click', () => dom.goalDialog.close());
 
   // Textarea ergonomics + `/` & `@` autocomplete
   function autoResizeTextarea() {
@@ -604,13 +674,22 @@
       dom.agentEmblem.classList.toggle('onyx-spinning', busy);
       dom.agentBusyProgress.classList.toggle('hidden', !busy);
       dom.agentBannerName.textContent = `#${focused.id} ${focused.name} [${focused.state}]`;
-      dom.agentBannerGoal.textContent = focused.goal || '';
+      focusedGoalFull = (focused.goal || '').trim();
+      const singleLineGoal = focusedGoalFull.replace(/\s+/g, ' ');
+      dom.agentBannerGoal.textContent = singleLineGoal || 'Active session';
+      dom.agentBannerGoal.disabled = !focusedGoalFull;
+      dom.agentBannerGoal.title = focusedGoalFull
+        ? 'Click to view full goal'
+        : '';
     } else {
       dom.agentEmblemWrap.classList.remove('is-busy', 'is-approval');
       dom.agentEmblem.classList.remove('onyx-spinning');
       dom.agentBusyProgress.classList.add('hidden');
       dom.agentBannerName.textContent = 'Ready';
+      focusedGoalFull = '';
       dom.agentBannerGoal.textContent = 'Type a goal or slash command below.';
+      dom.agentBannerGoal.disabled = true;
+      dom.agentBannerGoal.title = '';
     }
 
     // Queue bar
@@ -688,70 +767,295 @@
       dom.servicesBody.replaceChildren(p);
     }
 
-    // Conversation stream
-    const wasNearBottom = (dom.messages.scrollHeight - dom.messages.scrollTop - dom.messages.clientHeight) < 80;
-    renderMessages(focused, s.stream_preview);
+    // Conversation & transparent trace stream
+    const wasNearBottom = (dom.messages.scrollHeight - dom.messages.scrollTop - dom.messages.clientHeight) < 88;
+    renderMessages(focused, liveStream || s.stream_preview, s.tick || 0);
     if (wasNearBottom) {
       dom.messages.scrollTop = dom.messages.scrollHeight;
     }
   }
 
-  function renderMessages(focused, streamPreview) {
-    dom.messages.replaceChildren();
-    if (!focused || (!focused.memory.length && !focused.goal)) {
-      const card = document.createElement('div');
-      card.className = 'welcome-card';
-      const logo = document.createElement('img');
-      logo.className = 'welcome-logo';
-      logo.src = '/logo.jpg';
-      logo.alt = 'openOnyx';
-      logo.width = 68;
-      logo.height = 68;
-      const h2 = document.createElement('h2');
-      h2.textContent = 'openOnyx Ready';
-      const p = document.createElement('p');
-      p.textContent = 'Deterministic coding agent with Scent impact analysis, Sprout orchestration, and Session Vault snapshots.';
-      const prompts = document.createElement('div');
-      prompts.className = 'welcome-prompts';
-      for (const sample of ['Summarize this repository architecture', '/services', '/mode plan']) {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.className = 'chip-btn';
-        b.textContent = sample;
-        b.addEventListener('click', () => sendCommand(sample).catch(() => {}));
-        prompts.append(b);
+  function summarizeToolCall(rawText) {
+    const trimmed = String(rawText || '').trim();
+    let toolName = '';
+    let argsRaw = '';
+    let parsedObj = null;
+
+    if (trimmed.startsWith('{')) {
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && typeof obj === 'object') {
+          toolName = obj.tool || obj.name || '';
+          parsedObj = obj.args && typeof obj.args === 'object' ? obj.args : obj;
+        }
+      } catch (_) {}
+    }
+
+    if (!toolName) {
+      const m = /^([a-zA-Z0-9_.:-]+)(?:\s+([\s\S]*))?$/.exec(trimmed);
+      if (m) {
+        toolName = m[1];
+        argsRaw = (m[2] || '').trim();
+        if (argsRaw.startsWith('{')) {
+          try { parsedObj = JSON.parse(argsRaw); } catch (_) {}
+        }
       }
-      card.append(logo, h2, p, prompts);
-      dom.messages.append(card);
+    }
+
+    let summary = '';
+    if (parsedObj && typeof parsedObj === 'object') {
+      const p = parsedObj.path || parsedObj.file || parsedObj.rel_path || '';
+      if (p) {
+        if (parsedObj.start_line || parsedObj.end_line) {
+          summary = `${p} (L${parsedObj.start_line || 1}–L${parsedObj.end_line || '…'})`;
+        } else if (Array.isArray(parsedObj.edits)) {
+          summary = `${p} (${parsedObj.edits.length} edits)`;
+        } else {
+          summary = String(p);
+        }
+      } else if (parsedObj.command) {
+        summary = String(parsedObj.command);
+      } else if (parsedObj.symbol) {
+        summary = String(parsedObj.symbol);
+      } else if (parsedObj.pattern || parsedObj.query) {
+        summary = String(parsedObj.pattern || parsedObj.query);
+      } else if (parsedObj.name) {
+        summary = String(parsedObj.name);
+      } else if (parsedObj.goal) {
+        summary = String(parsedObj.goal);
+      } else if (parsedObj.service || parsedObj.id) {
+        summary = String(parsedObj.service || parsedObj.id);
+      } else if (Array.isArray(parsedObj.steps)) {
+        summary = `${parsedObj.steps.length} plan steps`;
+      } else {
+        const keys = Object.keys(parsedObj).filter((k) => k !== 'tool' && k !== 'name');
+        summary = keys.map((k) => `${k}=${JSON.stringify(parsedObj[k])}`).join(' ');
+      }
+    } else {
+      summary = argsRaw.split('\n')[0] || trimmed.split('\n')[0];
+    }
+
+    const formattedPayload = parsedObj
+      ? JSON.stringify(parsedObj, null, 2)
+      : trimmed;
+
+    return {
+      toolName,
+      summary: summary.slice(0, 140),
+      payload: formattedPayload,
+    };
+  }
+
+  function summarizeObservation(rawText) {
+    const text = String(rawText || '');
+    const lines = text.split('\n').filter((l) => l.trim().length > 0);
+    const first = (lines[0] || '(empty output)').trim();
+    const suffix = lines.length > 1 ? ` · ${lines.length} lines` : '';
+    return {
+      summary: `${first.slice(0, 115)}${suffix}`,
+      payload: text,
+    };
+  }
+
+  function renderMessages(focused, streamPreview, currentTick) {
+    const memory = (focused && Array.isArray(focused.memory)) ? focused.memory : [];
+    const lastEntry = memory.length > 0 ? memory[memory.length - 1] : null;
+    const historyKey = focused
+      ? `${focused.id}|${focused.goal}|${memory.length}|${lastEntry ? lastEntry.seq : 0}|${lastEntry ? (lastEntry.text || '').length : 0}|${traceMode}`
+      : 'empty';
+
+    if (historyKey !== lastHistoryKey) {
+      lastHistoryKey = historyKey;
+      historyContainer.replaceChildren();
+
+      if (!focused || (!memory.length && !focused.goal)) {
+        const card = document.createElement('div');
+        card.className = 'welcome-card';
+        const logo = document.createElement('img');
+        logo.className = 'welcome-logo';
+        logo.src = '/logo.jpg';
+        logo.alt = 'openOnyx';
+        logo.width = 68;
+        logo.height = 68;
+        const h2 = document.createElement('h2');
+        h2.textContent = 'openOnyx Ready';
+        const p = document.createElement('p');
+        p.textContent = 'Deterministic coding agent with transparent execution trace, Scent impact analysis, Sprout orchestration, and Session Vault snapshots.';
+        const prompts = document.createElement('div');
+        prompts.className = 'welcome-prompts';
+        for (const sample of ['Summarize this repository architecture', '/services', '/mode plan']) {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'chip-btn';
+          b.textContent = sample;
+          b.addEventListener('click', () => sendCommand(sample).catch(() => {}));
+          prompts.append(b);
+        }
+        card.append(logo, h2, p, prompts);
+        historyContainer.append(card);
+      } else {
+        if (focused.goal) {
+          historyContainer.append(buildMessageCard('user', 'You', focused.goal, false));
+        }
+
+        for (let i = 0; i < memory.length; i++) {
+          const entry = memory[i];
+          const kind = entry.kind || 'trace';
+          const text = entry.text || '';
+          const seq = entry.seq != null ? entry.seq : i;
+          const tick = entry.tick != null ? entry.tick : 0;
+
+          if (kind === 'user') {
+            historyContainer.append(buildMessageCard('user', 'You', text, false));
+          } else if (kind === 'say' || kind === 'result') {
+            historyContainer.append(buildMessageCard('assistant', 'openOnyx', text, false));
+          } else if (kind === 'system') {
+            historyContainer.append(buildSystemCard(text, tick));
+          } else {
+            historyContainer.append(buildToolCard(focused.id, seq, kind, text, tick));
+          }
+        }
+      }
+    }
+
+    renderLiveActivity(focused, streamPreview, currentTick);
+  }
+
+  function ensureLiveCard() {
+    if (liveCard.root) return liveCard;
+
+    const card = document.createElement('article');
+    card.className = 'trace-live-card';
+
+    const head = document.createElement('div');
+    head.className = 'trace-live-head';
+
+    const orb = document.createElement('img');
+    orb.className = 'msg-stream-orb onyx-spinning';
+    orb.src = '/logo.jpg';
+    orb.alt = '';
+    orb.setAttribute('aria-hidden', 'true');
+    orb.width = 16;
+    orb.height = 16;
+
+    const phaseLabel = document.createElement('span');
+    const meta = document.createElement('span');
+    meta.className = 'trace-live-meta';
+
+    head.append(orb, phaseLabel, meta);
+
+    const thoughtPre = document.createElement('pre');
+    thoughtPre.className = 'live-thought hidden';
+
+    const body = document.createElement('div');
+    body.className = 'msg-body hidden';
+
+    card.append(head, thoughtPre, body);
+
+    liveCard.root = card;
+    liveCard.phaseLabel = phaseLabel;
+    liveCard.meta = meta;
+    liveCard.thoughtPre = thoughtPre;
+    liveCard.body = body;
+    liveCard.lastStreamText = '';
+    return liveCard;
+  }
+
+  function renderLiveActivity(focused, streamPreview, currentTick) {
+    if (!focused) {
+      if (liveSlot.childNodes.length) liveSlot.replaceChildren();
+      liveCard.lastStreamText = '';
       return;
     }
 
-    if (focused.goal) {
-      dom.messages.append(buildMessageCard('user', 'You', focused.goal, false));
+    const isBusy = ['thinking', 'acting', 'waiting_children'].includes(focused.state);
+    const hasStream = Boolean(
+      streamPreview &&
+      streamPreview.agent_id === focused.id &&
+      (streamPreview.text || streamPreview.thought || streamPreview.thought_chars > 0)
+    );
+
+    if (!isBusy && !hasStream) {
+      if (liveSlot.childNodes.length) liveSlot.replaceChildren();
+      liveCard.lastStreamText = '';
+      return;
     }
 
-    for (const entry of focused.memory) {
-      const kind = entry.kind;
-      const text = entry.text || '';
-      if (kind === 'user') {
-        dom.messages.append(buildMessageCard('user', 'You', text, false));
-      } else if (kind === 'say') {
-        dom.messages.append(buildMessageCard('assistant', 'openOnyx', text, false));
-      } else if (kind === 'system') {
-        const div = document.createElement('div');
-        div.className = 'msg msg-system';
-        div.textContent = text;
-        dom.messages.append(div);
-      } else {
-        dom.messages.append(buildToolCard(kind, text));
+    const lc = ensureLiveCard();
+    if (lc.root.parentNode !== liveSlot) {
+      liveSlot.replaceChildren(lc.root);
+    }
+
+    const thoughtChars = hasStream
+      ? Number(streamPreview.thought_chars || (streamPreview.thought ? streamPreview.thought.length : 0))
+      : 0;
+    const streamText = hasStream && streamPreview.text ? String(streamPreview.text) : '';
+    const streamThought = hasStream && streamPreview.thought ? String(streamPreview.thought) : '';
+
+    if (focused.state === 'acting') {
+      lc.phaseLabel.textContent = 'Executing tool…';
+    } else if (focused.state === 'waiting_children') {
+      lc.phaseLabel.textContent = 'Waiting for subagent(s)…';
+    } else if (streamText) {
+      lc.phaseLabel.textContent = 'openOnyx · streaming…';
+    } else if (thoughtChars > 0) {
+      lc.phaseLabel.textContent = traceMode === 'full'
+        ? `openOnyx · thinking (${formatTokens(thoughtChars)} chars)…`
+        : `Thinking (${formatTokens(thoughtChars)} chars) · switch to Full to inspect`;
+    } else {
+      lc.phaseLabel.textContent = 'Thinking…';
+    }
+
+    const stepText = focused.max_steps > 0
+      ? `step ${focused.steps || 0}/${focused.max_steps} · `
+      : '';
+    lc.meta.textContent = `${stepText}t${currentTick}`;
+
+    // Option A: raw thought text is rendered ONLY on-demand in `Trace: Full` mode
+    if (traceMode === 'full' && streamThought) {
+      if (lc.thoughtPre.textContent !== streamThought) {
+        lc.thoughtPre.textContent = streamThought;
+        lc.thoughtPre.scrollTop = lc.thoughtPre.scrollHeight;
       }
+      lc.thoughtPre.classList.remove('hidden');
+    } else {
+      lc.thoughtPre.classList.add('hidden');
     }
 
-    if (streamPreview && streamPreview.agent_id === focused.id && streamPreview.text) {
-      const card = buildMessageCard('assistant', 'openOnyx · streaming…', streamPreview.text, true);
-      card.classList.add('msg-streaming');
-      dom.messages.append(card);
+    // Live streamed answer text (or `[calling tool...]` hint) is always lightweight and helpful
+    if (streamText) {
+      if (lc.lastStreamText !== streamText) {
+        lc.lastStreamText = streamText;
+        lc.body.replaceChildren();
+        appendFormattedProse(lc.body, streamText);
+      }
+      lc.body.classList.remove('hidden');
+    } else {
+      lc.lastStreamText = '';
+      lc.body.classList.add('hidden');
     }
+  }
+
+  function buildSystemCard(text, tick) {
+    const div = document.createElement('div');
+    div.className = 'msg msg-system';
+
+    const tag = document.createElement('span');
+    tag.className = 'tool-tag tool-tag-system';
+    tag.textContent = 'system';
+
+    const body = document.createElement('span');
+    body.className = 'msg-system-text';
+    body.textContent = text;
+
+    div.append(tag, body);
+    if (tick > 0) {
+      const tickSpan = document.createElement('span');
+      tickSpan.className = 'tool-tick';
+      tickSpan.textContent = `t${tick}`;
+      div.append(tickSpan);
+    }
+    return div;
   }
 
   function buildMessageCard(role, label, text, spinningOrb) {
@@ -779,24 +1083,78 @@
     return el;
   }
 
-  function buildToolCard(kind, text) {
+  function buildToolCard(agentId, seq, kind, text, tick) {
+    const isError = kind === 'tool_error' || kind === 'error' || kind === 'denied';
+    const isObserve = kind === 'observe';
+    const isCall = kind === 'call';
+
     const details = document.createElement('details');
     details.className = 'tool-card';
-    if (kind === 'observe') details.classList.add('is-observe');
-    if (kind === 'error' || kind === 'denied') details.classList.add('is-error');
+    if (isObserve) details.classList.add('is-observe');
+    if (isError) details.classList.add('is-error');
+
+    const cardKey = `${agentId}:${seq}`;
+    const defaultOpen = traceMode === 'full' || isError;
+    const isOpen = traceOpenOverrides.has(cardKey)
+      ? traceOpenOverrides.get(cardKey)
+      : defaultOpen;
+    details.open = Boolean(isOpen);
+
+    details.addEventListener('toggle', () => {
+      traceOpenOverrides.set(cardKey, details.open);
+    });
 
     const summary = document.createElement('summary');
+
+    const chevron = document.createElement('span');
+    chevron.className = 'tool-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.textContent = '▸';
+
     const tag = document.createElement('span');
     tag.className = 'tool-tag';
-    tag.textContent = kind;
-    const preview = document.createElement('span');
-    preview.className = 'tool-preview';
-    preview.textContent = text.split('\n')[0].slice(0, 140);
-    summary.append(tag, preview);
+    tag.textContent = kind === 'tool_error' ? 'error' : kind;
+
+    summary.append(chevron, tag);
+
+    let payloadText = text;
+    if (isCall) {
+      const parsed = summarizeToolCall(text);
+      if (parsed.toolName) {
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'tool-name';
+        nameSpan.textContent = parsed.toolName;
+        summary.append(nameSpan);
+      }
+      const preview = document.createElement('span');
+      preview.className = 'tool-preview';
+      preview.textContent = parsed.summary;
+      summary.append(preview);
+      payloadText = parsed.payload;
+    } else if (isObserve) {
+      const obs = summarizeObservation(text);
+      const preview = document.createElement('span');
+      preview.className = 'tool-preview';
+      preview.textContent = obs.summary;
+      summary.append(preview);
+      payloadText = obs.payload;
+    } else {
+      const preview = document.createElement('span');
+      preview.className = 'tool-preview';
+      preview.textContent = String(text || '').split('\n')[0].slice(0, 140);
+      summary.append(preview);
+    }
+
+    if (tick > 0) {
+      const tickSpan = document.createElement('span');
+      tickSpan.className = 'tool-tick';
+      tickSpan.textContent = `t${tick}`;
+      summary.append(tickSpan);
+    }
 
     const payload = document.createElement('pre');
     payload.className = 'tool-payload';
-    payload.textContent = text;
+    payload.textContent = payloadText;
 
     details.append(summary, payload);
     return details;
