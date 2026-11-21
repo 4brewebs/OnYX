@@ -2,7 +2,7 @@
 
 > 🇬🇧 **[Read the full User Manual in English](index-en.md)**
 
-Bienvenido al manual oficial de **`openonyx`**, el harness de agente de programación determinista (CLI y TUI) construido sobre el microkernel **OnYX** (`onyx-core` → `onyx-soul-agents` → `onyx-workspace` → `open-onyx`).
+Bienvenido al manual oficial de **`openonyx`**, el harness de agente de programación determinista (**CLI, TUI y Web PWA embebida**) construido sobre el microkernel **OnYX** (`onyx-core` → `onyx-soul-agents` → `onyx-workspace` → `open-onyx`).
 
 A diferencia de otros asistentes de terminal que mezclan estado en memoria volátil, `openonyx` registra cada decisión, lectura, edición y comando en un **grafo EAV determinista** con:
 
@@ -10,7 +10,8 @@ A diferencia de otros asistentes de terminal que mezclan estado en memoria volá
 - **Time-travel y bifurcación segura** (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`).
 - **Checkpoints Git reversibles (`/undo`)** sin tocar `HEAD` ni tu área de *staging*.
 - **Grabación y reproducción 100% offline** (`ONYXTR2`, 0 llamadas de red, 0 escrituras en disco).
-- **Seguridad por capas**: modos `PLAN` / `BUILD` / `EXPLORE`, reglas `.onyx/config.toml` (`deny > ask > allow`), sandbox OS con `env_clear()`, protección RO del Control Plane y `ProcessJob` RAII.
+- **Seguridad por capas**: **Workspace Trust con `blake3`** (`openonyx trust` / `/trust`), modos `PLAN` / `BUILD` / `EXPLORE`, reglas `.onyx/config.toml` (`deny > ask > allow`), *Scent-Heated Approvals*, sandbox OS con `env_clear()`, protección RO del Control Plane y `ProcessJob` RAII.
+- **Interfaz Web / PWA embebida (`openonyx serve`)**: servidor HTTP/1.1 + SSE puro en `std::net` (0 `tokio`), pensado para navegador local, móvil Android/iOS o despliegue detrás de proxy HTTPS, con autenticación constante por `blake3` (Cookie `HttpOnly` / `Bearer`) y `--cors-origin` para clientes externos.
 - **Navegación semántica AST** (`onyx-scent`: `scent_outline` + `scent_impact`) y **orquestación local de servicios/contenedores** (`sprout.toml`).
 
 ---

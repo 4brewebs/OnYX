@@ -69,6 +69,8 @@ cmd = "docker compose up -d postgres"
 stop_cmd = "docker compose stop postgres"
 logs_cmd = "docker compose logs --tail=100 postgres"
 container = "myapp-postgres"
+# Optional: run `service_exec` as a specific user (e.g. "1000:1000" or "app")
+# exec_user = "1000:1000"
 ready_port = 5432
 
 [services.api]
@@ -90,7 +92,7 @@ The legacy Sprout format (`[global]` + `[[service]]` with `env_wrapper`, `dir`, 
 - `/service logs <id> [tail]`: prints recent lines from the service log buffer.
 - On terminals `>= 100` columns wide, statuses appear live in the right-hand **`Services (Sprout)`** panel, and `openonyx doctor` audits `sprout.toml` syntax, DAG cycles, container runtime availability, and occupied ports.
 
-> **Sandbox network note:** if the agent needs `shell_exec` to hit a local Sprout endpoint (e.g. `http://127.0.0.1:8080/health`), launch with `--sandbox-net localhost` (or set `network = "localhost"` in `.onyx/config.toml`).
+> **Sandbox network, trust & container note:** if the agent needs `shell_exec` to hit a local Sprout endpoint (e.g. `http://127.0.0.1:8080/health`), launch with `--sandbox-net localhost` (or set `network = "localhost"` in `.onyx/config.toml`). In addition, when a workspace is not yet trusted (`openonyx trust add` or `/trust`), Sprout displays `[UNTRUSTED — run /trust]` and blocks `start`, `stop`, and `exec` until the current `sprout.toml` hash is approved (any 1-byte edit revokes trust automatically). `container_cli` strictly accepts `docker`, `nerdctl`, or `podman`, and optional `exec_user` runs `service_exec` as the specified user.
 
 ---
 
