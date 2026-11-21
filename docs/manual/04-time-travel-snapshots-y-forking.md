@@ -1,10 +1,42 @@
 # 04. Time-Travel, Snapshots y Forking
 
+> 🇬🇧 **[Read this chapter in English](04-time-travel-snapshots-and-forking.md)**
+
 Una de las capacidades diferenciales de `openonyx` es que el estado completo del agente vive en un grafo EAV determinista que puede guardarse, inspeccionarse, reproducirse sin red, revertirse en disco y **bifurcarse sin destruir la rama original**.
 
 ---
 
-## 1. Cómo funcionan `snapshots.onyxpack` y los hitos
+## 1. Bóveda de Sesiones (`.onyx/vault/`) y `--auto-save`
+
+Para evitar ensuciar la raíz del repositorio con directorios `.snaps_*`, forks y archivos `.tr`, `openonyx` centraliza las sesiones en **`<workspace>/.onyx/vault/`**:
+
+```text
+<workspace>/.onyx/vault/
+├── .gitignore                                  # creado automáticamente con `*`
+├── 20261121-103500_qwen3-coder_main/           # generado por --auto-save
+│   ├── snapshots.onyxpack
+│   └── 20261121-103500_qwen3-coder_main.tr
+├── 20261121-103500_qwen3-coder_main.fork-t12/  # rama creada por /fork o /rewind
+├── feat-auth/                                  # --snapshot-dir feat-auth --record chat.tr
+│   ├── snapshots.onyxpack
+│   └── chat.tr
+└── unassigned/                                 # solo --record suelta.tr (sin snapshot-dir)
+    └── suelta.tr
+```
+
+### Reglas de resolución
+- **`--auto-save`** *(o `ONYX_AUTO_SAVE=1`)*: crea automáticamente `<workspace>/.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama|goal>]/` con `snapshots.onyxpack` y `<id>.tr` juntos, muestra `vault:<id>` en la cabecera de la TUI y al salir imprime el comando exacto `openonyx chat --resume <id>`.
+- **Nombres cortos sin separador de ruta (`/` o `\`):**
+  - `--snapshot-dir feat-auth` → `.onyx/vault/feat-auth/`
+  - `--snapshot-dir feat-auth --record chat.tr` → el `.tr` se guarda **dentro** de `.onyx/vault/feat-auth/chat.tr`.
+  - `--record solo.tr` (sin `--snapshot-dir`) → se guarda en `.onyx/vault/unassigned/solo.tr`.
+- **Rutas explícitas intactas:** cualquier ruta absoluta o con separador (`./mi-dir`, `C:\tmp\snaps`, `../otro`) se respeta tal cual.
+- **Búsqueda transparente al leer:** `--resume`, `inspect`, `rewind`, `replay` y `doctor` buscan primero la ruta literal en disco y, si es un nombre corto, la localizan automáticamente dentro de `.onyx/vault/` (y `.onyx/vault/unassigned/` para `.tr`).
+- **Aislamiento total de Git y herramientas:** `openonyx` crea `.onyx/vault/.gitignore` (`*`) automáticamente para que `git status` y los checkpoints `/undo` nunca absorban el vault, mientras `WorkspacePolicy` oculta `.onyx/vault/` de `fs_list`/`glob_files`/`code_search` y lo protege como Control Plane de solo lectura.
+
+---
+
+## 2. Cómo funcionan `snapshots.onyxpack` y los hitos
 
 Al pasar `--snapshot-dir <dir>` en `chat`, `run` o `replay`, `MilestoneSnapshotSystem` captura snapshots solo en **transiciones relevantes** en lugar de desperdiciar disco en ticks inactivos:
 
@@ -24,7 +56,7 @@ Todos los hitos se almacenan en un único contenedor append-only comprimido **`<
 
 ---
 
-## 2. Inspeccionar una sesión (`openonyx inspect`)
+## 3. Inspeccionar una sesión (`openonyx inspect`)
 
 Sin API key y sin tocar el workspace, puedes auditar cualquier directorio de snapshots:
 
@@ -43,7 +75,7 @@ openonyx inspect .snaps_feat --tick 24 --json
 
 ---
 
-## 3. Deshacer cambios paso a paso (`/undo`)
+## 4. Deshacer cambios paso a paso (`/undo`)
 
 Cada vez que `fs_write` o `fs_edit` va a modificar el disco en modo `BUILD`, `WorkspaceToolBridge` captura automáticamente un **checkpoint de árbol Git ligero** usando un `GIT_INDEX_FILE` temporal (`git add -A` + `git write-tree`):
 
@@ -59,7 +91,7 @@ Cuando escribes **`/undo`** dentro de `openonyx chat`:
 
 ---
 
-## 4. Bifurcar y viajar en el tiempo en vivo (dentro de la TUI)
+## 5. Bifurcar y viajar en el tiempo en vivo (dentro de la TUI)
 
 Si iniciaste `chat` con `--snapshot-dir <dir>` (o `--resume <dir>`), puedes explorar alternativas **sin cerrar la TUI y sin sobrescribir el historial original**:
 
@@ -86,7 +118,7 @@ Si iniciaste `chat` con `--snapshot-dir <dir>` (o `--resume <dir>`), puedes expl
 
 ---
 
-## 5. Time-Travel y Forking desde la CLI
+## 6. Time-Travel y Forking desde la CLI
 
 También puedes retomar, bifurcar o auditar desde la línea de comandos:
 
@@ -126,7 +158,7 @@ openonyx rewind .snaps_feat 12 --transcript feat.tr
 
 ---
 
-## 6. Transcripciones y Replay 100% Offline (`ONYXTR2`)
+## 7. Transcripciones y Replay 100% Offline (`ONYXTR2`)
 
 Grabando una sesión con `--record <archivo.tr>` (alias `--save-transcript <archivo.tr>`), `RecordingBridge` registra todas las decisiones del LLM, llamadas estructuradas (`call_id`), comandos slash (`Tab`, `/mode`, `/undo`, `/compact`, etc.) y metadatos de checkpoints (`[checkpoint:<head>:<tree>]`).
 
@@ -145,7 +177,7 @@ Esto resulta invaluable para:
 
 ---
 
-## 7. Auditoría de Salud (`openonyx doctor`)
+## 8. Auditoría de Salud (`openonyx doctor`)
 
 Tras un corte de energía, un error de red o antes de un rewind delicado, ejecuta:
 

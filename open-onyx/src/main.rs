@@ -6,13 +6,14 @@ mod ops;
 mod pack;
 mod session;
 mod tui;
+mod vault;
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use command::{CommandSpawnerSystem, PendingSessionAction, PendingSystemNotes};
 use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
@@ -39,6 +40,10 @@ use session::{
     run_session,
 };
 use tui::TuiDriver;
+use vault::{
+    auto_save_from_env, ensure_vault_gitignore, resolve_fork_dir, resolve_read_snapshot_dir,
+    resolve_read_transcript, resolve_write_storage, session_display_label,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LlmProvider {
@@ -83,6 +88,7 @@ struct CliArgs {
     shell_timeout_secs: Option<u64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
+    auto_save: bool,
     resume_dir: Option<PathBuf>,
     resume_tick: Option<u64>,
     fork_dir: Option<PathBuf>,
@@ -110,6 +116,7 @@ impl CliArgs {
             shell_timeout_secs: None,
             save_transcript: None,
             snapshot_dir: None,
+            auto_save: false,
             resume_dir: None,
             resume_tick: None,
             fork_dir: None,
@@ -171,6 +178,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut shell_timeout_secs: Option<u64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
+    let mut auto_save = false;
     let mut resume_dir = None;
     let mut fork_dir = None;
     let mut truncate_future = false;
@@ -272,6 +280,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 let p = args.next().ok_or("--snapshot-dir requires a path")?;
                 snapshot_dir = Some(PathBuf::from(p));
             }
+            "--auto-save" => auto_save = true,
             "--snapshot-every" => {
                 let s = args
                     .next()
@@ -401,6 +410,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         shell_timeout_secs,
         save_transcript,
         snapshot_dir,
+        auto_save,
         resume_dir,
         resume_tick,
         fork_dir,
@@ -412,7 +422,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -438,9 +448,10 @@ OPTIONS:
       --sandbox-net <pol>  Network policy inside sandbox: `offline` (default), `localhost`, or `unrestricted`
       --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
       --shell-timeout <s>  Timeout in seconds per `shell_exec` command
+      --auto-save          Auto-save snapshots + ONYXTR2 transcript together in `.onyx/vault/<timestamp>_<model>[_<branch|goal>]/` (or `ONYX_AUTO_SAVE=1`)
       --save-transcript <f>, --record <f>
-                           Record deterministic `ONYXTR2` transcript to `<file>`
-      --snapshot-dir <dir> Save compressed milestone snapshots to `<dir>/snapshots.onyxpack`
+                           Record deterministic `ONYXTR2` transcript (short names go inside `--snapshot-dir`, or `.onyx/vault/unassigned/` if no snapshot dir)
+      --snapshot-dir <dir> Save compressed milestone snapshots to `<dir>/snapshots.onyxpack` (short names resolve inside `.onyx/vault/<dir>/`)
       --snapshot-every <n> Also capture periodic snapshots every <n> ticks
       --max-snapshots <n>  Opt-in sliding window retention (keeps `init` + latest `n - 1` milestones)
   -r, --resume <dir>       Resume `chat` from the latest snapshot (or `--tick <n>`) stored in `<dir>`
@@ -482,12 +493,14 @@ PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
                            Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
   Live Plan & Services     Right-hand panels (`plan_update` + `sprout.toml`) shown automatically when width >= 100 columns
   User Manual              Full guide available in `docs/manual/index.md`
+  Session Vault            `.onyx/vault/<session>/` stores snapshots + `.tr` together (`.onyx/vault/unassigned/` for standalone `.tr`; auto-ignored by Git)
 
 ENVIRONMENT VARIABLES:
   GEMINI_API_KEY, OPENAI_API_KEY, ONYX_API_KEY
   ONYX_PROVIDER            Default provider (`gemini` | `openai`)
   ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
   ONYX_EFFORT              Default reasoning/thinking effort (`low` | `medium` | `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`)
+  ONYX_AUTO_SAVE           Enable `--auto-save` by default (`1` | `true` | `yes` | `on`)
   GEMINI_API_BASE          Custom Gemini API endpoint
   OPENAI_API_BASE / OPENAI_BASE_URL
                            Custom OpenAI-compatible API endpoint"#
@@ -712,6 +725,34 @@ fn prepare_chat_resume(
     })
 }
 
+fn print_vault_summary(
+    workspace: &Path,
+    opts: &SessionOptions,
+    shared_store: Option<&SharedPackStore>,
+) {
+    let active_snap = shared_store
+        .map(SharedPackStore::current_dir)
+        .or_else(|| opts.snapshot_dir.clone());
+    if active_snap.is_none() && opts.save_transcript.is_none() {
+        return;
+    }
+    let mut parts = Vec::new();
+    if let Some(ref dir) = active_snap {
+        parts.push(format!("snapshots={}", dir.display()));
+    }
+    if let Some(ref tr) = opts.save_transcript {
+        parts.push(format!("transcript={}", tr.display()));
+    }
+    println!("[openOnyx vault] {}", parts.join(" · "));
+    if let Some(ref dir) = active_snap {
+        if let Some(label) = session_display_label(workspace, dir) {
+            if dir.starts_with(vault::vault_root(workspace)) {
+                println!("[openOnyx vault] resume with: openonyx chat --resume {label}");
+            }
+        }
+    }
+}
+
 fn launch_interactive_chat(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -720,6 +761,7 @@ fn launch_interactive_chat(
     base_opts: &SessionOptions,
     resume_override: Option<(&Path, Option<u64>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let llm = resolve_llm_config(cli, &cli.workspace)?;
     let checkpoints = PendingCheckpoints::default();
     let chat_config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(128),
@@ -727,17 +769,43 @@ fn launch_interactive_chat(
         ..base_config.clone()
     };
 
+    let resolved_fork_dir = cli
+        .fork_dir
+        .as_deref()
+        .map(|fd| resolve_fork_dir(&cli.workspace, fd));
+    let explicit_snap_raw =
+        if resume_override.is_some() && cli.resume_dir.as_deref() == cli.snapshot_dir.as_deref() {
+            None
+        } else {
+            cli.snapshot_dir.as_deref()
+        };
+    let explicit_snap_resolved = explicit_snap_raw.map(|d| {
+        if vault::is_explicit_path(d) {
+            d.to_path_buf()
+        } else {
+            vault::vault_root(&cli.workspace).join(d)
+        }
+    });
+
     let mut effective_opts = base_opts.clone();
     let resume_plan = match resume_override {
-        Some((dir, tick)) => {
+        Some((raw_dir, tick)) => {
+            let resolved_dir = resolve_read_snapshot_dir(&cli.workspace, raw_dir);
+            if resolved_fork_dir
+                .as_deref()
+                .is_some_and(|p| p.starts_with(vault::vault_root(&cli.workspace)))
+                || resolved_dir.starts_with(vault::vault_root(&cli.workspace))
+            {
+                ensure_vault_gitignore(&cli.workspace)?;
+            }
             let plan = prepare_chat_resume(
-                dir,
+                &resolved_dir,
                 tick,
-                cli.fork_dir.as_deref(),
+                resolved_fork_dir.as_deref(),
                 cli.truncate_future,
                 &cli.workspace,
                 &chat_config,
-                base_opts.snapshot_dir.as_deref(),
+                explicit_snap_resolved.as_deref(),
             )?;
             effective_opts.snapshot_dir = Some(plan.active_snapshot_dir.clone());
             effective_opts.save_step_snapshots = true;
@@ -745,6 +813,30 @@ fn launch_interactive_chat(
         }
         None => None,
     };
+
+    let auto_save = cli.auto_save || auto_save_from_env();
+    let resolved_storage = resolve_write_storage(
+        &cli.workspace,
+        if resume_plan.is_some() {
+            None
+        } else {
+            cli.snapshot_dir.as_deref()
+        },
+        cli.save_transcript.as_deref(),
+        resume_plan
+            .as_ref()
+            .map(|p| p.active_snapshot_dir.as_path()),
+        auto_save,
+        Some(&llm.model),
+        None,
+        SystemTime::now(),
+    );
+    if resolved_storage.uses_vault {
+        ensure_vault_gitignore(&cli.workspace)?;
+    }
+    effective_opts.snapshot_dir = resolved_storage.snapshot_dir.clone();
+    effective_opts.save_transcript = resolved_storage.save_transcript.clone();
+    effective_opts.save_step_snapshots = effective_opts.snapshot_dir.is_some();
 
     let shared_store = effective_opts
         .snapshot_dir
@@ -789,7 +881,6 @@ fn launch_interactive_chat(
         }
     }
 
-    let llm = resolve_llm_config(cli, &cli.workspace)?;
     let stream_preview = StreamPreviewHandle::new();
     let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
@@ -802,7 +893,8 @@ fn launch_interactive_chat(
         .with_stream_preview(stream_preview.clone())
         .with_telemetry(telemetry.clone())
         .with_context_config(ctx_cfg)
-        .with_model_info(llm.model.clone(), llm.effort);
+        .with_model_info(llm.model.clone(), llm.effort)
+        .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone());
     let tui_handle = tui.handle();
     let quit = tui.quit_flag();
     let bridge_ready = Arc::new(AtomicBool::new(false));
@@ -812,7 +904,7 @@ fn launch_interactive_chat(
         ws_vocab,
         mode_handle: mode_handle.clone(),
         tools: tools.clone(),
-        snapshot_store: shared_store,
+        snapshot_store: shared_store.clone(),
         pending_action,
         pending_notes,
     };
@@ -875,6 +967,8 @@ fn launch_interactive_chat(
             action_ctx: Some(action_ctx),
         },
     )?;
+    drop(driver);
+    print_vault_summary(&cli.workspace, &effective_opts, shared_store.as_ref());
     Ok(())
 }
 
@@ -935,10 +1029,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.mode {
         Mode::Run(goal) => {
+            let llm = resolve_llm_config(&cli, &cli.workspace)?;
+            let auto_save = cli.auto_save || auto_save_from_env();
+            let resolved = resolve_write_storage(
+                &cli.workspace,
+                cli.snapshot_dir.as_deref(),
+                cli.save_transcript.as_deref(),
+                None,
+                auto_save,
+                Some(&llm.model),
+                Some(goal),
+                SystemTime::now(),
+            );
+            if resolved.uses_vault {
+                ensure_vault_gitignore(&cli.workspace)?;
+            }
+            let run_opts = SessionOptions {
+                snapshot_dir: resolved.snapshot_dir,
+                save_transcript: resolved.save_transcript,
+                save_step_snapshots: false,
+                ..session_opts
+            };
+            let run_opts = SessionOptions {
+                save_step_snapshots: run_opts.snapshot_dir.is_some(),
+                ..run_opts
+            };
+
             let checkpoints = PendingCheckpoints::default();
             let (mut host, ws_vocab) =
-                build_host_with_options(1, config, &session_opts, None, Some(checkpoints.clone()))?;
-            let llm = resolve_llm_config(&cli, &cli.workspace)?;
+                build_host_with_options(1, config, &run_opts, None, Some(checkpoints.clone()))?;
 
             host.spawn(&make_spec(goal, cli.auto_approve));
 
@@ -960,7 +1079,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_session(
                 &mut host,
                 &mut driver,
-                &session_opts,
+                &run_opts,
                 StopPolicy::Settled { max_ticks: 256 },
             )?;
 
@@ -975,13 +1094,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if snap.cumulative.input_tokens > 0 || snap.cumulative.output_tokens > 0 {
                 println!("[openOnyx telemetry] {}", snap.format_status_bar());
             }
+            print_vault_summary(&cli.workspace, &run_opts, None);
         }
         Mode::Chat => {
             let resume_arg = cli.resume_dir.as_deref().map(|dir| (dir, cli.resume_tick));
             launch_interactive_chat(&cli, &policy, tools, &config, &session_opts, resume_arg)?;
         }
         Mode::Replay(path) => {
-            let bytes = fs::read(path)?;
+            let resolved_tr = resolve_read_transcript(&cli.workspace, path);
+            let resolved_out = resolve_write_storage(
+                &cli.workspace,
+                cli.snapshot_dir.as_deref(),
+                None,
+                None,
+                false,
+                None,
+                None,
+                SystemTime::now(),
+            );
+            if resolved_out.uses_vault {
+                ensure_vault_gitignore(&cli.workspace)?;
+            }
+            let replay_opts = SessionOptions {
+                save_step_snapshots: resolved_out.snapshot_dir.is_some(),
+                snapshot_dir: resolved_out.snapshot_dir,
+                save_transcript: None,
+                ..session_opts
+            };
+
+            let bytes = fs::read(&resolved_tr)?;
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
             let has_commands = !transcript.commands.is_empty();
             let replay_config = AgentConfig {
@@ -995,7 +1136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (mut host, _ws_vocab) = build_host_with_options(
                 1,
                 replay_config,
-                &session_opts,
+                &replay_opts,
                 Some(Box::new(replay_spawner)),
                 Some(PendingCheckpoints::default()),
             )?;
@@ -1008,7 +1149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_session(
                 &mut host,
                 &mut driver,
-                &session_opts,
+                &replay_opts,
                 StopPolicy::ReplayExhausted { max_ticks: 4096 },
             )?;
 
@@ -1027,13 +1168,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             list,
             json,
         } => {
-            run_inspect(dir, *tick, *list, *json, config)?;
+            let resolved_dir = resolve_read_snapshot_dir(&cli.workspace, dir);
+            run_inspect(&resolved_dir, *tick, *list, *json, config)?;
         }
         Mode::Rewind {
             dir,
             tick,
             transcript,
         } => {
+            let resolved_dir = resolve_read_snapshot_dir(&cli.workspace, dir);
             if cli.interactive && !cli.dry_run && transcript.is_none() {
                 launch_interactive_chat(
                     &cli,
@@ -1041,15 +1184,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tools,
                     &config,
                     &session_opts,
-                    Some((dir.as_path(), Some(*tick))),
+                    Some((resolved_dir.as_path(), Some(*tick))),
                 )?;
                 return Ok(());
             }
-            let store = PackSnapshotStore::new(dir);
+            let store = PackSnapshotStore::new(&resolved_dir);
             let target_tick = store.resolve_tick_or_floor(*tick).ok_or_else(|| {
                 format!(
                     "no snapshots found in `{}` at or before tick {tick}",
-                    dir.display()
+                    resolved_dir.display()
                 )
             })?;
             if target_tick != *tick {
@@ -1057,7 +1200,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "[openOnyx rewind] requested tick {tick} is not a milestone; resolving to prior milestone tick {target_tick}"
                 );
             }
-            reconcile_rewind_effects(&cli.workspace, dir, target_tick, &config, cli.dry_run)?;
+            reconcile_rewind_effects(
+                &cli.workspace,
+                &resolved_dir,
+                target_tick,
+                &config,
+                cli.dry_run,
+            )?;
             if cli.dry_run {
                 return Ok(());
             }
@@ -1067,7 +1216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
-                Some(dir),
+                Some(&resolved_dir),
                 Some(Box::new(spawner)),
                 Some(checkpoints.clone()),
             )?;
@@ -1079,7 +1228,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let rewind_opts = SessionOptions::default();
             if let Some(tr_path) = transcript {
-                let bytes = fs::read(tr_path)?;
+                let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
+                let bytes = fs::read(&resolved_tr)?;
                 let tr = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
                 let mut driver = ReplayBridge::new(tr)
                     .starting_at(next_tick)
@@ -1127,7 +1277,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             snapshot_dir,
             transcript,
         } => {
-            let report = run_doctor(&cli.workspace, snapshot_dir.as_ref(), transcript.as_ref());
+            let resolved_dir = snapshot_dir
+                .as_ref()
+                .map(|d| resolve_read_snapshot_dir(&cli.workspace, d));
+            let resolved_tr = transcript
+                .as_ref()
+                .map(|t| resolve_read_transcript(&cli.workspace, t));
+            let report = run_doctor(&cli.workspace, resolved_dir.as_ref(), resolved_tr.as_ref());
             report.print();
             if !report.errors.is_empty() {
                 return Err(format!("doctor detected {} error(s)", report.errors.len()).into());
@@ -1861,6 +2017,7 @@ mod tests {
             "--effort",
             "--api-base",
             "--snapshot-dir",
+            "--auto-save",
             "--record",
             "--resume",
             "--fork-dir",
@@ -1882,15 +2039,29 @@ mod tests {
             "load_skill",
             "Live Plan",
             "docs/manual/index.md",
+            ".onyx/vault/",
             "ENVIRONMENT VARIABLES:",
             "GEMINI_API_KEY",
             "OPENAI_API_KEY",
             "ONYX_PROVIDER",
             "ONYX_EFFORT",
+            "ONYX_AUTO_SAVE",
             "OPENAI_API_BASE",
         ] {
             assert!(help.contains(needle), "help text missing `{needle}`");
         }
+
+        let auto_chat =
+            parse_args_from(["chat", "--auto-save"].into_iter().map(str::to_string)).unwrap();
+        assert!(auto_chat.auto_save);
+        let auto_run = parse_args_from(
+            ["run", "check crates", "--auto-save"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert!(auto_run.auto_save);
+        assert!(matches!(auto_run.mode, Mode::Run(ref g) if g == "check crates"));
     }
 
     #[test]

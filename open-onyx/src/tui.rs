@@ -42,6 +42,8 @@ use crate::context::{
     project_memory,
 };
 use crate::gemini::StreamPreviewHandle;
+use crate::pack::SharedPackStore;
+use crate::vault::session_display_label;
 
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(90);
 const SPINNER_STEP_RAD: f64 = 0.35;
@@ -73,6 +75,8 @@ struct TuiInner {
     context_config: TieredContextConfig,
     model_name: String,
     reasoning_effort: Option<ReasoningEffort>,
+    session_label: Option<String>,
+    snapshot_store: Option<SharedPackStore>,
     seen_compact_count: usize,
     input: String,
     queued: Vec<OnyxEvent>,
@@ -149,6 +153,8 @@ impl TuiDriver {
                 context_config: TieredContextConfig::default(),
                 model_name: String::new(),
                 reasoning_effort: None,
+                session_label: None,
+                snapshot_store: None,
                 seen_compact_count: 0,
                 input: String::new(),
                 queued: Vec::new(),
@@ -240,6 +246,19 @@ impl TuiDriver {
         self
     }
 
+    pub fn with_session_storage(
+        self,
+        session_label: Option<String>,
+        snapshot_store: Option<SharedPackStore>,
+    ) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.session_label = session_label;
+            inner.snapshot_store = snapshot_store;
+        }
+        self
+    }
+
     pub fn handle(&self) -> TuiHandle {
         TuiHandle {
             inner: Rc::clone(&self.inner),
@@ -252,6 +271,19 @@ impl TuiDriver {
 }
 
 impl TuiInner {
+    fn active_session_label(&self) -> Option<String> {
+        self.snapshot_store
+            .as_ref()
+            .and_then(|st| {
+                let dir = st.current_dir();
+                self.workspace_root
+                    .as_deref()
+                    .and_then(|ws| session_display_label(ws, &dir))
+                    .or_else(|| dir.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            })
+            .or_else(|| self.session_label.clone())
+    }
+
     fn shutdown_inner(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -641,6 +673,12 @@ impl TuiInner {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            if let Some(vlabel) = self.active_session_label() {
+                phase_spans.push(Span::styled(
+                    format!("  · vault:{vlabel}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             header_lines.push(Line::from(phase_spans));
 
             // Row 3: compact single-line agent strip only when >1 agent exists; otherwise quiet hint.
@@ -737,7 +775,8 @@ impl TuiInner {
                 "idle — enter a goal below",
                 Style::default().fg(Color::Gray),
             )));
-            header_lines.push(Line::from(vec![
+            let active_vault_label = self.active_session_label();
+            let mut idle_meta = vec![
                 Span::styled("model: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     if model_display.is_empty() {
@@ -751,7 +790,14 @@ impl TuiInner {
                     format!("  ·  effort: {effort_display}"),
                     Style::default().fg(Color::DarkGray),
                 ),
-            ]));
+            ];
+            if let Some(ref vlabel) = active_vault_label {
+                idle_meta.push(Span::styled(
+                    format!("  ·  vault: {vlabel}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            header_lines.push(Line::from(idle_meta));
             header_lines.push(Line::from(Span::styled(
                 "Tab: Plan/Build · F2: Agents · /rewind · /fork · /services · Esc: quit",
                 Style::default().fg(Color::DarkGray),

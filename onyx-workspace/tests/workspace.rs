@@ -2037,3 +2037,47 @@ fn restore_git_tree_checkpoint_removes_newly_created_untracked_fs_write_target()
         "base\n"
     );
 }
+
+#[test]
+fn vault_dir_is_ignored_and_control_plane_protected() {
+    let dir = TempDir::new("vault_policy");
+    fs::create_dir_all(dir.0.join(".onyx/vault/session1")).unwrap();
+    fs::write(
+        dir.0.join(".onyx/vault/session1/snapshots.onyxpack"),
+        b"ONYXPK1",
+    )
+    .unwrap();
+    fs::write(dir.0.join(".onyx/vault/session1/session1.tr"), b"ONYXTR2").unwrap();
+    fs::create_dir_all(dir.0.join(".onyx/skills/demo")).unwrap();
+    fs::write(dir.0.join(".onyx/skills/demo/SKILL.md"), "# demo skill\n").unwrap();
+    fs::write(dir.0.join("hello.txt"), "hello\n").unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    assert!(policy.is_ignored(&dir.0.join(".onyx/vault")));
+    assert!(policy.is_ignored(&dir.0.join(".onyx/vault/session1/snapshots.onyxpack")));
+    assert!(!policy.is_ignored(&dir.0.join(".onyx/skills/demo/SKILL.md")));
+
+    assert!(policy.is_control_plane_path(".onyx/vault/session1/snapshots.onyxpack"));
+    assert!(
+        policy
+            .check_control_plane_write(".onyx/vault/unassigned/x.tr")
+            .is_err()
+    );
+
+    let tools = WorkspaceTools::new(policy);
+    let listed = tools.execute("fs_list", "{}").unwrap();
+    assert!(listed.contains("hello.txt"), "{listed}");
+    assert!(
+        !listed.contains("vault"),
+        "vault should be hidden from fs_list: {listed}"
+    );
+    assert!(
+        tools
+            .execute(
+                "fs_write",
+                r#"{"path":".onyx/vault/session1/tamper.txt","content":"nope"}"#
+            )
+            .is_err(),
+        "agent writes into .onyx/vault must be blocked"
+    );
+}

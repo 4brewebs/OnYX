@@ -392,6 +392,11 @@ fn save_transcript_if_configured<D: SessionDriver>(
 ) -> io::Result<()> {
     if let Some(path) = &opts.save_transcript {
         if let Some(bytes) = driver.transcript_bytes() {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
             fs::write(path, bytes)?;
         }
     }

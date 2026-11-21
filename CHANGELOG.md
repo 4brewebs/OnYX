@@ -4,6 +4,12 @@ All notable changes to the **OnYX** workspace crates (`onyx-core`, `onyx-soul`, 
 
 ## [Unreleased]
 
+### Added (`open-onyx` & `onyx-workspace` — Session Vault `.onyx/vault/` & `--auto-save`)
+
+- **Centralized session vault (`open-onyx/src/vault.rs`)**: short session names for `--snapshot-dir <name>` resolve under `<workspace>/.onyx/vault/<name>/`, co-locating short `--record <file>` transcripts inside the same directory (or under `.onyx/vault/unassigned/<file>` when no snapshot dir is set) while preserving explicit paths verbatim.
+- **`--auto-save` & `ONYX_AUTO_SAVE`**: automatically creates descriptive timestamped session folders (`<YYYYMMDD-HHMMSS>_<model>[_<branch|goal>]`) containing both `snapshots.onyxpack` and `<session>.tr`, generates `.onyx/vault/.gitignore` (`*`) automatically so Git status and `/undo` checkpoints never index vault files, displays live `vault:<label>` in the TUI header (updating across `/fork` and `/rewind`), prints the resume command on exit, and resolves short names transparently in `--resume`, `inspect`, `rewind`, `replay`, and `doctor`.
+- **Policy & doctor hardening (`onyx-workspace/src/policy.rs`, `open-onyx/src/ops.rs`)**: `.onyx/vault/**` is ignored during workspace scans (`fs_list`, `glob_files`, `code_search`), protected as read-only Control Plane against agent writes, and audited by `openonyx doctor`.
+
 ### Added (`open-onyx` — SDD-03 Block 1: Non-Destructive Time-Travel & Forking)
 
 - **CLI & live TUI time-travel / forking**:

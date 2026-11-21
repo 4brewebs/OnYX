@@ -16,6 +16,7 @@
 - `ONYX_MODEL` / `OPENAI_MODEL` — optional OpenAI-compatible model name (defaults to `gpt-4o`, overridden by `--model`).
 - `OPENAI_API_BASE` / `OPENAI_BASE_URL` — optional base URL for `--provider openai` (defaults to `https://api.openai.com/v1`, overridden by `--api-base`).
 - `ONYX_EFFORT` — optional reasoning/thinking effort (`low`, `medium`, or `high`; overridden by `--effort`, with provider-specific fallbacks `GEMINI_THINKING_LEVEL` for Gemini and `OPENAI_REASONING_EFFORT` for OpenAI).
+- `ONYX_AUTO_SAVE` — enable `--auto-save` by default (`1`, `true`, `yes`, or `on`), automatically storing snapshots and transcripts together under `<workspace>/.onyx/vault/<session>/`.
 
 ## Project Instructions
 
@@ -29,8 +30,8 @@ Loaded files are filtered through `scrub_secrets`, combined with the host OS she
 ## Usage
 
 ```text
-openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
-openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
+openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
+openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
 openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]
@@ -95,6 +96,14 @@ Audit Git worktree health, stray artifacts, `snapshots.onyxpack` integrity (incl
 cargo run -p open-onyx -- doctor --snapshot-dir snaps_chat --transcript chat.tr
 ```
 
+## Session Vault (`.onyx/vault/`) & `--auto-save`
+
+To keep workspace roots clean, `openonyx` centralizes session data inside `<workspace>/.onyx/vault/` (automatically creating `.onyx/vault/.gitignore` with `*` so Git status and `/undo` checkpoints never index vault files, while `onyx-workspace` ignores `.onyx/vault/` in searches and protects it as read-only Control Plane):
+
+- **`--auto-save`** (or `ONYX_AUTO_SAVE=1`): automatically creates `<workspace>/.onyx/vault/<YYYYMMDD-HHMMSS>_<model>[_<branch|goal>]/` storing both `snapshots.onyxpack` and `<session>.tr` together, displays `vault:<session>` in the TUI header, and prints the exact `--resume` command on exit.
+- **Short names vs explicit paths**: passing a short name such as `--snapshot-dir feat-auth --record chat.tr` stores both files under `.onyx/vault/feat-auth/`; passing `--record solo.tr` without `--snapshot-dir` stores it under `.onyx/vault/unassigned/solo.tr`. Explicit paths containing `/` or `\` (or absolute paths) are preserved verbatim.
+- **Transparent vault lookup**: `--resume`, `inspect`, `rewind`, `replay`, and `doctor` check literal paths first and fall back to `.onyx/vault/` automatically for short names.
+
 ## Milestone Snapshots, Forking & `snapshots.onyxpack`
 
 When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapshots only at meaningful graph transitions (tagged as `init`, `spawn`, `approval:<tool>`, `tool:<tool>`, `tool_error:<tool>`, `cmd:/agent`, `cmd:/undo`, `cmd:/rewind`, `cmd:/fork`, `cmd:/compact`, `cmd:/mode ...`, `cmd:/new`, `settled`, `failed`, `exit`, plus optional `--snapshot-every <n>` `periodic` frames) instead of dumping full uncompressed `tick-*.bin` files on idle or internal micro-ticks.
@@ -128,6 +137,7 @@ When `--snapshot-dir <dir>` is enabled, `MilestoneSnapshotSystem` records snapsh
 - [`src/context.rs`](src/context.rs): shared `TieredContextConfig` / `ToolOutputTier` projection (Tier 0 full recent outputs, deterministic coordinate-preserving Tier 1 summaries for older outputs, Tier 2 `/compact` and auto-compaction boundaries, prompt-cache-stable prefixes), `ReasoningEffort`, and `TokenUsage` / `SessionTelemetryHandle` extraction for Gemini and OpenAI.
 - [`src/command.rs`](src/command.rs): pure `CommandSpawnerSystem` (`OnyxSystem`, zero disk/Git I/O) handling `SlashCommand` (`/new`, `/mode`, `/agent`, `/undo`, `/rewind`, `/fork`, `/compact`, `/services`, `/service`), `PendingSessionAction` / `PendingSystemNotes`, `on_restore` mode sync, and multi-turn `continue_agent` with active-root protection.
 - [`src/pack.rs`](src/pack.rs): `PackSnapshotStore`, `SharedPackStore` (live branch switching), `fork_pack_until_tick`, `truncate_pack_until_tick`, `default_fork_dir`, `verify_pack_integrity` (zlib-compressed `snapshots.onyxpack` with FNV-1a verification, truncated-tail crash tolerance, opt-in `--max-snapshots` compaction, and legacy `tick-*.bin` fallback), and `MilestoneSnapshotSystem`.
+- [`src/vault.rs`](src/vault.rs): centralized `.onyx/vault/` session storage resolver (`resolve_write_storage`, `resolve_read_snapshot_dir`, `resolve_read_transcript`, `generate_auto_session_id`, `ensure_vault_gitignore`, `audit_vault`) backing `--auto-save` / `ONYX_AUTO_SAVE`.
 - [`src/session.rs`](src/session.rs): declares logical surfaces (`SURFACE_STATUS`, `SURFACE_TRACE`, `SURFACE_APPROVAL`, `SURFACE_PLAN`, `SURFACE_SERVICES` via `active_surfaces`), provides `SessionDriver`, `CliApprovalDriver`, `apply_session_action` (live `/rewind` and `/fork` orchestration), `build_host` / `build_host_with_shared_store`, and the single `run_session` tick loop parameterized by `StopPolicy` (`Settled`, `ReplayExhausted`, `Quit`) using `AgentHost::step_with`.
 - [`src/ops.rs`](src/ops.rs): offline snapshot & ledger utilities (`render_inspect` / `run_inspect` with `--list` and `--json`, `reconcile_rewind_effects` & quiet `reconcile_rewind_effects_report` for live TUI rewind, and `run_doctor`).
 - [`src/gemini.rs`](src/gemini.rs): `GeminiResponder` (sync), `AsyncGeminiDriver` (non-blocking `:streamGenerateContent?alt=sse` HTTP worker + `StreamPreviewHandle` + `InFlightGuard`), `load_project_instructions` + OS shell hint + on-demand skills catalog, `thinkingLevel` (`--effort`), *as-of* read `superseded` projection + `ContextBudget` pruning, sequential multi-`functionCall` queueing, `"user"`/`"system"` turn mapping, and `thoughtSignature` inheritance.

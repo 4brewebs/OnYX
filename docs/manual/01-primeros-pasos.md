@@ -1,5 +1,7 @@
 # 01. Primeros Pasos con openOnyx
 
+> 🇬🇧 **[Read this chapter in English](01-first-steps.md)**
+
 En menos de 10 minutos pasarás de compilar `openonyx` a ejecutar tu primera sesión interactiva con streaming SSE, cambios supervisados con diff en color, modo `PLAN`/`BUILD` y reversión instantánea con `/undo`.
 
 ---
@@ -37,18 +39,18 @@ openonyx doctor
 **Windows (PowerShell):**
 ```powershell
 $env:GEMINI_API_KEY = "tu-api-key"
-openonyx chat --snapshot-dir .onyx_snaps --record session.tr
+openonyx chat --auto-save
 ```
 
 **Linux / macOS (bash/zsh):**
 ```sh
 export GEMINI_API_KEY="tu-api-key"
-openonyx chat --snapshot-dir .onyx_snaps --record session.tr
+openonyx chat --auto-save
 ```
 
 Para elegir modelo o esfuerzo de razonamiento (`low`, `medium`, `high`):
 ```sh
-openonyx chat --model gemini-2.5-pro --effort high --snapshot-dir .onyx_snaps
+openonyx chat --model gemini-2.5-pro --effort high --auto-save
 ```
 
 ### Opción B — OpenAI / OpenRouter
@@ -56,18 +58,18 @@ openonyx chat --model gemini-2.5-pro --effort high --snapshot-dir .onyx_snaps
 **Windows (PowerShell):**
 ```powershell
 $env:OPENAI_API_KEY = "sk-..."
-openonyx chat --provider openai --model gpt-4o --effort medium --snapshot-dir .onyx_snaps
+openonyx chat --provider openai --model gpt-4o --effort medium --auto-save
 ```
 
 **Linux / macOS:**
 ```sh
 export OPENAI_API_KEY="sk-..."
-openonyx chat --provider openai --model gpt-4o --effort medium --snapshot-dir .onyx_snaps
+openonyx chat --provider openai --model gpt-4o --effort medium --auto-save
 ```
 
 Con OpenRouter u otro proxy compatible:
 ```sh
-openonyx chat --provider openai --api-base https://openrouter.ai/api/v1 --model anthropic/claude-sonnet-4
+openonyx chat --provider openai --api-base https://openrouter.ai/api/v1 --model anthropic/claude-sonnet-4 --auto-save
 ```
 
 ### Opción C — Modelo local (Ollama, vLLM, LM Studio)
@@ -76,15 +78,15 @@ Cuando especificas `--api-base` (o `OPENAI_API_BASE` / `OPENAI_BASE_URL`), **no 
 
 **Ollama:**
 ```sh
-openonyx chat --provider openai --api-base http://localhost:11434/v1 --model qwen2.5-coder:14b --effort low --snapshot-dir .onyx_snaps
+openonyx chat --provider openai --api-base http://localhost:11434/v1 --model qwen2.5-coder:14b --effort low --auto-save
 ```
 
 **vLLM / LM Studio:**
 ```sh
-openonyx chat --provider openai --api-base http://localhost:8000/v1 --model Qwen/Qwen3-Coder-30B-A3B --snapshot-dir .onyx_snaps
+openonyx chat --provider openai --api-base http://localhost:8000/v1 --model Qwen/Qwen3-Coder-30B-A3B --auto-save
 ```
 
-> **Consejo para modelos locales:** empieza con `--effort low` o `--effort medium` y siempre activa `--snapshot-dir` para poder volver atrás con `/rewind` si el modelo toma un desvío.
+> **Consejo:** usar **`--auto-save`** (o fijar `ONYX_AUTO_SAVE=1` en tu entorno) guarda automáticamente los snapshots y la transcripción `.tr` juntos dentro de `.onyx/vault/<fecha>_<modelo>_<rama>/` (ignorado automáticamente por Git) para que nunca ensucies la raíz del repo y siempre puedas usar `/rewind` o `--resume`.
 
 ---
 

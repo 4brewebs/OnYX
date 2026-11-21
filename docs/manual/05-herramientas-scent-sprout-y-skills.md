@@ -1,5 +1,7 @@
 # 05. Herramientas del Agente, Scent, Sprout, Skills y Automatización
 
+> 🇬🇧 **[Read this chapter in English](05-tools-scent-sprout-and-skills.md)**
+
 Este capítulo recoge el catálogo completo de las **19 herramientas** disponibles para el agente dentro de `openonyx`, cómo aprovechar la navegación AST (`onyx-scent`), cómo orquestar procesos y contenedores locales con `sprout.toml`, cómo personalizar el comportamiento mediante `ONYX.md` / skills y cómo ejecutar tareas en modo headless (`openonyx run`).
 
 ---
