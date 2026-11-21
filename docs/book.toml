@@ -1,0 +1,17 @@
+[book]
+title = "openOnyx — Manual de Usuario"
+description = "Guía completa del harness de agente determinista openOnyx (CLI, TUI, sandbox OS, time-travel, forking, Scent y Sprout)."
+authors = ["OnYX"]
+language = "es"
+src = "manual"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "ayu"
+site-url = "/OnYX/"
+git-repository-url = "https://github.com/4brewebs/OnYX"
+edit-url-template = "https://github.com/4brewebs/OnYX/edit/main/docs/manual/{path}"

@@ -1,5 +1,9 @@
 # OnYX
 
+[![Manual de Usuario](https://img.shields.io/badge/docs-Manual%20de%20Usuario-1f6feb?style=for-the-badge)](https://4brewebs.github.io/OnYX/)
+[![Primeros Pasos ES](https://img.shields.io/badge/gu%C3%ADa-Espa%C3%B1ol-e36209?style=for-the-badge)](docs/manual/01-primeros-pasos.md)
+[![Quickstart EN](https://img.shields.io/badge/quickstart-English-2da44e?style=for-the-badge)](docs/manual/01-first-steps.md)
+
 **Un Lego de cerebros, no una solución cerrada.**
 
 OnYX separa un núcleo de contratos, pequeño y sin dependencias, de las almas que lo cumplen. Si tu realidad es distinta, escribe tu propia alma: el contrato es lo que importa.

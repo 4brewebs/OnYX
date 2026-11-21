@@ -1,5 +1,9 @@
 # OnYX
 
+[![User Manual](https://img.shields.io/badge/docs-User%20Manual-1f6feb?style=for-the-badge)](https://4brewebs.github.io/OnYX/)
+[![Quickstart EN](https://img.shields.io/badge/quickstart-English-2da44e?style=for-the-badge)](docs/manual/01-first-steps.md)
+[![Primeros Pasos ES](https://img.shields.io/badge/gu%C3%ADa-Espa%C3%B1ol-e36209?style=for-the-badge)](docs/manual/01-primeros-pasos.md)
+
 **A Lego of brains, not a closed solution.**
 
 OnYX separates a small, dependency-free core of contracts from the souls that fulfill them.
