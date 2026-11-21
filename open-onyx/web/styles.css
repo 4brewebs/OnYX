@@ -647,14 +647,14 @@ button.pill:active {
   }
 }
 
-/* Agent Status Banner with Real Orbital Emblem */
+/* Agent Status Banner with Real Orbital Emblem (strict 1-line compact goal) */
 .agent-banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
-  flex-wrap: wrap;
-  padding: 0.52rem 0.95rem;
+  flex-wrap: nowrap;
+  padding: 0.45rem 0.95rem;
   border-bottom: 1px solid var(--border);
   background: color-mix(in oklab, var(--bg-surface) 78%, transparent);
 }
@@ -664,7 +664,8 @@ button.pill:active {
   align-items: center;
   gap: 0.55rem;
   min-inline-size: 0;
-  flex: 1;
+  flex: 1 1 auto;
+  overflow: hidden;
 }
 
 .agent-emblem-wrap {
@@ -707,15 +708,66 @@ button.pill:active {
 }
 
 .agent-banner-goal {
-  font-size: 0.84rem;
-  color: var(--ink-secondary);
+  flex: 1 1 auto;
   min-inline-size: 0;
+  max-inline-size: 100%;
+  min-block-size: auto;
+  padding: 0.14rem 0.42rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 0.82rem;
+  color: var(--ink-secondary);
+  text-align: start;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease, background-color 140ms ease;
+}
+
+.agent-banner-goal:hover:not(:disabled) {
+  color: var(--ink-primary);
+  border-color: var(--border);
+  background: var(--bg-elevated);
+}
+
+.agent-banner-goal:disabled {
+  cursor: default;
 }
 
 .agent-banner-actions {
   display: flex;
+  flex: none;
   gap: 0.35rem;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+}
+
+@media (max-width: 48rem) {
+  .agent-banner {
+    flex-wrap: wrap;
+  }
+  .agent-banner-main {
+    flex: 1 1 100%;
+  }
+  .agent-banner-actions {
+    flex-wrap: wrap;
+  }
+}
+
+.goal-dialog-text {
+  margin: 0;
+  padding: 0.75rem 0.9rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--ink-primary);
+  font-family: var(--font-sans);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-y: auto;
+  max-block-size: 60dvh;
 }
 
 .chip-btn {
@@ -735,14 +787,37 @@ button.pill:active {
   color: var(--ink-primary);
 }
 
-/* Conversation Stream */
+/* Conversation & Transparent Agent Trace Stream */
 .messages {
   overflow-y: auto;
   padding: 1rem max(0.95rem, env(safe-area-inset-left, 0px)) 1.25rem max(0.95rem, env(safe-area-inset-right, 0px));
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: 0.65rem;
   min-block-size: 0;
+}
+
+/* CRITICAL: prevent flexbox from ever crushing cards to 0px hairlines on overflow */
+.messages > *,
+.messages-history > *,
+.live-activity-slot > * {
+  flex-shrink: 0;
+}
+
+.messages-history {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.live-activity-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.live-activity-slot:empty {
+  display: none;
 }
 
 .welcome-card {
@@ -816,13 +891,23 @@ button.pill:active {
 }
 
 .msg-system {
-  align-self: center;
-  max-inline-size: 46rem;
-  padding: 0.45rem 0.85rem;
+  align-self: stretch;
+  max-inline-size: 56rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  padding: 0.45rem 0.8rem;
+  border-inline-start: 3px solid var(--border-strong);
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: 0.77rem;
   color: var(--ink-secondary);
   background: var(--bg-elevated);
+}
+
+.msg-system-text {
+  flex: 1;
+  min-inline-size: 0;
+  white-space: pre-wrap;
 }
 
 .msg-meta {
@@ -879,40 +964,69 @@ button.pill:active {
   font-size: 0.85em;
 }
 
-/* Collapsible Tool Trace Card */
+/* Transparent Collapsible Trace Card (always visible, never crushed to 0px) */
 .tool-card {
+  align-self: stretch;
   max-inline-size: 56rem;
   border-radius: var(--radius-md);
   border: 1px solid var(--border);
+  border-inline-start: 3px solid color-mix(in oklab, var(--accent) 68%, transparent);
   background: var(--bg-elevated);
-  overflow: hidden;
+}
+
+.tool-card.is-observe {
+  border-inline-start-color: color-mix(in oklab, var(--emerald) 65%, transparent);
 }
 
 .tool-card.is-error {
-  border-color: color-mix(in oklab, var(--crimson) 45%, transparent);
+  border-color: color-mix(in oklab, var(--crimson) 48%, transparent);
+  border-inline-start-color: var(--crimson);
 }
 
 .tool-card summary {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.5rem 0.8rem;
+  min-block-size: 2.35rem;
+  padding: 0.45rem 0.8rem;
+  border-radius: calc(var(--radius-md) - 2px);
   cursor: pointer;
   font-family: var(--font-mono);
   font-size: 0.78rem;
   color: var(--ink-secondary);
   list-style: none;
+  user-select: none;
+  transition: background-color 140ms ease;
+}
+
+.tool-card summary:hover {
+  background: color-mix(in oklab, var(--accent-soft) 50%, transparent);
 }
 
 .tool-card summary::-webkit-details-marker {
   display: none;
 }
 
+.tool-chevron {
+  display: inline-block;
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--ink-muted);
+  transition: rotate 150ms ease;
+}
+
+.tool-card[open] .tool-chevron {
+  rotate: 90deg;
+  color: var(--accent);
+}
+
 .tool-tag {
-  padding: 0.12rem 0.45rem;
+  flex: none;
+  padding: 0.12rem 0.48rem;
   border-radius: 6px;
   font-weight: 700;
-  font-size: 0.7rem;
+  font-size: 0.69rem;
+  letter-spacing: 0.03em;
   text-transform: uppercase;
   background: var(--accent-soft);
   color: var(--accent);
@@ -928,6 +1042,17 @@ button.pill:active {
   color: var(--crimson);
 }
 
+.tool-tag-system {
+  background: color-mix(in oklab, var(--ink-secondary) 14%, transparent);
+  color: var(--ink-secondary);
+}
+
+.tool-name {
+  flex: none;
+  font-weight: 700;
+  color: var(--ink-primary);
+}
+
 .tool-preview {
   min-inline-size: 0;
   overflow: hidden;
@@ -936,18 +1061,77 @@ button.pill:active {
   flex: 1;
 }
 
+.tool-tick {
+  flex: none;
+  font-size: 0.7rem;
+  color: var(--ink-muted);
+  margin-inline-start: auto;
+}
+
 .tool-payload {
   margin: 0;
   padding: 0.75rem 0.9rem;
   border-top: 1px solid var(--border);
+  border-radius: 0 0 calc(var(--radius-md) - 2px) calc(var(--radius-md) - 2px);
   background: var(--bg-code);
   color: #e4dccd;
   font-family: var(--font-mono);
   font-size: 0.78rem;
+  line-height: 1.48;
+  white-space: pre-wrap;
+  overflow: auto;
+  max-block-size: 22rem;
+}
+
+/* Live Agent Phase / Thinking / Streaming Card */
+.trace-live-card {
+  align-self: stretch;
+  max-inline-size: 56rem;
+  border-radius: var(--radius-md);
+  border: 1px solid color-mix(in oklab, var(--accent) 46%, transparent);
+  border-inline-start: 3px solid var(--accent);
+  background: color-mix(in oklab, var(--bg-surface) 90%, var(--accent-soft));
+  padding: 0.65rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.trace-live-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.trace-live-meta {
+  margin-inline-start: auto;
+  font-weight: 500;
+  color: var(--ink-muted);
+}
+
+.live-thought {
+  margin: 0;
+  padding: 0.55rem 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--ink-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
   line-height: 1.45;
   white-space: pre-wrap;
-  overflow-x: auto;
-  max-block-size: 20rem;
+  max-block-size: 12rem;
+  overflow-y: auto;
+}
+
+.chip-btn.is-active {
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 55%, transparent);
+  background: var(--accent-soft);
 }
 
 /* Approval Dock + Scent Impact + Unified Diff */

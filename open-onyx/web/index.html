@@ -83,9 +83,15 @@
             </span>
             <progress id="agent-busy-progress" class="sr-only hidden" aria-label="Agent is working"></progress>
             <span id="agent-banner-name" class="agent-banner-name">Ready</span>
-            <span id="agent-banner-goal" class="agent-banner-goal">Type a goal or slash command below.</span>
+            <button
+              id="agent-banner-goal"
+              type="button"
+              class="agent-banner-goal"
+              title="Click to inspect full goal"
+            >Type a goal or slash command below.</button>
           </div>
           <div class="agent-banner-actions">
+            <button id="trace-mode-btn" type="button" class="chip-btn" title="Toggle compact or full trace details (click any trace tag to inspect)">Trace: Compact</button>
             <button id="quick-undo-btn" type="button" class="chip-btn" title="Revert latest Git checkpoint (/undo)">/undo</button>
             <button id="quick-compact-btn" type="button" class="chip-btn" title="Compact older turns (/compact)">/compact</button>
             <button id="quick-fork-btn" type="button" class="chip-btn" title="Branch snapshots (/fork)">/fork</button>
@@ -236,6 +242,17 @@
         <button id="trust-cancel-btn" type="button" class="btn btn-ghost">Cancel</button>
         <button id="trust-approve-btn" type="button" class="btn btn-approve">Trust Workspace (/trust)</button>
       </div>
+    </div>
+  </dialog>
+
+  <!-- Native modal dialog: Full Agent Goal inspection (zero layout shift in chat banner) -->
+  <dialog id="goal-dialog" closedby="any" aria-labelledby="goal-dialog-title">
+    <div class="dialog-body">
+      <div class="dialog-head-row">
+        <h2 id="goal-dialog-title">Agent Goal</h2>
+        <button id="goal-dialog-close" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <pre id="goal-dialog-text" class="goal-dialog-text"></pre>
     </div>
   </dialog>
 

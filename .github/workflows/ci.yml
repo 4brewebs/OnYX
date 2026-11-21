@@ -38,17 +38,19 @@ jobs:
     permissions:
       contents: read
       checks: write
-    env:
-      # Override rust-toolchain.toml (MSRV 1.85.1): cargo-audit 0.23+ requires rustc >= 1.88
-      # and only parses Cargo.lock / Cargo.toml without compiling the workspace.
-      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       - name: Cargo Audit (RustSec advisories)
         uses: rustsec/audit-check@v2
+        env:
+          # Override rust-toolchain.toml (MSRV 1.85.1): cargo-audit 0.23+ requires rustc >= 1.88
+          # and only parses Cargo.lock / Cargo.toml without compiling the workspace.
+          RUSTUP_TOOLCHAIN: stable
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Cargo Deny (advisories, licenses, bans, sources)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: --locked check advisories licenses bans sources
+          arguments: --locked
+          command: check
+          command-arguments: advisories licenses bans sources

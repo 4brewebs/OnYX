@@ -304,6 +304,7 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
     preview: Option<&StreamPreviewHandle>,
 ) -> Result<JsonValue, String> {
     let mut text_acc = String::new();
+    let mut thought_acc = String::new();
     let mut tool_calls_map: BTreeMap<usize, (String, String)> = BTreeMap::new();
     let mut last_finish_reason: Option<String> = None;
     let mut last_usage: Option<JsonValue> = None;
@@ -349,6 +350,16 @@ pub(crate) fn accumulate_openai_sse_reader<R: std::io::BufRead>(
                     last_finish_reason = Some(fr.to_string());
                 }
                 if let Some(delta) = choice.get("delta") {
+                    if let Some(reasoning) = delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(|v| v.as_str())
+                    {
+                        thought_acc.push_str(reasoning);
+                        if let Some(prev) = preview {
+                            prev.set_thought(agent.0, request, &thought_acc);
+                        }
+                    }
                     if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                         text_acc.push_str(content);
                         if let Some(prev) = preview {
@@ -881,6 +892,7 @@ mod tests {
         let preview = StreamPreviewHandle::new();
         let telemetry = SessionTelemetryHandle::new("gpt-4o", false);
         let text_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"plan first \"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hola \"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"OpenAI!\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -895,7 +907,9 @@ mod tests {
             Some(&preview),
         )
         .unwrap();
-        assert_eq!(preview.get().unwrap().text, "Hola OpenAI!");
+        let prev_snap = preview.get().unwrap();
+        assert_eq!(prev_snap.text, "Hola OpenAI!");
+        assert_eq!(prev_snap.thought, "plan first ");
         let reply = parse_openai_response(&json, ConceptId(2), 5, &pending, Some(&telemetry));
         assert_eq!(reply, Reply::done(ConceptId(2), 5, "Hola OpenAI!"));
         let snap = telemetry.snapshot();

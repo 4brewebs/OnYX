@@ -31,6 +31,7 @@ pub struct StreamPreview {
     pub agent: u64,
     pub request: u64,
     pub text: String,
+    pub thought: String,
 }
 
 #[derive(Clone, Default)]
@@ -46,10 +47,33 @@ impl StreamPreviewHandle {
 
     pub fn set(&self, agent: u64, request: u64, text: impl Into<String>) {
         if let Ok(mut guard) = self.inner.lock() {
+            let prev_thought = guard
+                .as_ref()
+                .filter(|p| p.agent == agent && p.request == request)
+                .map(|p| p.thought.clone())
+                .unwrap_or_default();
             *guard = Some(StreamPreview {
                 agent,
                 request,
                 text: text.into(),
+                thought: prev_thought,
+            });
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn set_thought(&self, agent: u64, request: u64, thought: impl Into<String>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let prev_text = guard
+                .as_ref()
+                .filter(|p| p.agent == agent && p.request == request)
+                .map(|p| p.text.clone())
+                .unwrap_or_default();
+            *guard = Some(StreamPreview {
+                agent,
+                request,
+                text: prev_text,
+                thought: thought.into(),
             });
             self.dirty.store(true, Ordering::Release);
         }
@@ -436,6 +460,7 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
     preview: Option<&StreamPreviewHandle>,
 ) -> Result<JsonValue, String> {
     let mut text_acc = String::new();
+    let mut thought_acc = String::new();
     let mut call_parts: Vec<JsonValue> = Vec::new();
     let mut last_finish_reason: Option<String> = None;
     let mut last_usage: Option<JsonValue> = None;
@@ -477,6 +502,12 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
                                 }
                             }
                         } else if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                thought_acc.push_str(t);
+                                if let Some(prev) = preview {
+                                    prev.set_thought(agent.0, request, &thought_acc);
+                                }
+                            }
                             continue;
                         } else if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
                             text_acc.push_str(t);
@@ -1207,6 +1238,7 @@ mod tests {
         assert_eq!(snap.agent, 3);
         assert_eq!(snap.request, 9);
         assert_eq!(snap.text, "Hola OnYX!");
+        assert_eq!(snap.thought, "hidden");
         assert!(preview.take_dirty());
         assert!(!preview.take_dirty());
 
