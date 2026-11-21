@@ -2,6 +2,31 @@
 
 All notable changes to the **OnYX** workspace crates (`onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-scent`, `onyx-workspace`, and `open-onyx`) are documented in this file.
 
+## [Unreleased]
+
+### Added (`open-onyx` — SDD-03 Block 1: Non-Destructive Time-Travel & Forking)
+
+- **CLI & live TUI time-travel / forking**:
+  - `openonyx chat --resume <dir> --tick <n> [--fork-dir <dir>] [--truncate-future]` and `openonyx rewind <dir> <tick> --interactive|--tui [--fork-dir <dir>] [--truncate-future]` restore a historical milestone into a safe sibling fork pack by default (leaving the original `snapshots.onyxpack` untouched unless `--truncate-future` is passed) and launch the interactive TUI.
+  - Live `/rewind [tick]` (lists milestones without arguments; rewinds in-place when idle with active-agent / in-flight guards and quiet Git reconciliation) and `/fork [name]` (branches `snapshots.onyxpack` up to the current tick into a sibling directory via `SharedPackStore`, emitting `cmd:/rewind` and `cmd:/fork` milestone tags).
+  - `PackSnapshotStore::verify_pack_integrity`, `fork_pack_until_tick`, `truncate_pack_until_tick`, and `default_fork_dir` in `open-onyx/src/pack.rs`.
+
+### Added (`open-onyx`, `onyx-workspace` & `onyx-soul-agents` — Multi-Agent TUI, `--effort`, Anti-Loop Hardening & User Manual)
+
+- **Reasoning effort control**: added `--effort <low|medium|high>` and `ONYX_EFFORT` (with provider fallbacks `GEMINI_THINKING_LEVEL` and `OPENAI_REASONING_EFFORT`), wired into Gemini `thinkingLevel` and OpenAI `reasoning_effort` and surfaced in the compact 3-row TUI header.
+- **Interactive multi-agent TUI ergonomics**: added `F2` Agent Selector popup (`render_agent_picker`), `/agent [id|name]` (`cmd:/agent`), `Ctrl+Tab` quick-cycle, `[agent #id name]` origin badges in approval banners, animated Braille status emblem (`⠋..⠏`, 90 ms throttle), auto-focus on `/new`, and active-root protection preventing duplicate root agent spawns while `thinking`/`acting`/`waiting_children`/`waiting_approval`.
+- **Local LLM & tool anti-loop hardening**:
+  - `onyx-soul-agents`: capped inherited `spawn_agent` child step budgets at `DEFAULT_SUBAGENT_MAX_STEPS = 32` (with optional explicit `max_steps` override in JSON args, preserving 0 external dependencies).
+  - `onyx-workspace`: added session `seen_outlines` cache for `scent_outline` (invalidated automatically on file edits, `shell_exec`, and `/undo`), overlapping/subset `fs_read` range deduplication (`covered_by:<start>-<end>`), and actionable error hints when reading binary OnYX artifacts (`ONYXTR1`, `ONYXTR2`, `ONYXPK1`, `ONYXAG`).
+  - `open-onyx`: injected host OS shell hints (Windows PowerShell vs Unix/POSIX) and anti-loop rules into `BASE_INSTRUCTION`.
+- **Comprehensive User Manual (`docs/manual/`)**: added a complete, cross-linked 8-chapter User Manual for `open-onyx` covering ES/EN quickstart, daily TUI & multi-agent workflow, modes/permissions/OS sandbox, time-travel/snapshots/forking, all 19 tools + `onyx-scent` + Sprout + custom skills, and full CLI/troubleshooting reference, and synchronized `--help`, TUI hints, `SKILL.md`, and crate READMEs.
+
+### Fixed
+
+- **OpenAI/vLLM SSE resilience (`open-onyx/src/openai.rs`)**: tolerate chunked-stream EOF errors after a completed response (`finish_reason` / `[DONE]`) and retry up to 2 transient transport/408/429/5xx/stream errors with exponential backoff (`400ms`, `1200ms`).
+- **Untracked file cleanup on `/undo` & `/rewind` (`onyx-workspace/src/state.rs`, `bridge.rs`, `open-onyx/src/ops.rs`)**: `restore_git_tree_checkpoint_for_targets` now deletes newly created untracked `fs_write` files that did not exist in the pre-mutation `tree_sha`, while preserving unrelated user untracked files.
+- **Linux Ubuntu 24.04 AppArmor `bwrap` & CI fixes (`onyx-workspace/src/sandbox.rs`, `.github/workflows/ci.yml`)**: added live `bwrap_is_usable()` probe with safe fallback when AppArmor restricts unprivileged user namespaces, fixed `/tmp` bind order and pre-sandbox offline network checks, fixed Sprout log readiness test ordering, and aligned CI toolchain to `1.85.1`.
+
 ## [0.1.1] - 2026-11-19
 
 Patch release updating **`onyx-workspace` (`0.1.1`)** and **`open-onyx` (`0.1.1`)** with SDD-01 (tiered context, prompt caching, `/compact`, live telemetry) and SDD-02 (`code_search` v2, `glob_files`, declarative `.onyx/config.toml` permissions). Unchanged crates (`onyx-core`, `onyx-soul`, `onyx-soul-agents`, `onyx-scent`) remain at **`0.1.0`** with zero external dependencies preserved in the core/soul layer.

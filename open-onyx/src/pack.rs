@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
@@ -177,6 +178,10 @@ impl PackSnapshotStore {
     pub fn with_max_snapshots(mut self, max: Option<usize>) -> Self {
         self.max_snapshots = max.filter(|&n| n > 0);
         self
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     pub fn pack_path(&self) -> PathBuf {
@@ -523,6 +528,246 @@ impl PackSnapshotStore {
         }
         Ok(raw)
     }
+
+    /// Verifica la integridad de todos los hitos almacenados (magic, descompresión, longitud y checksum FNV-1a).
+    pub fn verify_pack_integrity(&self) -> Result<usize, OnyxError> {
+        if let Some(err) = &self.corruption_error {
+            return Err(OnyxError::Format(err.clone()));
+        }
+        if self.truncated_tail_bytes > 0 {
+            return Err(OnyxError::Format(format!(
+                "pack `{}` has {} truncated trailing bytes",
+                self.pack_path().display(),
+                self.truncated_tail_bytes
+            )));
+        }
+        let ticks = self.ticks();
+        for &tick in &ticks {
+            let _ = self.load_tick(tick)?;
+        }
+        Ok(ticks.len())
+    }
+}
+
+/// Resultado de bifurcar un `PackSnapshotStore` hasta un tick concreto (`REQ-03.3`, `TEST-03.1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkPackReport {
+    pub source_dir: PathBuf,
+    pub dest_dir: PathBuf,
+    pub resolved_tick: u64,
+    pub copied_snapshots: usize,
+}
+
+/// Calcula un directorio hermano determinista para una nueva rama de snapshots,
+/// evitando colisiones con ramas existentes.
+pub fn default_fork_dir(base_dir: &Path, tick: u64, label: Option<&str>) -> PathBuf {
+    if let Some(raw_label) = label.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = Path::new(raw_label);
+        if p.is_absolute() || raw_label.contains('/') || raw_label.contains('\\') {
+            return p.to_path_buf();
+        }
+        let sanitized: String = raw_label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let slug = sanitized.trim_matches('-');
+        let suffix = if slug.is_empty() {
+            format!("t{tick}")
+        } else {
+            slug.to_string()
+        };
+        return unique_sibling_fork_dir(base_dir, &suffix);
+    }
+    unique_sibling_fork_dir(base_dir, &format!("t{tick}"))
+}
+
+fn unique_sibling_fork_dir(base_dir: &Path, suffix: &str) -> PathBuf {
+    let parent = base_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base_name = base_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("snapshots");
+    let first = parent.join(format!("{base_name}.fork-{suffix}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..=10_000u32 {
+        let cand = parent.join(format!("{base_name}.fork-{suffix}-{n}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    parent.join(format!("{base_name}.fork-{suffix}-overflow"))
+}
+
+/// Copia únicamente los snapshots válidos con `tick <= target_tick` (resolviendo al hito
+/// `<= target_tick`) en `dest_dir`, preservando intacto el `snapshots.onyxpack` de origen (`REQ-03.3`).
+pub fn fork_pack_until_tick(
+    src_dir: &Path,
+    dest_dir: &Path,
+    target_tick: u64,
+) -> Result<ForkPackReport, OnyxError> {
+    let src_canon = fs::canonicalize(src_dir).unwrap_or_else(|_| src_dir.to_path_buf());
+    let dest_canon = fs::canonicalize(dest_dir).unwrap_or_else(|_| dest_dir.to_path_buf());
+    if src_canon == dest_canon {
+        return Err(OnyxError::Format(format!(
+            "fork destination `{}` must differ from source `{}`",
+            dest_dir.display(),
+            src_dir.display()
+        )));
+    }
+
+    let src_store = PackSnapshotStore::new(src_dir);
+    if let Some(err) = src_store.corruption_error() {
+        return Err(OnyxError::Format(err.to_string()));
+    }
+    let resolved_tick = src_store
+        .resolve_tick_or_floor(target_tick)
+        .ok_or_else(|| {
+            OnyxError::Format(format!(
+                "no snapshots found in `{}` at or before tick {target_tick}",
+                src_dir.display()
+            ))
+        })?;
+
+    if dest_dir.join(PACK_FILE_NAME).exists() {
+        return Err(OnyxError::Format(format!(
+            "fork destination `{}` already contains `{PACK_FILE_NAME}`; choose a fresh directory",
+            dest_dir.display()
+        )));
+    }
+
+    fs::create_dir_all(dest_dir).map_err(|e| OnyxError::Io(e.to_string()))?;
+    let mut dest_store = PackSnapshotStore::new(dest_dir);
+    let mut copied = 0usize;
+    for meta in src_store.entries() {
+        if meta.tick > resolved_tick {
+            break;
+        }
+        let raw = src_store.load_tick(meta.tick)?;
+        dest_store.save_milestone(meta.tick, &meta.tag, &raw)?;
+        copied += 1;
+    }
+    dest_store.verify_pack_integrity()?;
+
+    Ok(ForkPackReport {
+        source_dir: src_dir.to_path_buf(),
+        dest_dir: dest_dir.to_path_buf(),
+        resolved_tick,
+        copied_snapshots: copied,
+    })
+}
+
+/// Reescribe atómicamente `dir/snapshots.onyxpack` conservando solo los frames `<= target_tick`
+/// (opt-in explícito vía `--truncate-future`).
+pub fn truncate_pack_until_tick(dir: &Path, target_tick: u64) -> Result<ForkPackReport, OnyxError> {
+    let tmp_dir = unique_sibling_fork_dir(dir, &format!("truncate-t{target_tick}"));
+    let report = fork_pack_until_tick(dir, &tmp_dir, target_tick)?;
+    let src_pack = tmp_dir.join(PACK_FILE_NAME);
+    let dst_pack = dir.join(PACK_FILE_NAME);
+    fs::rename(&src_pack, &dst_pack).map_err(|e| OnyxError::Io(e.to_string()))?;
+    let _ = fs::remove_dir_all(&tmp_dir);
+    // Eliminar snapshots legados con tick > resolved_tick si existieran.
+    if let Ok(read_dir) = fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(t) = legacy_tick_of(name) {
+                    if t > report.resolved_tick {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
+    Ok(ForkPackReport {
+        source_dir: dir.to_path_buf(),
+        dest_dir: dir.to_path_buf(),
+        resolved_tick: report.resolved_tick,
+        copied_snapshots: report.copied_snapshots,
+    })
+}
+
+/// Handle compartible y thread-safe sobre [`PackSnapshotStore`] que permite cambiar de
+/// directorio/rama en caliente (`/fork` y `/rewind` dentro de `chat`) sin recrear `AgentHost`.
+#[derive(Clone)]
+pub struct SharedPackStore {
+    inner: Arc<Mutex<PackSnapshotStore>>,
+    max_snapshots: Option<usize>,
+}
+
+impl SharedPackStore {
+    pub fn new(dir: impl AsRef<Path>, max_snapshots: Option<usize>) -> Self {
+        let store = PackSnapshotStore::new(dir).with_max_snapshots(max_snapshots);
+        Self {
+            inner: Arc::new(Mutex::new(store)),
+            max_snapshots,
+        }
+    }
+
+    pub fn current_dir(&self) -> PathBuf {
+        self.inner
+            .lock()
+            .map(|g| g.dir().to_path_buf())
+            .unwrap_or_default()
+    }
+
+    pub fn switch_dir(&self, new_dir: impl AsRef<Path>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = PackSnapshotStore::new(new_dir).with_max_snapshots(self.max_snapshots);
+        }
+    }
+
+    pub fn entries(&self) -> Vec<SnapshotMeta> {
+        self.inner.lock().map(|g| g.entries()).unwrap_or_default()
+    }
+
+    pub fn latest_tick(&self) -> Option<u64> {
+        self.inner.lock().ok().and_then(|g| g.latest_tick())
+    }
+
+    pub fn resolve_tick_or_floor(&self, requested: u64) -> Option<u64> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.resolve_tick_or_floor(requested))
+    }
+
+    pub fn save_milestone(&self, tick: u64, tag: &str, bytes: &[u8]) -> Result<(), OnyxError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| OnyxError::Io("pack snapshot store lock poisoned".into()))?;
+        guard.save_milestone(tick, tag, bytes)
+    }
+}
+
+impl SnapshotStore for SharedPackStore {
+    fn save(&mut self, key: &str, bytes: &[u8]) -> Result<(), OnyxError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| OnyxError::Io("pack snapshot store lock poisoned".into()))?;
+        guard.save(key, bytes)
+    }
+
+    fn load(&self, key: &str) -> Result<Vec<u8>, OnyxError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| OnyxError::Io("pack snapshot store lock poisoned".into()))?;
+        guard.load(key)
+    }
 }
 
 impl SnapshotStore for PackSnapshotStore {
@@ -695,6 +940,16 @@ impl OnyxSystem for MilestoneSnapshotSystem {
                     || cmd.starts_with("/services ")
                 {
                     cmd_tag = Some("cmd:/service".to_string());
+                } else if cmd == "/agent"
+                    || cmd == "/agents"
+                    || cmd.starts_with("/agent ")
+                    || cmd.starts_with("/agents ")
+                {
+                    cmd_tag = Some("cmd:/agent".to_string());
+                } else if cmd == "/rewind" || cmd.starts_with("/rewind ") {
+                    cmd_tag = Some("cmd:/rewind".to_string());
+                } else if cmd == "/fork" || cmd.starts_with("/fork ") {
+                    cmd_tag = Some("cmd:/fork".to_string());
                 }
             }
         }
@@ -876,5 +1131,60 @@ mod tests {
         assert_eq!(reopened.load("8").unwrap(), frame8);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_pack_until_tick_copies_prefix_verifies_integrity_and_preserves_source() {
+        // TEST-03.1: `fork_pack_until_tick` copies exactly frames `<= target_tick`,
+        // passes `verify_pack_integrity`, and leaves the source pack byte-identical.
+        let src = temp_dir("fork-src");
+        let dst = temp_dir("fork-dst");
+        let _ = fs::remove_dir_all(&dst);
+
+        let mut store = PackSnapshotStore::new(&src);
+        let p0 = b"ONYXAG\x01\0frame-0-payload-aaaaaaaaaaaa";
+        let p4 = b"ONYXAG\x01\0frame-4-payload-bbbbbbbbbbbb";
+        let p9 = b"ONYXAG\x01\0frame-9-payload-cccccccccccc";
+        let p15 = b"ONYXAG\x01\0frame-15-payload-dddddddddddd";
+        store.save("0:init", p0).unwrap();
+        store.save("4:spawn", p4).unwrap();
+        store.save("9:tool:fs_edit", p9).unwrap();
+        store.save("15:settled", p15).unwrap();
+        let src_bytes_before = fs::read(src.join(PACK_FILE_NAME)).unwrap();
+
+        // Requesting tick 10 resolves to floor milestone tick 9.
+        let report = fork_pack_until_tick(&src, &dst, 10).unwrap();
+        assert_eq!(report.resolved_tick, 9);
+        assert_eq!(report.copied_snapshots, 3);
+
+        let forked = PackSnapshotStore::new(&dst);
+        assert_eq!(forked.verify_pack_integrity().unwrap(), 3);
+        assert_eq!(forked.ticks(), vec![0, 4, 9]);
+        assert_eq!(forked.load_tick(0).unwrap(), p0);
+        assert_eq!(forked.load_tick(4).unwrap(), p4);
+        assert_eq!(forked.load_tick(9).unwrap(), p9);
+        assert!(forked.load_tick(15).is_err());
+
+        // Source pack must remain byte-for-byte untouched.
+        assert_eq!(
+            fs::read(src.join(PACK_FILE_NAME)).unwrap(),
+            src_bytes_before
+        );
+
+        // Second fork into an already-populated destination must fail safely.
+        assert!(fork_pack_until_tick(&src, &dst, 4).is_err());
+        // Forking into source itself must also fail safely.
+        assert!(fork_pack_until_tick(&src, &src, 4).is_err());
+
+        // Explicit `truncate_pack_until_tick` rewrites in place cleanly.
+        let trunc = truncate_pack_until_tick(&dst, 4).unwrap();
+        assert_eq!(trunc.resolved_tick, 4);
+        assert_eq!(trunc.copied_snapshots, 2);
+        let after_trunc = PackSnapshotStore::new(&dst);
+        assert_eq!(after_trunc.ticks(), vec![0, 4]);
+        assert_eq!(after_trunc.verify_pack_integrity().unwrap(), 2);
+
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
     }
 }

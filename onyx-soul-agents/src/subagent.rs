@@ -15,6 +15,8 @@ use crate::vocab::{AgentState, Vocab};
 
 pub const SUBAGENT_NAME: &str = "agent_subagents";
 pub const SPAWN_AGENT_TOOL: &str = "spawn_agent";
+/// Límite por defecto de pasos para subagentes delegados (evita bucles largos en modelos pequeños).
+pub const DEFAULT_SUBAGENT_MAX_STEPS: i64 = 32;
 
 pub struct SubagentSystem {
     config: AgentConfig,
@@ -184,13 +186,14 @@ impl SubagentSystem {
             Some(Value::Text(s)) => s.as_str(),
             _ => "",
         };
-        let (child_name, child_goal) = match parse_spawn_args(raw_args, parent, *request) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                emit_tool_result(ctx, v, parent, *request, false, err);
-                return;
-            }
-        };
+        let (child_name, child_goal, requested_max_steps) =
+            match parse_spawn_args(raw_args, parent, *request) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    emit_tool_result(ctx, v, parent, *request, false, err);
+                    return;
+                }
+            };
 
         let tools: Vec<String> = ctx
             .graph
@@ -215,11 +218,14 @@ impl SubagentSystem {
             .with_tools(tools.iter().map(String::as_str))
             .with_approval_tools(approval_tools.iter().map(String::as_str))
             .with_extra(parent_req_attr, Value::Int(*request));
-        if let Some(ms) = int(&*ctx.graph, parent, v.max_steps) {
-            if ms > 0 {
-                spec = spec.with_max_steps(ms);
-            }
-        }
+        let parent_max_steps = int(&*ctx.graph, parent, v.max_steps).filter(|&ms| ms > 0);
+        let child_max_steps = match (requested_max_steps, parent_max_steps) {
+            (Some(req_ms), Some(parent_ms)) => req_ms.min(parent_ms),
+            (Some(req_ms), None) => req_ms,
+            (None, Some(parent_ms)) => parent_ms.min(DEFAULT_SUBAGENT_MAX_STEPS),
+            (None, None) => DEFAULT_SUBAGENT_MAX_STEPS,
+        };
+        spec = spec.with_max_steps(child_max_steps);
         if let Some(tt) = int(&*ctx.graph, parent, v.timeout) {
             if tt > 0 {
                 spec = spec.with_timeout_ticks(tt);
@@ -295,7 +301,7 @@ fn parse_spawn_args(
     raw: &str,
     parent: ConceptId,
     request: i64,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Option<i64>), String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("spawn_agent requires a non-empty goal".to_string());
@@ -309,12 +315,46 @@ fn parse_spawn_args(
         let name = extract_json_string(trimmed, "name")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("subagent-{}-{request}", parent.0));
-        return Ok((name, goal));
+        let max_steps = extract_json_positive_int(trimmed, "max_steps");
+        return Ok((name, goal, max_steps));
     }
     Ok((
         format!("subagent-{}-{request}", parent.0),
         trimmed.to_string(),
+        None,
     ))
+}
+
+fn extract_json_positive_int(json: &str, key: &str) -> Option<i64> {
+    let bytes = json.as_bytes();
+    let needle = format!("\"{key}\"");
+    let mut search_from = 0usize;
+    while let Some(rel_idx) = json[search_from..].find(&needle) {
+        let key_end = search_from + rel_idx + needle.len();
+        let mut i = key_end;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b':' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start {
+                if let Ok(val) = json[start..i].parse::<i64>() {
+                    if val > 0 {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+        search_from = key_end;
+    }
+    None
 }
 
 fn extract_json_string(json: &str, key: &str) -> Option<String> {

@@ -27,8 +27,8 @@ pub use state::{
     WorkspaceModeHandle, WorkspaceVocab, all_recorded_effects, capture_git_tree_checkpoint,
     effects_after_tick, graph_workspace_mode, graph_workspace_plan, graph_workspace_services,
     is_effect_undone, is_file_read, latest_undoable_effect, mark_latest_effect_undone,
-    restore_git_tree_checkpoint, set_workspace_mode, set_workspace_plan, set_workspace_services,
-    undone_effects,
+    restore_git_tree_checkpoint, restore_git_tree_checkpoint_for_targets, set_workspace_mode,
+    set_workspace_plan, set_workspace_services, undone_effects,
 };
 pub use tools::{
     FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,

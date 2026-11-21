@@ -1,14 +1,15 @@
-//! Adaptador TUI interactivo (`ratatui` + `crossterm`) para `openOnyx`.
-//! Vive fuera de `onyx-core` y `onyx-soul-agents` para mantener los souls con 0 dependencias.
+//! Interactive TUI adapter (`ratatui` + `crossterm`) for `openOnyx`.
+//! Lives outside `onyx-core` and `onyx-soul-agents` to keep souls dependency-free.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
+use std::f64::consts::{PI, TAU};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -24,18 +25,40 @@ use onyx_workspace::{
     WorkspaceVocab, graph_workspace_plan, graph_workspace_services, preview_tool_diff,
 };
 use ratatui::{
-    Terminal,
+    Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Wrap,
+        canvas::{Canvas, Line as CanvasLine, Points},
+    },
 };
 
 use crate::context::{
-    COMPACT_MARKER, SessionTelemetryHandle, TieredContextConfig, ToolOutputTier, project_memory,
+    COMPACT_MARKER, ReasoningEffort, SessionTelemetryHandle, TieredContextConfig, ToolOutputTier,
+    project_memory,
 };
 use crate::gemini::StreamPreviewHandle;
+
+const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(90);
+const SPINNER_STEP_RAD: f64 = 0.35;
+
+enum FocusSwitch {
+    Next,
+    Target(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentRow {
+    pub id: ConceptId,
+    pub name: String,
+    pub is_root: bool,
+    pub state: String,
+    pub goal: String,
+}
 
 struct TuiInner {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -48,12 +71,22 @@ struct TuiInner {
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
     context_config: TieredContextConfig,
+    model_name: String,
+    reasoning_effort: Option<ReasoningEffort>,
     seen_compact_count: usize,
     input: String,
     queued: Vec<OnyxEvent>,
     active_approval: Option<(ConceptId, u64, String, String)>,
     approval_diff: Option<String>,
     seen_approvals: BTreeSet<(u64, u64)>,
+    focused_agent: Option<ConceptId>,
+    last_known_root: Option<ConceptId>,
+    pending_focus_switch: Option<FocusSwitch>,
+    agent_picker_open: bool,
+    agent_picker_idx: usize,
+    last_agent_ids: Vec<ConceptId>,
+    spinner_angle: f64,
+    last_spinner_tick: Instant,
     scroll_from_bottom: usize,
     last_viewport_height: usize,
     quit: Arc<AtomicBool>,
@@ -73,14 +106,16 @@ impl TuiHandle {
         self.inner.borrow_mut().render(graph);
     }
 
-    /// Lee entrada de teclado/resize cuando el cerebro está en reposo (`is_settled()`),
-    /// o refresca deltas SSE / telemetría en vuelo sin avanzar `host.ticks()`.
+    /// Reads keyboard/resize input while the brain is settled (`is_settled()`),
+    /// or refreshes in-flight SSE deltas, telemetry, and throttled emblem rotation without advancing `host.ticks()`.
     pub fn pump_idle(&self, graph: &dyn GraphView) {
         let mut inner = self.inner.borrow_mut();
         let ui_event = inner.poll_crossterm();
         let stream_dirty = inner.stream_preview.take_dirty();
         let telemetry_dirty = inner.telemetry.take_dirty();
-        if (ui_event || stream_dirty || telemetry_dirty)
+        let busy = inner.is_any_agent_busy(graph);
+        let spinner_dirty = inner.advance_spinner_if_due(busy);
+        if (ui_event || stream_dirty || telemetry_dirty || spinner_dirty)
             && inner.queued.is_empty()
             && !inner.quit.load(Ordering::Relaxed)
         {
@@ -112,12 +147,22 @@ impl TuiDriver {
                 stream_preview: StreamPreviewHandle::default(),
                 telemetry: SessionTelemetryHandle::default(),
                 context_config: TieredContextConfig::default(),
+                model_name: String::new(),
+                reasoning_effort: None,
                 seen_compact_count: 0,
                 input: String::new(),
                 queued: Vec::new(),
                 active_approval: None,
                 approval_diff: None,
                 seen_approvals: BTreeSet::new(),
+                focused_agent: None,
+                last_known_root: None,
+                pending_focus_switch: None,
+                agent_picker_open: false,
+                agent_picker_idx: 0,
+                last_agent_ids: Vec::new(),
+                spinner_angle: 0.0,
+                last_spinner_tick: Instant::now(),
                 scroll_from_bottom: 0,
                 last_viewport_height: 20,
                 quit: Arc::new(AtomicBool::new(false)),
@@ -182,6 +227,19 @@ impl TuiDriver {
         self
     }
 
+    pub fn with_model_info(
+        self,
+        model: impl Into<String>,
+        effort: Option<ReasoningEffort>,
+    ) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.model_name = model.into();
+            inner.reasoning_effort = effort;
+        }
+        self
+    }
+
     pub fn handle(&self) -> TuiHandle {
         TuiHandle {
             inner: Rc::clone(&self.inner),
@@ -201,7 +259,47 @@ impl TuiInner {
         Ok(())
     }
 
-    /// Devuelve `true` si hubo algún evento de UI o cerebro.
+    fn is_any_agent_busy(&self, graph: &dyn GraphView) -> bool {
+        if self.active_approval.is_some() {
+            return false;
+        }
+        graph.query(&[self.vocab.state]).into_iter().any(|id| {
+            matches!(
+                prop_text(graph, id, self.vocab.state).as_deref(),
+                Some("thinking" | "acting" | "waiting_children")
+            )
+        })
+    }
+
+    fn advance_spinner_if_due(&mut self, busy: bool) -> bool {
+        if !busy {
+            if self.spinner_angle != 0.0 {
+                self.spinner_angle = 0.0;
+                return true;
+            }
+            return false;
+        }
+        if self.last_spinner_tick.elapsed() >= SPINNER_FRAME_INTERVAL {
+            self.last_spinner_tick = Instant::now();
+            self.spinner_angle = (self.spinner_angle + SPINNER_STEP_RAD) % TAU;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open_agent_picker(&mut self) {
+        self.agent_picker_open = true;
+        if let Some(cur) = self.focused_agent {
+            if let Some(idx) = self.last_agent_ids.iter().position(|id| *id == cur) {
+                self.agent_picker_idx = idx;
+                return;
+            }
+        }
+        self.agent_picker_idx = 0;
+    }
+
+    /// Returns `true` if a UI or brain event occurred.
     fn poll_crossterm(&mut self) -> bool {
         if !event::poll(Duration::from_millis(16)).unwrap_or(false) {
             return false;
@@ -225,8 +323,46 @@ impl TuiInner {
                 }
                 let is_ctrl_c = modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
-                if is_ctrl_c || matches!(code, CtKeyCode::Esc) {
+                if is_ctrl_c {
                     self.quit.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                if self.agent_picker_open {
+                    match code {
+                        CtKeyCode::Esc | CtKeyCode::F(2) => {
+                            self.agent_picker_open = false;
+                        }
+                        CtKeyCode::Up | CtKeyCode::Char('k') => {
+                            let len = self.last_agent_ids.len();
+                            if len > 0 {
+                                self.agent_picker_idx = if self.agent_picker_idx == 0 {
+                                    len - 1
+                                } else {
+                                    self.agent_picker_idx - 1
+                                };
+                            }
+                        }
+                        CtKeyCode::Down | CtKeyCode::Char('j') => {
+                            let len = self.last_agent_ids.len();
+                            if len > 0 {
+                                self.agent_picker_idx = (self.agent_picker_idx + 1) % len;
+                            }
+                        }
+                        CtKeyCode::Enter => {
+                            if let Some(&chosen) = self.last_agent_ids.get(self.agent_picker_idx) {
+                                self.focused_agent = Some(chosen);
+                                self.scroll_from_bottom = 0;
+                            }
+                            self.agent_picker_open = false;
+                        }
+                        _ => {}
+                    }
+                    return true;
+                }
+                if matches!(code, CtKeyCode::Esc) {
+                    self.quit.store(true, Ordering::Relaxed);
+                } else if matches!(code, CtKeyCode::F(2)) {
+                    self.open_agent_picker();
                 } else if apply_scroll_key(
                     &mut self.scroll_from_bottom,
                     self.last_viewport_height,
@@ -251,6 +387,10 @@ impl TuiInner {
                     }
                 } else {
                     match code {
+                        CtKeyCode::Tab if modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.pending_focus_switch = Some(FocusSwitch::Next);
+                            self.scroll_from_bottom = 0;
+                        }
                         CtKeyCode::Tab => {
                             let next_cmd = match self.mode_handle.get() {
                                 WorkspaceMode::Build => "/mode plan",
@@ -269,8 +409,27 @@ impl TuiInner {
                             self.input.clear();
                             if !cmd.is_empty() {
                                 self.scroll_from_bottom = 0;
-                                self.queued
-                                    .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
+                                if cmd == "/agent" || cmd == "/agents" {
+                                    if self.last_agent_ids.len() > 1 {
+                                        self.open_agent_picker();
+                                    } else {
+                                        self.pending_focus_switch = Some(FocusSwitch::Next);
+                                    }
+                                } else if let Some(rest) = cmd
+                                    .strip_prefix("/agent ")
+                                    .or_else(|| cmd.strip_prefix("/agents "))
+                                {
+                                    let target = rest.trim();
+                                    if target.is_empty() {
+                                        self.open_agent_picker();
+                                    } else {
+                                        self.pending_focus_switch =
+                                            Some(FocusSwitch::Target(target.to_string()));
+                                    }
+                                } else {
+                                    self.queued
+                                        .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
+                                }
                             }
                         }
                         _ => {}
@@ -301,7 +460,10 @@ impl PlatformDriver for TuiDriver {
     }
 
     fn present(&mut self, graph: &dyn GraphView, _surfaces: &[SurfaceBinding]) {
-        self.inner.borrow_mut().render(graph);
+        let mut inner = self.inner.borrow_mut();
+        let busy = inner.is_any_agent_busy(graph);
+        inner.advance_spinner_if_due(busy);
+        inner.render(graph);
     }
 }
 
@@ -318,7 +480,7 @@ impl TuiInner {
                     if policy.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
                         != PermissionDecision::Ask
                     {
-                        // Auto-aprobado o auto-denegado por `WorkspaceToolBridge` según política.
+                        // Auto-approved or auto-denied by `WorkspaceToolBridge` per policy.
                         continue;
                     }
                 }
@@ -335,22 +497,205 @@ impl TuiInner {
         }
 
         let agents = graph.query(&[self.vocab.state]);
-        let mut status_line = String::from("idle (enter a goal below)");
+        let agent_rows: Vec<AgentRow> = agents
+            .iter()
+            .map(|id| AgentRow {
+                id: *id,
+                name: prop_text(graph, *id, self.vocab.name).unwrap_or_default(),
+                is_root: graph.related(*id, self.vocab.rel_parent).is_empty(),
+                state: prop_text(graph, *id, self.vocab.state).unwrap_or_default(),
+                goal: prop_text(graph, *id, self.vocab.goal).unwrap_or_default(),
+            })
+            .collect();
+        self.last_agent_ids = agents.clone();
+        if self.agent_picker_idx >= agent_rows.len() {
+            self.agent_picker_idx = agent_rows.len().saturating_sub(1);
+        }
+
+        let explicit_switch = self.pending_focus_switch.take();
+        if let Some(switch) = explicit_switch {
+            if !agent_rows.is_empty() {
+                match switch {
+                    FocusSwitch::Next => {
+                        let next_idx = self
+                            .focused_agent
+                            .and_then(|cur| agent_rows.iter().position(|r| r.id == cur))
+                            .map(|idx| (idx + 1) % agent_rows.len())
+                            .unwrap_or(0);
+                        self.focused_agent = Some(agent_rows[next_idx].id);
+                    }
+                    FocusSwitch::Target(query) => {
+                        let q_lower = query.to_ascii_lowercase();
+                        let matched = if let Ok(target_num) = query.parse::<u64>() {
+                            agent_rows
+                                .iter()
+                                .find(|r| r.id.0 == target_num)
+                                .map(|r| r.id)
+                        } else {
+                            agent_rows
+                                .iter()
+                                .find(|r| r.name.eq_ignore_ascii_case(&query))
+                                .or_else(|| {
+                                    agent_rows
+                                        .iter()
+                                        .find(|r| r.name.to_ascii_lowercase().contains(&q_lower))
+                                })
+                                .map(|r| r.id)
+                        };
+                        if let Some(id) = matched {
+                            self.focused_agent = Some(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let (active_agent, root_changed) =
+            resolve_focused_agent(&agent_rows, self.focused_agent, &mut self.last_known_root);
+        self.focused_agent = active_agent;
+        if root_changed {
+            self.scroll_from_bottom = 0;
+        }
+
+        let any_agent_active = agent_rows
+            .iter()
+            .any(|r| matches!(r.state.as_str(), "thinking" | "acting" | "waiting_children"));
+
+        let is_busy = self.active_approval.is_none() && any_agent_active;
+        let spinner_angle = if is_busy { self.spinner_angle } else { 0.0 };
+
+        let mut header_lines: Vec<Line<'static>> = Vec::with_capacity(3);
         let mut log_lines: Vec<Line<'static>> = Vec::new();
         let mut latest_agent_memory: Option<(String, Vec<(String, String)>)> = None;
         let mut compact_count = 0usize;
+        let model_display = if self.model_name.is_empty() {
+            self.telemetry.snapshot().model
+        } else {
+            self.model_name.clone()
+        };
+        let effort_display = self
+            .reasoning_effort
+            .map(ReasoningEffort::as_str)
+            .unwrap_or("auto");
 
-        for id in &agents {
-            let name = prop_text(graph, *id, self.vocab.name).unwrap_or_default();
-            let state = prop_text(graph, *id, self.vocab.state).unwrap_or_default();
-            let goal = prop_text(graph, *id, self.vocab.goal).unwrap_or_default();
-            status_line = format!("agent={} state={} goal={}", name, state, goal);
+        if let Some(id) = active_agent {
+            let active_row = agent_rows.iter().find(|r| r.id == id);
+            let name = active_row.map(|r| r.name.as_str()).unwrap_or("");
+            let state = active_row.map(|r| r.state.as_str()).unwrap_or("");
+            let goal = active_row.map(|r| r.goal.clone()).unwrap_or_default();
+            let role_tag = if active_row.map(|r| r.is_root).unwrap_or(true) {
+                "root"
+            } else {
+                "sub"
+            };
+
+            // Row 1: goal (single line, no wrap so phase is never pushed out).
+            header_lines.push(Line::from(vec![
+                Span::styled("goal:  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(sanitize_display_line(&goal)),
+            ]));
+
+            // Row 2: phase + focused agent identity + compact multi-agent indicator.
+            let phase_label = if self.active_approval.is_some() {
+                "awaiting human approval ([y] / [n])"
+            } else {
+                match state {
+                    "thinking" => "thinking / streaming...",
+                    "acting" => "executing workspace tool...",
+                    "waiting_children" => "waiting for subagent(s)...",
+                    "done" => "settled (ready for follow-up)",
+                    "fail" => "failed (enter follow-up or /new)",
+                    _ => "idle",
+                }
+            };
+            let phase_color = if is_busy {
+                Color::Rgb(255, 248, 231)
+            } else if self.active_approval.is_some() {
+                Color::Yellow
+            } else {
+                Color::Gray
+            };
+            let mut phase_spans = vec![
+                Span::styled("phase: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(phase_label, Style::default().fg(phase_color)),
+                Span::styled(
+                    format!("  · #{id_num} {name} [{role_tag}]", id_num = id.0),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if agent_rows.len() > 1 {
+                let active_count = agent_rows
+                    .iter()
+                    .filter(|r| {
+                        matches!(r.state.as_str(), "thinking" | "acting" | "waiting_children")
+                    })
+                    .count();
+                phase_spans.push(Span::styled(
+                    format!("  [{}/{} agents · F2]", active_count, agent_rows.len()),
+                    Style::default()
+                        .fg(if active_count > 0 {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            header_lines.push(Line::from(phase_spans));
+
+            // Row 3: compact single-line agent strip only when >1 agent exists; otherwise quiet hint.
+            if agent_rows.len() > 1 {
+                let mut strip_spans = vec![Span::styled(
+                    "focus: ",
+                    Style::default().fg(Color::DarkGray),
+                )];
+                for (i, row) in agent_rows.iter().enumerate() {
+                    if i > 0 {
+                        strip_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                    }
+                    let is_cur = row.id == id;
+                    let short_state = match row.state.as_str() {
+                        "waiting_children" => "wait",
+                        "waiting_approval" => "appr",
+                        "thinking" => "think",
+                        "acting" => "act",
+                        other => other,
+                    };
+                    let label = if is_cur {
+                        format!("*{}:{} ({short_state})", row.id.0, row.name)
+                    } else {
+                        format!("{}:{} ({short_state})", row.id.0, row.name)
+                    };
+                    let style = if is_cur {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else if matches!(
+                        row.state.as_str(),
+                        "thinking" | "acting" | "waiting_children"
+                    ) {
+                        Style::default().fg(Color::Cyan)
+                    } else if row.state == "waiting_approval" {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    strip_spans.push(Span::styled(label, style));
+                }
+                header_lines.push(Line::from(strip_spans));
+            } else {
+                header_lines.push(Line::from(Span::styled(
+                    "Tab: Plan/Build · F2: Agents · /rewind · /fork · /services · Esc: quit",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
             if !goal.is_empty() {
                 push_multiline_entry(&mut log_lines, "user", Color::LightCyan, &goal);
             }
 
             let mut mem_pairs: Vec<(String, String)> = Vec::new();
-            for mem_id in graph.related(*id, self.vocab.rel_memory) {
+            for mem_id in graph.related(id, self.vocab.rel_memory) {
                 let kind = prop_text(graph, mem_id, self.vocab.mem_kind).unwrap_or_default();
                 let text = prop_text(graph, mem_id, self.vocab.mem_text).unwrap_or_default();
                 if kind == "system" && text.starts_with(COMPACT_MARKER) {
@@ -369,7 +714,7 @@ impl TuiInner {
             }
             latest_agent_memory = Some((goal, mem_pairs));
 
-            if let Some(res) = prop_text(graph, *id, self.vocab.result) {
+            if let Some(res) = prop_text(graph, id, self.vocab.result) {
                 if !res.is_empty() {
                     push_multiline_entry(&mut log_lines, "result", Color::LightGreen, &res);
                 }
@@ -387,6 +732,30 @@ impl TuiInner {
                     }
                 }
             }
+        } else {
+            header_lines.push(Line::from(Span::styled(
+                "idle — enter a goal below",
+                Style::default().fg(Color::Gray),
+            )));
+            header_lines.push(Line::from(vec![
+                Span::styled("model: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    if model_display.is_empty() {
+                        "(default)".to_string()
+                    } else {
+                        model_display.clone()
+                    },
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("  ·  effort: {effort_display}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            header_lines.push(Line::from(Span::styled(
+                "Tab: Plan/Build · F2: Agents · /rewind · /fork · /services · Esc: quit",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         let mut telemetry_bar = self.telemetry.snapshot().format_status_bar();
@@ -407,6 +776,18 @@ impl TuiInner {
         }
         let input_snapshot = self.input.clone();
         let approval_snapshot = self.active_approval.clone();
+        let approval_agent_label = approval_snapshot.as_ref().map(|(aid, _, _, _)| {
+            let name = agent_rows
+                .iter()
+                .find(|r| r.id == *aid)
+                .map(|r| r.name.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                format!("#{}", aid.0)
+            } else {
+                format!("#{} {}", aid.0, name)
+            }
+        });
         let diff_snapshot = self.approval_diff.clone();
         let plan_snapshot = self
             .ws_vocab
@@ -423,9 +804,14 @@ impl TuiInner {
             .as_ref()
             .map(|p| p.sandbox.mode.as_badge())
             .unwrap_or("workspace");
-        let header_title = format!(
-            " openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}] — Deterministic Harness (Esc/Ctrl+C to quit) "
+        let header_title = format_header_title(
+            mode_label,
+            sandbox_badge,
+            &model_display,
+            self.reasoning_effort,
         );
+        let picker_open = self.agent_picker_open;
+        let picker_idx = self.agent_picker_idx;
         let terminal = &mut self.terminal;
         let scroll_from_bottom = &mut self.scroll_from_bottom;
         let last_viewport_height = &mut self.last_viewport_height;
@@ -467,15 +853,19 @@ impl TuiInner {
                             lines.push(Line::from(Span::styled(dline.to_string(), style)));
                         }
                     }
+                    let agent_tag = approval_agent_label
+                        .as_deref()
+                        .map(|lbl| format!(" [agent {lbl}]"))
+                        .unwrap_or_default();
                     (
-                        " Approval Required ([y] Approve / [n] Deny) ".to_string(),
+                        format!(" Approval Required{agent_tag} ([y] Approve / [n] Deny) "),
                         lines,
                         Color::Yellow,
                     )
                 }
                 None => (
                     format!(
-                        " [{mode_label}] Goal / Command (Enter send, Tab Plan/Build, /undo, /compact, /services, /new) "
+                        " [{mode_label}] Goal / Command (Enter send · Tab Plan/Build · F2 Agents · /rewind · /fork · /undo · /compact · /services · /new) "
                     ),
                     vec![Line::from(format!("> {input_snapshot}"))],
                     Color::White,
@@ -506,25 +896,46 @@ impl TuiInner {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
+                    Constraint::Length(5),
                     Constraint::Min(5),
                     Constraint::Length(bottom_height),
                 ])
                 .split(f.area());
 
-            let header = Paragraph::new(status_line).block(
-                Block::default()
-                    .title(header_title)
-                    .title_bottom(
-                        Line::from(Span::styled(
-                            format!(" {telemetry_bar} "),
-                            Style::default().fg(Color::Cyan),
-                        ))
-                        .right_aligned(),
-                    )
-                    .borders(Borders::ALL),
-            );
-            f.render_widget(header, chunks[0]);
+            let header_block = Block::default()
+                .title(header_title)
+                .title_top(
+                    Line::from(Span::styled(
+                        " F2:Agents · Esc:Quit ",
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                    .right_aligned(),
+                )
+                .title_bottom(
+                    Line::from(Span::styled(
+                        format!(" {telemetry_bar} "),
+                        Style::default().fg(Color::Cyan),
+                    ))
+                    .right_aligned(),
+                )
+                .borders(Borders::ALL);
+            let header_inner = header_block.inner(chunks[0]);
+            f.render_widget(header_block, chunks[0]);
+
+            let header_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Length(1),
+                    Constraint::Min(10),
+                ])
+                .split(header_inner);
+
+            render_onyx_emblem(f, header_cols[0], spinner_angle, is_busy);
+
+            // Render header without wrapping so `goal`, `phase`, and `focus` stay pinned to their rows.
+            let header_text = Paragraph::new(header_lines);
+            f.render_widget(header_text, header_cols[2]);
 
             let has_side_panel = plan_snapshot.is_some() || services_snapshot.is_some();
             let (trace_area, side_area) = if has_side_panel && f.area().width >= 100 {
@@ -629,11 +1040,213 @@ impl TuiInner {
                 bottom = bottom.scroll((u16::try_from(bottom_scroll).unwrap_or(u16::MAX), 0));
             }
             f.render_widget(bottom, chunks[2]);
+
+            if picker_open {
+                render_agent_picker(f, f.area(), &agent_rows, active_agent, picker_idx);
+            }
         });
     }
 }
 
-/// Estiliza cada línea del panel `Services (Sprout)` según su estado (`REQ-08.5`, `TEST-08.5`).
+/// Formats the non-invasive top header title showing mode, sandbox, model, and reasoning effort.
+pub(crate) fn format_header_title(
+    mode_label: &str,
+    sandbox_badge: &str,
+    model_name: &str,
+    effort: Option<ReasoningEffort>,
+) -> String {
+    let model = model_name.trim();
+    if model.is_empty() {
+        format!(" openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}] ")
+    } else {
+        let effort_label = effort.map(ReasoningEffort::as_str).unwrap_or("auto");
+        format!(
+            " openOnyx [{mode_label}] [SANDBOX:{sandbox_badge}] · {model} (effort:{effort_label}) "
+        )
+    }
+}
+
+/// Resolves which agent the TUI should display:
+/// - Automatically follows a newly created root agent (e.g. after `/new`).
+/// - Never lets a spawned subagent hijack focus away from the currently viewed agent.
+/// - Preserves an explicit user focus choice as long as that agent still exists.
+pub(crate) fn resolve_focused_agent(
+    rows: &[AgentRow],
+    current_focus: Option<ConceptId>,
+    last_known_root: &mut Option<ConceptId>,
+) -> (Option<ConceptId>, bool) {
+    let latest_root = rows.iter().rfind(|r| r.is_root).map(|r| r.id);
+    let root_changed = latest_root.is_some() && latest_root != *last_known_root;
+    *last_known_root = latest_root;
+    if root_changed {
+        return (latest_root, true);
+    }
+    let valid_current = current_focus.filter(|id| rows.iter().any(|r| r.id == *id));
+    let resolved = valid_current
+        .or(latest_root)
+        .or_else(|| rows.first().map(|r| r.id));
+    (resolved, false)
+}
+
+/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`).
+pub(crate) fn render_agent_picker(
+    f: &mut Frame<'_>,
+    area: Rect,
+    rows: &[AgentRow],
+    focused: Option<ConceptId>,
+    selected_idx: usize,
+) {
+    if area.width < 20 || area.height < 6 {
+        return;
+    }
+    let popup_w = area.width.saturating_sub(6).clamp(32, 82).min(area.width);
+    let desired_h = u16::try_from(rows.len().saturating_add(4)).unwrap_or(14);
+    let popup_h = desired_h
+        .clamp(6, 16)
+        .min(area.height.saturating_sub(2).max(5));
+    let x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_area = Rect::new(x, y, popup_w, popup_h);
+
+    f.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no agents yet — enter a goal to start)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let max_goal_chars = usize::from(popup_w.saturating_sub(34)).max(12);
+        for (idx, row) in rows.iter().enumerate() {
+            let is_sel = idx == selected_idx;
+            let is_cur = Some(row.id) == focused;
+            let marker = if is_cur { "*" } else { " " };
+            let role = if row.is_root { "root" } else { "sub " };
+            let state_color = match row.state.as_str() {
+                "thinking" | "acting" | "waiting_children" => Color::Cyan,
+                "waiting_approval" => Color::Yellow,
+                "done" => Color::Green,
+                "fail" => Color::Red,
+                _ => Color::Gray,
+            };
+            let clean_goal = sanitize_display_line(&row.goal);
+            let goal_preview = if clean_goal.chars().count() > max_goal_chars {
+                let head: String = clean_goal
+                    .chars()
+                    .take(max_goal_chars.saturating_sub(1))
+                    .collect();
+                format!("{head}…")
+            } else {
+                clean_goal
+            };
+            let base_style = if is_sel {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let state_style = if is_sel {
+                base_style
+            } else {
+                Style::default().fg(state_color)
+            };
+            let dim_style = if is_sel {
+                base_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} #{:<3} ", row.id.0), base_style),
+                Span::styled(format!("{} ", row.name), base_style),
+                Span::styled(format!("[{role}] "), dim_style),
+                Span::styled(format!("({}) ", row.state), state_style),
+                Span::styled(goal_preview, dim_style),
+            ]));
+        }
+    }
+
+    let block = Block::default()
+        .title(" Select Agent (Up/Down · Enter focus · Esc/F2 close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let widget = Paragraph::new(lines).block(block);
+    f.render_widget(widget, popup_area);
+}
+
+/// Renders the parametric openOnyx emblem in Braille sub-pixels (`6x3` cells = `12x12` dots).
+/// Rotates smoothly while `is_busy` is `true` and rests at `0.0` rad when idle or awaiting approval.
+pub(crate) fn render_onyx_emblem(f: &mut Frame<'_>, area: Rect, angle_rad: f64, is_busy: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rot = |x: f64, y: f64| -> (f64, f64) {
+        let (s, c) = angle_rad.sin_cos();
+        (x * c - y * s, x * s + y * c)
+    };
+
+    let core_color = if is_busy {
+        Color::Rgb(255, 248, 231)
+    } else {
+        Color::Rgb(180, 155, 118)
+    };
+    let arc_color = if is_busy {
+        Color::Rgb(212, 180, 131)
+    } else {
+        Color::DarkGray
+    };
+
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([-1.15, 1.15])
+        .y_bounds([-1.15, 1.15])
+        .paint(|ctx| {
+            // Opposing orbital C-arcs
+            let arc_steps = 16;
+            for base in [0.0_f64, PI] {
+                for i in 0..arc_steps {
+                    let t0 = base - 0.85 + (i as f64 / arc_steps as f64) * 1.7;
+                    let t1 = base - 0.85 + ((i + 1) as f64 / arc_steps as f64) * 1.7;
+                    let (x1, y1) = rot(0.92 * t0.cos(), 0.92 * t0.sin());
+                    let (x2, y2) = rot(0.92 * t1.cos(), 0.92 * t1.sin());
+                    ctx.draw(&CanvasLine {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        color: arc_color,
+                    });
+                }
+            }
+
+            // Central 4-point concave astroid star
+            let star_steps = 16;
+            for i in 0..star_steps {
+                let t0 = (i as f64 / star_steps as f64) * TAU;
+                let t1 = ((i + 1) as f64 / star_steps as f64) * TAU;
+                let (x1, y1) = rot(0.62 * t0.cos().powi(3), 0.78 * t0.sin().powi(3));
+                let (x2, y2) = rot(0.62 * t1.cos().powi(3), 0.78 * t1.sin().powi(3));
+                ctx.draw(&CanvasLine {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color: core_color,
+                });
+            }
+
+            // Two bright orbital nodes
+            ctx.draw(&Points {
+                coords: &[rot(-0.62, 0.0), rot(0.62, 0.0)],
+                color: Color::White,
+            });
+        });
+
+    f.render_widget(canvas, area);
+}
+
+/// Styles each line of the `Services (Sprout)` panel by status (`REQ-08.5`, `TEST-08.5`).
 pub(crate) fn render_services_lines(svc_text: &str) -> Vec<Line<'static>> {
     svc_text
         .lines()
@@ -732,8 +1345,8 @@ pub(crate) fn apply_scroll_key(
     }
 }
 
-/// Calcula el número total de filas visuales que ocupan `lines` al envolver texto a `inner_width` columnas,
-/// replicando exactamente la máquina de estados de `ratatui::widgets::reflow::WordWrapper` con `Wrap { trim: false }`.
+/// Computes the total visual row count occupied by `lines` when wrapped to `inner_width` columns,
+/// matching `ratatui::widgets::reflow::WordWrapper` with `Wrap { trim: false }`.
 pub(crate) fn visual_row_count(lines: &[Line<'_>], inner_width: u16) -> usize {
     if inner_width == 0 {
         return lines.len();
@@ -844,6 +1457,137 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    #[test]
+    fn header_title_displays_model_and_effort_compactly() {
+        assert_eq!(
+            format_header_title("BUILD", "workspace", "qwen38-27b", None),
+            " openOnyx [BUILD] [SANDBOX:workspace] · qwen38-27b (effort:auto) "
+        );
+        assert_eq!(
+            format_header_title(
+                "PLAN",
+                "strict",
+                "gemini-4-hydrogen",
+                Some(ReasoningEffort::High)
+            ),
+            " openOnyx [PLAN] [SANDBOX:strict] · gemini-4-hydrogen (effort:high) "
+        );
+        assert_eq!(
+            format_header_title("BUILD", "off", "", None),
+            " openOnyx [BUILD] [SANDBOX:off] "
+        );
+    }
+
+    #[test]
+    fn focus_resolution_follows_new_root_and_ignores_subagents() {
+        let mut last_root = None;
+        let root1 = AgentRow {
+            id: ConceptId(1),
+            name: "openonyx-1".to_string(),
+            is_root: true,
+            state: "waiting_children".to_string(),
+            goal: "audit repo".to_string(),
+        };
+        let (focused, changed) = resolve_focused_agent(&[root1.clone()], None, &mut last_root);
+        assert_eq!(focused, Some(ConceptId(1)));
+        assert!(changed);
+
+        // Spawning a subagent must NOT hijack focus away from root1.
+        let sub = AgentRow {
+            id: ConceptId(2),
+            name: "auditor".to_string(),
+            is_root: false,
+            state: "acting".to_string(),
+            goal: "audit open-onyx".to_string(),
+        };
+        let (focused, changed) =
+            resolve_focused_agent(&[root1.clone(), sub.clone()], focused, &mut last_root);
+        assert_eq!(focused, Some(ConceptId(1)));
+        assert!(!changed);
+
+        // Explicit user switch to subagent stays sticky while no new root appears.
+        let (focused, changed) = resolve_focused_agent(
+            &[root1.clone(), sub.clone()],
+            Some(ConceptId(2)),
+            &mut last_root,
+        );
+        assert_eq!(focused, Some(ConceptId(2)));
+        assert!(!changed);
+
+        // Starting a fresh root agent via `/new` automatically moves focus to the new root.
+        let root2 = AgentRow {
+            id: ConceptId(3),
+            name: "openonyx-2".to_string(),
+            is_root: true,
+            state: "thinking".to_string(),
+            goal: "new task".to_string(),
+        };
+        let (focused, changed) =
+            resolve_focused_agent(&[root1, sub, root2], focused, &mut last_root);
+        assert_eq!(focused, Some(ConceptId(3)));
+        assert!(changed);
+    }
+
+    #[test]
+    fn agent_picker_popup_renders_agents_with_role_and_state() {
+        let rows = vec![
+            AgentRow {
+                id: ConceptId(1),
+                name: "openonyx-1".to_string(),
+                is_root: true,
+                state: "waiting_children".to_string(),
+                goal: "audit repository".to_string(),
+            },
+            AgentRow {
+                id: ConceptId(113),
+                name: "auditor".to_string(),
+                is_root: false,
+                state: "acting".to_string(),
+                goal: "inspect open-onyx".to_string(),
+            },
+        ];
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_agent_picker(f, f.area(), &rows, Some(ConceptId(1)), 1);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..20)
+            .map(|y| (0..90).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Select Agent"), "{rendered}");
+        assert!(rendered.contains("openonyx-1"), "{rendered}");
+        assert!(rendered.contains("auditor"), "{rendered}");
+        assert!(rendered.contains("[root]"), "{rendered}");
+        assert!(rendered.contains("[sub ]"), "{rendered}");
+    }
+
+    #[test]
+    fn onyx_emblem_renders_braille_cells_in_idle_and_rotating_states() {
+        let backend = TestBackend::new(6, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        for (angle, busy) in [(0.0_f64, false), (0.66_f64, true)] {
+            terminal
+                .draw(|f| {
+                    render_onyx_emblem(f, f.area(), angle, busy);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let non_empty = (0..3)
+                .flat_map(|y| (0..6).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].symbol().trim() != "")
+                .count();
+            assert!(
+                non_empty > 0,
+                "expected Braille glyph cells for angle={angle}, busy={busy}"
+            );
+        }
+    }
 
     #[test]
     fn visual_row_count_accounts_for_word_wrapping_and_scroll_keys() {

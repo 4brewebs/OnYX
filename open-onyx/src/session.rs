@@ -8,16 +8,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSpec, AgentState, EventBus, Graph, GraphView, OnyxSystem,
-    PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder, SubagentSystem,
+    AgentConfig, AgentHost, AgentSpec, AgentState, EventBus, Graph, GraphView, HeadlessDriver,
+    OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder, SubagentSystem,
     SurfaceBinding, SurfaceId, Vocab, pending_approvals,
 };
 use onyx_workspace::{
-    PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode, WorkspacePolicy,
-    WorkspaceTools, WorkspaceVocab,
+    PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
+    WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
 };
 
-use crate::pack::{MilestoneSnapshotSystem, PackSnapshotStore};
+use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
+use crate::ops::reconcile_rewind_effects_report;
+use crate::pack::{
+    MilestoneSnapshotSystem, PackSnapshotStore, SharedPackStore, default_fork_dir,
+    fork_pack_until_tick,
+};
 use crate::tui::TuiHandle;
 
 pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
@@ -93,6 +98,19 @@ pub struct SessionOptions {
     pub max_snapshots: Option<usize>,
 }
 
+/// Contexto necesario para ejecutar `/rewind <tick>` y `/fork [label]` en caliente dentro de `chat`.
+#[derive(Clone)]
+pub struct SessionActionContext {
+    pub workspace_root: PathBuf,
+    pub config: AgentConfig,
+    pub ws_vocab: WorkspaceVocab,
+    pub mode_handle: WorkspaceModeHandle,
+    pub tools: WorkspaceTools,
+    pub snapshot_store: Option<SharedPackStore>,
+    pub pending_action: PendingSessionAction,
+    pub pending_notes: PendingSystemNotes,
+}
+
 pub enum StopPolicy {
     Settled {
         max_ticks: usize,
@@ -106,6 +124,7 @@ pub enum StopPolicy {
         llm_in_flight: Arc<AtomicUsize>,
         llm_ready: Arc<AtomicBool>,
         bridge_ready: Arc<AtomicBool>,
+        action_ctx: Option<SessionActionContext>,
     },
 }
 
@@ -146,10 +165,12 @@ pub fn run_session<D: SessionDriver>(
             llm_in_flight,
             llm_ready,
             bridge_ready,
+            action_ctx,
         } => {
             tui.render(host.graph());
             let mut needs_follow_up_tick = false;
             let mut stepped_in_session = false;
+            let shared_store = action_ctx.as_ref().and_then(|c| c.snapshot_store.clone());
             while !quit.load(Ordering::Relaxed) {
                 let ui_queued = tui.has_queued_events();
                 let ready =
@@ -169,8 +190,27 @@ pub fn run_session<D: SessionDriver>(
                     // `spawn_event` (por `CommandSpawnerSystem`) y otro en crear
                     // el agente en el grafo (por `AgentSpawner`).
                     needs_follow_up_tick = ui_queued;
+
+                    if let Some(ctx) = &action_ctx {
+                        if let Some(action) = ctx.pending_action.take() {
+                            if matches!(action, SessionAction::Rewind { .. })
+                                && llm_in_flight.load(Ordering::Acquire) > 0
+                            {
+                                emit_session_note(
+                                    host,
+                                    &ctx.pending_notes,
+                                    "[/rewind] Cannot rewind while an LLM request is in flight; wait until settled.",
+                                );
+                            } else {
+                                let _ = apply_session_action(host, action, ctx);
+                                needs_follow_up_tick = false;
+                            }
+                            tui.render(host.graph());
+                        }
+                    }
+
                     if !was_settled && host.is_settled() {
-                        save_latest_snapshot(opts, host);
+                        save_latest_snapshot_with_store(opts, shared_store.as_ref(), host);
                         let _ = save_transcript_if_configured(opts, driver);
                     }
                 } else {
@@ -178,7 +218,7 @@ pub fn run_session<D: SessionDriver>(
                 }
             }
             if stepped_in_session {
-                save_latest_snapshot(opts, host);
+                save_latest_snapshot_with_store(opts, shared_store.as_ref(), host);
             }
             save_transcript_if_configured(opts, driver)?;
         }
@@ -186,16 +226,163 @@ pub fn run_session<D: SessionDriver>(
     Ok(())
 }
 
-fn save_latest_snapshot(opts: &SessionOptions, host: &AgentHost) {
-    if let Some(dir) = &opts.snapshot_dir {
-        if host.ticks() > 0 {
-            let mut store = PackSnapshotStore::new(dir).with_max_snapshots(opts.max_snapshots);
-            let _ = store.save_milestone(
-                host.ticks().saturating_sub(1),
-                "exit",
-                &host.graph().export(),
-            );
+/// Ejecuta de forma atómica una acción `/fork` o `/rewind <tick>` sobre el host activo (`REQ-03.2`, `REQ-03.3`).
+///
+/// Garantiza:
+/// - Nunca muta ni sobrescribe el `snapshots.onyxpack` de la línea temporal anterior.
+/// - Reconcilia el working tree Git en silencio (sin `println!` sobre la TUI).
+/// - Resetea `seen_reads` y sincroniza `WorkspaceModeHandle` tras restaurar.
+pub fn apply_session_action(
+    host: &mut AgentHost,
+    action: SessionAction,
+    ctx: &SessionActionContext,
+) -> String {
+    let Some(store) = &ctx.snapshot_store else {
+        let msg =
+            "[session] Snapshot persistence is disabled; pass `--snapshot-dir <dir>`.".to_string();
+        emit_session_note(host, &ctx.pending_notes, &msg);
+        return msg;
+    };
+
+    match action {
+        SessionAction::Fork { label } => {
+            let src_dir = store.current_dir();
+            let current_tick = if host.ticks() > 0 {
+                let tick = host.ticks().saturating_sub(1);
+                let _ = store.save_milestone(tick, "cmd:/fork", &host.graph().export());
+                tick
+            } else {
+                store.latest_tick().unwrap_or(0)
+            };
+            let dest_dir = default_fork_dir(&src_dir, current_tick, label.as_deref());
+            let note = match fork_pack_until_tick(&src_dir, &dest_dir, current_tick) {
+                Ok(report) => {
+                    store.switch_dir(&report.dest_dir);
+                    format!(
+                        "[/fork] Created branch `{}` with {} milestone(s) up to tick {} (original `{}` preserved).",
+                        report.dest_dir.display(),
+                        report.copied_snapshots,
+                        report.resolved_tick,
+                        report.source_dir.display()
+                    )
+                }
+                Err(err) => format!("[/fork] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &note);
+            note
         }
+        SessionAction::Rewind { requested_tick } => {
+            if !host.is_settled() {
+                let msg = "[/rewind] Cannot rewind while an agent is active; wait until settled."
+                    .to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            }
+            let src_dir = store.current_dir();
+            let Some(target_tick) = store.resolve_tick_or_floor(requested_tick) else {
+                let msg = format!(
+                    "[/rewind] No milestone snapshot found at or before tick {requested_tick} in `{}`.",
+                    src_dir.display()
+                );
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            let latest_tick = store.latest_tick();
+
+            let rewind_report = match reconcile_rewind_effects_report(
+                &ctx.workspace_root,
+                &src_dir,
+                target_tick,
+                &ctx.config,
+                false,
+            ) {
+                Ok(r) => r,
+                Err(err) => {
+                    let msg = format!("[/rewind] ERROR reconciling workspace git state: {err}");
+                    emit_session_note(host, &ctx.pending_notes, &msg);
+                    return msg;
+                }
+            };
+
+            let mut branch_note = String::new();
+            if latest_tick.is_some_and(|latest| latest > target_tick) {
+                let fork_dir = default_fork_dir(&src_dir, target_tick, None);
+                match fork_pack_until_tick(&src_dir, &fork_dir, target_tick) {
+                    Ok(report) => {
+                        store.switch_dir(&report.dest_dir);
+                        branch_note = format!(
+                            " Branched snapshots into `{}` ({} milestones, original `{}` preserved).",
+                            report.dest_dir.display(),
+                            report.copied_snapshots,
+                            src_dir.display()
+                        );
+                    }
+                    Err(err) => {
+                        let msg = format!("[/rewind] ERROR forking snapshot pack: {err}");
+                        emit_session_note(host, &ctx.pending_notes, &msg);
+                        return msg;
+                    }
+                }
+            }
+
+            host.request_restore(&target_tick.to_string());
+            host.step(&mut HeadlessDriver::new());
+            host.set_tick(target_tick.saturating_add(1));
+
+            if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ctx.ws_vocab) {
+                ctx.mode_handle.set(restored_mode);
+            }
+            ctx.tools.clear_seen_reads();
+
+            let mut summary = if target_tick != requested_tick {
+                format!(
+                    "[/rewind] Restored milestone tick {target_tick} (requested {requested_tick}); clock at tick {}.",
+                    host.ticks()
+                )
+            } else {
+                format!(
+                    "[/rewind] Restored milestone tick {target_tick}; clock at tick {}.",
+                    host.ticks()
+                )
+            };
+            if let Some(sha) = &rewind_report.restored_tree_sha {
+                summary.push_str(&format!(
+                    " Restored git tree `{sha}` ({} orphaned effect(s)).",
+                    rewind_report.orphaned_count
+                ));
+            }
+            summary.push_str(&branch_note);
+            emit_session_note(host, &ctx.pending_notes, &summary);
+            summary
+        }
+    }
+}
+
+fn emit_session_note(host: &mut AgentHost, pending_notes: &PendingSystemNotes, note: &str) {
+    pending_notes.push(note.to_string());
+    let preserved_tick = host.ticks();
+    host.step(&mut HeadlessDriver::new());
+    host.set_tick(preserved_tick);
+}
+
+fn save_latest_snapshot(opts: &SessionOptions, host: &AgentHost) {
+    save_latest_snapshot_with_store(opts, None, host);
+}
+
+fn save_latest_snapshot_with_store(
+    opts: &SessionOptions,
+    shared_store: Option<&SharedPackStore>,
+    host: &AgentHost,
+) {
+    if host.ticks() == 0 {
+        return;
+    }
+    let tick = host.ticks().saturating_sub(1);
+    if let Some(store) = shared_store {
+        let _ = store.save_milestone(tick, "exit", &host.graph().export());
+    } else if let Some(dir) = &opts.snapshot_dir {
+        let mut store = PackSnapshotStore::new(dir).with_max_snapshots(opts.max_snapshots);
+        let _ = store.save_milestone(tick, "exit", &host.graph().export());
     }
 }
 
@@ -348,6 +535,17 @@ pub fn build_host_with_options(
     extra_system: Option<Box<dyn OnyxSystem>>,
     checkpoints: Option<PendingCheckpoints>,
 ) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
+    build_host_with_shared_store(seed, config, opts, extra_system, checkpoints, None)
+}
+
+pub fn build_host_with_shared_store(
+    seed: u64,
+    config: AgentConfig,
+    opts: &SessionOptions,
+    extra_system: Option<Box<dyn OnyxSystem>>,
+    checkpoints: Option<PendingCheckpoints>,
+    shared_store: Option<SharedPackStore>,
+) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
     let mut ledger = WorkspaceLedgerSystem::new();
     if let Some(cp) = checkpoints {
         ledger = ledger.with_checkpoints(cp);
@@ -359,7 +557,12 @@ pub fn build_host_with_options(
     if let Some(sys) = extra_system {
         builder = builder.system(sys);
     }
-    if let Some(dir) = &opts.snapshot_dir {
+    if let Some(store) = shared_store {
+        if opts.save_step_snapshots {
+            builder = builder.system(Box::new(MilestoneSnapshotSystem::new(opts.snapshot_every)));
+        }
+        builder = builder.store(Box::new(store));
+    } else if let Some(dir) = &opts.snapshot_dir {
         if opts.save_step_snapshots {
             builder = builder.system(Box::new(MilestoneSnapshotSystem::new(opts.snapshot_every)));
         }

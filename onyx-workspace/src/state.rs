@@ -299,6 +299,42 @@ pub fn restore_git_tree_checkpoint(root: &Path, tree_sha: &str) -> Result<(), St
     Ok(())
 }
 
+/// Restaura `tree_sha` y además elimina de forma segura cualquier archivo objetivo creado
+/// después del checkpoint (p. ej. `fs_write` sobre un archivo nuevo *untracked* que no existía
+/// en `tree_sha`), sin tocar ningún otro archivo sin rastrear del usuario.
+pub fn restore_git_tree_checkpoint_for_targets(
+    root: &Path,
+    tree_sha: &str,
+    candidate_created_targets: &[&str],
+) -> Result<(), String> {
+    restore_git_tree_checkpoint(root, tree_sha)?;
+    for raw_target in candidate_created_targets {
+        let norm = normalize_rel_path(raw_target);
+        if norm.is_empty()
+            || norm.starts_with('/')
+            || norm.split('/').any(|seg| seg == ".." || seg == ".git")
+        {
+            continue;
+        }
+        let existed_in_tree = Command::new("git")
+            .args(["ls-tree", "--name-only", tree_sha, "--", &norm])
+            .current_dir(root)
+            .output()
+            .ok()
+            .is_some_and(|o| {
+                o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+            });
+        if existed_in_tree {
+            continue;
+        }
+        let abs = root.join(&norm);
+        if abs.is_file() {
+            let _ = std::fs::remove_file(&abs);
+        }
+    }
+    Ok(())
+}
+
 /// Consulta en el grafo si un archivo relativo ya fue leído en la sesión.
 pub fn is_file_read(graph: &dyn GraphView, ws: &WorkspaceVocab, rel_path: &str) -> bool {
     file_read_tick(graph, ws, rel_path).is_some()
