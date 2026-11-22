@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use onyx_soul_agents::{
-    AgentSpec, AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError, OnyxEvent,
-    OnyxSystem, SystemEvent, Value, Vocab, append_agent_memory, continue_agent, spawn_event,
+    AgentSpec, AgentState, AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError,
+    OnyxEvent, OnyxSystem, SystemEvent, Value, Vocab, append_agent_memory, continue_agent,
+    spawn_event,
 };
 use onyx_workspace::{
     SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab,
@@ -82,6 +83,7 @@ pub enum SlashCommand {
     RewindInvalid(String),
     Fork(Option<String>),
     Trust(Option<String>),
+    Cancel { all: bool },
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
@@ -183,6 +185,19 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
         } else {
             Some(trimmed.to_string())
         }));
+    }
+    let lower = cmd.to_ascii_lowercase();
+    if lower == "/cancel" || lower == "/stop" {
+        return Some(SlashCommand::Cancel { all: false });
+    }
+    if let Some(rest) = lower
+        .strip_prefix("/cancel ")
+        .or_else(|| lower.strip_prefix("/stop "))
+    {
+        let arg = rest.trim();
+        return Some(SlashCommand::Cancel {
+            all: arg == "all" || arg == "root",
+        });
     }
     None
 }
@@ -824,6 +839,114 @@ impl OnyxSystem for CommandSpawnerSystem {
                         };
                         if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
                             append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::Cancel { all } => {
+                        let live_children: Vec<ConceptId> = ctx
+                            .graph
+                            .query(&[v.state])
+                            .into_iter()
+                            .filter(|id| {
+                                !ctx.graph.related(*id, v.rel_parent).is_empty()
+                                    && matches!(
+                                        ctx.graph.get(*id, v.state),
+                                        Some(Value::Text(ref s))
+                                            if AgentState::parse(s).is_some_and(|st| !st.is_terminal())
+                                    )
+                            })
+                            .collect();
+
+                        for &child in &live_children {
+                            ctx.graph
+                                .set(child, v.pending_tool, Value::Text(String::new()));
+                            ctx.graph
+                                .set(child, v.pending_args, Value::Text(String::new()));
+                            ctx.graph
+                                .set(child, v.pending_call_id, Value::Text(String::new()));
+                            ctx.graph.set(child, v.pending, Value::Int(0));
+                            ctx.graph.set(
+                                child,
+                                v.state,
+                                Value::Text(AgentState::Failed.as_str().into()),
+                            );
+                            ctx.graph.set(
+                                child,
+                                v.result,
+                                Value::Text("cancelled by user".to_string()),
+                            );
+                            append_agent_memory(
+                                ctx.graph,
+                                &v,
+                                child,
+                                "system",
+                                "[/cancel] Subagent cancelled by user.",
+                                now,
+                            );
+                        }
+
+                        if !live_children.is_empty() && !all {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    &format!(
+                                        "[/cancel] Cancelled {} active subagent(s); returning control to parent agent (use `/cancel all` to stop the parent too).",
+                                        live_children.len()
+                                    ),
+                                    now,
+                                );
+                            }
+                        } else {
+                            let live_roots: Vec<ConceptId> = ctx
+                                .graph
+                                .query(&[v.state])
+                                .into_iter()
+                                .filter(|id| {
+                                    ctx.graph.related(*id, v.rel_parent).is_empty()
+                                        && matches!(
+                                            ctx.graph.get(*id, v.state),
+                                            Some(Value::Text(ref s))
+                                                if AgentState::parse(s).is_some_and(|st| !st.is_terminal())
+                                        )
+                                })
+                                .collect();
+                            for &root in &live_roots {
+                                ctx.graph
+                                    .set(root, v.pending_tool, Value::Text(String::new()));
+                                ctx.graph
+                                    .set(root, v.pending_args, Value::Text(String::new()));
+                                ctx.graph
+                                    .set(root, v.pending_call_id, Value::Text(String::new()));
+                                ctx.graph.set(root, v.pending, Value::Int(0));
+                                ctx.graph.set(
+                                    root,
+                                    v.state,
+                                    Value::Text(AgentState::Done.as_str().into()),
+                                );
+                                ctx.graph.set(root, v.result, Value::Text(String::new()));
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root,
+                                    "system",
+                                    "[/cancel] Active turn interrupted by user. Ready for your next prompt.",
+                                    now,
+                                );
+                            }
+                            if live_children.is_empty() && live_roots.is_empty() {
+                                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                    append_agent_memory(
+                                        ctx.graph,
+                                        &v,
+                                        root_id,
+                                        "system",
+                                        "[/cancel] No active task to cancel.",
+                                        now,
+                                    );
+                                }
+                            }
                         }
                     }
                 }

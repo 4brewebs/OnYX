@@ -950,6 +950,12 @@ impl OnyxSystem for MilestoneSnapshotSystem {
                     cmd_tag = Some("cmd:/rewind".to_string());
                 } else if cmd == "/fork" || cmd.starts_with("/fork ") {
                     cmd_tag = Some("cmd:/fork".to_string());
+                } else if cmd == "/cancel"
+                    || cmd == "/stop"
+                    || cmd.starts_with("/cancel ")
+                    || cmd.starts_with("/stop ")
+                {
+                    cmd_tag = Some("cmd:/cancel".to_string());
                 }
             }
         }

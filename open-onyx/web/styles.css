@@ -1134,6 +1134,18 @@ button.pill:active {
   background: var(--accent-soft);
 }
 
+.chip-btn-stop {
+  color: var(--crimson);
+  border-color: color-mix(in oklab, var(--crimson) 55%, transparent);
+  background: var(--crimson-soft);
+  font-weight: 700;
+}
+
+.chip-btn-stop:hover {
+  border-color: var(--crimson);
+  color: var(--crimson);
+}
+
 /* Approval Dock + Scent Impact + Unified Diff */
 .approval-dock {
   container: approval-card / inline-size;
