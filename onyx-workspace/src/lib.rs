@@ -8,6 +8,7 @@ pub mod sprout;
 pub mod state;
 pub mod tools;
 pub mod trust;
+pub mod worktree;
 
 pub use bridge::WorkspaceToolBridge;
 pub use impact::{ImpactAssessment, ImpactConfig, ImpactPatch, apply_impact_escalation};
@@ -43,4 +44,9 @@ pub use trust::{
     ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,
     default_trust_store_path, evaluate_workspace_trust, hash_file_blake3, list_trusted_workspaces,
     normalize_workspace_key, revoke_workspace_trust, trust_workspace,
+};
+pub use worktree::{
+    GitVersion, MIN_GIT_VERSION, ONYX_WT_DIR_ENV, SubagentNetworkPolicy, WorktreeHandle,
+    WorktreeInfo, WorktreeManager, WorktreeMergeOutcome, check_git_version, parse_git_version,
+    resolve_worktree_base_dir, validate_job_id,
 };
