@@ -737,6 +737,9 @@ impl TuiInner {
                             None
                         }
                         Some(MergePreviewState::Conflict { .. }) => continue,
+                        // `SDD-10` Fase 3: Control Plane → sin banner; `SubagentManagerDriver`
+                        // niega la solicitud de plano (disco de `root` intacto).
+                        Some(MergePreviewState::ControlPlaneDenied { .. }) => continue,
                         None => {
                             if static_dec != PermissionDecision::Ask {
                                 continue;

@@ -16,7 +16,8 @@
 //! - Entorno saneado (`env_clear()` + allowlist): sin `NODE_OPTIONS` salvo opt-in `allowed_env`,
 //!   home aislado salvo `inherit_home`, sin hints `*_OFFLINE`/`NO_PROXY` con allowlist de red.
 //! - `clean_summary`: salida combinada con ANSI quitado + secretos borrados, acotado a 4 KB.
-//! - Log crudo del vault (`.onyx/vault/subagent-logs/<job_id>.log`): `SDD-10` Fase 3.
+//!   El `stdout`/`stderr` crudo se expone en la salida para que el worker selle el log del
+//!   vault (`.onyx/vault/subagent-logs/<job_id>.log`) pasado por `scrub_secrets` (`SDD-10` Fase 3).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -44,9 +45,16 @@ pub struct ExternalRunOutput {
     /// `true` si se levantó `cancel_flag` y se mató el árbol de procesos.
     pub cancelled: bool,
     /// `stdout + stderr` combinados: ANSI quitado + secretos borrados, máx. 4 KB.
+    /// Es el **log**, nunca la verdad: la propuesta solo se construye de Git
+    /// (`capture_subagent_commit` + `changed_files_between`, `SDD-10` Fase 3).
     pub clean_summary: String,
-    /// Ruta del log completo persistente (Fase 3: `.onyx/vault/subagent-logs/<job_id>.log`);
-    /// `None` hasta que llegue el vault en `SDD-10` Fase 3.
+    /// `stdout` crudo (acotado a `PIPE_CAP_BYTES`), antes de `strip_ansi`/`scrub_secrets`:
+    /// lo usa el worker para sellar el log del vault (`SDD-10` Fase 3).
+    pub stdout: String,
+    /// `stderr` crudo (acotado a `PIPE_CAP_BYTES`), antes de `strip_ansi`/`scrub_secrets`.
+    pub stderr: String,
+    /// Ruta del log completo persistente (`.onyx/vault/subagent-logs/<job_id>.log`,
+    /// `SDD-10` Fase 3); `None` si no se pudo escribir en el vault.
     pub full_log_path: Option<PathBuf>,
 }
 
@@ -263,7 +271,7 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
         }
         drop(prompt_file); // RAII: elimina el archivo del prompt (si existía).
 
-        let mut combined = stdout;
+        let mut combined = stdout.clone();
         if !stderr.is_empty() {
             if !combined.is_empty() {
                 combined.push('\n');
@@ -280,7 +288,10 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
             timed_out,
             cancelled,
             clean_summary,
-            // Log crudo del vault (`.onyx/vault/subagent-logs/<job_id>.log`): SDD-10 Fase 3.
+            stdout,
+            stderr,
+            // El worker (`run_subagent_worker`) sella el log crudo `scrub_secrets` en
+            // `.onyx/vault/subagent-logs/<job_id>.log` y rellena esta ruta (`SDD-10` Fase 3).
             full_log_path: None,
         })
     }

@@ -23,10 +23,11 @@ use onyx_soul_agents::{
     pending_approvals, pending_tool_calls,
 };
 use onyx_workspace::{
-    ImpactAssessment, PermissionDecision, SubagentNetworkPolicy, SubagentProposal,
-    WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
+    ImpactAssessment, MergeDeltaVerdict, PermissionDecision, SubagentNetworkPolicy,
+    SubagentProposal, WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
     WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, WorktreeHandle, WorktreeManager,
-    WorktreeMergeOutcome, apply_impact_escalation, is_async_subagent_tool, validate_job_id,
+    WorktreeMergeOutcome, apply_impact_escalation, classify_merge_delta, is_async_subagent_tool,
+    is_control_plane_rel_path, scrub_secrets, validate_job_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -276,6 +277,13 @@ pub enum MergePreviewState {
         conflicting_files: Vec<String>,
         #[allow(dead_code)]
         details: String,
+    },
+    /// `SDD-10` Fase 3: el delta `<root_now_commit>..<merged_tree>` toca el *Control Plane*
+    /// (`.onyx/config.toml`, `.env*`, `.git/hooks/**`, ...). El merge se **niega** sin tocar
+    /// el disco de `root`; el worktree se conserva para inspección o `subagent_discard`.
+    ControlPlaneDenied {
+        #[allow(dead_code)]
+        denied_files: Vec<String>,
     },
 }
 
@@ -759,6 +767,18 @@ impl SubagentManager {
                 changed_files,
                 unified_diff,
             } => {
+                // `SDD-10` Fase 3: comprobación **obligatoria** de Control Plane sobre el
+                // delta real `<root_now_commit>..<merged_tree>` ANTES de sellar el ticket.
+                // `root_now_commit`/`merged_tree` solo se usan en `Deny` para el mensaje.
+                if classify_merge_delta(&changed_files) == MergeDeltaVerdict::Deny {
+                    let denied_files: Vec<String> = changed_files
+                        .iter()
+                        .filter(|f| is_control_plane_rel_path(f))
+                        .cloned()
+                        .collect();
+                    self.pending_merge_tickets.remove(id);
+                    return Ok(MergePreviewState::ControlPlaneDenied { denied_files });
+                }
                 let impact = self
                     .root_tools
                     .as_ref()
@@ -931,6 +951,22 @@ impl SubagentManager {
                 }
             }
         };
+
+        // `SDD-10` Fase 3: guarda **dura** de Control Plane antes de materializar en `root`
+        // (cubre tanto el ticket en caché como el recién sellado). El disco de `root` y el
+        // worktree quedan intactos: el job sigue `Done` y el worktree se conserva.
+        if classify_merge_delta(&ticket.changed_files) == MergeDeltaVerdict::Deny {
+            let denied_files: Vec<String> = ticket
+                .changed_files
+                .iter()
+                .filter(|f| is_control_plane_rel_path(f))
+                .cloned()
+                .collect();
+            return Err(format!(
+                "blocked: subagent `{id}` merge delta touches Control Plane paths {denied_files:?}; merge denied without touching root disk (worktree `{}` kept for inspection or `subagent_discard`)",
+                handle.worktree_path.display()
+            ));
+        }
 
         // Guarda anti-TOCTOU: si algo modificó el árbol de root desde el preview/aprobación,
         // aborta limpiamente conservando intactos tanto el disco de root como el worktree.
@@ -1277,9 +1313,42 @@ fn run_subagent_worker(input: SubagentWorkerInput) {
             // lo que el harness haya dejado (o no).
             if !cancelled {
                 match driver.run_in_worktree(&handle.worktree_path, &goal, &cancel_flag) {
-                    Ok(out) => {
+                    Ok(mut out) => {
                         cancelled = out.cancelled;
                         ok = !out.cancelled && !out.timed_out && out.exit_code == 0;
+                        // `SDD-10` Fase 3: el log crudo pasa por `scrub_secrets` y se sella en el
+                        // **vault** del workspace root (no en el worktree):
+                        // `.onyx/vault/subagent-logs/<job_id>.log`, tras `ensure_vault_gitignore`.
+                        // El stdout/stderr es **log**, nunca verdad: la propuesta solo se construye
+                        // de `capture_subagent_commit` + `changed_files_between` (abajo).
+                        let mut log_note: Option<String> = None;
+                        {
+                            let workspace_root = worktree_mgr.workspace_root();
+                            let path = crate::vault::vault_subagent_logs_dir(workspace_root)
+                                .join(format!("{job_id}.log"));
+                            let raw_log = format!(
+                                "driver: {driver_id}\nexit_code: {exit_code}\ntimed_out: {timed_out}\ncancelled: {cancelled}\n\n--- stdout ---\n{stdout}\n\n--- stderr ---\n{stderr}\n",
+                                exit_code = out.exit_code,
+                                timed_out = out.timed_out,
+                                cancelled = out.cancelled,
+                                stdout = out.stdout,
+                                stderr = out.stderr
+                            );
+                            let scrubbed = scrub_secrets(&raw_log);
+                            match crate::vault::ensure_vault_gitignore(workspace_root).and_then(
+                                |_| {
+                                    if let Some(parent) = path.parent() {
+                                        std::fs::create_dir_all(parent)?;
+                                    }
+                                    std::fs::write(&path, scrubbed)
+                                },
+                            ) {
+                                Ok(()) => out.full_log_path = Some(path),
+                                // Best-effort: un fallo de escritura no fracasa el job (la verdad
+                                // vive en Git); se deja constancia en el `summary` de la propuesta.
+                                Err(e) => log_note = Some(format!("vault log write failed: {e}")),
+                            }
+                        }
                         let mut base = if out.cancelled {
                             "cancelled by parent".to_string()
                         } else if out.timed_out {
@@ -1300,6 +1369,9 @@ fn run_subagent_worker(input: SubagentWorkerInput) {
                         if !out.clean_summary.is_empty() {
                             base.push_str("\n--- output ---\n");
                             base.push_str(&out.clean_summary);
+                        }
+                        if let Some(note) = log_note {
+                            base.push_str(&format!(" [{note}]"));
                         }
                         summary = base;
                     }
@@ -1653,11 +1725,37 @@ impl PlatformDriver for SubagentManagerDriver {
                         view.agent.0,
                         view.request,
                     );
+                    // `SDD-10` Fase 3: el delta toca el *Control Plane* → se niega la
+                    // aprobación de plano (la guarda dura de `merge_job` queda como red de
+                    // seguridad); el disco de `root` no se toca y el worktree se conserva.
+                    if let Ok(MergePreviewState::ControlPlaneDenied { denied_files }) = &preview {
+                        if self.handled_approvals.insert((view.agent.0, view.request)) {
+                            self.push_reply(Reply::deny(
+                                view.agent,
+                                view.request,
+                                format!(
+                                    "Control Plane protection: subagent `{}` merge would touch {denied_files:?}; denied without touching root disk (worktree kept for inspection or `subagent_discard`)",
+                                    args.job_id
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
                     match preview {
                         Ok(MergePreviewState::Clean(ticket)) => {
-                            apply_impact_escalation(static_decision, ticket.impact.as_ref())
+                            // Superficie de gobernanza (`sprout.toml`, `.github/workflows/**`)
+                            // → `Ask` obligatorio: nunca auto-aprobado (`SDD-10` Fase 3).
+                            if classify_merge_delta(&ticket.changed_files) == MergeDeltaVerdict::Ask
+                            {
+                                PermissionDecision::Ask
+                            } else {
+                                apply_impact_escalation(static_decision, ticket.impact.as_ref())
+                            }
                         }
                         Ok(MergePreviewState::NoOp) => static_decision,
+                        // No alcanzable: `ControlPlaneDenied` se niega arriba (el `if let` no
+                        // estrecha el tipo para el exhaustiveness del match).
+                        Ok(MergePreviewState::ControlPlaneDenied { .. }) => PermissionDecision::Ask,
                         // Conflictos o errores de estado se aprueban para que `subagent_merge` los
                         // ejecute enseguida y devuelva la ruta exacta en conflicto a `root` (conservando worktree).
                         Ok(MergePreviewState::Conflict { .. }) | Err(_) => {
@@ -3172,6 +3270,700 @@ mod tests {
         assert!(!wt_base.exists());
 
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// `SDD-10` Fase 3 (retrocompatibilidad): una propuesta grabada en el wire **sin** el
+    /// campo `driver` (`SDD-09`) decodifica como `"native"`; el round-trip preserva el
+    /// `id` de un driver externo y el flag `cancelled`.
+    #[test]
+    fn decode_proposal_command_without_driver_field_defaults_to_native() {
+        let legacy = format!(
+            "{SUBAGENT_PROPOSAL_CMD_PREFIX}{{\"proposal\":{{\"job_id\":\"old-1\",\"spawn_tick\":3,\"branch_name\":\"onyx/sub/old-1\",\"base_commit\":\"b\",\"sub_commit\":\"s\",\"ok\":true,\"summary\":\"legacy sdd-09\",\"touched_files\":[\"a.txt\"]}},\"cancelled\":false}}"
+        );
+        let (p, cancelled) =
+            decode_proposal_command(&legacy).expect("el comando legacy debe decodificar");
+        assert_eq!(p.driver, "native");
+        assert_eq!(p.job_id, "old-1");
+        assert!(!cancelled);
+
+        let mut ext = p.clone();
+        ext.driver = "fake-drv".to_string();
+        let cmd = encode_proposal_command(&ext, true);
+        let (p2, c2) = decode_proposal_command(&cmd).unwrap();
+        assert_eq!(p2.driver, "fake-drv");
+        assert!(c2);
+    }
+
+    /// Directorio temporal del host (fuera de repo y worktree) para scripts de CLI fake.
+    fn host_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "onyx_extdrv_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Script cross-platform de CLI fake: `.cmd` en Windows (CRLF), `.sh` (0755) en el resto;
+    /// devuelve la ruta absoluta para usarla como `bin` del driver externo.
+    fn write_cli_script(
+        host_tmp: &Path,
+        name: &str,
+        body_windows: &str,
+        body_posix: &str,
+    ) -> String {
+        #[cfg(windows)]
+        {
+            let _ = body_posix;
+            let p = host_tmp.join(format!("{name}.cmd"));
+            fs::write(&p, body_windows).unwrap();
+            p.to_string_lossy().into_owned()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = body_windows;
+            let p = host_tmp.join(format!("{name}.sh"));
+            fs::write(&p, body_posix).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        }
+    }
+
+    /// `ExternalDriverConfig` mínima para los tests de `SDD-10` Fase 3 (stdin, 30 s).
+    fn test_external_driver(id: &str, bin: String) -> onyx_workspace::ExternalDriverConfig {
+        onyx_workspace::ExternalDriverConfig {
+            id: id.to_string(),
+            bin,
+            args: Vec::new(),
+            prompt_transport: onyx_workspace::PromptTransport::Stdin,
+            prompt_flag: None,
+            timeout: Duration::from_secs(30),
+            allowed_env: Vec::new(),
+            inherit_home: false,
+            network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+        }
+    }
+
+    /// Espera (con deadline de 30 s) a que un job de driver externo llegue a `done`/`failed`.
+    fn wait_for_external_job(mgr: &mut SubagentManager, job_id: &str) -> SubagentJobSummary {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let st = mgr.status(Some(job_id)).unwrap();
+            if st[0].status == "done" || st[0].status == "failed" {
+                return st[0].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "el job externo `{job_id}` no terminó en 30 s: {:?}",
+                st[0]
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Driver de test que aprueba **solo** los `spawn_subagent` pendientes (la aprobación
+    /// de `subagent_merge` la decide `SubagentManagerDriver`; el resto se deja pendiente).
+    struct AutoApproveSpawns {
+        vocab: Vocab,
+        queued: Vec<Reply>,
+        handled: BTreeSet<(u64, u64)>,
+    }
+    impl PlatformDriver for AutoApproveSpawns {
+        fn poll(&mut self, bus: &mut dyn EventBus) {
+            for r in self.queued.drain(..) {
+                bus.push(r.to_event());
+            }
+        }
+        fn present(&mut self, graph: &dyn GraphView, _: &[SurfaceBinding]) {
+            for v in pending_approvals(graph, &self.vocab) {
+                if v.pending_approval
+                    .as_ref()
+                    .is_some_and(|p| p.tool == "spawn_subagent")
+                    && self.handled.insert((v.agent.0, v.request))
+                {
+                    self.queued.push(Reply::approve(v.agent, v.request));
+                }
+            }
+        }
+    }
+
+    /// `SDD-10` Fase 3 (transductor determinista): el stdout del CLI **miente** (clama un
+    /// `lying.txt` que nunca crea y fuga un token); la verdad llega **solo** de Git
+    /// (`capture_subagent_commit` + `changed_files_between`), y el log crudo se sella en el
+    /// vault del root **pasado por `scrub_secrets`**.
+    #[test]
+    fn external_driver_stdout_lies_but_git_is_the_truth_and_vault_log_is_scrubbed() {
+        let repo = init_temp_git_repo("drv_liar");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_liar_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+        let host_tmp = host_tmp_dir("liar");
+
+        // El CLI fake crea **solo** `real-change.txt` en el worktree (CWD del runner).
+        let token = "sk-abcdefghijklmnopqrstuvwxyz1234";
+        let bin = write_cli_script(
+            &host_tmp,
+            "liar",
+            &format!(
+                "@echo off\r\necho hello > real-change.txt\r\necho CLAIM lying.txt\r\necho token {token}\r\n"
+            ),
+            &format!(
+                "#!/bin/sh\necho hello > real-change.txt\necho CLAIM lying.txt\necho token {token}\n"
+            ),
+        );
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![test_external_driver("liar", bin)]);
+        let mut mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        )
+        .with_root_tools(WorkspaceTools::new(WorkspacePolicy::new(&repo).unwrap()));
+
+        let spawned = mgr
+            .spawn_job("lie to me", Some("ext"), None, 1, Vec::new(), Some("liar"))
+            .unwrap();
+        assert_eq!(spawned.job_id, "ext-1");
+        let s = wait_for_external_job(&mut mgr, "ext-1");
+        assert_eq!(s.status, "done");
+        assert_eq!(s.ok, Some(true));
+        // La verdad viene de Git: el `lying.txt` de la mentira del stdout NO existe en el delta.
+        assert_eq!(s.touched_files, vec!["real-change.txt".to_string()]);
+        // El summary es el log saneado: conserva la claim y redacta el token.
+        assert!(s.summary.contains("CLAIM lying.txt"), "{}", s.summary);
+        assert!(s.summary.contains("[REDACTED]"), "{}", s.summary);
+        assert!(!s.summary.contains(token), "{}", s.summary);
+
+        // Log crudo (scrubbeado) sellado en el **vault del workspace root**, nunca en el worktree.
+        let log = crate::vault::vault_subagent_logs_dir(&repo).join("ext-1.log");
+        let log_raw = fs::read_to_string(&log)
+            .unwrap_or_else(|e| panic!("falta el log del vault en {}: {e}", log.display()));
+        assert!(log_raw.contains("CLAIM lying.txt"), "{log_raw}");
+        assert!(log_raw.contains("[REDACTED]"), "{log_raw}");
+        assert!(!log_raw.contains(token), "{log_raw}");
+        assert!(
+            crate::vault::vault_root(&repo).join(".gitignore").exists(),
+            "el vault debe llevar su `.gitignore` (`*`)"
+        );
+
+        // Preview sellado: `Clean` con `sub_commit` real y el delta exacto.
+        match mgr.prepare_merge_preview("ext-1").unwrap() {
+            MergePreviewState::Clean(ticket) => {
+                assert!(!ticket.sub_commit.is_empty());
+                assert_eq!(ticket.changed_files, vec!["real-change.txt".to_string()]);
+            }
+            other => panic!("esperado Clean, obtenido {other:?}"),
+        }
+        let report = mgr.merge_job("ext-1").unwrap();
+        assert!(!report.was_noop);
+        assert_eq!(report.changed_files, vec!["real-change.txt".to_string()]);
+        assert!(repo.join("real-change.txt").is_file());
+        assert!(!repo.join("lying.txt").exists());
+
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
+    }
+
+    /// `SDD-10` Fase 3 (NoOp): un driver externo que **no cambia nada** en el worktree
+    /// produce `sub_tree == base_tree` → el merge es `NoOp` y el disco de `root` queda intacto.
+    #[test]
+    fn external_driver_with_no_changes_produces_noop_merge_root_untouched() {
+        let repo = init_temp_git_repo("drv_noop");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_noop_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+        let host_tmp = host_tmp_dir("noop");
+
+        let bin = write_cli_script(
+            &host_tmp,
+            "noop",
+            "@echo off\r\necho doing absolutely nothing\r\n",
+            "#!/bin/sh\necho doing absolutely nothing\n",
+        );
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![test_external_driver("noopy", bin)]);
+        let mut mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        );
+
+        let spawned = mgr
+            .spawn_job(
+                "noop goal",
+                Some("noop"),
+                None,
+                1,
+                Vec::new(),
+                Some("noopy"),
+            )
+            .unwrap();
+        let s = wait_for_external_job(&mut mgr, &spawned.job_id);
+        assert_eq!(s.status, "done");
+        assert!(s.touched_files.is_empty(), "{:?}", s.touched_files);
+
+        match mgr.prepare_merge_preview(&spawned.job_id).unwrap() {
+            MergePreviewState::NoOp => {}
+            other => panic!("esperado NoOp, obtenido {other:?}"),
+        }
+        let head_before = git_head_sha(&repo);
+        let report = mgr.merge_job(&spawned.job_id).unwrap();
+        assert!(report.was_noop);
+        assert!(report.changed_files.is_empty());
+        // `root` intacto: `HEAD` sin mover y contenido sin cambios.
+        assert_eq!(git_head_sha(&repo), head_before);
+        assert_eq!(
+            fs::read_to_string(repo.join("root.txt")).unwrap(),
+            "root-v1\n"
+        );
+
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
+    }
+
+    /// `SDD-10` Fase 3 (Control Plane): un driver externo que toca `.env` + `.onyx/config.toml`
+    /// → el preview se niega de plano (`ControlPlaneDenied`) y `merge_job` falla **sin tocar**
+    /// el disco de `root` (el worktree se conserva para inspección/descarte).
+    #[test]
+    fn external_driver_control_plane_delta_is_denied_without_touching_root() {
+        let repo = init_temp_git_repo("drv_cp_deny");
+        // Sentinel de Control Plane **commitado** en `root` (el worktree lo hereda en base).
+        fs::create_dir_all(repo.join(".onyx")).unwrap();
+        fs::write(repo.join(".onyx").join("config.toml"), "control=original\n").unwrap();
+        let add_out = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(add_out.status.success());
+        let commit_out = Command::new("git")
+            .args(["commit", "-q", "-m", "add control plane sentinel"])
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@local")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@local")
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(commit_out.status.success());
+
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_cpdeny_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+        let host_tmp = host_tmp_dir("cpdeny");
+
+        let bin = write_cli_script(
+            &host_tmp,
+            "cp",
+            "@echo off\r\necho control=hacked > .onyx\\config.toml\r\necho secret=value > .env\r\n",
+            "#!/bin/sh\necho control=hacked > .onyx/config.toml\necho secret=value > .env\n",
+        );
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![test_external_driver("cphacker", bin)]);
+        let mut mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        )
+        .with_root_tools(WorkspaceTools::new(WorkspacePolicy::new(&repo).unwrap()));
+
+        let spawned = mgr
+            .spawn_job("hacked", Some("cp"), None, 1, Vec::new(), Some("cphacker"))
+            .unwrap();
+        let s = wait_for_external_job(&mut mgr, &spawned.job_id);
+        assert_eq!(s.status, "done");
+        for f in [".env", ".onyx/config.toml"] {
+            assert!(
+                s.touched_files.contains(&f.to_string()),
+                "{:?}",
+                s.touched_files
+            );
+        }
+
+        // Preview: negación de plano con las rutas de Control Plane identificadas.
+        match mgr.prepare_merge_preview(&spawned.job_id).unwrap() {
+            MergePreviewState::ControlPlaneDenied { denied_files } => {
+                for f in [".env", ".onyx/config.toml"] {
+                    assert!(denied_files.contains(&f.to_string()), "{denied_files:?}");
+                }
+            }
+            other => panic!("esperado ControlPlaneDenied, obtenido {other:?}"),
+        }
+        // Guarda dura: `merge_job` bloquea incluso sin ticket en caché.
+        let err = mgr.merge_job(&spawned.job_id).unwrap_err();
+        assert!(err.contains("Control Plane"), "{err}");
+
+        // `root` intacto: el sentinel sigue siendo el original y no aparece `.env`.
+        assert_eq!(
+            fs::read_to_string(repo.join(".onyx").join("config.toml")).unwrap(),
+            "control=original\n"
+        );
+        assert!(!repo.join(".env").exists());
+        // El worktree se conserva para inspección o descarte.
+        assert!(
+            s.worktree_path.is_dir(),
+            "el worktree debe conservarse tras la denegación"
+        );
+
+        mgr.discard_job(&spawned.job_id).unwrap();
+        assert!(!s.worktree_path.exists());
+
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
+    }
+
+    /// `SDD-10` Fase 3 (gobernanza, e2e vía host): un driver externo que toca `sprout.toml`
+    /// fuerza `Ask` en la aprobación de `subagent_merge` **aunque la política lo permita
+    /// estáticamente**: el merge nunca se materializa y `root` queda en `WaitingApproval`.
+    #[test]
+    fn external_driver_governance_delta_forces_ask_on_subagent_merge() {
+        use onyx_workspace::PermissionRules;
+
+        let repo = init_temp_git_repo("gov_ask");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_govask_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+        let host_tmp = host_tmp_dir("govask");
+
+        let bin = write_cli_script(
+            &host_tmp,
+            "gov",
+            "@echo off\r\necho name = hacked > sprout.toml\r\n",
+            "#!/bin/sh\necho 'name = \"hacked\"' > sprout.toml\n",
+        );
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_permissions(PermissionRules {
+                allow: vec!["subagent_merge".to_string()],
+                ..Default::default()
+            })
+            .with_external_drivers(vec![test_external_driver("gov", bin)]);
+        // La política **permite estáticamente** `subagent_merge`: el `Ask` debe venir de la
+        // superficie de gobernanza del delta, no de la regla.
+        assert_eq!(
+            policy.evaluate_permission_in_mode(
+                WorkspaceMode::Build,
+                "subagent_merge",
+                r#"{"job_id":"gov-1"}"#
+            ),
+            PermissionDecision::Allow
+        );
+        let driver_policy = policy.clone();
+        let tools = WorkspaceTools::new(policy.clone());
+
+        let cfg = AgentConfig {
+            default_max_steps: 192,
+            default_timeout_ticks: 512,
+            ..AgentConfig::default()
+        };
+        let (mut host, ws_vocab) = build_host(1, cfg, None, None).unwrap();
+        // `auto_approve=false`: `subagent_merge` pasa por el gate de aprobación del spec,
+        // de modo que la decisión `Ask`/`Allow` del driver realmente aplica.
+        host.spawn(&make_spec("touch governance", false));
+
+        let mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        )
+        .with_root_tools(tools.clone());
+        let handle = SubagentHandle::new(mgr);
+
+        let responder = move |req: &AgentView| {
+            static PHASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let p = PHASE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if p == 0 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "spawn_subagent",
+                    r#"{"name":"gov","goal":"touch governance","driver":"gov"}"#,
+                ))
+            } else {
+                let last_obs = req
+                    .memory
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == "observe")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                if last_obs.contains("\"status\":\"done\"") {
+                    Some(Reply::call_structured(
+                        req.agent,
+                        req.request,
+                        "subagent_merge",
+                        r#"{"job_id":"gov-1"}"#,
+                    ))
+                } else {
+                    thread::sleep(Duration::from_millis(120));
+                    Some(Reply::call_structured(
+                        req.agent,
+                        req.request,
+                        "subagent_status",
+                        r#"{"job_id":"gov-1"}"#,
+                    ))
+                }
+            }
+        };
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools.clone())
+            .with_mode(WorkspaceMode::Build)
+            .with_workspace_vocab(ws_vocab);
+        let sub_driver = SubagentManagerDriver::new(host.vocab(), handle.clone())
+            .with_policy(driver_policy)
+            .with_mode_handle(WorkspaceModeHandle::new(WorkspaceMode::Build))
+            .wrapping(ws_bridge.wrapping(AutoApproveSpawns {
+                vocab: host.vocab(),
+                queued: Vec::new(),
+                handled: BTreeSet::new(),
+            }));
+        let mut driver = RecordingBridge::new(host.vocab(), responder).wrapping(sub_driver);
+
+        let mut saw_merge_approval = false;
+        for _ in 0..256 {
+            host.step(&mut driver);
+            if host.pending_approvals().iter().any(|v| {
+                v.pending_approval
+                    .as_ref()
+                    .is_some_and(|p| p.tool == "subagent_merge")
+            }) {
+                saw_merge_approval = true;
+                break;
+            }
+        }
+        assert!(
+            saw_merge_approval,
+            "`root` debe quedar en `WaitingApproval` esperando la aprobación de `subagent_merge`"
+        );
+        let root_id = host.agents()[0];
+        assert_eq!(
+            host.agent_state(root_id),
+            Some(AgentState::WaitingApproval),
+            "memory: {:?}",
+            host.view(root_id).memory
+        );
+        // El merge **nunca** se materializó: la gobernanza no llegó a `root` y el job sigue unmerged.
+        assert!(
+            !repo.join("sprout.toml").exists(),
+            "el delta de gobernanza no debe materializarse sin aprobación explícita"
+        );
+        let s = handle.status(Some("gov-1")).unwrap();
+        assert_eq!(s[0].status, "done", "job terminado pero sin fusionar");
+
+        handle.discard_job("gov-1").unwrap();
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
+    }
+
+    /// `SDD-10` Fase 3 (replay offline): una ejecución con driver CLI externo se graba en una
+    /// `Transcript` y se reproduce con `ReplayBridge` **sin** `SubagentManager` ni CLI:
+    /// `fingerprint()` idéntico, 0 subprocessos (el marker no se recrea) y 0 worktrees.
+    #[test]
+    fn external_driver_run_replays_offline_with_identical_fingerprint() {
+        let repo = init_temp_git_repo("drv_replay_ext");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_drvreplay_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+        let host_tmp = host_tmp_dir("drvreplay");
+
+        // El CLI fake escribe en el worktree y un **marker fuera del repo** como prueba
+        // inequívoca de que durante el replay el proceso nunca se re-ejecuta.
+        let marker = host_tmp.join("ext_cli_marker.txt");
+        let _ = fs::remove_file(&marker);
+        let bin = write_cli_script(
+            &host_tmp,
+            "replay",
+            &format!(
+                "@echo off\r\necho hello > from_ext.txt\r\necho worked\r\necho marker > \"{}\"\r\n",
+                marker.to_string_lossy()
+            ),
+            &format!(
+                "#!/bin/sh\necho hello > from_ext.txt\necho worked\necho marker > \"{}\"\n",
+                marker.to_string_lossy()
+            ),
+        );
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![test_external_driver("cli", bin)]);
+        let tools = WorkspaceTools::new(policy.clone());
+
+        let cfg = AgentConfig {
+            default_max_steps: 192,
+            default_timeout_ticks: 512,
+            ..AgentConfig::default()
+        };
+        let (mut host, ws_vocab) = build_host(1, cfg.clone(), None, None).unwrap();
+        host.spawn(&make_spec("delegate to external cli", true));
+
+        let mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        )
+        .with_root_tools(tools.clone());
+        let handle = SubagentHandle::new(mgr);
+
+        let phase = Arc::new(Mutex::new(0usize));
+        let phase_clone = Arc::clone(&phase);
+        let responder = move |req: &AgentView| {
+            let mut p = phase_clone.lock().unwrap();
+            *p += 1;
+            if *p == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "spawn_subagent",
+                    r#"{"name":"ext","goal":"write from_ext.txt","driver":"cli"}"#,
+                ))
+            } else {
+                let last_obs = req
+                    .memory
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == "observe")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                if last_obs.contains("\"merged\":true") {
+                    Some(Reply::done(
+                        req.agent,
+                        req.request,
+                        "merged from external cli",
+                    ))
+                } else if last_obs.contains("\"status\":\"done\"") {
+                    Some(Reply::call_structured(
+                        req.agent,
+                        req.request,
+                        "subagent_merge",
+                        r#"{"job_id":"ext-1"}"#,
+                    ))
+                } else {
+                    thread::sleep(Duration::from_millis(120));
+                    Some(Reply::call_structured(
+                        req.agent,
+                        req.request,
+                        "subagent_status",
+                        r#"{"job_id":"ext-1"}"#,
+                    ))
+                }
+            }
+        };
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode(WorkspaceMode::Build)
+            .with_workspace_vocab(ws_vocab);
+        let sub_driver = SubagentManagerDriver::new(host.vocab(), handle).wrapping(
+            ws_bridge.wrapping(AutoApproveSpawns {
+                vocab: host.vocab(),
+                queued: Vec::new(),
+                handled: BTreeSet::new(),
+            }),
+        );
+        let mut driver = RecordingBridge::new(host.vocab(), responder).wrapping(sub_driver);
+
+        for _ in 0..512 {
+            host.step(&mut driver);
+            if !host.agents().is_empty() && host.is_settled() {
+                break;
+            }
+        }
+        assert!(host.is_settled(), "la grabación no se asentó");
+        let root_id = host.agents()[0];
+        assert_eq!(
+            host.agent_state(root_id),
+            Some(AgentState::Done),
+            "memory: {:?}",
+            host.view(root_id).memory
+        );
+        // Grabación real: el CLI se ejecutó (marker) y el merge materializó en `root`.
+        assert!(
+            marker.exists(),
+            "el CLI fake debe haberse ejecutado en la grabación"
+        );
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            fs::read_to_string(repo.join("from_ext.txt"))
+                .unwrap()
+                .contains("hello"),
+            "el merge debe haber materializado el cambio del CLI en root"
+        );
+        let original_fp = host.fingerprint();
+        let tr = driver.transcript().clone();
+        drop(driver);
+
+        // Tras el merge el worktree se desmontó: 0 worktrees en el directorio base.
+        let count_worktrees = || {
+            let mut n = 0usize;
+            if let Ok(entries) = fs::read_dir(&wt_base) {
+                for e in entries.flatten() {
+                    if e.path().is_dir() {
+                        if let Ok(sub) = fs::read_dir(e.path()) {
+                            n += sub
+                                .filter_map(|x| x.ok())
+                                .filter(|x| x.path().is_dir())
+                                .count();
+                        }
+                    }
+                }
+            }
+            n
+        };
+        assert_eq!(
+            count_worktrees(),
+            0,
+            "el worktree debe desmontarse tras el merge"
+        );
+
+        // Replay offline: host nuevo + `ReplayBridge` solo (sin `SubagentManager` → 0 I/O
+        // estructural; sin `SubagentManagerDriver` → la CLI nunca se re-ejecuta).
+        let (mut replay_host, _) = build_host(1, cfg, None, None).unwrap();
+        replay_host.spawn(&make_spec("delegate to external cli", true));
+        let mut replay_driver = ReplayBridge::new(tr).wrapping(HeadlessDriver::new());
+        for _ in 0..512 {
+            replay_host.step(&mut replay_driver);
+            if replay_driver.remaining() == 0 && replay_host.is_settled() {
+                break;
+            }
+        }
+        assert_eq!(
+            replay_host.fingerprint(),
+            original_fp,
+            "el replay offline debe reproducir el grafo bit-idéntico"
+        );
+        assert!(
+            !marker.exists(),
+            "el replay no debe re-ejecutar el CLI externo (0 subprocessos)"
+        );
+        assert_eq!(count_worktrees(), 0, "el replay no debe crear worktrees");
+
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
     }
 
     /// Crea en el host el script de "stall" (toca un fichero del worktree + nieto vivo que

@@ -21,8 +21,8 @@ pub use impact::{
     extract_unified_diff_line_ranges,
 };
 pub use policy::{
-    PermissionDecision, PermissionRules, WorkspacePolicy, compile_glob_regex,
-    is_control_plane_rel_path, is_mutating_tool,
+    MergeDeltaVerdict, PermissionDecision, PermissionRules, WorkspacePolicy, classify_merge_delta,
+    compile_glob_regex, is_control_plane_rel_path, is_governance_rel_path, is_mutating_tool,
 };
 pub use sandbox::{
     ContainerCli, NetworkPolicy, ProcessJob, ProcessLimits, ResolvedProcessBinary,

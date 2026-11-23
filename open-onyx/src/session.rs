@@ -568,7 +568,13 @@ impl PlatformDriver for CliApprovalDriver {
                     // `subagent_merge` se ejecute y devuelva el error exacto (rutas en
                     // conflicto, estado del job) a `root`, conservando el worktree
                     // (igual que TUI y Web; `SDD-10` Paso 0).
-                    Some(MergePreviewState::Conflict { .. }) | None => continue,
+                    // `ControlPlaneDenied`: no hay nada que aprobar; `SubagentManagerDriver`
+                    // niega la solicitud de plano (`SDD-10` Fase 3).
+                    Some(
+                        MergePreviewState::Conflict { .. }
+                        | MergePreviewState::ControlPlaneDenied { .. },
+                    )
+                    | None => continue,
                 }
             } else if let Some(tools) = &self.tools {
                 let (decision, imp) = tools.evaluate_permission_with_impact(

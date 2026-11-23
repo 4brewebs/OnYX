@@ -678,6 +678,49 @@ pub fn is_control_plane_rel_path(raw: &str) -> bool {
     file_name == ".env" || file_name.starts_with(".env.")
 }
 
+/// Veredicto de la clasificación del delta de un merge 3-way (`SDD-10` Fase 3):
+/// - [`MergeDeltaVerdict::Safe`]: el delta no toca superficies sensibles → aprobación
+///   estándar por impacto (`apply_impact_escalation`).
+/// - [`MergeDeltaVerdict::Ask`]: el delta toca `sprout.toml` o `.github/workflows/**`
+///   (gobernanza) → la aprobación del merge debe ser explícita (`Ask`), nunca auto-aprobada.
+/// - [`MergeDeltaVerdict::Deny`]: el delta toca el *Control Plane* solo lectura
+///   (`.onyx/config.toml`, `.env*`, `.git/hooks/**`, ...) → el merge debe bloquearse sin
+///   tocar el disco de `root`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeDeltaVerdict {
+    Safe,
+    Ask,
+    Deny,
+}
+
+/// Ruta de gobernanza no crítica (`SDD-10` Fase 3): un subagente (especialmente uno con
+/// driver externo) que la toca fuerza aprobación explícita (`Ask`) en el merge.
+pub fn is_governance_rel_path(raw: &str) -> bool {
+    let norm = raw.trim().replace('\\', "/");
+    let lower = norm
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    lower == "sprout.toml" || lower.starts_with(".github/workflows/")
+}
+
+/// Clasifica el delta `<root_now_commit>..<merged_tree>` de un merge 3-way contra el
+/// *Control Plane* (Deny) y las superficies de gobernanza (Ask). `Deny` corta a la primera
+/// ruta de Control Plane: un solo `.onyx/config.toml` o `.env*` bloquea el merge entero
+/// (`SDD-10` Fase 3).
+pub fn classify_merge_delta(changed_files: &[String]) -> MergeDeltaVerdict {
+    let mut verdict = MergeDeltaVerdict::Safe;
+    for f in changed_files {
+        if is_control_plane_rel_path(f) {
+            return MergeDeltaVerdict::Deny;
+        }
+        if verdict == MergeDeltaVerdict::Safe && is_governance_rel_path(f) {
+            verdict = MergeDeltaVerdict::Ask;
+        }
+    }
+    verdict
+}
+
 fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -1111,5 +1154,93 @@ impl WorkspacePolicy {
             return Err(format!("path `{raw}` escapes workspace root"));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod merge_delta_tests {
+    use super::*;
+
+    fn files(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_merge_delta_denies_control_plane_short_circuit() {
+        // `.onyx/config.toml` → Deny, aunque vayan otras rutas inofensivas.
+        assert_eq!(
+            classify_merge_delta(&files(&[".onyx/config.toml", "src/main.rs"])),
+            MergeDeltaVerdict::Deny
+        );
+        // `.env` / `.env.local` → Deny.
+        assert_eq!(
+            classify_merge_delta(&files(&[".env"])),
+            MergeDeltaVerdict::Deny
+        );
+        assert_eq!(
+            classify_merge_delta(&files(&[".env.local"])),
+            MergeDeltaVerdict::Deny
+        );
+        // `.git/hooks/**` y `.git/config` → Deny.
+        assert_eq!(
+            classify_merge_delta(&files(&[".git/hooks/pre-commit"])),
+            MergeDeltaVerdict::Deny
+        );
+        assert_eq!(
+            classify_merge_delta(&files(&[".git/config"])),
+            MergeDeltaVerdict::Deny
+        );
+        // `.onyx/vault/**` → Deny.
+        assert_eq!(
+            classify_merge_delta(&files(&[".onyx/vault/sess/a.tr"])),
+            MergeDeltaVerdict::Deny
+        );
+        // Deny corta a la primera: no importa el orden ni las rutas Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&["sprout.toml", ".env", "src/a.rs"])),
+            MergeDeltaVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn classify_merge_delta_asks_for_governance_paths() {
+        // `sprout.toml` → Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&["sprout.toml"])),
+            MergeDeltaVerdict::Ask
+        );
+        // `.github/workflows/**` → Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&[".github/workflows/ci.yml"])),
+            MergeDeltaVerdict::Ask
+        );
+        // Ask + inofensivo sigue siendo Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&["sprout.toml", "src/main.rs"])),
+            MergeDeltaVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn classify_merge_delta_safe_for_normal_sources() {
+        assert_eq!(classify_merge_delta(&files(&[])), MergeDeltaVerdict::Safe);
+        assert_eq!(
+            classify_merge_delta(&files(&["src/main.rs", "docs/readme.md"])),
+            MergeDeltaVerdict::Safe
+        );
+        // Un `workflows/` suelto (sin `.github/`) NO es gobernanza.
+        assert_eq!(
+            classify_merge_delta(&files(&["workflows/ci.yml"])),
+            MergeDeltaVerdict::Safe
+        );
+        // Separadores Windows se normalizan.
+        assert_eq!(
+            classify_merge_delta(&files(&[".github\\workflows\\ci.yml"])),
+            MergeDeltaVerdict::Ask
+        );
+        assert_eq!(
+            classify_merge_delta(&files(&[".onyx\\config.toml"])),
+            MergeDeltaVerdict::Deny
+        );
     }
 }
