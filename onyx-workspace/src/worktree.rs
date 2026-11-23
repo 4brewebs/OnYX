@@ -16,6 +16,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::policy::is_control_plane_rel_path;
+use crate::sandbox::NetworkPolicy;
 use crate::state::capture_git_tree_checkpoint;
 
 /// Variable de entorno opcional para sobreescribir el directorio base de *worktrees* temporales.
@@ -33,6 +34,27 @@ pub enum SubagentNetworkPolicy {
     NativeOffline,
     /// Harness CLI externo (`opencode`, `claude`, etc.) con lista explícita de hosts permitidos (`SDD-10` §2.7).
     ExternalHarnessAllowlist(Vec<String>),
+}
+
+impl SubagentNetworkPolicy {
+    /// `NetworkPolicy` de sandbox derivada para los subprocesos del subagente (`SDD-10` Fase 2):
+    /// - `NativeOffline` → `Offline` (los subprocesos de herramientas corren sin red; el host hace las LLM).
+    /// - `ExternalHarnessAllowlist` → **no-`Offline`** (el harness necesita llegar a su API):
+    ///   `Unrestricted` con allowlist declarada, `LocalhostOnly` con allowlist vacía.
+    ///   En ambos casos `apply_sanitized_env*` no inyecta hints `*_OFFLINE`/`NO_PROXY`;
+    ///   la allowlist de hosts es declarativa (el enforce de SO solo existe en contenedor).
+    pub fn derived_network_policy(&self) -> NetworkPolicy {
+        match self {
+            Self::NativeOffline => NetworkPolicy::Offline,
+            Self::ExternalHarnessAllowlist(allowlist) => {
+                if allowlist.is_empty() {
+                    NetworkPolicy::LocalhostOnly
+                } else {
+                    NetworkPolicy::Unrestricted
+                }
+            }
+        }
+    }
 }
 
 /// Cómo se entrega el prompt al CLI externo sin inyección de shell (`SDD-10` §3).

@@ -254,10 +254,18 @@ impl PlatformDriver for WorkspaceToolBridge {
                             .flatten()
                             .filter(|d| !d.eq_ignore_ascii_case("native"))
                         {
-                            // Gate de drivers externos (`SDD-10`): workspace no confiado o regla `deny`.
-                            let (_, gate_reason) =
-                                self.tools.policy().external_driver_gate(&driver);
-                            gate_reason
+                            // Gate de drivers externos (`SDD-10`): modo de solo lectura,
+                            // workspace no confiado o regla `deny`/`ask`.
+                            if !current_mode.allows_mutation() {
+                                format!(
+                                    "blocked by workspace mode `{:?}`: external harness driver `{driver}` cannot run CLI processes in read-only mode",
+                                    current_mode
+                                )
+                            } else {
+                                let (_, gate_reason) =
+                                    self.tools.policy().external_driver_gate(&driver);
+                                gate_reason
+                            }
                         } else {
                             format!(
                                 "blocked by control-plane protection (read-only): `{}`",

@@ -546,9 +546,27 @@ impl SubagentManager {
             .to_string();
         let handle = mgr.create_worktree(&job_id, spawn_tick)?;
 
+        // `SDD-10` Fase 2: el backend se resuelve **antes** de `for_worktree` porque la política
+        // de red del worktree depende del driver: un harness CLI externo deriva
+        // `ExternalHarnessAllowlist` (no-`Offline`, sin hints `*_OFFLINE`), el nativo mantiene
+        // `NativeOffline`.
+        let sub_seed = derive_subagent_seed(self.root_seed, spawn_tick, &job_id);
+        let worker_backend = match &resolved_external {
+            Some(driver) => WorkerBackend::External {
+                driver: driver.clone(),
+            },
+            None => WorkerBackend::Native {
+                graph_snapshot,
+                seed: sub_seed,
+            },
+        };
+        let wt_network_policy = match &worker_backend {
+            WorkerBackend::External { driver } => driver.config().network_policy.clone(),
+            WorkerBackend::Native { .. } => self.network_policy.clone(),
+        };
         let wt_policy = match self
             .root_policy
-            .for_worktree(&handle.worktree_path, &self.network_policy)
+            .for_worktree(&handle.worktree_path, &wt_network_policy)
         {
             Ok(p) => p,
             Err(e) => {
@@ -557,15 +575,6 @@ impl SubagentManager {
                     "failed to derive worktree policy for `{job_id}`: {e}"
                 ));
             }
-        };
-
-        let sub_seed = derive_subagent_seed(self.root_seed, spawn_tick, &job_id);
-        let worker_backend = match resolved_external {
-            Some(driver) => WorkerBackend::External { driver },
-            None => WorkerBackend::Native {
-                graph_snapshot,
-                seed: sub_seed,
-            },
         };
         let bounded_steps = max_steps
             .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS)
@@ -2353,9 +2362,11 @@ mod tests {
         assert_eq!(s.driver, "fake-drv");
         assert_eq!(s.status, "failed");
         assert_eq!(s.ok, Some(false));
+        // `SDD-10` Fase 2: el binario inexistente se rechaza **antes** del `spawn`
+        // (resolución explícita contra `PATH`/`PATHEXT`), con summary accionable.
         assert!(
             s.summary
-                .contains("failed to spawn external driver `fake-drv`"),
+                .contains("binary `definitely-missing-onyx-binary` was not resolved against PATH"),
             "summary must be actionable, got: {}",
             s.summary
         );
@@ -2367,6 +2378,214 @@ mod tests {
         let _ = mgr.discard_job(&spawned.job_id);
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// `SDD-10` Fase 2: el techo `max_concurrent` es **compartido** por subagentes nativos y
+    /// drivers externos, y el error de capacidad ocurre **antes** de crear el worktree.
+    #[test]
+    fn spawn_job_max_concurrent_is_shared_by_native_and_external_before_worktree_creation() {
+        use onyx_workspace::{ExternalDriverConfig, PromptTransport, SubagentNetworkPolicy};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let repo = init_temp_git_repo("mixed_cap");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_mixedcap_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        // 2 nativos bloqueados por factory + 1 externo que se mantiene vivo (sleep/ping).
+        let release = Arc::new(AtomicBool::new(false));
+        let release_factory = Arc::clone(&release);
+        // Presupuesto de bloqueo amplio (30 s): bajo carga de batería completa, los
+        // `spawn_job` (git worktree) tardan varios segundos; con un presupuesto corto el
+        // worker nativo devolvería `Reply::done` antes del assert de `active_count`.
+        let blocking_factory: ResponderFactory = Arc::new(move || {
+            let rel = Arc::clone(&release_factory);
+            Box::new(move |req: &AgentView| {
+                for _ in 0..3000 {
+                    if rel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Some(Reply::done(req.agent, req.request, "released"))
+            })
+        });
+
+        let sleeper = if cfg!(windows) {
+            ExternalDriverConfig {
+                id: "sleeper".to_string(),
+                bin: "ping".to_string(),
+                args: vec!["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+                prompt_transport: PromptTransport::Stdin,
+                prompt_flag: None,
+                timeout: Duration::from_secs(120),
+                allowed_env: Vec::new(),
+                inherit_home: false,
+                network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+            }
+        } else {
+            ExternalDriverConfig {
+                id: "sleeper".to_string(),
+                bin: "sleep".to_string(),
+                args: vec!["30".to_string()],
+                prompt_transport: PromptTransport::Stdin,
+                prompt_flag: None,
+                timeout: Duration::from_secs(120),
+                allowed_env: Vec::new(),
+                inherit_home: false,
+                network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+            }
+        };
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![sleeper]);
+        let mut mgr =
+            SubagentManager::with_worktree_base_dir(policy, 1, blocking_factory, Some(&wt_base))
+                .with_max_concurrent(3);
+
+        let n1 = mgr
+            .spawn_job("n1", Some("mix"), Some(8), 1, Vec::new(), None)
+            .unwrap();
+        let n2 = mgr
+            .spawn_job("n2", Some("mix"), Some(8), 2, Vec::new(), None)
+            .unwrap();
+        let e1 = mgr
+            .spawn_job("e1", Some("mix"), None, 3, Vec::new(), Some("sleeper"))
+            .unwrap();
+        assert_eq!(e1.driver, "sleeper");
+        let active = mgr.active_count();
+        assert_eq!(
+            active,
+            3,
+            "los 3 jobs debían estar Running ({}); estados: {:?}",
+            active,
+            mgr.status(None).unwrap()
+        );
+
+        // Los worktrees son hijos directos del directorio base resuelto (anidado bajo
+        // `wt_base/openonyx_subagent_<tag>_<pid>_<nanos>/`).
+        let wt_parent = n1.worktree_path.parent().unwrap().to_path_buf();
+        let count_worktrees = || {
+            fs::read_dir(&wt_parent)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .count()
+        };
+
+        // El 4º (nativo) no crea worktree: el techo se comprueba antes de `create_worktree`.
+        let err = mgr
+            .spawn_job("n4", Some("mix"), Some(8), 4, Vec::new(), None)
+            .unwrap_err();
+        assert!(
+            err.contains("max concurrent subagents reached (3/3)"),
+            "{err}"
+        );
+        assert_eq!(count_worktrees(), 3);
+
+        // Y el 4º externo tampoco (resolución de driver + techo, sin worktree).
+        let err = mgr
+            .spawn_job("e4", Some("mix"), None, 5, Vec::new(), Some("sleeper"))
+            .unwrap_err();
+        assert!(
+            err.contains("max concurrent subagents reached (3/3)"),
+            "{err}"
+        );
+        assert_eq!(count_worktrees(), 3);
+
+        release.store(true, Ordering::Release);
+        for id in [&n1.job_id, &n2.job_id, &e1.job_id] {
+            mgr.discard_job(id)
+                .unwrap_or_else(|e| panic!("discard {id}: {e}"));
+        }
+        assert_eq!(count_worktrees(), 0);
+        drop(mgr);
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// `SDD-10` Fase 2 (nivel manager): un driver externo con timeout y un **nieto** vivo que
+    /// retiene la pipe muere entero por `terminate()`/`taskkill`, el job queda `failed` y
+    /// `discard_job` elimina el worktree **sin** `Access Denied` (0 handles/procesos vivos).
+    #[test]
+    fn spawn_job_external_driver_timeout_with_grandchild_allows_worktree_removal() {
+        use onyx_workspace::{ExternalDriverConfig, PromptTransport, SubagentNetworkPolicy};
+
+        let repo = init_temp_git_repo("ext_timeout_wt");
+        let wt_base = repo.parent().unwrap().join(format!(
+            "openonyx_wt_base_exttimeout_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        // Script en el host (fuera del worktree): toca un fichero del worktree y deja un
+        // nieto vivo (`ping`/`sleep`) heredando la pipe de `stdout`.
+        let host_tmp = std::env::temp_dir().join(format!(
+            "onyx_extdrv_wt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&host_tmp).unwrap();
+        let script = write_stall_script(&host_tmp);
+
+        let driver = ExternalDriverConfig {
+            id: "staller".to_string(),
+            bin: script,
+            args: Vec::new(),
+            prompt_transport: PromptTransport::Stdin,
+            prompt_flag: None,
+            timeout: Duration::from_secs(3),
+            allowed_env: Vec::new(),
+            inherit_home: false,
+            network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+        };
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![driver]);
+        let mut mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        );
+
+        let spawned = mgr
+            .spawn_job("stall", Some("stall"), None, 1, Vec::new(), Some("staller"))
+            .unwrap();
+        assert_eq!(spawned.driver, "staller");
+
+        // El job debe terminar en `failed` (timeout ~3 s + kill del árbol) en < 30 s.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let statuses = mgr.status(Some(&spawned.job_id)).unwrap();
+            if matches!(statuses[0].status, "done" | "failed") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timeout job did not finish");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let s = &mgr.status(Some(&spawned.job_id)).unwrap()[0];
+        assert_eq!(s.status, "failed", "el driver debió fallar por timeout");
+        assert_eq!(s.ok, Some(false));
+
+        // `discard_job` elimina el worktree sin procesos vivos reteniendo handles (el
+        // nieto fue matado junto al árbol): `git worktree remove` no da `Access Denied`.
+        let r = mgr.discard_job(&spawned.job_id);
+        assert!(
+            r.is_ok(),
+            "remove_worktree falló (¿nieto vivo en el worktree?): {:?}",
+            r.err()
+        );
+        assert!(!s.worktree_path.exists(), "worktree debe estar desmontado");
+        drop(mgr);
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
     }
 
     #[test]
@@ -2953,5 +3172,31 @@ mod tests {
         assert!(!wt_base.exists());
 
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Crea en el host el script de "stall" (toca un fichero del worktree + nieto vivo que
+    /// hereda la pipe de `stdout`) y devuelve su ruta absoluta.
+    #[cfg(windows)]
+    fn write_stall_script(host_tmp: &Path) -> String {
+        let p = host_tmp.join("wt_stall.cmd");
+        fs::write(
+            &p,
+            "@echo off\r\necho marker > touch.txt\r\nping -n 300 127.0.0.1\r\n",
+        )
+        .unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[cfg(not(windows))]
+    fn write_stall_script(host_tmp: &Path) -> String {
+        let p = host_tmp.join("wt_stall.sh");
+        fs::write(
+            &p,
+            "#!/bin/sh\necho marker > touch.txt\nsleep 300 &\nwait\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().into_owned()
     }
 }

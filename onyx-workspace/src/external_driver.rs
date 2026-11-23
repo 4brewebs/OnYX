@@ -67,6 +67,13 @@ impl PartialDriver {
                 "config.toml line {line_no}: driver `id` must be non-empty with charset `[a-z0-9_-]`, got `{id}`"
             ));
         }
+        // `native` es el identificador reservado del motor interno (siempre disponible y
+        // nunca configurable): rechazarlo en el parseo evita sombras en silencio.
+        if id == "native" {
+            return Err(format!(
+                "config.toml line {line_no}: driver `id` `native` is reserved for the built-in OnYX engine and cannot be redefined"
+            ));
+        }
         let bin = self.bin.ok_or_else(|| {
             format!("config.toml line {line_no}: driver `{id}` missing required `bin`")
         })?;
@@ -467,6 +474,11 @@ enabled = true
         )
         .unwrap_err();
         assert!(unknown_key.contains("unknown key"), "{unknown_key}");
+
+        let reserved_native =
+            parse_external_drivers_toml("[[external_drivers]]\nid = \"native\"\nbin = \"x\"\n")
+                .unwrap_err();
+        assert!(reserved_native.contains("reserved"), "{reserved_native}");
 
         let missing_bin =
             parse_external_drivers_toml("[[external_drivers]]\nid = \"ok\"\n").unwrap_err();

@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 
 use crate::external_driver::{builtin_external_driver_presets, load_external_drivers};
 use crate::impact::ImpactConfig;
-use crate::sandbox::{NetworkPolicy, SandboxConfig, SandboxMode};
+use crate::sandbox::{SandboxConfig, SandboxMode};
 use crate::state::WorkspaceMode;
 use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
 use crate::worktree::{ExternalDriverConfig, SubagentNetworkPolicy};
@@ -745,7 +745,8 @@ impl WorkspacePolicy {
     /// desechable (`SDD-09` Fase 2):
     /// - Re-enraiza `root` en `worktree_root` canonizado.
     /// - Fuerza al menos `SandboxMode::WorkspaceWrite` (preservando `StrictContainer` si ya es más estricto).
-    /// - Aplica `SubagentNetworkPolicy` (`NativeOffline` -> `NetworkPolicy::Offline`).
+    /// - Aplica [`SubagentNetworkPolicy::derived_network_policy`] (`NativeOffline` -> `Offline`;
+    ///   `ExternalHarnessAllowlist` -> no-`Offline` para que el harness hable con su API).
     /// - Concede auto-aprobación confinada al worktree (`fs_write`/`fs_edit`/`shell_exec`)
     ///   preservando intactas todas las reglas `deny` y la protección del Control Plane.
     pub fn for_worktree(
@@ -759,12 +760,10 @@ impl WorkspacePolicy {
         if derived.sandbox.mode == SandboxMode::Off {
             derived.sandbox.mode = SandboxMode::WorkspaceWrite;
         }
-        match network_policy {
-            SubagentNetworkPolicy::NativeOffline => {
-                derived.sandbox.network = NetworkPolicy::Offline;
-            }
-            SubagentNetworkPolicy::ExternalHarnessAllowlist(_) => {}
-        }
+        // `SDD-10` Fase 2: el harness CLI externo deriva una política **no-`Offline`** (sin
+        // hints `*_OFFLINE`/`NO_PROXY`) para poder hablar con su API; el allowlist de hosts
+        // es declarativo (ver [`SubagentNetworkPolicy::derived_network_policy`]).
+        derived.sandbox.network = network_policy.derived_network_policy();
         derived.permissions = PermissionRules {
             deny: self.permissions.deny.clone(),
             allow: vec![
@@ -923,13 +922,14 @@ impl WorkspacePolicy {
         self.permissions.evaluate(tool, args_json, self.ignore_deny)
     }
 
-    /// Gate de aprobación/trust para `spawn_subagent` con driver externo no-nativo (`SDD-10` Fase 1).
+    /// Gate de aprobación/trust para `spawn_subagent` con driver externo no-nativo (`SDD-10`).
     ///
     /// Devuelve la decisión y un motivo accionable (no vacío en `Deny`/`Ask`):
     /// - Workspace no confiado → `Deny` absoluto (límite de confianza; ni `ignore_deny` lo anula).
     /// - Regla `deny` explícita `spawn_subagent(<driver>)` → `Deny`.
-    /// - Regla `allow` explícita `spawn_subagent(<driver>)` → `Allow`.
-    /// - En cualquier otro caso → `Ask` (nunca cae en el fallback estático `Allow` de
+    /// - Precedencia `ask` vs `allow` idéntica a [`PermissionRules::evaluate`] (especificidad;
+    ///   ante igual o mayor especificidad gana `ask`).
+    /// - Sin reglas `ask`/`allow` → `Ask` (nunca cae en el fallback estático `Allow` de
     ///   herramientas no mutantes, que aplicaría a `spawn_subagent` sin driver).
     pub fn external_driver_gate(&self, driver_id: &str) -> (PermissionDecision, String) {
         if !self.trust.config_trusted {
@@ -954,20 +954,42 @@ impl WorkspacePolicy {
                 ),
             );
         }
-        if self
+        // Misma semántica de especificidad que `PermissionRules::evaluate`: ante igual o
+        // mayor especificidad, `ask >= allow`; un `allow` más específico vence al `ask` genérico.
+        let best_ask = self
+            .permissions
+            .ask
+            .iter()
+            .filter_map(|rule| match_permission_rule(rule, "spawn_subagent", driver_id))
+            .max();
+        let best_allow = self
             .permissions
             .allow
             .iter()
-            .any(|rule| match_permission_rule(rule, "spawn_subagent", driver_id).is_some())
-        {
-            return (PermissionDecision::Allow, String::new());
+            .filter_map(|rule| match_permission_rule(rule, "spawn_subagent", driver_id))
+            .max();
+        let decision = match (best_ask, best_allow) {
+            (Some(ask_spec), Some(allow_spec)) => {
+                if ask_spec >= allow_spec {
+                    PermissionDecision::Ask
+                } else {
+                    PermissionDecision::Allow
+                }
+            }
+            (Some(_), None) => PermissionDecision::Ask,
+            (None, Some(_)) => PermissionDecision::Allow,
+            (None, None) => PermissionDecision::Ask,
+        };
+        if decision == PermissionDecision::Allow {
+            (PermissionDecision::Allow, String::new())
+        } else {
+            (
+                PermissionDecision::Ask,
+                format!(
+                    "external harness driver `{driver_id}` will run an external CLI process in an isolated Git worktree"
+                ),
+            )
         }
-        (
-            PermissionDecision::Ask,
-            format!(
-                "external harness driver `{driver_id}` will run an external CLI process in an isolated Git worktree"
-            ),
-        )
     }
 
     /// Evalúa las reglas de permisos aplicando las invariantes de seguridad:

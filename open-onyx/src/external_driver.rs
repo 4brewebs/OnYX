@@ -1,24 +1,37 @@
-//! Ejecutor de harnesses CLI externos como drivers de subagentes (`SDD-10` Fase 1).
+//! Ejecutor de harnesses CLI externos como drivers de subagentes (`SDD-10` Fase 2: ejecución segura).
 //!
 //! Contrato exacto del SDD: el driver se lanza dentro del worktree Git aislado ya creado
 //! por `SubagentManager` (reutilizando `WorktreeHandle`), sin `tokio` ni dependencias nuevas:
-//! - Prompt **solo** por `stdin` en Fase 1 (`arg`/`temp_file` llegan en Fase 2, con error accionable).
-//! - Dos hilos lectores acotados (`stdout`/`stderr`) para no bloquear el bucle de espera.
-//! - `try_wait()` con *deadline* (`config.timeout`) y `cancel_flag`; `child.kill()` en ambos casos
-//!   (el *process tree* completo llega en Fase 2).
+//! - El binario se resuelve **explícitamente** contra `PATH`/`PATHEXT` antes de `Command::new`
+//!   ([`onyx_workspace::resolve_process_binary`]); `PromptTransport::Arg` se rechaza para
+//!   wrappers de shell (`.cmd`/`.bat`) porque su argv pasa por `cmd.exe` y reinterpreta metacaracteres.
+//! - Transportes de prompt: `Stdin` (hilo escritor dedicado, tolera `BrokenPipe`), `Arg`
+//!   (único elemento argv) y `TempFile` (guard RAII de archivo temporal fuera del índice Git,
+//!   entregado por `prompt_flag`, placeholder `{prompt_file}` o argumento final).
+//! - Los dos hilos lectores acotados (`stdout`/`stderr`) se lanzan **antes** de escribir stdin,
+//!   para que ni un prompt grande ni una pipe llena bloqueen el bucle de espera.
+//! - `configure_process_isolation` + `ProcessJob::assign` inmediato tras `spawn`; a timeout o
+//!   cancelación se mata el **árbol** completo (`terminate()`; fallback `taskkill /F /T /PID`
+//!   en Windows si `assign` falla) antes de capturar estado o desmontar el worktree.
+//! - Entorno saneado (`env_clear()` + allowlist): sin `NODE_OPTIONS` salvo opt-in `allowed_env`,
+//!   home aislado salvo `inherit_home`, sin hints `*_OFFLINE`/`NO_PROXY` con allowlist de red.
 //! - `clean_summary`: salida combinada con ANSI quitado + secretos borrados, acotado a 4 KB.
+//! - Log crudo del vault (`.onyx/vault/subagent-logs/<job_id>.log`): `SDD-10` Fase 3.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use onyx_soul_agents::{AgentView, ApprovalPolicy};
 use onyx_workspace::{
-    ExternalDriverConfig, PromptTransport, scrub_secrets, spawn_subagent_driver_from_args,
+    ExternalDriverConfig, ProcessJob, ProcessLimits, PromptTransport,
+    apply_sanitized_env_for_external_harness, clean_process_path, configure_process_isolation,
+    ensure_sandbox_tmp_dir, resolve_process_binary, scrub_secrets, spawn_subagent_driver_from_args,
 };
 
 /// Resultado de una ejecución de un harness CLI externo dentro de un worktree (`SDD-10` §3).
@@ -26,13 +39,14 @@ use onyx_workspace::{
 pub struct ExternalRunOutput {
     /// Código de salida del proceso (`-1` si no fue posible obtenerlo tras kill/wait).
     pub exit_code: i32,
-    /// `true` si se alcanzó `config.timeout` y se mató el proceso.
+    /// `true` si se alcanzó `config.timeout` y se mató el árbol de procesos.
     pub timed_out: bool,
-    /// `true` si se levantó `cancel_flag` y se mató el proceso.
+    /// `true` si se levantó `cancel_flag` y se mató el árbol de procesos.
     pub cancelled: bool,
     /// `stdout + stderr` combinados: ANSI quitado + secretos borrados, máx. 4 KB.
     pub clean_summary: String,
-    /// Ruta del log completo persistente (Fase 2: `.onyx/vault/logs/`); `None` en Fase 1.
+    /// Ruta del log completo persistente (Fase 3: `.onyx/vault/subagent-logs/<job_id>.log`);
+    /// `None` hasta que llegue el vault en `SDD-10` Fase 3.
     pub full_log_path: Option<PathBuf>,
 }
 
@@ -58,11 +72,14 @@ pub trait ExternalHarnessDriver: Send + Sync {
     ) -> Result<ExternalRunOutput, String>;
 }
 
-/// Runner de serie para harnesses CLI (`SDD-10` Fase 1, contrato mínimo funcional).
+/// Runner de serie para harnesses CLI (`SDD-10` Fase 2: ejecución segura).
 ///
-/// Limites explícitos de Fase 1 (llegan en Fase 2, con errores accionables):
-/// - Solo `PromptTransport::Stdin` (los wrappers `.cmd` de Windows rompen `arg`).
-/// - Sin *process tree* kill, sin sandbox ni sanitización de entorno, sin PATH/PATHEXT.
+/// Garantías antes y durante el `spawn()`:
+/// - Binario resuelto explícito contra `PATH`/`PATHEXT` (nunca adivina `Command::new`).
+/// - `PromptTransport::Arg` rechazado en wrappers `.cmd`/`.bat` (injección vía `cmd.exe`).
+/// - `configure_process_isolation` + entorno saneado + `current_dir` limpia.
+/// - `ProcessJob` asignado **inmediatamente** tras `spawn`: el árbol muere entero a
+///   timeout/cancel, y el worktree se puede desmontar sin handles retenidos.
 pub struct ExternalDriverRunner {
     config: ExternalDriverConfig,
 }
@@ -91,36 +108,99 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
         task_prompt: &str,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<ExternalRunOutput, String> {
-        if self.config.prompt_transport != PromptTransport::Stdin {
+        // Resolución explícita de `bin` contra `PATH`/`PATHEXT` **antes** de `Command::new`:
+        // si es un wrapper de shell (`.cmd`/`.bat`), `Arg` es inyectable y se rechaza.
+        let resolved = resolve_process_binary(&self.config.bin).ok_or_else(|| {
+            format!(
+                "driver `{}`: binary `{}` was not resolved against PATH{} (install it or set an absolute path in `bin`)",
+                self.config.id,
+                self.config.bin,
+                if cfg!(windows) { "/PATHEXT" } else { "" }
+            )
+        })?;
+        if resolved.is_shell_wrapper && self.config.prompt_transport == PromptTransport::Arg {
             return Err(format!(
-                "driver `{}`: prompt transport `{:?}` is available in SDD-10 Phase 2 (Phase 1 only supports `\"stdin\"`)",
-                self.config.id, self.config.prompt_transport
+                "driver `{}`: prompt transport `\"arg\"` is rejected for shell wrappers (`{}`): their argv goes through `cmd.exe` and would reinterpret metacharacters; use `\"stdin\"` or `\"temp_file\"`",
+                self.config.id,
+                resolved.path.display()
             ));
         }
 
-        let mut child = Command::new(&self.config.bin)
-            .args(&self.config.args)
-            .current_dir(worktree_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                format!(
-                    "failed to spawn external driver `{}` (bin `{}`): {e}",
-                    self.config.id, self.config.bin
-                )
-            })?;
+        let sandbox_tmp = ensure_sandbox_tmp_dir(worktree_path)?;
 
-        // Prompt por stdin; tolera que el hijo cierre la entrada temprano (BrokenPipe).
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(task_prompt.as_bytes());
-            let _ = stdin.flush();
+        // argv según el transporte del prompt (el prompt nunca se concatena a una línea de shell).
+        let mut argv: Vec<String> = self.config.args.clone();
+        let mut stdin_piped = false;
+        let mut prompt_file: Option<TempPromptFile> = None;
+        match self.config.prompt_transport {
+            PromptTransport::Stdin => stdin_piped = true,
+            PromptTransport::Arg => argv.push(task_prompt.to_string()),
+            PromptTransport::TempFile => {
+                let guard = TempPromptFile::create(&self.config.id, task_prompt)
+                    .map_err(|e| format!("driver `{}`: {e}", self.config.id))?;
+                let prompt_path = guard.path.to_string_lossy().into_owned();
+                if let Some(flag) = self.config.prompt_flag.clone() {
+                    argv.push(flag);
+                    argv.push(prompt_path);
+                } else if argv.iter().any(|a| a.contains("{prompt_file}")) {
+                    for a in argv.iter_mut() {
+                        *a = a.replace("{prompt_file}", &prompt_path);
+                    }
+                } else {
+                    argv.push(prompt_path);
+                }
+                prompt_file = Some(guard);
+            }
         }
 
-        // Dos hilos lectores acotados: nunca dejan al bucle bloqueado en una pipe llena.
+        let mut cmd = Command::new(&resolved.path);
+        cmd.args(&argv)
+            .current_dir(clean_process_path(worktree_path))
+            .stdin(if stdin_piped {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_isolation(&mut cmd, true);
+        apply_sanitized_env_for_external_harness(
+            &mut cmd,
+            self.config.network_policy.derived_network_policy(),
+            worktree_path,
+            &sandbox_tmp,
+            &self.config.allowed_env,
+            self.config.inherit_home,
+        );
+
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "failed to spawn external driver `{}` (bin `{}`): {e}",
+                self.config.id,
+                resolved.path.display()
+            )
+        })?;
+
+        // Asignación inmediata al `ProcessJob`: ningún intervalo sin cobertura entre
+        // `spawn` y el bucle de espera (los nietos heredan el job/grupo de procesos).
+        let mut job = ProcessJob::assign(&child, ProcessLimits::default());
+
+        // Hilos lectores acotados **antes** de escribir stdin: un prompt grande o una pipe
+        // llena nunca pueden bloquear el bucle de espera.
         let stdout_handle = read_pipe_capped(child.stdout.take(), PIPE_CAP_BYTES);
         let stderr_handle = read_pipe_capped(child.stderr.take(), PIPE_CAP_BYTES);
+
+        // Escritor de stdin en hilo dedicado: tolera `BrokenPipe` si el hijo cierra la
+        // entrada temprano o muere; al terminarse cierra el lado de lectura del hijo.
+        let stdin_writer = if let Some(mut stdin) = child.stdin.take() {
+            let prompt = task_prompt.to_string();
+            Some(thread::spawn(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+                let _ = stdin.flush();
+            }))
+        } else {
+            None
+        };
 
         let deadline = Instant::now() + self.config.timeout;
         let mut timed_out = false;
@@ -131,14 +211,14 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
                 Ok(None) => {
                     if cancel_flag.load(Ordering::Acquire) {
                         cancelled = true;
-                        let _ = child.kill();
+                        kill_process_tree(&mut job, &mut child);
                         break child.wait().map_err(|e| {
                             format!("failed to reap external driver `{}`: {e}", self.config.id)
                         })?;
                     }
                     if Instant::now() >= deadline {
                         timed_out = true;
-                        let _ = child.kill();
+                        kill_process_tree(&mut job, &mut child);
                         break child.wait().map_err(|e| {
                             format!("failed to reap external driver `{}`: {e}", self.config.id)
                         })?;
@@ -146,8 +226,14 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
                     thread::sleep(Duration::from_millis(25));
                 }
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut job, &mut child);
+                    drop(job);
+                    drop(prompt_file);
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    if let Some(h) = stdin_writer {
+                        let _ = h.join();
+                    }
                     return Err(format!(
                         "failed to wait on external driver `{}`: {e}",
                         self.config.id
@@ -155,6 +241,15 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
                 }
             }
         };
+
+        // Termina explícitamente el `ProcessJob` RAII antes de capturar estado o desmontar el
+        // worktree: ningún nieto huérfano retiene handles ni writes de las pipes (crítico en
+        // Windows, donde un nieto vivo con la pipe abierta bloquearía a los hilos lectores).
+        if let Some(mut j) = job.take() {
+            j.terminate();
+        }
+        drop(job);
+
         let exit_code = status.code().unwrap_or(-1);
 
         let stdout = stdout_handle
@@ -163,6 +258,11 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
         let stderr = stderr_handle
             .join()
             .map_err(|_| "stderr reader thread panicked")?;
+        if let Some(h) = stdin_writer {
+            let _ = h.join();
+        }
+        drop(prompt_file); // RAII: elimina el archivo del prompt (si existía).
+
         let mut combined = stdout;
         if !stderr.is_empty() {
             if !combined.is_empty() {
@@ -180,8 +280,64 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
             timed_out,
             cancelled,
             clean_summary,
-            full_log_path: None, // vault logs: SDD-10 Fase 2
+            // Log crudo del vault (`.onyx/vault/subagent-logs/<job_id>.log`): SDD-10 Fase 3.
+            full_log_path: None,
         })
+    }
+}
+
+/// Mata el **árbol** completo del proceso hijo (hijo + nietos): `ProcessJob::terminate()`
+/// (Job Object en Windows, grupo de procesos POSIX en unix) o, si la asignación al job no fue
+/// posible, `taskkill /F /T /PID` como fallback en Windows (patrón de `WorkspaceTools`).
+/// La llamada `child.kill()` final es redundante pero barata y cubre la ventana de race.
+fn kill_process_tree(job: &mut Option<ProcessJob>, child: &mut Child) {
+    if let Some(mut j) = job.take() {
+        j.terminate();
+    } else {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &child.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Guard RAII del archivo temporal del prompt (`PromptTransport::TempFile`): se crea fuera del
+/// índice Git (en `temp_dir()`) y se elimina al salir de ámbito, incluso en error.
+struct TempPromptFile {
+    path: PathBuf,
+}
+
+impl TempPromptFile {
+    fn create(driver_id: &str, content: &str) -> std::io::Result<Self> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let safe_id: String = driver_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let name = format!(
+            "onyx-extdrv-{safe_id}-{}-{}.prompt",
+            std::process::id(),
+            seq
+        );
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, content)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempPromptFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -291,6 +447,7 @@ fn truncate_utf8_chars(s: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onyx_workspace::SubagentNetworkPolicy;
 
     #[test]
     fn approval_policy_only_fires_for_external_spawn_subagent() {
@@ -329,5 +486,332 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}]0;title\u{07}body"), "body");
         assert_eq!(strip_ansi("\u{1b}]8;;url\u{1b}\\link\u{1b}[0m"), "link");
         assert_eq!(strip_ansi("no escapes \u{1b}M here"), "no escapes  here");
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("onyx_extdrv_{prefix}_{pid}_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn base_config(id: &str, bin: &str) -> ExternalDriverConfig {
+        ExternalDriverConfig {
+            id: id.to_string(),
+            bin: bin.to_string(),
+            args: Vec::new(),
+            prompt_transport: PromptTransport::Stdin,
+            prompt_flag: None,
+            timeout: Duration::from_secs(60),
+            allowed_env: Vec::new(),
+            inherit_home: false,
+            network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+        }
+    }
+
+    fn no_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// Criterio de inyección (`SDD-10` Fase 2): un prompt hostil (`%PATH%&echo pwned|`)
+    /// entregado por stdin a un wrapper `.cmd` llega **literal** a la salida del wrapper;
+    /// `cmd.exe` no lo reinterpreta porque nunca pasa por una línea de comando.
+    #[cfg(windows)]
+    #[test]
+    fn stdin_prompt_to_cmd_wrapper_is_not_interpreted() {
+        let dir = temp_dir("cmdinj");
+        let wrapper = dir.join("wrapper.cmd");
+        let out_file = dir.join("out.txt");
+        // `more` sin argumentos lee el **stdin** byte a byte (a diferencia de `type`,
+        // que no admite entrada estándar) y lo volca a `out.txt`.
+        fs::write(
+            &wrapper,
+            format!("@echo off\r\nmore > \"{}\"\r\n", out_file.display()),
+        )
+        .unwrap();
+
+        let mut cfg = base_config("cmdinj", wrapper.to_str().unwrap());
+        cfg.timeout = Duration::from_secs(30);
+        let runner = ExternalDriverRunner::new(cfg);
+        let prompt = r"%PATH%&echo pwned|";
+        let out = runner
+            .run_in_worktree(&dir, prompt, &no_cancel())
+            .expect("el wrapper .cmd debe ejecutarse con prompt por stdin");
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.timed_out && !out.cancelled);
+
+        // El wrapper recibió el prompt byte a byte: `type` lo volcó literal a `out.txt`.
+        let captured = fs::read_to_string(&out_file).expect("el wrapper debe escribir out.txt");
+        assert_eq!(captured.trim_end_matches(['\r', '\n']), prompt);
+        // Nada del payload interpretado aparece en la salida combinada.
+        assert!(
+            !out.clean_summary.contains("pwned"),
+            "{}",
+            out.clean_summary
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `PromptTransport::Arg` sobre un wrapper `.cmd` se rechaza **antes** del `spawn`
+    /// (criterio de inyección `SDD-10` Fase 2).
+    #[cfg(windows)]
+    #[test]
+    fn arg_transport_rejected_for_shell_wrapper_before_spawn() {
+        let dir = temp_dir("argrej");
+        let wrapper = dir.join("wrapper.cmd");
+        fs::write(&wrapper, "@echo off\r\n").unwrap();
+
+        let mut cfg = base_config("argrej", wrapper.to_str().unwrap());
+        cfg.prompt_transport = PromptTransport::Arg;
+        cfg.timeout = Duration::from_secs(30);
+        let runner = ExternalDriverRunner::new(cfg);
+        let err = runner
+            .run_in_worktree(&dir, "prompt", &no_cancel())
+            .expect_err("Arg sobre .cmd debe rechazarse antes de spawn");
+        assert!(err.contains("rejected"), "{err}");
+        assert!(err.contains("arg"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fuga de entorno (`SDD-10` Fase 2): el hijo **no** ve `ONYX_TEST_SECRET` ni
+    /// `NODE_OPTIONS` (salvo opt-in `allowed_env`); sí ve `PATH` y el passthrough declarado.
+    #[test]
+    fn sanitized_env_hides_secrets_and_node_options() {
+        // Edition 2024: `set_var`/`remove_var` son `unsafe` (mutan el proceso entero).
+        unsafe {
+            std::env::set_var("ONYX_TEST_SECRET", "super-secret-value");
+            std::env::set_var("NODE_OPTIONS", "--require=/evil/inject.js");
+            std::env::set_var("ONYX_PASSTHROUGH_PROBE", "visible-to-child");
+        }
+        let result = run_env_probe();
+        unsafe {
+            std::env::remove_var("ONYX_TEST_SECRET");
+            std::env::remove_var("NODE_OPTIONS");
+            std::env::remove_var("ONYX_PASSTHROUGH_PROBE");
+        }
+        let out = result.expect("el probe debe ejecutarse");
+
+        // Los **valores** de las variables sensibles nunca llegan al hijo.
+        assert!(
+            !out.clean_summary.contains("super-secret-value"),
+            "{}",
+            out.clean_summary
+        );
+        assert!(
+            !out.clean_summary.contains("--require"),
+            "{}",
+            out.clean_summary
+        );
+        if cfg!(windows) {
+            // Ausente → texto literal; definida → su valor. `PATH` presente → expansión
+            // de substring (literal `~0,2` si estuviera ausente).
+            assert!(
+                out.clean_summary.contains("SECRET=[%ONYX_TEST_SECRET%]"),
+                "ONYX_TEST_SECRET debe estar ausente en el hijo (literal `%VAR%`): {}",
+                out.clean_summary
+            );
+            assert!(
+                out.clean_summary.contains("NODE=[%NODE_OPTIONS%]"),
+                "NODE_OPTIONS debe estar ausente en el hijo (sin opt-in allowed_env): {}",
+                out.clean_summary
+            );
+            assert!(
+                !out.clean_summary.contains("OFF=[true"),
+                "no debe inyectar hints offline con allowlist: {}",
+                out.clean_summary
+            );
+            assert!(
+                out.clean_summary.contains("PTH=[visible-to-child]"),
+                "allowed_env debe hacer visible el passthrough: {}",
+                out.clean_summary
+            );
+            assert!(
+                !out.clean_summary.contains("~0,2"),
+                "PATH base debe estar definida en el hijo: {}",
+                out.clean_summary
+            );
+        } else {
+            assert!(
+                !out.clean_summary.contains("ONYX_TEST_SECRET"),
+                "ONYX_TEST_SECRET debe estar ausente en el hijo: {}",
+                out.clean_summary
+            );
+            assert!(
+                !out.clean_summary.contains("NODE_OPTIONS"),
+                "NODE_OPTIONS debe estar ausente en el hijo: {}",
+                out.clean_summary
+            );
+            assert!(
+                !out.clean_summary.contains("CARGO_NET_OFFLINE"),
+                "no debe inyectar hints offline con allowlist: {}",
+                out.clean_summary
+            );
+            assert!(out.clean_summary.contains("PATH="), "{}", out.clean_summary);
+            assert!(
+                out.clean_summary
+                    .contains("ONYX_PASSTHROUGH_PROBE=visible-to-child"),
+                "allowed_env debe hacer visible el passthrough: {}",
+                out.clean_summary
+            );
+        }
+    }
+
+    fn run_env_probe() -> Result<ExternalRunOutput, String> {
+        let dir = temp_dir("envprobe");
+        let mut cfg = env_probe_config(&dir);
+        cfg.allowed_env = vec!["ONYX_PASSTHROUGH_PROBE".to_string()];
+        // Allowlist no-vacía → `Unrestricted` derivado (ver `derived_network_policy`).
+        cfg.network_policy =
+            SubagentNetworkPolicy::ExternalHarnessAllowlist(vec!["probe.api.test".to_string()]);
+        cfg.timeout = Duration::from_secs(30);
+        let runner = ExternalDriverRunner::new(cfg);
+        let out = runner.run_in_worktree(&dir, "prompt", &no_cancel());
+        let _ = fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// Config del probe de entorno: el hijo expande `%VAR%` (sin `if`, cuyo condición
+    /// falsa traga la cadena `&` en `cmd`). Variable ausente → texto literal entre
+    /// corchetes; definida → su valor.
+    #[cfg(windows)]
+    fn env_probe_config(_dir: &Path) -> ExternalDriverConfig {
+        let mut c = base_config("envprobe", "cmd");
+        c.args = vec!["/Q".into(), "/C".into()];
+        c.args.push(
+            "echo SECRET=[%ONYX_TEST_SECRET%] & echo NODE=[%NODE_OPTIONS%] & echo OFF=[%CARGO_NET_OFFLINE%] & echo PTH=[%ONYX_PASSTHROUGH_PROBE%] & echo P2=[%PATH:~0,2%]"
+                .into(),
+        );
+        c
+    }
+
+    #[cfg(not(windows))]
+    fn env_probe_config(dir: &Path) -> ExternalDriverConfig {
+        let script = dir.join("probe.sh");
+        fs::write(
+            &script,
+            "env | grep -E '^(ONYX_TEST_SECRET|NODE_OPTIONS|ONYX_PASSTHROUGH_PROBE|CARGO_NET_OFFLINE|PATH)=' || true\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = base_config("envprobe", "sh");
+        c.args = vec![script.display().to_string()];
+        c
+    }
+
+    /// Timeout + pipes grandes + nieto que retiene la pipe de `stdout`: sin deadlock,
+    /// el árbol muere entero y los lectores terminan (criterio de aceptación `SDD-10` Fase 2).
+    #[test]
+    fn timeout_kills_process_tree_with_large_output_and_grandchild() {
+        let dir = temp_dir("timeout");
+        let mut cfg = timeout_config(&dir);
+        // Timeout corto: el hijo (y su nieto) viven mucho más que 3 s.
+        cfg.timeout = Duration::from_secs(3);
+
+        let runner = ExternalDriverRunner::new(cfg);
+        let started = Instant::now();
+        let out = runner
+            .run_in_worktree(&dir, "prompt", &no_cancel())
+            .expect("timeout no debe producir error, solo terminar el árbol");
+        let elapsed = started.elapsed();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(out.timed_out, "debe reportar timeout");
+        assert!(!out.cancelled);
+        // Muerte del árbol + reap del hijo debe ser rápida (sin esperar a `ping -n 300`).
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "el kill del árbol tardó demasiado: {elapsed:?} (¿deadlock en las pipes?)"
+        );
+        // El hijo escribió ~145 KB antes de morir: la salida capturada se trunca a 4 KB.
+        assert!(
+            out.clean_summary.contains("truncated"),
+            "debe capturar y truncar la salida grande: {}",
+            out.clean_summary
+        );
+    }
+
+    /// Script de stress: volca ~145 KB por `stdout` y luego deja vivir a un **nieto** que
+    /// hereda la pipe (Windows: `ping`; unix: `sleep &`): matar solo al hijo dejaría la pipe
+    /// abierta → deadlock en el lector. El kill del árbol es lo que hace el test verde.
+    #[cfg(windows)]
+    fn timeout_config(dir: &Path) -> ExternalDriverConfig {
+        let script = dir.join("bigout.cmd");
+        fs::write(
+            &script,
+            "@echo off\r\nfor /L %%i in (1,1,1800) do @echo 01234567890123456789012345678901234567890123456789012345678901234567890123456789\r\nping -n 300 127.0.0.1\r\n",
+        )
+        .unwrap();
+        base_config("timeout", script.to_str().unwrap())
+    }
+
+    #[cfg(not(windows))]
+    fn timeout_config(dir: &Path) -> ExternalDriverConfig {
+        let script = dir.join("bigout.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 1800 ]; do\n  printf '01234567890123456789012345678901234567890123456789012345678901234567890123456789\\n'\n  i=$((i+1))\ndone\nsleep 300 &\nwait\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        base_config("timeout", script.to_str().unwrap())
+    }
+
+    /// `PromptTransport::TempFile`: el archivo del prompt se entrega por placeholder
+    /// `{prompt_file}` y se elimina al terminar (guard RAII).
+    #[test]
+    fn temp_file_transport_placeholder_and_raii_cleanup() {
+        let dir = temp_dir("tmpfile");
+        let mut cfg = if cfg!(windows) {
+            let mut c = base_config("tmpfile", "cmd");
+            c.prompt_transport = PromptTransport::TempFile;
+            c.args = vec!["/Q".into(), "/C".into(), "type {prompt_file}".into()];
+            c
+        } else {
+            let mut c = base_config("tmpfile", "sh");
+            c.prompt_transport = PromptTransport::TempFile;
+            c.args = vec!["-c".into(), "cat {prompt_file}".into()];
+            c
+        };
+        cfg.timeout = Duration::from_secs(30);
+
+        // Buscamos el archivo temporal antes y después para verificar la RAII.
+        let before: Vec<PathBuf> = list_prompt_files("tmpfile");
+        let prompt = "hola-temp-file-77";
+        let runner = ExternalDriverRunner::new(cfg);
+        let out = runner
+            .run_in_worktree(&dir, prompt, &no_cancel())
+            .expect("temp_file debe ejecutarse");
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            out.clean_summary.contains("hola-temp-file-77"),
+            "{}",
+            out.clean_summary
+        );
+        let after: Vec<PathBuf> = list_prompt_files("tmpfile");
+        let created: Vec<_> = after.into_iter().filter(|p| !before.contains(p)).collect();
+        assert!(
+            created.is_empty(),
+            "el archivo del prompt debe eliminarse al terminar: {created:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn list_prompt_files(driver_id: &str) -> Vec<PathBuf> {
+        let prefix = format!("onyx-extdrv-{driver_id}-");
+        let mut out = Vec::new();
+        if let Ok(rd) = fs::read_dir(std::env::temp_dir()) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    out.push(e.path());
+                }
+            }
+        }
+        out
     }
 }

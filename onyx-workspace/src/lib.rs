@@ -25,11 +25,12 @@ pub use policy::{
     is_control_plane_rel_path, is_mutating_tool,
 };
 pub use sandbox::{
-    ContainerCli, NetworkPolicy, ProcessJob, ProcessLimits, SandboxCapabilities, SandboxConfig,
-    SandboxDriverKind, SandboxMode, SandboxPatch, apply_sanitized_env, clean_process_path,
+    ContainerCli, NetworkPolicy, ProcessJob, ProcessLimits, ResolvedProcessBinary,
+    SandboxCapabilities, SandboxConfig, SandboxDriverKind, SandboxMode, SandboxPatch,
+    apply_sanitized_env, apply_sanitized_env_for_external_harness, clean_process_path,
     configure_process_isolation, detect_container_cli, detect_sandbox_capabilities,
     ensure_sandbox_tmp_dir, is_sensitive_env_key, prepare_sandboxed_shell_command,
-    validate_oci_image_ref,
+    resolve_process_binary, resolve_process_binary_in, validate_oci_image_ref,
 };
 pub use sprout::{
     ServiceKind, ServiceStatus, SproutAudit, SproutConfig, SproutServiceSpec, SproutSupervisor,

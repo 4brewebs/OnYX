@@ -1679,13 +1679,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let tools = WorkspaceTools::new(policy.clone());
 
-    // `SDD-10` Fase 1: ids de los drivers de harness CLI registrados (siempre al menos
+    // `SDD-10`: ids de los drivers de harness CLI registrados (siempre al menos
     // el preset integrado `opencode`), para los esquemas de `spawn_subagent` y el manager.
-    let driver_ids: Vec<String> = policy
-        .external_drivers()
-        .iter()
-        .map(|d| d.id.clone())
-        .collect();
+    // Fase 2: en un workspace **no confiado** no se expone ni un driver externo
+    // (defense in depth: `external_driver_gate` y `spawn_job` lo bloquean además).
+    let driver_ids: Vec<String> = if policy.trust.config_trusted {
+        policy
+            .external_drivers()
+            .iter()
+            .map(|d| d.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(64),

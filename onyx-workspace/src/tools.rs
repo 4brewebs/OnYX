@@ -144,9 +144,11 @@ impl WorkspaceTools {
     /// Evalúa `WorkspaceMode` + `PermissionRules` estáticas + escalado monótono *Scent-Heated Approval*
     /// (`Allow → Ask`, nunca debilitando `Deny` ni `Ask`).
     ///
-    /// `SDD-10` Fase 1: `spawn_subagent` con un driver externo no-nativo se decide por el gate
-    /// [`WorkspacePolicy::external_driver_gate`] (trust + regla `allow`/`deny` explícita por driver),
-    /// sin aplicar ni el escalado de impacto ni el fallback estático de no-mutantes.
+    /// `SDD-10`: `spawn_subagent` con un driver externo no-nativo se decide por el gate
+    /// [`WorkspacePolicy::external_driver_gate`] (trust + regla `allow`/`deny`/`ask` por driver),
+    /// sin aplicar ni el escalado de impacto ni el fallback estático de no-mutantes; y en
+    /// modo `Plan`/`Explore` (`!mode.allows_mutation()`) queda **siempre** `Deny`, porque un
+    /// harness externo ejecuta procesos y red fuera del control de `WorkspaceToolBridge`.
     pub fn evaluate_permission_with_impact(
         &self,
         mode: WorkspaceMode,
@@ -156,6 +158,9 @@ impl WorkspaceTools {
         if tool == "spawn_subagent" {
             if let Some(driver) = spawn_subagent_driver_from_args(args_json) {
                 if !driver.eq_ignore_ascii_case("native") {
+                    if !mode.allows_mutation() {
+                        return (PermissionDecision::Deny, None);
+                    }
                     let (decision, _reason) = self.policy.external_driver_gate(&driver);
                     return (decision, None);
                 }
