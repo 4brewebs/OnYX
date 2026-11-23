@@ -14,7 +14,8 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
-    WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
+    WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, apply_impact_escalation,
+    graph_workspace_mode,
 };
 
 use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
@@ -23,6 +24,7 @@ use crate::pack::{
     MilestoneSnapshotSystem, PackSnapshotStore, SharedPackStore, default_fork_dir,
     fork_pack_until_tick,
 };
+use crate::subagent::{MergePreviewState, SubagentHandle};
 
 /// Interfaz mínima de bombeo UI compartida entre `TuiHandle` (`openonyx chat`) y
 /// `WebHandle` (`openonyx serve`) para que ambos corran sobre el mismo bucle determinista
@@ -106,7 +108,7 @@ pub struct SessionOptions {
     pub max_snapshots: Option<usize>,
 }
 
-/// Contexto necesario para ejecutar `/rewind <tick>` y `/fork [label]` en caliente dentro de `chat`.
+/// Contexto necesario para ejecutar `/rewind <tick>`, `/fork`, `/merge` y `/discard` en caliente dentro de `chat` / `serve`.
 #[derive(Clone)]
 pub struct SessionActionContext {
     pub workspace_root: PathBuf,
@@ -115,6 +117,7 @@ pub struct SessionActionContext {
     pub mode_handle: WorkspaceModeHandle,
     pub tools: WorkspaceTools,
     pub snapshot_store: Option<SharedPackStore>,
+    pub subagents: Option<SubagentHandle>,
     pub pending_action: PendingSessionAction,
     pub pending_notes: PendingSystemNotes,
 }
@@ -245,6 +248,61 @@ pub fn apply_session_action(
     action: SessionAction,
     ctx: &SessionActionContext,
 ) -> String {
+    match &action {
+        SessionAction::MergeSubagent { job_id } => {
+            let Some(ref sub) = ctx.subagents else {
+                let msg = "[/merge] Async subagents are unavailable in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            let msg = match sub.merge_job(job_id) {
+                Ok(report) => {
+                    ctx.pending_notes
+                        .push_subagent_status(report.job_id.clone(), "merged");
+                    let impact_suffix = report
+                        .impact
+                        .as_ref()
+                        .map(|imp| format!(" {}", imp.summary_line))
+                        .unwrap_or_default();
+                    if report.was_noop {
+                        format!(
+                            "[/merge] Subagent `{}` had no net file changes; worktree cleaned.{impact_suffix}",
+                            report.job_id
+                        )
+                    } else {
+                        format!(
+                            "[/merge] Merged subagent `{}` into root ({} file(s): {}).{impact_suffix}",
+                            report.job_id,
+                            report.changed_files.len(),
+                            report.changed_files.join(", ")
+                        )
+                    }
+                }
+                Err(err) => format!("[/merge] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return msg;
+        }
+        SessionAction::DiscardSubagent { job_id } => {
+            let Some(ref sub) = ctx.subagents else {
+                let msg = "[/discard] Async subagents are unavailable in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            let msg = match sub.discard_job(job_id) {
+                Ok(summary) => {
+                    ctx.pending_notes
+                        .push_subagent_status(job_id.as_str(), "discarded");
+                    format!("[/discard] {summary}")
+                }
+                Err(err) => format!("[/discard] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return msg;
+        }
+        SessionAction::Rewind { .. } | SessionAction::Fork { .. } => {}
+    }
+
     let Some(store) = &ctx.snapshot_store else {
         let msg =
             "[session] Snapshot persistence is disabled; pass `--snapshot-dir <dir>`.".to_string();
@@ -363,6 +421,9 @@ pub fn apply_session_action(
             emit_session_note(host, &ctx.pending_notes, &summary);
             summary
         }
+        SessionAction::MergeSubagent { .. } | SessionAction::DiscardSubagent { .. } => {
+            unreachable!("subagent session actions return early above")
+        }
     }
 }
 
@@ -417,6 +478,7 @@ pub struct CliApprovalDriver {
     vocab: Vocab,
     policy: Option<WorkspacePolicy>,
     tools: Option<WorkspaceTools>,
+    subagents: Option<SubagentHandle>,
     inner: Box<dyn PlatformDriver>,
     seen: BTreeSet<(u64, u64)>,
     queued: Vec<Reply>,
@@ -428,6 +490,7 @@ impl CliApprovalDriver {
             vocab,
             policy: None,
             tools: None,
+            subagents: None,
             inner: Box::new(inner),
             seen: BTreeSet::new(),
             queued: Vec::new(),
@@ -441,6 +504,11 @@ impl CliApprovalDriver {
 
     pub fn with_tools(mut self, tools: WorkspaceTools) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    pub fn with_subagents(mut self, subagents: SubagentHandle) -> Self {
+        self.subagents = Some(subagents);
         self
     }
 }
@@ -459,7 +527,34 @@ impl PlatformDriver for CliApprovalDriver {
             let Some(pending) = &view.pending_approval else {
                 continue;
             };
-            let impact = if let Some(tools) = &self.tools {
+            let mut preview_diff: Option<String> = None;
+            let impact = if pending.tool == "subagent_merge" {
+                let static_dec = self.policy.as_ref().map_or(PermissionDecision::Ask, |pol| {
+                    pol.evaluate_permission_in_mode(
+                        WorkspaceMode::Build,
+                        &pending.tool,
+                        &pending.args,
+                    )
+                });
+                let job_id = serde_json::from_str::<serde_json::Value>(&pending.args)
+                    .ok()
+                    .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
+                let imp = job_id.and_then(|jid| {
+                    self.subagents.as_ref().and_then(|h| {
+                        match h.preview_merge_for_approval(&jid).ok()? {
+                            MergePreviewState::Clean(ticket) => {
+                                preview_diff = Some(ticket.unified_diff);
+                                ticket.impact
+                            }
+                            _ => None,
+                        }
+                    })
+                });
+                if apply_impact_escalation(static_dec, imp.as_ref()) != PermissionDecision::Ask {
+                    continue;
+                }
+                imp
+            } else if let Some(tools) = &self.tools {
                 let (decision, imp) = tools.evaluate_permission_with_impact(
                     WorkspaceMode::Build,
                     &pending.tool,
@@ -485,7 +580,12 @@ impl PlatformDriver for CliApprovalDriver {
             if !self.seen.insert((view.agent.0, view.request)) {
                 continue;
             }
-            let reply = if prompt_approval(&pending.tool, &pending.args, impact.as_ref()) {
+            let reply = if prompt_approval(
+                &pending.tool,
+                &pending.args,
+                impact.as_ref(),
+                preview_diff.as_deref(),
+            ) {
                 Reply::approve(view.agent, view.request)
             } else {
                 Reply::deny(view.agent, view.request, "denied by user")
@@ -495,12 +595,22 @@ impl PlatformDriver for CliApprovalDriver {
     }
 }
 
-fn prompt_approval(tool: &str, args: &str, impact: Option<&ImpactAssessment>) -> bool {
+fn prompt_approval(
+    tool: &str,
+    args: &str,
+    impact: Option<&ImpactAssessment>,
+    diff_preview: Option<&str>,
+) -> bool {
     println!("\n[openOnyx] Approval required for `{tool}`:");
     if let Some(imp) = impact {
         println!("  {}", imp.summary_line);
     }
     println!("  args: {args}");
+    if let Some(diff) = diff_preview {
+        for line in diff.lines().take(24) {
+            println!("  {line}");
+        }
+    }
     print!("Approve? [y/N]: ");
     let _ = io::stdout().flush();
     let mut line = String::new();

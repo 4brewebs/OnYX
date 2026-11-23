@@ -10,6 +10,8 @@ use onyx_soul_agents::{
 };
 use serde_json::Value as JsonValue;
 
+use crate::worktree::SubagentProposal;
+
 /// Modo operativo del agente sobre el repositorio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceMode {
@@ -134,6 +136,13 @@ pub struct WorkspaceVocab {
     pub effect_tree_sha: Attr,
     pub effect_undone: Attr,
     pub effect_symbols: Attr,
+    pub subagent_job_id: Attr,
+    pub subagent_branch: Attr,
+    pub subagent_status: Attr,
+    pub subagent_ok: Attr,
+    pub subagent_spawn_tick: Attr,
+    pub subagent_summary: Attr,
+    pub subagent_touched_files: Attr,
 }
 
 impl WorkspaceVocab {
@@ -160,8 +169,29 @@ impl WorkspaceVocab {
             effect_tree_sha: reg("ws.effect.tree_sha"),
             effect_undone: reg("ws.effect.undone"),
             effect_symbols: reg("ws.effect.symbols"),
+            subagent_job_id: reg("ws.subagent.job_id"),
+            subagent_branch: reg("ws.subagent.branch"),
+            subagent_status: reg("ws.subagent.status"),
+            subagent_ok: reg("ws.subagent.ok"),
+            subagent_spawn_tick: reg("ws.subagent.spawn_tick"),
+            subagent_summary: reg("ws.subagent.summary"),
+            subagent_touched_files: reg("ws.subagent.touched_files"),
         }
     }
+}
+
+/// Registro semántico en el grafo EAV de un subagente asíncrono (`SDD-09` §2.2 / §3).
+/// Nunca utiliza `ConceptId` externos para reconciliar; identifica por clave semántica `job_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedSubagent {
+    pub id: ConceptId,
+    pub job_id: String,
+    pub branch: String,
+    pub status: String,
+    pub ok: bool,
+    pub spawn_tick: u64,
+    pub summary: String,
+    pub touched_files: Vec<String>,
 }
 
 /// Representación de solo lectura de un efecto registrado en el ledger EAV.
@@ -548,6 +578,121 @@ pub fn graph_workspace_services<G: GraphView + ?Sized>(
     prop_text(graph, id, ws.services_text).filter(|s| !s.trim().is_empty())
 }
 
+/// Reconcilia semánticamente una [`SubagentProposal`] en el grafo EAV identificando el concepto
+/// exclusivamente por clave semántica `ws.subagent.job_id` (nunca por `ConceptId`) y registrando
+/// cada archivo tocado mediante `ensure_file_node` (`ws.file.path`).
+pub fn upsert_subagent_record<G: Graph + ?Sized>(
+    graph: &mut G,
+    ws: &WorkspaceVocab,
+    proposal: &SubagentProposal,
+    status: &str,
+) -> ConceptId {
+    let existing = graph.query(&[ws.subagent_job_id]).into_iter().find(|&id| {
+        prop_text(graph, id, ws.subagent_job_id).as_deref() == Some(proposal.job_id.as_str())
+    });
+    let id = existing.unwrap_or_else(|| graph.create());
+
+    graph.set(id, ws.subagent_job_id, Value::Text(proposal.job_id.clone()));
+    graph.set(
+        id,
+        ws.subagent_branch,
+        Value::Text(proposal.branch_name.clone()),
+    );
+    graph.set(id, ws.subagent_status, Value::Text(status.to_string()));
+    graph.set(id, ws.subagent_ok, Value::Bool(proposal.ok));
+    graph.set(
+        id,
+        ws.subagent_spawn_tick,
+        Value::Int(i64::try_from(proposal.spawn_tick).unwrap_or(i64::MAX)),
+    );
+    graph.set(
+        id,
+        ws.subagent_summary,
+        Value::Text(proposal.summary.clone()),
+    );
+
+    let normalized_files: Vec<String> = proposal
+        .touched_files
+        .iter()
+        .map(|p| normalize_rel_path(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    graph.set(
+        id,
+        ws.subagent_touched_files,
+        Value::Text(normalized_files.join("\n")),
+    );
+
+    for path in &normalized_files {
+        let _ = ensure_file_node(graph, ws, path);
+    }
+
+    id
+}
+
+/// Actualiza `ws.subagent.status` buscando por clave semántica `job_id`.
+pub fn update_subagent_status<G: Graph + ?Sized>(
+    graph: &mut G,
+    ws: &WorkspaceVocab,
+    job_id: &str,
+    status: &str,
+) {
+    if let Some(id) = graph
+        .query(&[ws.subagent_job_id])
+        .into_iter()
+        .find(|&cid| prop_text(graph, cid, ws.subagent_job_id).as_deref() == Some(job_id))
+    {
+        graph.set(id, ws.subagent_status, Value::Text(status.to_string()));
+    }
+}
+
+/// Devuelve los registros de subagentes asíncronos persistidos en el grafo EAV, ordenados
+/// canónicamente por `(spawn_tick, job_id)`.
+pub fn graph_subagent_records<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Vec<RecordedSubagent> {
+    let mut out = Vec::new();
+    for id in graph.query(&[ws.subagent_job_id]) {
+        let Some(job_id) = prop_text(graph, id, ws.subagent_job_id) else {
+            continue;
+        };
+        let branch = prop_text(graph, id, ws.subagent_branch).unwrap_or_default();
+        let status = prop_text(graph, id, ws.subagent_status).unwrap_or_else(|| "unknown".into());
+        let ok = matches!(graph.get(id, ws.subagent_ok), Some(Value::Bool(true)));
+        let spawn_tick = match graph.get(id, ws.subagent_spawn_tick) {
+            Some(Value::Int(t)) if t >= 0 => t as u64,
+            _ => 0,
+        };
+        let summary = prop_text(graph, id, ws.subagent_summary).unwrap_or_default();
+        let touched_files = prop_text(graph, id, ws.subagent_touched_files)
+            .map(|raw| {
+                raw.lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(RecordedSubagent {
+            id,
+            job_id,
+            branch,
+            status,
+            ok,
+            spawn_tick,
+            summary,
+            touched_files,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.spawn_tick
+            .cmp(&b.spawn_tick)
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
+    out
+}
+
 /// Marca en el grafo la intención determinista de deshacer el último efecto reversible,
 /// invalidando `file_dirty` sin ejecutar I/O en disco/git (el driver vivo lo materializa).
 pub fn mark_latest_effect_undone<G: Graph + ?Sized>(
@@ -881,6 +1026,118 @@ fn record_tool_observation(
                 Value::Text(format!("shell_exec: {cmd}")),
             );
         }
+        "subagent_merge" => {
+            let json_part = obs.obs_text.split(" [").next().unwrap_or(obs.obs_text);
+            let obs_json: JsonValue = serde_json::from_str(json_part).unwrap_or(JsonValue::Null);
+            let job_id = obs_json
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| parsed.get("job_id").and_then(|v| v.as_str()))
+                .unwrap_or("unknown")
+                .to_string();
+            let changed_files: Vec<String> = obs_json
+                .get("changed_files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(normalize_rel_path)
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for path in &changed_files {
+                let file_id = ensure_file_node(graph, wv, path);
+                graph.set(file_id, wv.file_dirty, Value::Bool(true));
+                graph.set(file_id, wv.file_read_tick, Value::Int(obs.tick));
+            }
+            update_subagent_status(graph, wv, &job_id, "merged");
+
+            let eff = graph.create();
+            graph.set(eff, wv.effect_tick, Value::Int(obs.tick));
+            graph.set(
+                eff,
+                wv.effect_agent,
+                Value::Int(i64::try_from(obs.agent_id).unwrap_or(0)),
+            );
+            graph.set(
+                eff,
+                wv.effect_tool,
+                Value::Text("subagent_merge".to_string()),
+            );
+            graph.set(eff, wv.effect_target, Value::Text(job_id.clone()));
+            graph.set(
+                eff,
+                wv.effect_reversibility,
+                Value::Text(EffectReversibility::Compensable.as_str().to_string()),
+            );
+            graph.set(
+                eff,
+                wv.effect_summary,
+                Value::Text(format!(
+                    "merged {} file(s) from {job_id}",
+                    changed_files.len()
+                )),
+            );
+            let ckpt_from_json = obs_json
+                .get("checkpoint_tree")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|tree| {
+                    let head = obs_json
+                        .get("checkpoint_head")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    (head, tree.to_string())
+                });
+            if let Some((head_sha, tree_sha)) =
+                parse_inline_checkpoint(obs.obs_text).or(ckpt_from_json)
+            {
+                if !head_sha.is_empty() {
+                    graph.set(eff, wv.effect_head_sha, Value::Text(head_sha));
+                }
+                if !tree_sha.is_empty() {
+                    graph.set(eff, wv.effect_tree_sha, Value::Text(tree_sha));
+                }
+            }
+            let json_symbols: Vec<String> = obs_json
+                .get("epicenters")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let inline_symbols = parse_inline_symbols(obs.obs_text);
+            let touched_symbols = if inline_symbols.is_empty() {
+                json_symbols
+            } else {
+                inline_symbols
+            };
+            if !touched_symbols.is_empty() {
+                graph.set(
+                    eff,
+                    wv.effect_symbols,
+                    Value::Text(touched_symbols.join(",")),
+                );
+            }
+        }
+        "subagent_discard" => {
+            let json_part = obs.obs_text.split(" [").next().unwrap_or(obs.obs_text);
+            let obs_json: JsonValue = serde_json::from_str(json_part).unwrap_or(JsonValue::Null);
+            if let Some(job_id) = obs_json
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| parsed.get("job_id").and_then(|v| v.as_str()))
+            {
+                update_subagent_status(graph, wv, job_id, "discarded");
+            }
+        }
         _ => {}
     }
 }
@@ -926,5 +1183,51 @@ fn prop_text<G: GraphView + ?Sized>(g: &G, id: ConceptId, attr: Attr) -> Option<
     match g.get(id, attr) {
         Some(Value::Text(s)) => Some(s),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use onyx_soul_agents::AgentGraph;
+
+    use super::*;
+
+    #[test]
+    fn upsert_subagent_record_reconciles_by_semantic_job_id_and_file_path() {
+        let mut graph = AgentGraph::new();
+        let ws = WorkspaceVocab::resolve(&mut graph);
+
+        // Pre-seed a file node and occupy earlier ConceptIds cleanly.
+        let existing_file = ensure_file_node(&mut graph, &ws, "src/lib.rs");
+        let proposal = SubagentProposal {
+            job_id: "worker-1".to_string(),
+            spawn_tick: 14,
+            branch_name: "onyx/sub/worker-1".to_string(),
+            base_commit: "aaa".to_string(),
+            sub_commit: "bbb".to_string(),
+            ok: true,
+            summary: "added foo helper".to_string(),
+            touched_files: vec!["./src/lib.rs".to_string(), "src/new_mod.rs".to_string()],
+        };
+
+        let id1 = upsert_subagent_record(&mut graph, &ws, &proposal, "done");
+        let mut updated = proposal.clone();
+        updated.summary = "refined foo helper".to_string();
+        let id2 = upsert_subagent_record(&mut graph, &ws, &updated, "merged");
+
+        // Must reconcile onto the exact same semantic node rather than duplicating by ConceptId.
+        assert_eq!(id1, id2);
+        let records = graph_subagent_records(&graph, &ws);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job_id, "worker-1");
+        assert_eq!(records[0].status, "merged");
+        assert_eq!(records[0].summary, "refined foo helper");
+        assert_eq!(
+            records[0].touched_files,
+            vec!["src/lib.rs".to_string(), "src/new_mod.rs".to_string()]
+        );
+
+        let lib_file_id = ensure_file_node(&mut graph, &ws, "src/lib.rs");
+        assert_eq!(lib_file_id, existing_file);
     }
 }

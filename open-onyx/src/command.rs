@@ -11,13 +11,15 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab,
-    evaluate_workspace_trust, format_services_panel_from_toon, graph_workspace_mode,
-    graph_workspace_plan, graph_workspace_services, mark_latest_effect_undone,
-    revoke_workspace_trust, set_workspace_mode, set_workspace_services, trust_workspace,
+    evaluate_workspace_trust, format_services_panel_from_toon, graph_subagent_records,
+    graph_workspace_mode, graph_workspace_plan, graph_workspace_services,
+    mark_latest_effect_undone, revoke_workspace_trust, set_workspace_mode, set_workspace_services,
+    trust_workspace, update_subagent_status, upsert_subagent_record,
 };
 
 use crate::context::{COMPACT_MARKER, build_compaction_summary};
 use crate::pack::SharedPackStore;
+use crate::subagent::{SubagentHandle, decode_proposal_command};
 
 /// Acción de sesión solicitada por un comando slash que requiere operar sobre `AgentHost`,
 /// `PackSnapshotStore` o el árbol Git fuera de un tick individual (`REQ-03.2`, `REQ-03.3`).
@@ -25,6 +27,8 @@ use crate::pack::SharedPackStore;
 pub enum SessionAction {
     Rewind { requested_tick: u64 },
     Fork { label: Option<String> },
+    MergeSubagent { job_id: String },
+    DiscardSubagent { job_id: String },
 }
 
 #[derive(Clone, Default)]
@@ -46,10 +50,16 @@ impl PendingSessionAction {
     }
 }
 
+#[derive(Default)]
+struct PendingSystemQueue {
+    notes: Vec<String>,
+    subagent_statuses: Vec<(String, &'static str)>,
+}
+
 /// Cola thread-safe de notas de sistema que `CommandSpawnerSystem` proyecta en la memoria del
 /// agente raíz en el siguiente tick (manteniendo todas las mutaciones del grafo dentro de `OnyxSystem`).
 #[derive(Clone, Default)]
-pub struct PendingSystemNotes(Arc<Mutex<Vec<String>>>);
+pub struct PendingSystemNotes(Arc<Mutex<PendingSystemQueue>>);
 
 impl PendingSystemNotes {
     pub fn new() -> Self {
@@ -58,14 +68,27 @@ impl PendingSystemNotes {
 
     pub fn push(&self, note: impl Into<String>) {
         if let Ok(mut guard) = self.0.lock() {
-            guard.push(note.into());
+            guard.notes.push(note.into());
         }
     }
 
     pub fn drain(&self) -> Vec<String> {
         self.0
             .lock()
-            .map(|mut g| std::mem::take(&mut *g))
+            .map(|mut g| std::mem::take(&mut g.notes))
+            .unwrap_or_default()
+    }
+
+    pub fn push_subagent_status(&self, job_id: impl Into<String>, status: &'static str) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.subagent_statuses.push((job_id.into(), status));
+        }
+    }
+
+    pub fn drain_subagent_statuses(&self) -> Vec<(String, &'static str)> {
+        self.0
+            .lock()
+            .map(|mut g| std::mem::take(&mut g.subagent_statuses))
             .unwrap_or_default()
     }
 }
@@ -79,6 +102,9 @@ pub enum SlashCommand {
     Services,
     Service(String),
     Agent(Option<String>),
+    Subagents,
+    MergeSubagent(String),
+    DiscardSubagent(String),
     Rewind(Option<u64>),
     RewindInvalid(String),
     Fork(Option<String>),
@@ -187,6 +213,21 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
         }));
     }
     let lower = cmd.to_ascii_lowercase();
+    if lower == "/subagents" || lower == "/subagent" {
+        return Some(SlashCommand::Subagents);
+    }
+    if let Some(rest) = cmd.strip_prefix("/merge ") {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(SlashCommand::MergeSubagent(trimmed.to_string()));
+        }
+    }
+    if let Some(rest) = cmd.strip_prefix("/discard ") {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(SlashCommand::DiscardSubagent(trimmed.to_string()));
+        }
+    }
     if lower == "/cancel" || lower == "/stop" {
         return Some(SlashCommand::Cancel { all: false });
     }
@@ -245,6 +286,7 @@ pub struct CommandSpawnerSystem {
     ws_vocab: Option<WorkspaceVocab>,
     mode_handle: WorkspaceModeHandle,
     sprout: Option<SproutSupervisor>,
+    subagents: Option<SubagentHandle>,
     workspace_root: Option<PathBuf>,
     snapshot_store: Option<SharedPackStore>,
     pending_action: PendingSessionAction,
@@ -262,6 +304,7 @@ impl CommandSpawnerSystem {
             ws_vocab: None,
             mode_handle: WorkspaceModeHandle::default(),
             sprout: None,
+            subagents: None,
             workspace_root: None,
             snapshot_store: None,
             pending_action: PendingSessionAction::new(),
@@ -271,6 +314,11 @@ impl CommandSpawnerSystem {
             force_new_agent: false,
             counter: 0,
         }
+    }
+
+    pub fn with_subagents(mut self, subagents: SubagentHandle) -> Self {
+        self.subagents = Some(subagents);
+        self
     }
 
     pub fn with_max_steps(mut self, max_steps_per_turn: i64) -> Self {
@@ -366,6 +414,15 @@ impl OnyxSystem for CommandSpawnerSystem {
             })
             .unwrap_or(0);
 
+        let status_updates = self.pending_notes.drain_subagent_statuses();
+        if !status_updates.is_empty() {
+            if let Some(wv) = self.ws_vocab {
+                for (job_id, status) in status_updates {
+                    update_subagent_status(ctx.graph, &wv, &job_id, status);
+                }
+            }
+        }
+
         let notes = self.pending_notes.drain();
         if !notes.is_empty() {
             if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
@@ -381,6 +438,49 @@ impl OnyxSystem for CommandSpawnerSystem {
             };
             let cmd = raw_cmd.trim();
             if cmd.is_empty() {
+                continue;
+            }
+
+            // Ingesta determinista y proactiva de propuestas `SubagentProposal` en frontera de tick
+            // (`SDD-09` Fase 3): reconcilia semánticamente en grafo (`job_id` / `ws.file.path`, nunca
+            // `ConceptId`) y despierta proactivamente a `root` si estaba ocioso sin hacer polling.
+            if let Some((proposal, cancelled)) = decode_proposal_command(cmd) {
+                let status = if cancelled {
+                    "cancelled"
+                } else if proposal.ok {
+                    "done"
+                } else {
+                    "failed"
+                };
+                if let Some(wv) = self.ws_vocab {
+                    upsert_subagent_record(ctx.graph, &wv, &proposal, status);
+                }
+                let touched = if proposal.touched_files.is_empty() {
+                    "(no file edits)".to_string()
+                } else {
+                    proposal.touched_files.join(", ")
+                };
+                let summary_preview: String = proposal.summary.trim().chars().take(240).collect();
+                let notice = format!(
+                    "[subagent `{}` finished · status={status} · branch={}]\ntouched: {touched}\nsummary: {summary_preview}\nUse `subagent_merge` (or `/merge {id}`) to reconcile 3-way into root, or `subagent_discard` (`/discard {id}`) to drop the worktree.",
+                    proposal.job_id,
+                    proposal.branch_name,
+                    id = proposal.job_id
+                );
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    if cancelled
+                        || !continue_agent(
+                            ctx.graph,
+                            &v,
+                            root_id,
+                            &notice,
+                            self.max_steps_per_turn,
+                            now,
+                        )
+                    {
+                        append_agent_memory(ctx.graph, &v, root_id, "system", &notice, now);
+                    }
+                }
                 continue;
             }
 
@@ -658,6 +758,104 @@ impl OnyxSystem for CommandSpawnerSystem {
                         };
                         if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
                             append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::Subagents => {
+                        let live_list = self
+                            .subagents
+                            .as_ref()
+                            .map(|h| h.list_summaries())
+                            .unwrap_or_default();
+                        let note = if !live_list.is_empty() {
+                            let mut lines = vec![format!(
+                                "[/subagents] {} background worktree job(s):",
+                                live_list.len()
+                            )];
+                            for s in live_list {
+                                let files = if s.touched_files.is_empty() {
+                                    "0 files".to_string()
+                                } else {
+                                    s.touched_files.join(", ")
+                                };
+                                lines.push(format!(
+                                    "  - [bg #{}] ({}) branch={} touched=[{}] goal=\"{}\"",
+                                    s.job_id, s.status, s.branch_name, files, s.goal
+                                ));
+                            }
+                            lines.join("\n")
+                        } else if let Some(wv) = self.ws_vocab {
+                            let recs = graph_subagent_records(&*ctx.graph, &wv);
+                            if recs.is_empty() {
+                                "[/subagents] No async background worktree jobs.".to_string()
+                            } else {
+                                let mut lines = vec![format!(
+                                    "[/subagents] {} recorded worktree job(s):",
+                                    recs.len()
+                                )];
+                                for r in recs {
+                                    lines.push(format!(
+                                        "  - [bg #{}] ({}) branch={} touched=[{}]",
+                                        r.job_id,
+                                        r.status,
+                                        r.branch,
+                                        r.touched_files.join(", ")
+                                    ));
+                                }
+                                lines.join("\n")
+                            }
+                        } else {
+                            "[/subagents] No async background worktree jobs.".to_string()
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::MergeSubagent(job_id) => {
+                        if !self.mode_handle.get().allows_mutation() {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    &format!(
+                                        "[/merge] Blocked in `{}` mode: switch to BUILD to merge `{job_id}`.",
+                                        self.mode_handle.get().as_label()
+                                    ),
+                                    now,
+                                );
+                            }
+                        } else if self.subagents.is_none() {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    "[/merge] Async subagent worktree manager is unavailable in this mode (offline replay).",
+                                    now,
+                                );
+                            }
+                        } else {
+                            self.pending_action
+                                .set(SessionAction::MergeSubagent { job_id });
+                        }
+                    }
+                    SlashCommand::DiscardSubagent(job_id) => {
+                        if self.subagents.is_none() {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    "[/discard] Async subagent worktree manager is unavailable in this mode (offline replay).",
+                                    now,
+                                );
+                            }
+                        } else {
+                            self.pending_action
+                                .set(SessionAction::DiscardSubagent { job_id });
                         }
                     }
                     SlashCommand::Rewind(None) => {

@@ -5,6 +5,7 @@ mod openai;
 mod ops;
 mod pack;
 mod session;
+mod subagent;
 mod tui;
 mod tui_input;
 mod vault;
@@ -42,6 +43,10 @@ use session::{
     build_host_with_checkpoints, build_host_with_options, build_host_with_shared_store, make_spec,
     run_session,
 };
+use subagent::{
+    DEFAULT_MAX_CONCURRENT_SUBAGENTS, ONYX_MAX_SUBAGENTS_ENV, ResponderFactory,
+    SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentManager, SubagentManagerDriver,
+};
 use tui::TuiDriver;
 use vault::{
     auto_save_from_env, ensure_vault_gitignore, resolve_fork_dir, resolve_read_snapshot_dir,
@@ -67,6 +72,7 @@ impl LlmProvider {
     }
 }
 
+#[derive(Clone)]
 struct LlmConfig {
     provider: LlmProvider,
     api_key: String,
@@ -91,6 +97,7 @@ struct CliArgs {
     sandbox_network: Option<NetworkPolicy>,
     dry_run: bool,
     max_steps: Option<i64>,
+    max_subagents: Option<usize>,
     shell_timeout_secs: Option<u64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
@@ -121,6 +128,7 @@ impl CliArgs {
             sandbox_network: None,
             dry_run: false,
             max_steps: None,
+            max_subagents: None,
             shell_timeout_secs: None,
             save_transcript: None,
             snapshot_dir: None,
@@ -195,6 +203,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut sandbox_network: Option<NetworkPolicy> = None;
     let mut dry_run = false;
     let mut max_steps: Option<i64> = None;
+    let mut max_subagents: Option<usize> = None;
     let mut shell_timeout_secs: Option<u64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
@@ -309,6 +318,18 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--max-steps must be > 0".to_string());
                 }
                 max_steps = Some(parsed);
+            }
+            "--max-subagents" => {
+                let s = args
+                    .next()
+                    .ok_or("--max-subagents requires a positive integer")?;
+                let parsed = s
+                    .parse::<usize>()
+                    .map_err(|_| "--max-subagents must be a positive integer")?;
+                if parsed == 0 {
+                    return Err("--max-subagents must be > 0".to_string());
+                }
+                max_subagents = Some(parsed);
             }
             "--shell-timeout" => {
                 let s = args
@@ -498,6 +519,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         sandbox_network,
         dry_run,
         max_steps,
+        max_subagents,
         shell_timeout_secs,
         save_transcript,
         snapshot_dir,
@@ -513,7 +535,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -546,6 +568,7 @@ OPTIONS:
       --sandbox <mode>     OS sandbox profile for `shell_exec`: `workspace-write` (default), `strict-container`, or `off`
       --sandbox-net <pol>  Network policy inside sandbox: `offline` (default), `localhost`, or `unrestricted`
       --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
+      --max-subagents <n>  Max parallel async subagent worktrees (default: 3, or `ONYX_MAX_SUBAGENTS`)
       --shell-timeout <s>  Timeout in seconds per `shell_exec` command
       --auto-save          Auto-save snapshots + ONYXTR2 transcript together in `.onyx/vault/<timestamp>_<model>[_<branch|goal>]/` (or `ONYX_AUTO_SAVE=1`)
       --save-transcript <f>, --record <f>
@@ -582,6 +605,9 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
   /agent [id|name]         Open agent selector or focus a specific agent by ID or name
+  /subagents               List background async subagent worktree jobs and touched files
+  /merge <job_id>          Reconcile 3-way and merge a finished async subagent into root
+  /discard <job_id>        Cancel and remove an async subagent worktree and temporary branch
   /undo                    Revert the latest reversible git checkpoint (also removes newly created untracked `fs_write` files)
   /rewind [tick]           List milestones or rewind in-place to `<tick>` (forks snapshots safely + restores git tree)
   /fork [name]             Branch snapshots up to the current tick into a sibling directory without mutating the original
@@ -612,6 +638,7 @@ ENVIRONMENT VARIABLES:
   ONYX_ALLOW_CUSTOM_AUTH_HOST
                            Allow sending API keys to custom remote HTTPS `--api-base` hosts (`1` | `true`)
   ONYX_TRUST_FILE          Optional override path for `trusted_workspaces.toml`
+  ONYX_MAX_SUBAGENTS       Max parallel async subagent worktrees (default: 3)
   ONYX_WEB_BIND            Default bind address for `openonyx serve` (default: `127.0.0.1:8787`)
   ONYX_WEB_API_KEY         Explicit API key for `openonyx serve` (required when binding non-loopback addresses)
   ONYX_WEB_CORS_ORIGIN     Optional allowed browser origin for external SPAs (e.g. `http://localhost:5173`)
@@ -992,6 +1019,17 @@ fn print_vault_summary(
     }
 }
 
+fn resolve_max_subagents(cli: Option<usize>) -> usize {
+    cli.or_else(|| {
+        env::var(ONYX_MAX_SUBAGENTS_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+    .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS)
+    .max(1)
+}
+
 fn launch_interactive_chat(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -1084,13 +1122,22 @@ fn launch_interactive_chat(
     let pending_action = PendingSessionAction::new();
     let pending_notes = PendingSystemNotes::new();
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    let bridge_ready = Arc::new(AtomicBool::new(false));
+    let sub_llm = llm.clone();
+    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None));
+    let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
+        .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_root_tools(tools.clone());
+    let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(chat_config.default_max_steps)
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
-        .with_pending_notes(pending_notes.clone());
+        .with_pending_notes(pending_notes.clone())
+        .with_subagents(sub_handle.clone());
     if !policy.trust.is_fully_trusted() {
         let mut msg = format!(
             "[Workspace Trust: {}] Project `allow` rules, `[sandbox]`/`[impact]` relaxations, and `sprout.toml` execution are blocked until you run `/trust` or `openonyx trust`.",
@@ -1145,10 +1192,10 @@ fn launch_interactive_chat(
         .with_telemetry(telemetry.clone())
         .with_context_config(ctx_cfg)
         .with_model_info(llm.model.clone(), llm.effort)
-        .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone());
+        .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
+        .with_subagents(sub_handle.clone());
     let tui_handle = tui.handle();
     let quit = tui.quit_flag();
-    let bridge_ready = Arc::new(AtomicBool::new(false));
     let action_ctx = SessionActionContext {
         workspace_root: cli.workspace.clone(),
         config: chat_config,
@@ -1158,15 +1205,22 @@ fn launch_interactive_chat(
         snapshot_store: shared_store.clone(),
         pending_action,
         pending_notes,
+        subagents: Some(sub_handle.clone()),
     };
     let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
-        .with_mode_handle(mode_handle)
+        .with_mode_handle(mode_handle.clone())
         .with_workspace_vocab(ws_vocab)
         .sync_existing_undos(host.graph())
         .with_checkpoints(checkpoints)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .require_read_before_edit(true)
         .wrapping(tui);
+    let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
+        .with_policy(policy.clone())
+        .with_mode_handle(mode_handle)
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_proactive_notifications(true)
+        .wrapping(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
@@ -1185,7 +1239,7 @@ fn launch_interactive_chat(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
-            .wrapping(ws_bridge),
+            .wrapping(sub_driver),
         ),
         LlmProvider::OpenAi => rec_bridge.wrapping(
             AsyncOpenAiDriver::new(
@@ -1201,7 +1255,7 @@ fn launch_interactive_chat(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
-            .wrapping(ws_bridge),
+            .wrapping(sub_driver),
         ),
     };
 
@@ -1309,13 +1363,22 @@ fn launch_web_serve(
     let pending_action = PendingSessionAction::new();
     let pending_notes = PendingSystemNotes::new();
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    let bridge_ready = Arc::new(AtomicBool::new(false));
+    let sub_llm = llm.clone();
+    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None));
+    let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
+        .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_root_tools(tools.clone());
+    let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(serve_config.default_max_steps)
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
-        .with_pending_notes(pending_notes.clone());
+        .with_pending_notes(pending_notes.clone())
+        .with_subagents(sub_handle.clone());
     if !policy.trust.is_fully_trusted() {
         pending_notes.push(format!(
             "[Workspace Trust: {}] Project `allow` rules, `[sandbox]`/`[impact]` relaxations, and `sprout.toml` execution are blocked until you run `/trust` or `openonyx trust`.",
@@ -1361,7 +1424,8 @@ fn launch_web_serve(
     .with_stream_preview(stream_preview.clone())
     .with_telemetry(telemetry.clone())
     .with_model_info(llm.model.clone(), llm.effort)
-    .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone());
+    .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
+    .with_subagents(sub_handle.clone());
 
     let bound = web_driver.local_addr();
     let web_handle = web_driver.handle();
@@ -1390,7 +1454,6 @@ fn launch_web_serve(
     println!("  API State:  GET http://{bound}/api/v1/state (Authorization: Bearer <key>)");
     println!("  Press Ctrl+C to stop cleanly.");
 
-    let bridge_ready = Arc::new(AtomicBool::new(false));
     let action_ctx = SessionActionContext {
         workspace_root: cli.workspace.clone(),
         config: serve_config,
@@ -1400,15 +1463,22 @@ fn launch_web_serve(
         snapshot_store: shared_store.clone(),
         pending_action,
         pending_notes,
+        subagents: Some(sub_handle.clone()),
     };
     let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
-        .with_mode_handle(mode_handle)
+        .with_mode_handle(mode_handle.clone())
         .with_workspace_vocab(ws_vocab)
         .sync_existing_undos(host.graph())
         .with_checkpoints(checkpoints)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .require_read_before_edit(true)
         .wrapping(web_driver);
+    let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
+        .with_policy(policy.clone())
+        .with_mode_handle(mode_handle)
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_proactive_notifications(true)
+        .wrapping(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
@@ -1427,7 +1497,7 @@ fn launch_web_serve(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
-            .wrapping(ws_bridge),
+            .wrapping(sub_driver),
         ),
         LlmProvider::OpenAi => rec_bridge.wrapping(
             AsyncOpenAiDriver::new(
@@ -1443,7 +1513,7 @@ fn launch_web_serve(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
-            .wrapping(ws_bridge),
+            .wrapping(sub_driver),
         ),
     };
 
@@ -1645,21 +1715,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             host.spawn(&make_spec(goal, cli.auto_approve));
 
+            let sub_llm = llm.clone();
+            let sub_factory: ResponderFactory =
+                Arc::new(move || build_sync_responder(&sub_llm, None));
+            let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
+                .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
+                .with_root_tools(tools.clone());
+            let sub_handle = SubagentHandle::new(sub_manager);
             let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
                 .with_policy(policy.clone())
-                .with_tools(tools.clone());
+                .with_tools(tools.clone())
+                .with_subagents(sub_handle.clone());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode(WorkspaceMode::Build)
                 .with_workspace_vocab(ws_vocab)
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(cli_driver);
+            let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
+                .with_policy(policy.clone())
+                .with_proactive_notifications(false)
+                .wrapping(ws_bridge);
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),
                 build_sync_responder(&llm, Some(telemetry.clone())),
             )
-            .wrapping(ws_bridge);
+            .wrapping(sub_driver);
 
             run_session(
                 &mut host,
@@ -1709,7 +1791,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let bytes = fs::read(&resolved_tr)?;
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
-            let has_commands = !transcript.commands.is_empty();
+            let has_commands = transcript
+                .commands
+                .iter()
+                .any(|c| !c.command.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX));
             let replay_config = AgentConfig {
                 default_max_steps: cli.max_steps.unwrap_or(128),
                 default_timeout_ticks: 512,
@@ -3366,6 +3451,7 @@ ready_log = "READY_BUS"
             snapshot_store: Some(shared_store.clone()),
             pending_action,
             pending_notes,
+            subagents: None,
         };
         let fork_msg = session::apply_session_action(
             &mut host,

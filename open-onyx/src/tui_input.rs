@@ -47,9 +47,19 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Compact older turns into summary (`[focus]`)",
     },
     SlashCommandHint {
+        command: "/discard",
+        insert: "/discard ",
+        description: "Cancel and drop an async subagent worktree (`<job_id>`)",
+    },
+    SlashCommandHint {
         command: "/fork",
         insert: "/fork ",
         description: "Branch snapshots into sibling folder (`[name]`)",
+    },
+    SlashCommandHint {
+        command: "/merge",
+        insert: "/merge ",
+        description: "3-way merge finished async subagent into root (`<job_id>`)",
     },
     SlashCommandHint {
         command: "/mode",
@@ -75,6 +85,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         command: "/services",
         insert: "/services",
         description: "Show status of `sprout.toml` services",
+    },
+    SlashCommandHint {
+        command: "/subagents",
+        insert: "/subagents",
+        description: "List background async worktree subagent jobs",
     },
     SlashCommandHint {
         command: "/trust",

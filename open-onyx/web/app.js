@@ -7,6 +7,9 @@
   const SLASH_HINTS = [
     { key: '/cancel', desc: 'Stop active subagent or interrupt current turn' },
     { key: '/cancel all', desc: 'Interrupt both subagents and root turn' },
+    { key: '/subagents', desc: 'List background worktree subagent jobs' },
+    { key: '/merge', desc: '3-way merge finished async subagent (`<job_id>`)' },
+    { key: '/discard', desc: 'Cancel & discard async subagent worktree (`<job_id>`)' },
     { key: '/mode plan', desc: 'Switch to read-only PLAN mode' },
     { key: '/mode build', desc: 'Switch to BUILD mode (edits enabled)' },
     { key: '/undo', desc: 'Revert latest reversible Git checkpoint' },
@@ -71,6 +74,9 @@
     servicesBody: document.getElementById('services-body'),
     svcStartAll: document.getElementById('svc-start-all'),
     svcStopAll: document.getElementById('svc-stop-all'),
+    subagentsCard: document.getElementById('subagents-card'),
+    subagentsBadge: document.getElementById('subagents-badge'),
+    subagentsBody: document.getElementById('subagents-body'),
     costBadge: document.getElementById('cost-badge'),
     telIn: document.getElementById('tel-in'),
     telCache: document.getElementById('tel-cache'),
@@ -587,16 +593,73 @@
     }
   }
 
+  function buildSubagentCard(job, showTitlePrefix) {
+    const card = document.createElement('article');
+    card.className = 'bg-subagent-card';
+
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.className = 'bg-subagent-id';
+    title.textContent = `${showTitlePrefix ? '[bg #' : '#'}${job.job_id}${showTitlePrefix ? ']' : ''}`;
+    const badge = document.createElement('span');
+    badge.className = 'pill pill-mono';
+    if (job.status === 'done' || job.status === 'merged') badge.classList.add('pill-live');
+    else if (job.status === 'failed') badge.classList.add('pill-danger');
+    badge.textContent = job.status;
+    header.append(title, badge);
+
+    const filesCount = Array.isArray(job.touched_files) ? job.touched_files.length : 0;
+    const meta = document.createElement('p');
+    meta.className = 'bg-subagent-meta';
+    meta.textContent = `${job.branch || ''} · ${filesCount} file(s)${job.goal ? ` · ${job.goal}` : ''}`;
+
+    card.append(header, meta);
+
+    const canMerge = job.status === 'done' || (job.status === 'failed' && filesCount > 0);
+    const canDiscard = ['running', 'done', 'failed'].includes(job.status);
+    if (canMerge || canDiscard) {
+      const footer = document.createElement('footer');
+      if (canMerge) {
+        const mergeBtn = document.createElement('button');
+        mergeBtn.type = 'button';
+        mergeBtn.className = 'chip-btn is-active';
+        mergeBtn.textContent = 'Merge';
+        mergeBtn.title = `3-way merge ${job.job_id} into root`;
+        mergeBtn.addEventListener('click', () => {
+          dom.agentDialog.close();
+          sendCommand(`/merge ${job.job_id}`).catch(() => {});
+        });
+        footer.append(mergeBtn);
+      }
+      if (canDiscard) {
+        const discardBtn = document.createElement('button');
+        discardBtn.type = 'button';
+        discardBtn.className = 'chip-btn chip-btn-stop';
+        discardBtn.textContent = job.status === 'running' ? 'Stop' : 'Discard';
+        discardBtn.title = `Discard worktree ${job.job_id}`;
+        discardBtn.addEventListener('click', () => {
+          dom.agentDialog.close();
+          sendCommand(`/discard ${job.job_id}`).catch(() => {});
+        });
+        footer.append(discardBtn);
+      }
+      card.append(footer);
+    }
+    return card;
+  }
+
   function renderAgentPicker(s) {
     dom.agentList.replaceChildren();
-    if (!s.agents || s.agents.length === 0) {
+    const hasGraphAgents = Array.isArray(s.agents) && s.agents.length > 0;
+    const hasBg = Array.isArray(s.subagents) && s.subagents.length > 0;
+    if (!hasGraphAgents && !hasBg) {
       const p = document.createElement('p');
       p.className = 'empty-note';
       p.textContent = 'No active agents yet.';
       dom.agentList.append(p);
       return;
     }
-    for (const ag of s.agents) {
+    for (const ag of (s.agents || [])) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = ag.id === s.focused_agent_id ? 'agent-row-btn is-focused' : 'agent-row-btn';
@@ -624,6 +687,11 @@
       });
       dom.agentList.append(btn);
     }
+    if (hasBg) {
+      for (const job of s.subagents) {
+        dom.agentList.append(buildSubagentCard(job, true));
+      }
+    }
   }
 
   function renderState(s) {
@@ -643,11 +711,14 @@
     }
 
     const agents = s.agents || [];
+    const bgJobs = Array.isArray(s.subagents) ? s.subagents : [];
+    const activeBgCount = bgJobs.filter((j) => j.status === 'running').length;
     const subCount = agents.filter((a) => !a.is_root).length;
     const focused = agents.find((a) => a.id === s.focused_agent_id) || agents[0] || null;
-    dom.agentsBtn.textContent = subCount > 0
-      ? `Agent #${focused ? focused.id : 1} · sub:${subCount}`
-      : `Agent #${focused ? focused.id : 1}`;
+    const agentParts = [`Agent #${focused ? focused.id : 1}`];
+    if (subCount > 0) agentParts.push(`sub:${subCount}`);
+    if (activeBgCount > 0) agentParts.push(`bg:${activeBgCount}`);
+    dom.agentsBtn.textContent = agentParts.join(' · ');
 
     // Any agent busy rotates the real orbital openOnyx emblem (like the TUI!)
     const anyActive = agents.some((a) =>
@@ -777,6 +848,21 @@
       p.className = 'empty-note';
       p.textContent = 'No sprout.toml services loaded.';
       dom.servicesBody.replaceChildren(p);
+    }
+
+    if (bgJobs.length > 0) {
+      dom.subagentsCard.classList.remove('hidden');
+      dom.subagentsBadge.textContent = `${activeBgCount} active`;
+      dom.subagentsBadge.classList.toggle('pill-live', activeBgCount > 0);
+      const list = document.createElement('div');
+      list.className = 'bg-subagents-list';
+      for (const job of bgJobs) {
+        list.append(buildSubagentCard(job, false));
+      }
+      dom.subagentsBody.replaceChildren(list);
+    } else {
+      dom.subagentsCard.classList.add('hidden');
+      dom.subagentsBody.replaceChildren();
     }
 
     // Conversation & transparent trace stream

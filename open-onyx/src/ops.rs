@@ -10,9 +10,10 @@ use onyx_soul_agents::{
     AgentConfig, AgentGraph, Graph, GraphView, HeadlessDriver, Transcript, Value,
 };
 use onyx_workspace::{
-    RecordedEffect, SandboxDriverKind, SandboxMode, WorkspacePolicy, all_recorded_effects,
-    audit_sprout_workspace, detect_sandbox_capabilities, effects_after_tick, graph_workspace_mode,
-    graph_workspace_plan, is_effect_undone, restore_git_tree_checkpoint_for_targets,
+    RecordedEffect, SandboxDriverKind, SandboxMode, WorkspacePolicy, WorktreeManager,
+    all_recorded_effects, audit_sprout_workspace, check_git_version, detect_sandbox_capabilities,
+    effects_after_tick, graph_workspace_mode, graph_workspace_plan, is_effect_undone,
+    restore_git_tree_checkpoint_for_targets,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -501,6 +502,21 @@ pub fn run_doctor(
 ) -> DoctorReport {
     let mut report = DoctorReport::default();
 
+    let git_version_ok = match check_git_version() {
+        Ok(ver) => {
+            report.checks.push(format!(
+                "git version {ver} (>= 2.38.0; 3-way worktree merge-tree ready)"
+            ));
+            true
+        }
+        Err(err) => {
+            report.warnings.push(format!(
+                "git >= 2.38.0 check failed (async subagent worktree 3-way merge disabled): {err}"
+            ));
+            false
+        }
+    };
+
     let git_ok = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(workspace)
@@ -511,6 +527,46 @@ pub fn run_doctor(
         report
             .checks
             .push(format!("git worktree valid at {}", workspace.display()));
+        if git_version_ok {
+            match WorktreeManager::new(workspace) {
+                Ok(mgr) => match mgr.prune_worktrees() {
+                    Ok(()) => {
+                        let active_sub = mgr
+                            .list_worktrees()
+                            .map(|list| {
+                                list.into_iter()
+                                    .filter(|w| w.is_onyx_subagent)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        report.checks.push(format!(
+                            "git worktrees pruned (active onyx subagent worktrees: {})",
+                            active_sub.len()
+                        ));
+                        if !active_sub.is_empty() {
+                            let names: Vec<String> = active_sub
+                                .iter()
+                                .map(|w| {
+                                    w.branch
+                                        .clone()
+                                        .unwrap_or_else(|| w.path.display().to_string())
+                                })
+                                .collect();
+                            report.warnings.push(format!(
+                                "leftover onyx subagent worktree(s) detected: {}",
+                                names.join(", ")
+                            ));
+                        }
+                    }
+                    Err(e) => report
+                        .warnings
+                        .push(format!("failed to prune git worktrees: {e}")),
+                },
+                Err(e) => report
+                    .warnings
+                    .push(format!("worktree manager initialization skipped: {e}")),
+            }
+        }
     } else {
         report.warnings.push(format!(
             "workspace `{}` is not a git worktree",
@@ -762,4 +818,77 @@ pub fn run_doctor(
     }
 
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_verifies_git_version_and_prunes_stale_worktrees() {
+        let dir = std::env::temp_dir().join(format!(
+            "openonyx_doctor_wt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let wt_base = dir
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_doctor_wt_base_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&wt_base);
+        fs::create_dir_all(&dir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@local")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@local")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-q"]);
+        fs::write(dir.join("README.md"), "hello\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        // Create a worktree and simulate an abrupt crash by deleting its folder directly.
+        let mgr = WorktreeManager::with_base_dir_override(&dir, Some(&wt_base)).unwrap();
+        let handle = mgr.create_worktree("stale-1", 1).unwrap();
+        fs::remove_dir_all(&handle.worktree_path).unwrap();
+
+        let report = run_doctor(&dir, None, None);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains(">= 2.38.0") && c.contains("merge-tree")),
+            "expected git >= 2.38 check: {:?}",
+            report.checks
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains("git worktrees pruned (active onyx subagent worktrees: 0)")),
+            "expected pruned worktree check: {:?}",
+            report.checks
+        );
+
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

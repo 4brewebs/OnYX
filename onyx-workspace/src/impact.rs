@@ -323,6 +323,80 @@ pub fn extract_edit_line_ranges(
     ranges
 }
 
+/// Extrae rangos `(rel_path, start_line, end_line)` 1-based inclusivos a partir de un diff
+/// unificado (`git diff --no-color`), listo para alimentar *Scent-Heated Approval* en `subagent_merge`.
+pub fn extract_unified_diff_line_ranges(unified_diff: &str) -> Vec<(String, usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut current_old_path: Option<String> = None;
+    let mut current_new_path: Option<String> = None;
+
+    for raw_line in unified_diff.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("diff --git ") {
+            current_old_path = None;
+            current_new_path = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
+            let trimmed = rest.trim();
+            if trimmed == "/dev/null" {
+                current_old_path = None;
+            } else {
+                let rel = trimmed
+                    .strip_prefix("a/")
+                    .unwrap_or(trimmed)
+                    .replace('\\', "/");
+                current_old_path = Some(rel);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let trimmed = rest.trim();
+            if trimmed == "/dev/null" {
+                current_new_path = None;
+            } else {
+                let rel = trimmed
+                    .strip_prefix("b/")
+                    .unwrap_or(trimmed)
+                    .replace('\\', "/");
+                current_new_path = Some(rel);
+            }
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            if let Some((old_start, old_count)) = parse_unified_hunk_old_span(line) {
+                if let Some(ref rel) = current_old_path {
+                    let start = old_start.max(1);
+                    let end = if old_count == 0 {
+                        start
+                    } else {
+                        start.saturating_add(old_count.saturating_sub(1))
+                    };
+                    ranges.push((rel.clone(), start, end));
+                } else if let Some(ref rel) = current_new_path {
+                    // Archivo nuevo (`--- /dev/null`): conservamos un rango mínimo `(1, 1)`.
+                    ranges.push((rel.clone(), 1, 1));
+                }
+            }
+        }
+    }
+
+    ranges
+}
+
+fn parse_unified_hunk_old_span(header: &str) -> Option<(usize, usize)> {
+    let after = header.strip_prefix("@@ -")?;
+    let old_part = after.split_whitespace().next()?;
+    if let Some((start_s, count_s)) = old_part.split_once(',') {
+        Some((
+            start_s.parse::<usize>().ok()?,
+            count_s.parse::<usize>().ok()?,
+        ))
+    } else {
+        Some((old_part.parse::<usize>().ok()?, 1))
+    }
+}
+
 fn locate_snippet_line_range(content: &str, snippet: &str) -> Option<(usize, usize)> {
     // 1. Coincidencia exacta por subcadena.
     if let Some(byte_pos) = content.find(snippet) {
@@ -414,6 +488,64 @@ pub fn evaluate_mutation_impact(
     None
 }
 
+/// Evalúa en best-effort el calor AST (`onyx-scent`) de un diff unificado completo
+/// (por ejemplo el delta `<root_now_commit>..<merged_tree>` antes de aprobar `subagent_merge`).
+#[cfg(feature = "scent")]
+pub fn evaluate_unified_diff_impact(
+    policy: &WorkspacePolicy,
+    unified_diff: &str,
+    scent_index: &Mutex<onyx_scent::WorkspaceIndex>,
+) -> Option<ImpactAssessment> {
+    if !policy.impact.enabled {
+        return None;
+    }
+    let ranges = extract_unified_diff_line_ranges(unified_diff);
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let mut guard = scent_index.lock().ok()?;
+    let _ = guard.index_workspace(&policy.root);
+
+    let cfg = onyx_scent::DistillerConfig {
+        iterations: u8::try_from(policy.impact.max_hops.clamp(1, 4)).unwrap_or(2),
+        threshold_bp: 1_000,
+        ..onyx_scent::DistillerConfig::default()
+    };
+    let summary = guard.impact_for_line_ranges(&ranges, &cfg)?;
+
+    let hard_threshold_hit = summary.max_heat_bp >= policy.impact.hard_ask_bp;
+    let escalates_allow_to_ask = hard_threshold_hit
+        || (summary.max_heat_bp >= policy.impact.ask_heat_bp && summary.touches_public_src);
+
+    let summary_line = format_impact_line(
+        summary.callers,
+        summary.hops,
+        summary.touches_public_src,
+        summary.max_heat_bp,
+        &summary.epicenters,
+    );
+
+    Some(ImpactAssessment {
+        max_heat_bp: summary.max_heat_bp,
+        callers: summary.callers,
+        hops: summary.hops,
+        touches_public_src: summary.touches_public_src,
+        hard_threshold_hit,
+        escalates_allow_to_ask,
+        epicenters: summary.epicenters,
+        summary_line,
+    })
+}
+
+#[cfg(not(feature = "scent"))]
+pub fn evaluate_unified_diff_impact(
+    _policy: &WorkspacePolicy,
+    _unified_diff: &str,
+) -> Option<ImpactAssessment> {
+    None
+}
+
 /// Formatea la línea de impacto legible que se muestra en TUI y CLI (`REQ-MIX1.3`).
 pub fn format_impact_line(
     callers: usize,
@@ -447,4 +579,77 @@ pub fn format_impact_line(
     format!(
         "# impact: {callers} {caller_word}, {hops} {hop_word}, {scope} [heat {max_heat_bp}bp]{ep_preview}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_unified_diff_line_ranges_parses_modified_and_added_hunks() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,4 +12,5 @@ pub fn hot() {
+-    old
++    new
+@@ -40 +41 @@ fn tail() {}
+diff --git a/src/new_file.rs b/src/new_file.rs
+new file mode 100644
+--- /dev/null
++++ b/src/new_file.rs
+@@ -0,0 +1,3 @@
++pub fn created() {}
+";
+        let ranges = extract_unified_diff_line_ranges(diff);
+        assert_eq!(
+            ranges,
+            vec![
+                ("src/lib.rs".to_string(), 12, 15),
+                ("src/lib.rs".to_string(), 40, 40),
+                ("src/new_file.rs".to_string(), 1, 1),
+            ]
+        );
+    }
+
+    #[cfg(feature = "scent")]
+    #[test]
+    fn evaluate_unified_diff_impact_computes_scent_heat_on_rust_callers() {
+        let dir = std::env::temp_dir().join(format!("onyx_diff_impact_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn hot_api(x: i32) -> i32 {\n    x + 1\n}\n\npub fn caller_one() -> i32 {\n    hot_api(1)\n}\n\npub fn caller_two() -> i32 {\n    hot_api(2)\n}\n",
+        )
+        .unwrap();
+
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let idx = Mutex::new(onyx_scent::WorkspaceIndex::new());
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+ pub fn hot_api(x: i32) -> i32 {
+-    x + 1
++    x + 2
+ }
+";
+        let assessment = evaluate_unified_diff_impact(&policy, diff, &idx)
+            .expect("hot_api diff must yield Scent impact");
+        assert!(assessment.touches_public_src, "{assessment:?}");
+        assert!(assessment.callers >= 2, "{assessment:?}");
+        assert!(assessment.max_heat_bp >= policy.impact.ask_heat_bp);
+        assert!(assessment.escalates_allow_to_ask, "{assessment:?}");
+        assert!(
+            assessment.summary_line.contains("hot_api"),
+            "{}",
+            assessment.summary_line
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -73,6 +73,23 @@ pub struct WorktreeHandle {
     pub base_tree: String,
 }
 
+/// Propuesta estructurada emitida por un subagente al terminar (`SDD-09` §3).
+///
+/// Reconcilia conocimiento por claves semánticas (`touched_files`), nunca por `ConceptId` numérico.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentProposal {
+    pub job_id: String,
+    pub spawn_tick: u64,
+    pub branch_name: String,
+    pub base_commit: String,
+    /// Commit efímero capturando el working tree final del subagente (vacío si fue cancelado/fallido antes de capturar).
+    pub sub_commit: String,
+    pub ok: bool,
+    pub summary: String,
+    /// Rutas relativas tocadas por el subagente respecto a `base_commit`.
+    pub touched_files: Vec<String>,
+}
+
 /// Entrada reportada por [`WorktreeManager::list_worktrees`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -90,6 +107,7 @@ pub enum WorktreeMergeOutcome {
     /// Fusión 3-way limpia lista para aprobación + *Scent-Heated Approval* y aplicación sin mover `HEAD`.
     Clean {
         root_now_commit: String,
+        root_now_tree: String,
         merged_tree: String,
         changed_files: Vec<String>,
         unified_diff: String,
@@ -249,6 +267,15 @@ impl WorktreeManager {
         )
     }
 
+    /// Devuelve la lista ordenada de rutas relativas modificadas entre `from_commit` y `to_commit`.
+    pub fn changed_files_between(
+        &self,
+        from_commit: &str,
+        to_commit: &str,
+    ) -> Result<Vec<String>, String> {
+        diff_name_only(&self.workspace_root, from_commit, to_commit)
+    }
+
     /// Evalúa una fusión 3-way en memoria/objetos Git entre el estado actual (posiblemente sucio)
     /// de `root` (`root_now_commit`) y `sub_commit`, usando `handle.base_commit` como ancestro común.
     /// Nunca modifica el *working tree*, `HEAD` ni `.git/index` de `root`.
@@ -303,6 +330,7 @@ impl WorktreeManager {
                     diff_unified(&self.workspace_root, &root_now_tree, &merged_tree)?;
                 Ok(WorktreeMergeOutcome::Clean {
                     root_now_commit,
+                    root_now_tree,
                     merged_tree,
                     changed_files,
                     unified_diff,
@@ -376,6 +404,36 @@ impl WorktreeManager {
         Ok(applied)
     }
 
+    /// Captura el `tree_sha` actual del *working tree* de `root` sin mutar `HEAD` ni `.git/index`.
+    pub fn current_working_tree_sha(&self) -> Result<String, String> {
+        let (_, tree_sha) = capture_git_tree_checkpoint(&self.workspace_root).ok_or_else(|| {
+            format!(
+                "failed to capture current git working tree checkpoint for `{}`",
+                self.workspace_root.display()
+            )
+        })?;
+        Ok(tree_sha)
+    }
+
+    /// Versión resistente a **TOCTOU** (*Time-of-Check to Time-of-Use*) de [`Self::apply_clean_merge`]:
+    /// antes de escribir un solo byte, verifica que el *working tree* actual de `root` siga teniendo
+    /// exactamente `expected_root_now_tree` (el árbol evaluado durante el preview/aprobación humana).
+    /// Si `root` (u otro proceso) modificó el disco mientras tanto, aborta limpio sin mutar archivos.
+    pub fn apply_clean_merge_checked(
+        &self,
+        root_now_commit: &str,
+        expected_root_now_tree: &str,
+        merged_tree: &str,
+    ) -> Result<Vec<String>, String> {
+        let live_tree = self.current_working_tree_sha()?;
+        if live_tree != expected_root_now_tree {
+            return Err(format!(
+                "TOCTOU guard aborted merge: root working tree changed since preview/approval (expected tree `{expected_root_now_tree}`, current tree `{live_tree}`); re-run `subagent_merge` to refresh preview and impact assessment"
+            ));
+        }
+        self.apply_clean_merge(root_now_commit, merged_tree)
+    }
+
     /// Desmonta el *worktree* y elimina la rama temporal `onyx/sub/<job_id>`.
     /// El llamador debe haber cerrado antes cualquier `ProcessJob` asociado para evitar
     /// bloqueos de archivos en Windows.
@@ -399,10 +457,27 @@ impl WorktreeManager {
             let _ = self.prune_worktrees();
         }
 
-        let _ = Command::new("git")
+        let br_del = Command::new("git")
             .args(["branch", "-D", &handle.branch_name])
             .current_dir(&self.workspace_root)
-            .output();
+            .output()
+            .map_err(|e| format!("failed to run git branch -D `{}`: {e}", handle.branch_name))?;
+        if !br_del.status.success() {
+            let full_ref = format!("refs/heads/{}", handle.branch_name);
+            let still_exists = Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", &full_ref])
+                .current_dir(&self.workspace_root)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if still_exists {
+                return Err(format!(
+                    "failed to delete temporary branch `{}`: {}",
+                    handle.branch_name,
+                    String::from_utf8_lossy(&br_del.stderr).trim()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -921,6 +996,7 @@ mod tests {
                 merged_tree,
                 changed_files,
                 unified_diff,
+                ..
             } => {
                 assert!(
                     changed_files.contains(&"b.txt".to_string()),
@@ -975,6 +1051,18 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|w| w.is_onyx_subagent)
+        );
+        let branch_ref = format!("refs/heads/{}", handle.branch_name);
+        let branch_exists = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", &branch_ref])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !branch_exists,
+            "temporary branch `{}` must be deleted by remove_worktree",
+            handle.branch_name
         );
 
         let _ = fs::remove_dir_all(&wt_base);
@@ -1056,6 +1144,71 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("Control Plane"), "{err}");
         assert!(!repo.join(".onyx/config.toml").exists());
+
+        mgr.remove_worktree(&handle).unwrap();
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn apply_clean_merge_checked_aborts_on_toctou_without_touching_disk() {
+        let repo = init_temp_git_repo("toctou_guard");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("onyx_wt_base_toctou_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        let mgr = WorktreeManager::with_base_dir_override(&repo, Some(&wt_base)).unwrap();
+        let handle = mgr.create_worktree("job-toctou", 40).unwrap();
+
+        fs::write(handle.worktree_path.join("b.txt"), "subagent-b\n").unwrap();
+        let (sub_commit, _) = mgr.capture_subagent_commit(&handle).unwrap();
+
+        let (root_now_commit, root_now_tree, merged_tree) =
+            match mgr.preview_three_way_merge(&handle, &sub_commit).unwrap() {
+                WorktreeMergeOutcome::Clean {
+                    root_now_commit,
+                    root_now_tree,
+                    merged_tree,
+                    ..
+                } => (root_now_commit, root_now_tree, merged_tree),
+                other => panic!("expected Clean preview, got {other:?}"),
+            };
+
+        // Simulate concurrent root mutation between approval preview and merge apply (TOCTOU window).
+        fs::write(repo.join("a.txt"), "root-modified-during-approval\n").unwrap();
+
+        let err = mgr
+            .apply_clean_merge_checked(&root_now_commit, &root_now_tree, &merged_tree)
+            .unwrap_err();
+        assert!(err.contains("TOCTOU"), "{err}");
+        // Must leave `b.txt` untouched when TOCTOU guard aborts!
+        assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "orig-b\n");
+        assert_eq!(
+            fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "root-modified-during-approval\n"
+        );
+
+        // Re-previewing refreshes `root_now_tree` and merges cleanly.
+        let (c2, t2, m2) = match mgr.preview_three_way_merge(&handle, &sub_commit).unwrap() {
+            WorktreeMergeOutcome::Clean {
+                root_now_commit,
+                root_now_tree,
+                merged_tree,
+                ..
+            } => (root_now_commit, root_now_tree, merged_tree),
+            other => panic!("expected Clean after refresh, got {other:?}"),
+        };
+        mgr.apply_clean_merge_checked(&c2, &t2, &m2).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.join("b.txt")).unwrap(),
+            "subagent-b\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "root-modified-during-approval\n"
+        );
 
         mgr.remove_worktree(&handle).unwrap();
         let _ = fs::remove_dir_all(&wt_base);

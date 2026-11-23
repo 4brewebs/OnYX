@@ -7,9 +7,10 @@ use regex::Regex;
 use serde_json::Value as JsonValue;
 
 use crate::impact::ImpactConfig;
-use crate::sandbox::SandboxConfig;
+use crate::sandbox::{NetworkPolicy, SandboxConfig, SandboxMode};
 use crate::state::WorkspaceMode;
 use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
+use crate::worktree::SubagentNetworkPolicy;
 
 /// Resultado de evaluar las reglas de permisos para una herramienta y sus argumentos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +228,13 @@ impl PermissionRules {
 pub fn is_mutating_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "fs_write" | "fs_edit" | "shell_exec" | "service_start" | "service_stop" | "service_exec"
+        "fs_write"
+            | "fs_edit"
+            | "shell_exec"
+            | "service_start"
+            | "service_stop"
+            | "service_exec"
+            | "subagent_merge"
     )
 }
 
@@ -718,6 +725,42 @@ impl WorkspacePolicy {
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = timeout;
         self
+    }
+
+    /// Deriva una política confinada para ejecutar un subagente nativo dentro de un *worktree*
+    /// desechable (`SDD-09` Fase 2):
+    /// - Re-enraiza `root` en `worktree_root` canonizado.
+    /// - Fuerza al menos `SandboxMode::WorkspaceWrite` (preservando `StrictContainer` si ya es más estricto).
+    /// - Aplica `SubagentNetworkPolicy` (`NativeOffline` -> `NetworkPolicy::Offline`).
+    /// - Concede auto-aprobación confinada al worktree (`fs_write`/`fs_edit`/`shell_exec`)
+    ///   preservando intactas todas las reglas `deny` y la protección del Control Plane.
+    pub fn for_worktree(
+        &self,
+        worktree_root: impl AsRef<Path>,
+        network_policy: &SubagentNetworkPolicy,
+    ) -> io::Result<Self> {
+        let canonical = fs::canonicalize(worktree_root)?;
+        let mut derived = self.clone();
+        derived.root = canonical;
+        if derived.sandbox.mode == SandboxMode::Off {
+            derived.sandbox.mode = SandboxMode::WorkspaceWrite;
+        }
+        match network_policy {
+            SubagentNetworkPolicy::NativeOffline => {
+                derived.sandbox.network = NetworkPolicy::Offline;
+            }
+            SubagentNetworkPolicy::ExternalHarnessAllowlist(_) => {}
+        }
+        derived.permissions = PermissionRules {
+            deny: self.permissions.deny.clone(),
+            allow: vec![
+                "fs_write(*)".to_string(),
+                "fs_edit(*)".to_string(),
+                "shell_exec(*)".to_string(),
+            ],
+            ask: Vec::new(),
+        };
+        Ok(derived)
     }
 
     /// Carga secciones `[permissions]`, `[sandbox]` e `[impact]` desde `~/.onyx/config.toml` y

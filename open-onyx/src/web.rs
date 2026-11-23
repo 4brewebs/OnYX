@@ -26,8 +26,9 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     ImpactAssessment, PermissionDecision, SandboxDriverKind, SproutSupervisor, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, detect_sandbox_capabilities,
-    graph_workspace_plan, graph_workspace_services, preview_tool_diff,
+    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, apply_impact_escalation,
+    detect_sandbox_capabilities, graph_subagent_records, graph_workspace_plan,
+    graph_workspace_services, preview_tool_diff,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,7 @@ use crate::context::{ReasoningEffort, SessionTelemetryHandle};
 use crate::gemini::StreamPreviewHandle;
 use crate::pack::SharedPackStore;
 use crate::session::UiIdlePump;
+use crate::subagent::{MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle};
 use crate::tui_input::WorkspaceFileIndex;
 use crate::vault::session_display_label;
 
@@ -249,6 +251,19 @@ pub struct WebTelemetrySnapshot {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct WebSubagentSnapshot {
+    pub job_id: String,
+    pub name: String,
+    pub status: String,
+    pub ok: Option<bool>,
+    pub spawn_tick: u64,
+    pub branch: String,
+    pub goal: String,
+    pub touched_files: Vec<String>,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct WebStateSnapshot {
     pub schema: &'static str,
     pub version: u64,
@@ -261,6 +276,7 @@ pub struct WebStateSnapshot {
     pub vault_label: Option<String>,
     pub focused_agent_id: Option<u64>,
     pub agents: Vec<WebAgentSnapshot>,
+    pub subagents: Vec<WebSubagentSnapshot>,
     pub stream_preview: Option<WebStreamPreview>,
     pub pending_approval: Option<WebApprovalSnapshot>,
     pub plan: Option<String>,
@@ -358,6 +374,9 @@ impl WebHub {
         let cmd = raw_cmd.trim();
         if cmd.is_empty() {
             return Err("command cannot be empty".to_string());
+        }
+        if cmd.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX.trim_end()) || cmd.starts_with("/__onyx_") {
+            return Err("reserved internal command prefix".to_string());
         }
         let mut guard = self
             .state
@@ -468,6 +487,10 @@ fn is_immediate_web_slash(cmd: &str) -> bool {
         || lower.starts_with("/services ")
         || lower == "/service"
         || lower.starts_with("/service ")
+        || lower == "/subagents"
+        || lower == "/subagent"
+        || lower.starts_with("/merge ")
+        || lower.starts_with("/discard ")
         || lower == "/trust"
         || lower.starts_with("/trust ")
         || lower == "/undo"
@@ -488,6 +511,7 @@ struct WebRuntimeInner {
     policy: Option<WorkspacePolicy>,
     tools: Option<WorkspaceTools>,
     sprout: Option<SproutSupervisor>,
+    subagents: Option<SubagentHandle>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
@@ -596,6 +620,7 @@ impl WebDriver {
             policy,
             tools: None,
             sprout: None,
+            subagents: None,
             mode_handle: WorkspaceModeHandle::default(),
             stream_preview: StreamPreviewHandle::default(),
             telemetry: SessionTelemetryHandle::default(),
@@ -645,6 +670,13 @@ impl WebDriver {
     pub fn with_sprout(self, sprout: SproutSupervisor) -> Self {
         if let Ok(mut inner) = self.inner.lock() {
             inner.sprout = Some(sprout);
+        }
+        self
+    }
+
+    pub fn with_subagents(self, subagents: SubagentHandle) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.subagents = Some(subagents);
         }
         self
     }
@@ -807,7 +839,48 @@ impl WebRuntimeInner {
             let Some(p) = &a.pending_approval else {
                 continue;
             };
-            let impact_assessment = if let Some(tools) = &self.tools {
+            let mut merge_preview_diff: Option<String> = None;
+            let impact_assessment = if p.tool == "subagent_merge" {
+                let static_dec = self.policy.as_ref().map_or(PermissionDecision::Ask, |pol| {
+                    pol.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                });
+                if static_dec == PermissionDecision::Deny {
+                    continue;
+                }
+                let job_id = serde_json::from_str::<serde_json::Value>(&p.args)
+                    .ok()
+                    .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
+                let preview = job_id.and_then(|jid| {
+                    self.subagents
+                        .as_ref()
+                        .and_then(|h| h.preview_merge_for_approval(&jid).ok())
+                });
+                match preview {
+                    Some(MergePreviewState::Clean(ticket)) => {
+                        if apply_impact_escalation(static_dec, ticket.impact.as_ref())
+                            != PermissionDecision::Ask
+                        {
+                            continue;
+                        }
+                        merge_preview_diff =
+                            Some(truncate_web_diff_lines(&ticket.unified_diff, 120));
+                        ticket.impact
+                    }
+                    Some(MergePreviewState::NoOp) => {
+                        if static_dec != PermissionDecision::Ask {
+                            continue;
+                        }
+                        None
+                    }
+                    Some(MergePreviewState::Conflict { .. }) => continue,
+                    None => {
+                        if static_dec != PermissionDecision::Ask {
+                            continue;
+                        }
+                        None
+                    }
+                }
+            } else if let Some(tools) = &self.tools {
                 let (decision, impact) =
                     tools.evaluate_permission_with_impact(current_mode, &p.tool, &p.args);
                 if decision != PermissionDecision::Ask {
@@ -827,10 +900,11 @@ impl WebRuntimeInner {
 
             let key = (a.agent, a.request);
             if self.cached_approval_key != Some(key) {
-                self.cached_approval_diff = self
-                    .workspace_root
-                    .as_deref()
-                    .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 120));
+                self.cached_approval_diff = merge_preview_diff.or_else(|| {
+                    self.workspace_root
+                        .as_deref()
+                        .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 120))
+                });
                 self.cached_approval_impact = impact_assessment;
                 self.cached_approval_key = Some(key);
             }
@@ -924,6 +998,41 @@ impl WebRuntimeInner {
             guard.focused_agent_id = latest_root.or_else(|| agents.first().map(|a| a.id));
         }
 
+        let subagents: Vec<WebSubagentSnapshot> = if let Some(ref handle) = self.subagents {
+            handle
+                .list_summaries()
+                .into_iter()
+                .map(|s| WebSubagentSnapshot {
+                    job_id: s.job_id,
+                    name: s.name,
+                    status: s.status.to_string(),
+                    ok: s.ok,
+                    spawn_tick: s.spawn_tick,
+                    branch: s.branch_name,
+                    goal: s.goal,
+                    touched_files: s.touched_files,
+                    summary: s.summary,
+                })
+                .collect()
+        } else if let Some(wv) = &self.ws_vocab {
+            graph_subagent_records(graph, wv)
+                .into_iter()
+                .map(|r| WebSubagentSnapshot {
+                    job_id: r.job_id.clone(),
+                    name: r.job_id,
+                    status: r.status,
+                    ok: Some(r.ok),
+                    spawn_tick: r.spawn_tick,
+                    branch: r.branch,
+                    goal: String::new(),
+                    touched_files: r.touched_files,
+                    summary: r.summary,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let next_version = guard.version.saturating_add(1);
         let snap = WebStateSnapshot {
             schema: "onyx.web.state.v1",
@@ -941,6 +1050,7 @@ impl WebRuntimeInner {
             vault_label: self.active_session_label(),
             focused_agent_id: guard.focused_agent_id,
             agents,
+            subagents,
             stream_preview,
             pending_approval: active_approval_snapshot,
             plan,
@@ -974,6 +1084,17 @@ fn strip_version(json: &str) -> &str {
     match json.find(",\"tick\":") {
         Some(idx) => &json[idx..],
         None => json,
+    }
+}
+
+fn truncate_web_diff_lines(diff: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= max_lines {
+        diff.to_string()
+    } else {
+        let mut head = lines[..max_lines].join("\n");
+        head.push_str(&format!("\n... (+{} more lines)", lines.len() - max_lines));
+        head
     }
 }
 
@@ -1941,6 +2062,13 @@ mod tests {
         );
         assert!(csrf.starts_with("HTTP/1.1 403 Forbidden"), "{csrf}");
 
+        // 3b. Spoofed internal subagent proposal command prefix is blocked (400).
+        let (spoof, _) = in_memory_exchange(
+            &hub,
+            "POST /api/v1/command HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer test-api-key-1234567890\r\nContent-Length: 41\r\n\r\n{\"command\":\"/__onyx_subagent_proposal {}\"}",
+        );
+        assert!(spoof.starts_with("HTTP/1.1 400 Bad Request"), "{spoof}");
+
         // 4. Login issues HttpOnly cookie and grants /api/v1/state access.
         let login_body = r#"{"api_key":"test-api-key-1234567890"}"#;
         let login_req = format!(
@@ -2142,6 +2270,7 @@ mod tests {
             );
             if state_resp.contains("\"pending_approval\":{") {
                 assert!(state_resp.contains("hello onyx web"), "{state_resp}");
+                assert!(state_resp.contains("\"subagents\":"), "{state_resp}");
                 let body_start = state_resp.find("\r\n\r\n").unwrap() + 4;
                 let parsed: serde_json::Value =
                     serde_json::from_str(&state_resp[body_start..]).unwrap();

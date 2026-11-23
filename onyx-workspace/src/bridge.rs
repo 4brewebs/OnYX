@@ -14,7 +14,7 @@ use crate::state::{
     capture_git_tree_checkpoint, file_read_tick, graph_workspace_mode, is_file_read,
     normalize_rel_path, restore_git_tree_checkpoint_for_targets, undone_effects,
 };
-use crate::tools::WorkspaceTools;
+use crate::tools::{WorkspaceTools, is_async_subagent_tool};
 
 /// Driver que observa agentes en `AgentState::Acting` con herramientas del
 /// workspace pendientes, valida políticas de modo/lectura previa, las ejecuta
@@ -216,6 +216,12 @@ impl PlatformDriver for WorkspaceToolBridge {
                 &pending.tool,
                 &pending.args,
             );
+            // Para `subagent_merge`, solo hacemos cumplir `Deny` aquí (p. ej. modo PLAN o regla deny).
+            // Nunca auto-aprobamos `Allow`/`Ask` aquí: `SubagentManagerDriver` evalúa el diff
+            // 3-way real con `onyx-scent` y sella el ticket anti-TOCTOU antes de aprobar.
+            if pending.tool == "subagent_merge" && decision != PermissionDecision::Deny {
+                continue;
+            }
             match decision {
                 PermissionDecision::Allow => {
                     if self.handled_approvals.insert((view.agent.0, view.request)) {
@@ -258,7 +264,7 @@ impl PlatformDriver for WorkspaceToolBridge {
             inner.present(graph, surfaces);
         }
         for (agent, request, pending) in pending_tool_calls(graph, &self.vocab) {
-            if pending.tool == "spawn_agent" {
+            if pending.tool == "spawn_agent" || is_async_subagent_tool(&pending.tool) {
                 continue;
             }
             if !self.dispatched.insert((agent.0, request)) {

@@ -22,7 +22,7 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     ImpactAssessment, PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_plan,
+    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, apply_impact_escalation, graph_workspace_plan,
     graph_workspace_services, preview_tool_diff,
 };
 use ratatui::{
@@ -44,6 +44,9 @@ use crate::context::{
 };
 use crate::gemini::StreamPreviewHandle;
 use crate::pack::SharedPackStore;
+use crate::subagent::{
+    MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentJobSummary,
+};
 use crate::tui_input::{
     InputBuffer, InputHistory, PopupState, QueuedPrompts, WorkspaceFileIndex, render_input_popup,
 };
@@ -74,6 +77,7 @@ struct TuiInner {
     policy: Option<WorkspacePolicy>,
     tools: Option<WorkspaceTools>,
     sprout: Option<SproutSupervisor>,
+    subagents: Option<SubagentHandle>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
@@ -188,6 +192,7 @@ impl TuiDriver {
                 policy: None,
                 tools: None,
                 sprout: None,
+                subagents: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
                 telemetry: SessionTelemetryHandle::default(),
@@ -252,6 +257,14 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.sprout = Some(sprout);
+        }
+        self
+    }
+
+    pub fn with_subagents(self, subagents: SubagentHandle) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.subagents = Some(subagents);
         }
         self
     }
@@ -606,7 +619,10 @@ impl TuiInner {
                             let cmd = self.input.as_str().trim().to_string();
                             self.input.clear();
                             self.popup.close();
-                            if !cmd.is_empty() {
+                            if !cmd.is_empty()
+                                && !cmd.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX.trim_end())
+                                && !cmd.starts_with("/__onyx_")
+                            {
                                 self.history.push(cmd.clone());
                                 self.scroll_from_bottom = 0;
                                 if cmd == "/agent" || cmd == "/agents" {
@@ -687,7 +703,48 @@ impl TuiInner {
                 let Some(p) = &a.pending_approval else {
                     continue;
                 };
-                let impact_assessment = if let Some(tools) = &self.tools {
+                let mut merge_preview_diff: Option<String> = None;
+                let impact_assessment = if p.tool == "subagent_merge" {
+                    let static_dec = self.policy.as_ref().map_or(PermissionDecision::Ask, |pol| {
+                        pol.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                    });
+                    if static_dec == PermissionDecision::Deny {
+                        continue;
+                    }
+                    let job_id = serde_json::from_str::<serde_json::Value>(&p.args)
+                        .ok()
+                        .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
+                    let preview = job_id.and_then(|jid| {
+                        self.subagents
+                            .as_ref()
+                            .and_then(|h| h.preview_merge_for_approval(&jid).ok())
+                    });
+                    match preview {
+                        Some(MergePreviewState::Clean(ticket)) => {
+                            if apply_impact_escalation(static_dec, ticket.impact.as_ref())
+                                != PermissionDecision::Ask
+                            {
+                                continue;
+                            }
+                            merge_preview_diff =
+                                Some(truncate_diff_lines(&ticket.unified_diff, 14));
+                            ticket.impact
+                        }
+                        Some(MergePreviewState::NoOp) => {
+                            if static_dec != PermissionDecision::Ask {
+                                continue;
+                            }
+                            None
+                        }
+                        Some(MergePreviewState::Conflict { .. }) => continue,
+                        None => {
+                            if static_dec != PermissionDecision::Ask {
+                                continue;
+                            }
+                            None
+                        }
+                    }
+                } else if let Some(tools) = &self.tools {
                     let (decision, impact) =
                         tools.evaluate_permission_with_impact(current_mode, &p.tool, &p.args);
                     if decision != PermissionDecision::Ask {
@@ -706,10 +763,11 @@ impl TuiInner {
                     None
                 };
                 if self.seen_approvals.insert((a.agent.0, a.request)) {
-                    self.approval_diff = self
-                        .workspace_root
-                        .as_deref()
-                        .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
+                    self.approval_diff = merge_preview_diff.or_else(|| {
+                        self.workspace_root
+                            .as_deref()
+                            .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14))
+                    });
                     self.approval_impact = impact_assessment;
                     self.active_approval =
                         Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
@@ -717,6 +775,13 @@ impl TuiInner {
                 }
             }
         }
+
+        let bg_jobs: Vec<SubagentJobSummary> = self
+            .subagents
+            .as_ref()
+            .map(SubagentHandle::list_summaries)
+            .unwrap_or_default();
+        let active_bg_jobs = bg_jobs.iter().filter(|j| j.status == "running").count();
 
         let agents = graph.query(&[self.vocab.state]);
         let agent_rows: Vec<AgentRow> = agents
@@ -862,14 +927,20 @@ impl TuiInner {
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
-            if active_subagents > 0 {
+            if active_subagents > 0 || active_bg_jobs > 0 {
+                let total_sub = active_subagents + active_bg_jobs;
+                let tag = if active_bg_jobs > 0 {
+                    format!("  [subagents:{total_sub} · bg:{active_bg_jobs} · F2]")
+                } else {
+                    format!("  [subagents:{active_subagents} · F2]")
+                };
                 phase_spans.push(Span::styled(
-                    format!("  [subagents:{active_subagents} · F2]"),
+                    tag,
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
-            } else if agent_rows.len() > 1 {
+            } else if agent_rows.len() > 1 || !bg_jobs.is_empty() {
                 let active_count = agent_rows
                     .iter()
                     .filter(|r| {
@@ -1323,7 +1394,14 @@ impl TuiInner {
             f.render_widget(bottom, chunks[2]);
 
             if picker_open {
-                render_agent_picker(f, f.area(), &agent_rows, active_agent, picker_idx);
+                render_agent_picker_with_subagents(
+                    f,
+                    f.area(),
+                    &agent_rows,
+                    &bg_jobs,
+                    active_agent,
+                    picker_idx,
+                );
             } else if !is_approval && popup_snapshot.is_open() {
                 render_input_popup(f, f.area(), chunks[2], &popup_snapshot);
             }
@@ -1397,6 +1475,10 @@ fn is_immediate_slash_cmd(cmd: &str) -> bool {
         || lower.starts_with("/services ")
         || lower == "/service"
         || lower.starts_with("/service ")
+        || lower == "/subagents"
+        || lower == "/subagent"
+        || lower.starts_with("/merge ")
+        || lower.starts_with("/discard ")
         || lower == "/trust"
         || lower.starts_with("/trust ")
         || lower == "/undo"
@@ -1465,7 +1547,8 @@ pub(crate) fn resolve_focused_agent(
     (resolved, false)
 }
 
-/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`).
+/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`), keeping backward compatibility.
+#[allow(dead_code)]
 pub(crate) fn render_agent_picker(
     f: &mut Frame<'_>,
     area: Rect,
@@ -1473,13 +1556,26 @@ pub(crate) fn render_agent_picker(
     focused: Option<ConceptId>,
     selected_idx: usize,
 ) {
+    render_agent_picker_with_subagents(f, area, rows, &[], focused, selected_idx);
+}
+
+/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`) including background worktree jobs.
+pub(crate) fn render_agent_picker_with_subagents(
+    f: &mut Frame<'_>,
+    area: Rect,
+    rows: &[AgentRow],
+    bg_jobs: &[SubagentJobSummary],
+    focused: Option<ConceptId>,
+    selected_idx: usize,
+) {
     if area.width < 20 || area.height < 6 {
         return;
     }
     let popup_w = area.width.saturating_sub(6).clamp(32, 82).min(area.width);
-    let desired_h = u16::try_from(rows.len().saturating_add(4)).unwrap_or(14);
+    let desired_h =
+        u16::try_from(rows.len().saturating_add(bg_jobs.len()).saturating_add(5)).unwrap_or(18);
     let popup_h = desired_h
-        .clamp(6, 16)
+        .clamp(6, 20)
         .min(area.height.saturating_sub(2).max(5));
     let x = area.x + area.width.saturating_sub(popup_w) / 2;
     let y = area.y + area.height.saturating_sub(popup_h) / 2;
@@ -1488,7 +1584,7 @@ pub(crate) fn render_agent_picker(
     f.render_widget(Clear, popup_area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if rows.is_empty() {
+    if rows.is_empty() && bg_jobs.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no agents yet — enter a goal to start)",
             Style::default().fg(Color::DarkGray),
@@ -1542,14 +1638,64 @@ pub(crate) fn render_agent_picker(
                 Span::styled(goal_preview, dim_style),
             ]));
         }
+        for job in bg_jobs {
+            let state_color = match job.status {
+                "running" => Color::Cyan,
+                "done" | "merged" => Color::Green,
+                "failed" => Color::Red,
+                _ => Color::Gray,
+            };
+            let clean_goal = sanitize_display_line(&job.goal);
+            let goal_preview = if clean_goal.chars().count() > max_goal_chars {
+                let head: String = clean_goal
+                    .chars()
+                    .take(max_goal_chars.saturating_sub(1))
+                    .collect();
+                format!("{head}…")
+            } else {
+                clean_goal
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  [bg] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("#{} ", job.job_id),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("({}) ", job.status),
+                    Style::default().fg(state_color),
+                ),
+                Span::styled(
+                    format!("{} — ", job.branch_name),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(goal_preview, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
     }
 
     let block = Block::default()
-        .title(" Select Agent (Up/Down · Enter focus · Esc/F2 close) ")
+        .title(" Select Agent (Up/Down · Enter focus · /merge /discard · Esc/F2 close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let widget = Paragraph::new(lines).block(block);
     f.render_widget(widget, popup_area);
+}
+
+fn truncate_diff_lines(diff: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= max_lines {
+        diff.to_string()
+    } else {
+        let mut head = lines[..max_lines].join("\n");
+        head.push_str(&format!("\n... (+{} more lines)", lines.len() - max_lines));
+        head
+    }
 }
 
 /// Renders the parametric openOnyx emblem in Braille sub-pixels (`6x3` cells = `12x12` dots).
@@ -1945,6 +2091,52 @@ mod tests {
         assert!(rendered.contains("auditor"), "{rendered}");
         assert!(rendered.contains("[root]"), "{rendered}");
         assert!(rendered.contains("[sub ]"), "{rendered}");
+    }
+
+    #[test]
+    fn agent_picker_popup_renders_background_worktree_subagents() {
+        let rows = vec![AgentRow {
+            id: ConceptId(1),
+            name: "openonyx-1".to_string(),
+            is_root: true,
+            state: "thinking".to_string(),
+            goal: "coordinate background tasks".to_string(),
+        }];
+        let bg_jobs = vec![crate::subagent::SubagentJobSummary {
+            job_id: "bg-1".to_string(),
+            name: "worker".to_string(),
+            goal: "refactor parser".to_string(),
+            spawn_tick: 7,
+            branch_name: "onyx/sub/bg-1".to_string(),
+            worktree_path: std::path::PathBuf::from("wt/bg-1"),
+            status: "running",
+            ok: None,
+            touched_files: vec!["src/lib.rs".to_string()],
+            summary: String::new(),
+        }];
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_agent_picker_with_subagents(
+                    f,
+                    f.area(),
+                    &rows,
+                    &bg_jobs,
+                    Some(ConceptId(1)),
+                    0,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..20)
+            .map(|y| (0..90).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("[bg]"), "{rendered}");
+        assert!(rendered.contains("#bg-1"), "{rendered}");
+        assert!(rendered.contains("(running)"), "{rendered}");
+        assert!(rendered.contains("onyx/sub/bg-1"), "{rendered}");
     }
 
     #[test]

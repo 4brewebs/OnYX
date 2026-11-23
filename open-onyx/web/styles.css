@@ -1607,3 +1607,60 @@ dialog::backdrop {
   font-size: 0.76rem;
   color: var(--ink-secondary);
 }
+
+/* Async Background Worktree Subagent Cards (per modern-web-guidance `card` & `natural-interactions`) */
+.bg-subagents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.bg-subagent-card {
+  container-type: inline-size;
+  display: grid;
+  gap: 0.38rem;
+  padding: 0.58rem 0.7rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.bg-subagent-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.bg-subagent-id {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+.bg-subagent-meta {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-secondary);
+}
+
+.bg-subagent-card > footer {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+:where(button):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@container (inline-size < 16rem) {
+  .bg-subagent-card > footer .chip-btn {
+    flex: 1 1 auto;
+  }
+}
