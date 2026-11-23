@@ -1,5 +1,6 @@
 mod command;
 mod context;
+mod external_driver;
 mod gemini;
 mod openai;
 mod ops;
@@ -875,6 +876,7 @@ fn resolve_llm_config(
 fn build_sync_responder(
     llm: &LlmConfig,
     telemetry: Option<SessionTelemetryHandle>,
+    driver_ids: &[String],
 ) -> Box<dyn Responder> {
     let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     match llm.provider {
@@ -883,7 +885,8 @@ fn build_sync_responder(
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
-                .with_effort(llm.effort);
+                .with_effort(llm.effort)
+                .with_external_driver_ids(driver_ids.to_vec());
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -894,7 +897,8 @@ fn build_sync_responder(
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
-                .with_effort(llm.effort);
+                .with_effort(llm.effort)
+                .with_external_driver_ids(driver_ids.to_vec());
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -1037,6 +1041,7 @@ fn launch_interactive_chat(
     base_config: &AgentConfig,
     base_opts: &SessionOptions,
     resume_override: Option<(&Path, Option<u64>)>,
+    driver_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     let checkpoints = PendingCheckpoints::default();
@@ -1124,7 +1129,8 @@ fn launch_interactive_chat(
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
     let bridge_ready = Arc::new(AtomicBool::new(false));
     let sub_llm = llm.clone();
-    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None));
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
         .with_ready_flag(Arc::clone(&bridge_ready))
@@ -1239,6 +1245,7 @@ fn launch_interactive_chat(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
+            .with_external_driver_ids(driver_ids.to_vec())
             .wrapping(sub_driver),
         ),
         LlmProvider::OpenAi => rec_bridge.wrapping(
@@ -1255,6 +1262,7 @@ fn launch_interactive_chat(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
+            .with_external_driver_ids(driver_ids.to_vec())
             .wrapping(sub_driver),
         ),
     };
@@ -1284,6 +1292,7 @@ fn launch_web_serve(
     base_config: &AgentConfig,
     base_opts: &SessionOptions,
     web_cfg: WebServerConfig,
+    driver_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     let checkpoints = PendingCheckpoints::default();
@@ -1365,7 +1374,8 @@ fn launch_web_serve(
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
     let bridge_ready = Arc::new(AtomicBool::new(false));
     let sub_llm = llm.clone();
-    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None));
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
         .with_ready_flag(Arc::clone(&bridge_ready))
@@ -1497,6 +1507,7 @@ fn launch_web_serve(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
+            .with_external_driver_ids(driver_ids.to_vec())
             .wrapping(sub_driver),
         ),
         LlmProvider::OpenAi => rec_bridge.wrapping(
@@ -1513,6 +1524,7 @@ fn launch_web_serve(
             .with_telemetry(telemetry)
             .with_context_config(ctx_cfg)
             .with_effort(llm.effort)
+            .with_external_driver_ids(driver_ids.to_vec())
             .wrapping(sub_driver),
         ),
     };
@@ -1667,6 +1679,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let tools = WorkspaceTools::new(policy.clone());
 
+    // `SDD-10` Fase 1: ids de los drivers de harness CLI registrados (siempre al menos
+    // el preset integrado `opencode`), para los esquemas de `spawn_subagent` y el manager.
+    let driver_ids: Vec<String> = policy
+        .external_drivers()
+        .iter()
+        .map(|d| d.id.clone())
+        .collect();
+
     let config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(64),
         default_timeout_ticks: 128,
@@ -1716,8 +1736,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host.spawn(&make_spec(goal, cli.auto_approve));
 
             let sub_llm = llm.clone();
+            // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
             let sub_factory: ResponderFactory =
-                Arc::new(move || build_sync_responder(&sub_llm, None));
+                Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
             let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
                 .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
                 .with_root_tools(tools.clone());
@@ -1739,7 +1760,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),
-                build_sync_responder(&llm, Some(telemetry.clone())),
+                build_sync_responder(&llm, Some(telemetry.clone()), &driver_ids),
             )
             .wrapping(sub_driver);
 
@@ -1765,7 +1786,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Mode::Chat => {
             let resume_arg = cli.resume_dir.as_deref().map(|dir| (dir, cli.resume_tick));
-            launch_interactive_chat(&cli, &policy, tools, &config, &session_opts, resume_arg)?;
+            launch_interactive_chat(
+                &cli,
+                &policy,
+                tools,
+                &config,
+                &session_opts,
+                resume_arg,
+                &driver_ids,
+            )?;
         }
         Mode::Replay(path) => {
             let resolved_tr = resolve_read_transcript(&cli.workspace, path);
@@ -1855,6 +1884,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &config,
                     &session_opts,
                     Some((resolved_dir.as_path(), Some(*tick))),
+                    &driver_ids,
                 )?;
                 return Ok(());
             }
@@ -1923,7 +1953,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
                 let mut driver =
-                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None))
+                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None, &[]))
                         .starting_at(next_tick)
                         .wrapping(ws_bridge);
 
@@ -1966,7 +1996,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cors_origin,
         } => {
             let web_cfg = WebServerConfig::resolve(bind, api_key.clone(), cors_origin.clone())?;
-            launch_web_serve(&cli, &policy, tools, &config, &session_opts, web_cfg)?;
+            launch_web_serve(
+                &cli,
+                &policy,
+                tools,
+                &config,
+                &session_opts,
+                web_cfg,
+                &driver_ids,
+            )?;
         }
         Mode::Help | Mode::Version | Mode::Trust { .. } => unreachable!(),
     }

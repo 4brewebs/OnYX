@@ -13,6 +13,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crate::policy::is_control_plane_rel_path;
 use crate::state::capture_git_tree_checkpoint;
@@ -30,8 +31,55 @@ const SUBAGENT_BRANCH_PREFIX: &str = "onyx/sub/";
 pub enum SubagentNetworkPolicy {
     /// Subagente nativo: los subprocesos de herramientas corren offline (el host hace las llamadas LLM).
     NativeOffline,
-    /// Futuro *external harness driver* (`opencode`, `claude`, etc.) con lista explícita de hosts permitidos.
+    /// Harness CLI externo (`opencode`, `claude`, etc.) con lista explícita de hosts permitidos (`SDD-10` §2.7).
     ExternalHarnessAllowlist(Vec<String>),
+}
+
+/// Cómo se entrega el prompt al CLI externo sin inyección de shell (`SDD-10` §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTransport {
+    /// Recomendado y default: bytes del prompt al stdin del hijo (seguro en wrappers `.cmd`).
+    Stdin,
+    /// Un único elemento argv (rechazado en Windows si el binario resuelve a `.cmd`/`.bat`).
+    Arg,
+    /// Archivo temporal fuera del índice Git; pasa su ruta por `prompt_flag` o `{prompt_file}`.
+    TempFile,
+}
+
+impl PromptTransport {
+    /// Parsea el valor TOML (`"stdin" | "arg" | "temp_file"`).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "stdin" => Some(Self::Stdin),
+            "arg" => Some(Self::Arg),
+            "temp_file" => Some(Self::TempFile),
+            _ => None,
+        }
+    }
+}
+
+/// Driver de harness CLI cargado desde `[[external_drivers]]` de `.onyx/config.toml`
+/// (parser hand-rolled en [`crate::external_driver`], junto al de `[permissions]`; `SDD-10` §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDriverConfig {
+    /// Identificador único con charset `[a-z0-9_-]`, p. ej. `"opencode"`.
+    pub id: String,
+    /// Binario a resolver en `PATH`/`PATHEXT`, p. ej. `"opencode"`.
+    pub bin: String,
+    /// Argumentos fijos del CLI, p. ej. `["run", "--model", "qwen38-27b"]`.
+    pub args: Vec<String>,
+    /// Transporte del prompt (default `Stdin`).
+    pub prompt_transport: PromptTransport,
+    /// Flag opcional para `TempFile` (o placeholder `{prompt_file}` dentro de `args`).
+    pub prompt_flag: Option<String>,
+    /// Tope de ejecución del proceso externo.
+    pub timeout: Duration,
+    /// Whitelist de variables de entorno visibles para el hijo (incluye opt-in a `NODE_OPTIONS`).
+    pub allowed_env: Vec<String>,
+    /// `true` si el CLI necesita config/OAuth del `HOME` real (default `false`).
+    pub inherit_home: bool,
+    /// Gobernanza de red declarada por el driver (allowlist de hosts, `SDD-10` §2.7).
+    pub network_policy: SubagentNetworkPolicy,
 }
 
 /// Versión semántica detectada del binario `git` instalado en el host.
@@ -79,6 +127,9 @@ pub struct WorktreeHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentProposal {
     pub job_id: String,
+    /// Backend que ejecutó el job: `"native"` (motor en proceso) o el `id` de un harness CLI
+    /// externo configurado (`SDD-10`).
+    pub driver: String,
     pub spawn_tick: u64,
     pub branch_name: String,
     pub base_commit: String,

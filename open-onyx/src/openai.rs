@@ -37,6 +37,9 @@ struct OpenAiSharedState {
     telemetry: Option<SessionTelemetryHandle>,
     context_config: TieredContextConfig,
     effort: Option<ReasoningEffort>,
+    /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
+    /// esquema dinámico de `spawn_subagent` (`driver` opcional).
+    driver_ids: Vec<String>,
 }
 
 fn tool_call_args_as_string(raw: &JsonValue) -> String {
@@ -60,6 +63,7 @@ pub(crate) fn build_openai_request_body(
     project_instructions: &str,
     effort: Option<ReasoningEffort>,
     stream: bool,
+    driver_ids: &[String],
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut messages = Vec::with_capacity(projected.turns.len() + 1);
@@ -158,22 +162,23 @@ pub(crate) fn build_openai_request_body(
         }
     }
 
-    let tools: Vec<JsonValue> = WorkspaceTools::schemas_with_subagents(true)
-        .into_iter()
-        .filter(|s| req.tools.iter().any(|t| t == s.name))
-        .map(|s| {
-            let mut params = s.parameters;
-            lowercase_json_schema_types(&mut params);
-            json!({
-                "type": "function",
-                "function": {
-                    "name": s.name,
-                    "description": s.description,
-                    "parameters": params
-                }
+    let tools: Vec<JsonValue> =
+        WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
+            .into_iter()
+            .filter(|s| req.tools.iter().any(|t| t == s.name))
+            .map(|s| {
+                let mut params = s.parameters;
+                lowercase_json_schema_types(&mut params);
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": s.name,
+                        "description": s.description,
+                        "parameters": params
+                    }
+                })
             })
-        })
-        .collect();
+            .collect();
 
     let mut body = json!({
         "model": model,
@@ -647,6 +652,11 @@ impl OpenAiResponder {
         self.shared.effort = effort;
         self
     }
+
+    pub fn with_external_driver_ids(mut self, driver_ids: Vec<String>) -> Self {
+        self.shared.driver_ids = driver_ids;
+        self
+    }
 }
 
 impl Responder for OpenAiResponder {
@@ -662,6 +672,7 @@ impl Responder for OpenAiResponder {
             &self.shared.project_instructions,
             self.shared.effort,
             false,
+            &self.shared.driver_ids,
         );
         Some(execute_openai_http(
             &url,
@@ -754,6 +765,11 @@ impl AsyncOpenAiDriver {
         self.shared.effort = effort;
         self
     }
+
+    pub fn with_external_driver_ids(mut self, driver_ids: Vec<String>) -> Self {
+        self.shared.driver_ids = driver_ids;
+        self
+    }
 }
 
 impl PlatformDriver for AsyncOpenAiDriver {
@@ -796,6 +812,7 @@ impl PlatformDriver for AsyncOpenAiDriver {
                 &self.shared.project_instructions,
                 self.shared.effort,
                 true,
+                &self.shared.driver_ids,
             );
             let api_key = self.api_key.clone();
             let shared = self.shared.clone();
@@ -867,6 +884,7 @@ mod tests {
             "Project notes.",
             Some(ReasoningEffort::Medium),
             true,
+            &[],
         );
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["stream"], true);

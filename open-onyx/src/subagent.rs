@@ -31,8 +31,24 @@ use onyx_workspace::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::external_driver::{ExternalDriverRunner, ExternalHarnessDriver};
+
 /// Fábrica thread-safe para construir un `Responder` independiente por cada hilo de subagente.
 pub type ResponderFactory = Arc<dyn Fn() -> Box<dyn Responder> + Send + Sync>;
+
+/// Backend de ejecución de un job de subagente (`SDD-10` Fase 1):
+/// - [`WorkerBackend::Native`]: motor OnYX en proceso (snapshot del grafo + semilla derivada).
+/// - [`WorkerBackend::External`]: harness CLI externo (`opencode`, `claude`, ...) ejecutado
+///   dentro del mismo worktree Git aislado; solo el disco es la verdad (captura `git commit-tree`).
+pub enum WorkerBackend {
+    Native {
+        graph_snapshot: Vec<u8>,
+        seed: u64,
+    },
+    External {
+        driver: Arc<dyn ExternalHarnessDriver>,
+    },
+}
 
 /// Techo por defecto de subagentes activos simultáneos para proteger CPU/RAM (p. ej. VPS).
 pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 3;
@@ -45,9 +61,17 @@ pub const SUBAGENT_PROPOSAL_CMD_PREFIX: &str = "/__onyx_subagent_proposal ";
 const DEFAULT_SUBAGENT_MAX_STEPS: i64 = 32;
 const MAX_SUBAGENT_MAX_STEPS: i64 = 128;
 
+/// Default del campo `driver` en el wire de propuestas: `"native"` (compat con `SDD-09`).
+fn default_native_driver() -> String {
+    "native".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SubagentProposalWire {
     job_id: String,
+    /// Backend que ejecutó el job: `"native"` o el `id` del harness CLI externo (`SDD-10`).
+    #[serde(default = "default_native_driver")]
+    driver: String,
     spawn_tick: u64,
     branch_name: String,
     base_commit: String,
@@ -68,6 +92,7 @@ pub fn encode_proposal_command(proposal: &SubagentProposal, cancelled: bool) -> 
     let env = SubagentProposalEnvelope {
         proposal: SubagentProposalWire {
             job_id: proposal.job_id.clone(),
+            driver: proposal.driver.clone(),
             spawn_tick: proposal.spawn_tick,
             branch_name: proposal.branch_name.clone(),
             base_commit: proposal.base_commit.clone(),
@@ -89,6 +114,7 @@ pub fn decode_proposal_command(raw_cmd: &str) -> Option<(SubagentProposal, bool)
     Some((
         SubagentProposal {
             job_id: env.proposal.job_id,
+            driver: env.proposal.driver,
             spawn_tick: env.proposal.spawn_tick,
             branch_name: env.proposal.branch_name,
             base_commit: env.proposal.base_commit,
@@ -202,6 +228,8 @@ impl SubagentJobState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentJobSummary {
     pub job_id: String,
+    /// Backend de ejecución: `"native"` o el `id` del harness CLI externo (`SDD-10`).
+    pub driver: String,
     pub name: String,
     pub goal: String,
     pub spawn_tick: u64,
@@ -269,6 +297,8 @@ struct SubagentCompletion {
 
 struct ManagedJob {
     job_id: String,
+    /// Backend de ejecución resuelto en `spawn_job` (`"native"` o `id` de driver externo).
+    driver: String,
     name: String,
     goal: String,
     spawn_tick: u64,
@@ -287,6 +317,7 @@ impl ManagedJob {
         };
         SubagentJobSummary {
             job_id: self.job_id.clone(),
+            driver: self.driver.clone(),
             name: self.name.clone(),
             goal: self.goal.clone(),
             spawn_tick: self.spawn_tick,
@@ -309,13 +340,17 @@ impl ManagedJob {
     }
 }
 
-/// Gestor de subagentes asíncronos con aislamiento en *worktrees* Git (`SDD-09` Fases 2-4).
+/// Gestor de subagentes asíncronos con aislamiento en *worktrees* Git (`SDD-09` Fases 2-4,
+/// `SDD-10` Fase 1: drivers de harness CLI externos como backend alternativo).
 pub struct SubagentManager {
     worktree_mgr: Result<WorktreeManager, String>,
     root_policy: WorkspacePolicy,
     root_seed: u64,
     network_policy: SubagentNetworkPolicy,
     responder_factory: ResponderFactory,
+    /// Drivers de harness CLI externos registrados (`SDD-10`): construidos desde
+    /// `root_policy.external_drivers()` en [`Self::with_worktree_base_dir`].
+    external_drivers: Vec<Arc<dyn ExternalHarnessDriver>>,
     jobs: BTreeMap<String, ManagedJob>,
     pending_merge_tickets: BTreeMap<String, MergePreviewTicket>,
     tx: mpsc::Sender<SubagentCompletion>,
@@ -351,12 +386,20 @@ impl SubagentManager {
             let _ = mgr.prune_worktrees();
         }
         let (tx, rx) = mpsc::channel();
+        let external_drivers: Vec<Arc<dyn ExternalHarnessDriver>> = root_policy
+            .external_drivers()
+            .iter()
+            .map(|cfg| -> Arc<dyn ExternalHarnessDriver> {
+                Arc::new(ExternalDriverRunner::new(cfg.clone()))
+            })
+            .collect();
         Self {
             worktree_mgr,
             root_policy,
             root_seed,
             network_policy: SubagentNetworkPolicy::NativeOffline,
             responder_factory,
+            external_drivers,
             jobs: BTreeMap::new(),
             pending_merge_tickets: BTreeMap::new(),
             tx,
@@ -417,9 +460,23 @@ impl SubagentManager {
         }
     }
 
+    /// Lista los `id` de los drivers de harness CLI externos registrados (`SDD-10`),
+    /// p. ej. `["opencode"]` (los presets integrados siempre están disponibles).
+    #[allow(dead_code)]
+    pub fn external_driver_ids(&self) -> Vec<String> {
+        self.external_drivers
+            .iter()
+            .map(|d| d.id().to_string())
+            .collect()
+    }
+
     /// Lanza un subagente en un hilo aislado sobre un *worktree* Git nuevo y devuelve
     /// inmediatamente su resumen (`Running`) sin bloquear al agente raíz.
     /// Hace cumplir [`Self::max_concurrent`] deterministamente antes de crear worktrees o hilos.
+    ///
+    /// `driver` (`SDD-10` Fase 1): `None`/`"native"` → motor OnYX en proceso; `id` conocido
+    /// (`[[external_drivers]]`) → harness CLI externo dentro del mismo worktree; `id`
+    /// desconocido → error accionable con la lista de ids válidos.
     pub fn spawn_job(
         &mut self,
         goal: &str,
@@ -427,11 +484,46 @@ impl SubagentManager {
         max_steps: Option<i64>,
         spawn_tick: u64,
         graph_snapshot: Vec<u8>,
+        driver: Option<&str>,
     ) -> Result<SubagentJobSummary, String> {
         let goal_trimmed = goal.trim();
         if goal_trimmed.is_empty() {
             return Err("spawn_subagent requires a non-empty `goal`".to_string());
         }
+        // Resolución + validación del driver ANTES de crear worktree (error accionable temprano).
+        let resolved_external: Option<Arc<dyn ExternalHarnessDriver>> = match driver
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            Some(id) if !id.eq_ignore_ascii_case("native") => {
+                // Defense in depth: el gate de trust ya decide en la aprobación; aquí se
+                // garantiza que un workspace no confiado no ejecuta CLIs externos jamás.
+                if !self.root_policy.trust.config_trusted {
+                    return Err(format!(
+                        "blocked: external harness driver `{id}` requires a trusted workspace (run `openonyx trust` or `/trust` to approve)"
+                    ));
+                }
+                let entry = self
+                    .external_drivers
+                    .iter()
+                    .find(|d| d.id() == id)
+                    .ok_or_else(|| {
+                        let available: Vec<&str> = std::iter::once("native")
+                            .chain(self.external_drivers.iter().map(|d| d.id()))
+                            .collect();
+                        format!(
+                            "unknown subagent driver `{id}`; available drivers: {}",
+                            available.join(", ")
+                        )
+                    })?;
+                Some(entry.clone())
+            }
+            _ => None,
+        };
+        let driver_id = resolved_external
+            .as_ref()
+            .map(|d| d.id().to_string())
+            .unwrap_or_else(|| "native".to_string());
         let _ = self.poll_completions();
         let running = self
             .jobs
@@ -468,6 +560,13 @@ impl SubagentManager {
         };
 
         let sub_seed = derive_subagent_seed(self.root_seed, spawn_tick, &job_id);
+        let worker_backend = match resolved_external {
+            Some(driver) => WorkerBackend::External { driver },
+            None => WorkerBackend::Native {
+                graph_snapshot,
+                seed: sub_seed,
+            },
+        };
         let bounded_steps = max_steps
             .unwrap_or(DEFAULT_SUBAGENT_MAX_STEPS)
             .clamp(1, MAX_SUBAGENT_MAX_STEPS);
@@ -489,9 +588,8 @@ impl SubagentManager {
                     name: worker_name,
                     goal: worker_goal,
                     spawn_tick,
-                    sub_seed,
                     max_steps: bounded_steps,
-                    graph_snapshot,
+                    backend: worker_backend,
                     wt_policy,
                     handle: worker_handle,
                     worktree_mgr: mgr,
@@ -505,6 +603,7 @@ impl SubagentManager {
 
         let managed = ManagedJob {
             job_id: job_id.clone(),
+            driver: driver_id,
             name: display_name,
             goal: goal_trimmed.to_string(),
             spawn_tick,
@@ -917,12 +1016,13 @@ impl SubagentHandle {
         max_steps: Option<i64>,
         spawn_tick: u64,
         graph_snapshot: Vec<u8>,
+        driver: Option<&str>,
     ) -> Result<SubagentJobSummary, String> {
         let mut mgr = self
             .0
             .lock()
             .map_err(|_| "subagent manager lock poisoned".to_string())?;
-        mgr.spawn_job(goal, name, max_steps, spawn_tick, graph_snapshot)
+        mgr.spawn_job(goal, name, max_steps, spawn_tick, graph_snapshot, driver)
     }
 
     pub fn status(&self, job_id: Option<&str>) -> Result<Vec<SubagentJobSummary>, String> {
@@ -1018,9 +1118,10 @@ struct SubagentWorkerInput {
     name: String,
     goal: String,
     spawn_tick: u64,
-    sub_seed: u64,
     max_steps: i64,
-    graph_snapshot: Vec<u8>,
+    /// Backend de ejecución (`SDD-10`): solo [`WorkerBackend::Native`] usa
+    /// `max_steps`/`responder_factory`; [`WorkerBackend::External`] ejecuta el harness CLI.
+    backend: WorkerBackend,
     wt_policy: WorkspacePolicy,
     handle: WorktreeHandle,
     worktree_mgr: WorktreeManager,
@@ -1036,9 +1137,8 @@ fn run_subagent_worker(input: SubagentWorkerInput) {
         name,
         goal,
         spawn_tick,
-        sub_seed,
         max_steps,
-        graph_snapshot,
+        backend,
         wt_policy,
         handle,
         worktree_mgr,
@@ -1048,103 +1148,160 @@ fn run_subagent_worker(input: SubagentWorkerInput) {
         tx,
     } = input;
 
+    // `driver` de la propuesta: `"native"` o el `id` del harness CLI externo (`SDD-10`).
+    let driver_id = match &backend {
+        WorkerBackend::Native { .. } => "native".to_string(),
+        WorkerBackend::External { driver } => driver.id().to_string(),
+    };
+
     let mut ok = false;
     let mut summary;
     let mut cancelled = cancel_flag.load(Ordering::Acquire);
 
-    if !cancelled {
-        let wt_tools = WorkspaceTools::new(wt_policy).with_cancel_flag(Arc::clone(&cancel_flag));
-        let sub_config = AgentConfig {
-            default_max_steps: max_steps,
-            default_timeout_ticks: max_steps.saturating_mul(4).max(32),
-            ..AgentConfig::default()
-        };
+    match backend {
+        WorkerBackend::Native {
+            graph_snapshot,
+            seed: sub_seed,
+        } => {
+            if !cancelled {
+                let wt_tools =
+                    WorkspaceTools::new(wt_policy).with_cancel_flag(Arc::clone(&cancel_flag));
+                let sub_config = AgentConfig {
+                    default_max_steps: max_steps,
+                    default_timeout_ticks: max_steps.saturating_mul(4).max(32),
+                    ..AgentConfig::default()
+                };
 
-        let mut store = MemStore::new();
-        let has_snapshot =
-            !graph_snapshot.is_empty() && store.save("init", &graph_snapshot).is_ok();
+                let mut store = MemStore::new();
+                let has_snapshot =
+                    !graph_snapshot.is_empty() && store.save("init", &graph_snapshot).is_ok();
 
-        let host_res = AgentHost::builder(sub_seed)
-            .config(sub_config)
-            .system(Box::new(WorkspaceLedgerSystem::new()))
-            .store(Box::new(store))
-            .build();
+                let host_res = AgentHost::builder(sub_seed)
+                    .config(sub_config)
+                    .system(Box::new(WorkspaceLedgerSystem::new()))
+                    .store(Box::new(store))
+                    .build();
 
-        match host_res {
-            Ok(mut sub_host) => {
-                let sub_ws_vocab = WorkspaceVocab::resolve_with(|attr| sub_host.attr(attr));
-                if has_snapshot {
-                    sub_host.request_restore("init");
-                    sub_host.step(&mut HeadlessDriver::new());
-                    sub_host.set_tick(spawn_tick);
-                }
-
-                // Subagente nativo: sin `spawn_agent`/`spawn_subagent` recursivos y con
-                // auto-aprobación confinada al worktree desechable (las reglas `deny` y la
-                // protección del Control Plane siguen activas en `WorkspaceToolBridge`).
-                let sub_spec = AgentSpec::new(&name, &goal)
-                    .with_tools(WorkspaceTools::all_tool_names().iter().copied());
-                sub_host.spawn(&sub_spec);
-
-                let ws_bridge = WorkspaceToolBridge::new(sub_host.vocab(), wt_tools.clone())
-                    .with_mode(WorkspaceMode::Build)
-                    .with_workspace_vocab(sub_ws_vocab)
-                    .require_read_before_edit(true)
-                    .wrapping(HeadlessDriver::new());
-                let responder = (responder_factory)();
-                let mut driver =
-                    RecordingBridge::new(sub_host.vocab(), responder).wrapping(ws_bridge);
-
-                let max_ticks = usize::try_from(max_steps.saturating_mul(4).max(16)).unwrap_or(256);
-                for _ in 0..max_ticks {
-                    if cancel_flag.load(Ordering::Acquire) {
-                        cancelled = true;
-                        break;
-                    }
-                    sub_host.step(&mut driver);
-                    if cancel_flag.load(Ordering::Acquire) {
-                        cancelled = true;
-                        break;
-                    }
-                    if !sub_host.agents().is_empty() && sub_host.is_settled() {
-                        break;
-                    }
-                }
-
-                if let Some(agent_id) = sub_host.agents().last().copied() {
-                    let final_state = sub_host.agent_state(agent_id);
-                    ok = !cancelled && final_state == Some(AgentState::Done);
-                    summary = sub_host.result(agent_id).unwrap_or_else(|| {
-                        if cancelled {
-                            "cancelled by parent".to_string()
-                        } else {
-                            format!("subagent ended in state {final_state:?}")
+                match host_res {
+                    Ok(mut sub_host) => {
+                        let sub_ws_vocab = WorkspaceVocab::resolve_with(|attr| sub_host.attr(attr));
+                        if has_snapshot {
+                            sub_host.request_restore("init");
+                            sub_host.step(&mut HeadlessDriver::new());
+                            sub_host.set_tick(spawn_tick);
                         }
-                    });
-                } else {
-                    summary = if cancelled {
-                        "cancelled before spawn".to_string()
-                    } else {
-                        "subagent did not produce an agent entity".to_string()
-                    };
-                }
 
-                // Teardown explícito RAII ANTES de capturar commit o salir del hilo:
-                // 1. Detiene servicios Sprout (suelta sus `ProcessJob`).
-                // 2. Suelta `driver`, `sub_host` y `wt_tools` (libera handles en `worktree_path`).
-                let _ = wt_tools.sprout().stop(None, true);
-                drop(driver);
-                drop(sub_host);
-                drop(wt_tools);
-            }
-            Err(e) => {
-                let _ = wt_tools.sprout().stop(None, true);
-                drop(wt_tools);
-                summary = format!("failed to initialize isolated subagent host: {e}");
+                        // Subagente nativo: sin `spawn_agent`/`spawn_subagent` recursivos y con
+                        // auto-aprobación confinada al worktree desechable (las reglas `deny` y la
+                        // protección del Control Plane siguen activas en `WorkspaceToolBridge`).
+                        let sub_spec = AgentSpec::new(&name, &goal)
+                            .with_tools(WorkspaceTools::all_tool_names().iter().copied());
+                        sub_host.spawn(&sub_spec);
+
+                        let ws_bridge =
+                            WorkspaceToolBridge::new(sub_host.vocab(), wt_tools.clone())
+                                .with_mode(WorkspaceMode::Build)
+                                .with_workspace_vocab(sub_ws_vocab)
+                                .require_read_before_edit(true)
+                                .wrapping(HeadlessDriver::new());
+                        let responder = (responder_factory)();
+                        let mut driver =
+                            RecordingBridge::new(sub_host.vocab(), responder).wrapping(ws_bridge);
+
+                        let max_ticks =
+                            usize::try_from(max_steps.saturating_mul(4).max(16)).unwrap_or(256);
+                        for _ in 0..max_ticks {
+                            if cancel_flag.load(Ordering::Acquire) {
+                                cancelled = true;
+                                break;
+                            }
+                            sub_host.step(&mut driver);
+                            if cancel_flag.load(Ordering::Acquire) {
+                                cancelled = true;
+                                break;
+                            }
+                            if !sub_host.agents().is_empty() && sub_host.is_settled() {
+                                break;
+                            }
+                        }
+
+                        if let Some(agent_id) = sub_host.agents().last().copied() {
+                            let final_state = sub_host.agent_state(agent_id);
+                            ok = !cancelled && final_state == Some(AgentState::Done);
+                            summary = sub_host.result(agent_id).unwrap_or_else(|| {
+                                if cancelled {
+                                    "cancelled by parent".to_string()
+                                } else {
+                                    format!("subagent ended in state {final_state:?}")
+                                }
+                            });
+                        } else {
+                            summary = if cancelled {
+                                "cancelled before spawn".to_string()
+                            } else {
+                                "subagent did not produce an agent entity".to_string()
+                            };
+                        }
+
+                        // Teardown explícito RAII ANTES de capturar commit o salir del hilo:
+                        // 1. Detiene servicios Sprout (suelta sus `ProcessJob`).
+                        // 2. Suelta `driver`, `sub_host` y `wt_tools` (libera handles en
+                        //    `worktree_path`).
+                        let _ = wt_tools.sprout().stop(None, true);
+                        drop(driver);
+                        drop(sub_host);
+                        drop(wt_tools);
+                    }
+                    Err(e) => {
+                        let _ = wt_tools.sprout().stop(None, true);
+                        drop(wt_tools);
+                        summary = format!("failed to initialize isolated subagent host: {e}");
+                    }
+                }
+            } else {
+                summary = "cancelled before execution".to_string();
             }
         }
-    } else {
-        summary = "cancelled before execution".to_string();
+        WorkerBackend::External { driver } => {
+            // Harness CLI externo (`SDD-10`): se lanza dentro del mismo worktree Git aislado;
+            // el disco es la verdad y la captura `git commit-tree` compartida al final recoge
+            // lo que el harness haya dejado (o no).
+            if !cancelled {
+                match driver.run_in_worktree(&handle.worktree_path, &goal, &cancel_flag) {
+                    Ok(out) => {
+                        cancelled = out.cancelled;
+                        ok = !out.cancelled && !out.timed_out && out.exit_code == 0;
+                        let mut base = if out.cancelled {
+                            "cancelled by parent".to_string()
+                        } else if out.timed_out {
+                            format!(
+                                "external driver `{}` killed after timeout {:?}",
+                                driver.id(),
+                                driver.config().timeout
+                            )
+                        } else if out.exit_code == 0 {
+                            format!("external driver `{}` completed (exit 0)", driver.id())
+                        } else {
+                            format!(
+                                "external driver `{}` exited with code {}",
+                                driver.id(),
+                                out.exit_code
+                            )
+                        };
+                        if !out.clean_summary.is_empty() {
+                            base.push_str("\n--- output ---\n");
+                            base.push_str(&out.clean_summary);
+                        }
+                        summary = base;
+                    }
+                    Err(e) => {
+                        summary = e;
+                    }
+                }
+            } else {
+                summary = "cancelled before execution".to_string();
+            }
+        }
     }
 
     let (sub_commit, touched_files) = if cancelled {
@@ -1171,6 +1328,7 @@ fn run_subagent_worker(input: SubagentWorkerInput) {
 
     let proposal = SubagentProposal {
         job_id,
+        driver: driver_id,
         spawn_tick,
         branch_name: handle.branch_name,
         base_commit: handle.base_commit,
@@ -1216,6 +1374,10 @@ struct SpawnSubagentArgs {
     name: Option<String>,
     #[serde(default)]
     max_steps: Option<i64>,
+    /// Backend de ejecución (`SDD-10`): omitido/`"native"` → motor OnYX; `id` de un
+    /// `[[external_drivers]]` → harness CLI externo en el mismo worktree.
+    #[serde(default)]
+    driver: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1335,9 +1497,11 @@ impl SubagentManagerDriver {
                     args.max_steps,
                     self.current_poll,
                     snapshot,
+                    args.driver.as_deref(),
                 )?;
                 Ok(json!({
                     "job_id": summary.job_id,
+                    "driver": summary.driver,
                     "name": summary.name,
                     "status": summary.status,
                     "spawn_tick": summary.spawn_tick,
@@ -1356,6 +1520,7 @@ impl SubagentManagerDriver {
                     .map(|s| {
                         json!({
                             "job_id": s.job_id,
+                            "driver": s.driver,
                             "name": s.name,
                             "status": s.status,
                             "ok": s.ok,
@@ -1665,7 +1830,14 @@ mod tests {
                 .with_root_tools(tools);
 
         let spawned = mgr
-            .spawn_job("update sub.txt", Some("refactor"), Some(16), 5, Vec::new())
+            .spawn_job(
+                "update sub.txt",
+                Some("refactor"),
+                Some(16),
+                5,
+                Vec::new(),
+                None,
+            )
             .unwrap();
         assert_eq!(spawned.status, "running");
         assert_eq!(spawned.job_id, "refactor-1");
@@ -1765,7 +1937,14 @@ mod tests {
             SubagentManager::with_worktree_base_dir(policy, 99, sub_factory, Some(&wt_base));
 
         let spawned = mgr
-            .spawn_job("run long shell", Some("sleeper"), Some(8), 3, Vec::new())
+            .spawn_job(
+                "run long shell",
+                Some("sleeper"),
+                Some(8),
+                3,
+                Vec::new(),
+                None,
+            )
             .unwrap();
 
         // Wait until the subagent has actually dispatched `shell_exec` inside the worktree.
@@ -1824,6 +2003,7 @@ mod tests {
             tx.send(SubagentCompletion {
                 proposal: SubagentProposal {
                     job_id: id.to_string(),
+                    driver: "native".to_string(),
                     spawn_tick: tick,
                     branch_name: format!("onyx/sub/{id}"),
                     base_commit: "aaa".to_string(),
@@ -2019,15 +2199,15 @@ mod tests {
         assert_eq!(mgr.max_concurrent(), 2);
 
         let j1 = mgr
-            .spawn_job("job 1", Some("cap"), Some(8), 1, Vec::new())
+            .spawn_job("job 1", Some("cap"), Some(8), 1, Vec::new(), None)
             .unwrap();
         let j2 = mgr
-            .spawn_job("job 2", Some("cap"), Some(8), 2, Vec::new())
+            .spawn_job("job 2", Some("cap"), Some(8), 2, Vec::new(), None)
             .unwrap();
         assert_eq!(mgr.active_count(), 2);
 
         let err = mgr
-            .spawn_job("job 3", Some("cap"), Some(8), 3, Vec::new())
+            .spawn_job("job 3", Some("cap"), Some(8), 3, Vec::new(), None)
             .unwrap_err();
         assert!(
             err.contains("max concurrent subagents reached (2/2)"),
@@ -2044,6 +2224,147 @@ mod tests {
         let _ = mgr.discard_job(&j1.job_id);
         let _ = mgr.discard_job(&j2.job_id);
         drop(mgr);
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn spawn_job_rejects_unknown_external_driver_with_actionable_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "openonyx_drv_unknown_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let mut mgr = SubagentManager::new(policy, 1, Arc::new(|| Box::new(|_: &AgentView| None)));
+
+        // `driver` desconocido → error accionable que lista los ids disponibles
+        // (los presets integrados siempre están registrados: `native` + `opencode`).
+        let err = mgr
+            .spawn_job("goal", Some("x"), None, 1, Vec::new(), Some("nope"))
+            .unwrap_err();
+        assert!(err.contains("unknown subagent driver `nope`"), "{err}");
+        assert!(err.contains("native, opencode"), "{err}");
+
+        // `None` → backend nativo: el fallo (directorio no Git) llega en la creación del
+        // worktree, NO en la resolución de driver.
+        let err_native = mgr
+            .spawn_job("goal", None, None, 2, Vec::new(), None)
+            .unwrap_err();
+        assert!(
+            !err_native.contains("unknown subagent driver"),
+            "{err_native}"
+        );
+        assert!(
+            err_native.contains("async subagents require a Git repository"),
+            "{err_native}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_job_blocks_external_driver_on_untrusted_workspace() {
+        use onyx_workspace::WorkspaceTrustReport;
+
+        let repo = init_temp_git_repo("drv_untrusted");
+        let mut trust = WorkspaceTrustReport::no_project_config();
+        trust.config_trusted = false;
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_trust_report(trust);
+        let mut mgr = SubagentManager::new(policy, 1, Arc::new(|| Box::new(|_: &AgentView| None)));
+
+        let err = mgr
+            .spawn_job("goal", None, None, 1, Vec::new(), Some("opencode"))
+            .unwrap_err();
+        assert!(
+            err.contains("requires a trusted workspace"),
+            "untrusted workspace must hard-block external drivers, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn spawn_job_runs_external_driver_in_worktree_and_reports_result() {
+        use onyx_workspace::PromptTransport;
+
+        let repo = init_temp_git_repo("drv_e2e");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_drv_e2e_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        // Driver externo de prueba con un bin inexistente: el job debe completarse con
+        // `ok=false` y un summary accionable, sin romper el ciclo de trabajotree.
+        let fake = onyx_workspace::ExternalDriverConfig {
+            id: "fake-drv".to_string(),
+            bin: "definitely-missing-onyx-binary".to_string(),
+            args: Vec::new(),
+            prompt_transport: PromptTransport::Stdin,
+            prompt_flag: None,
+            timeout: Duration::from_secs(10),
+            allowed_env: Vec::new(),
+            inherit_home: false,
+            network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+        };
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![fake]);
+        let mut mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        );
+        assert_eq!(mgr.external_driver_ids(), vec!["fake-drv".to_string()]);
+
+        let spawned = mgr
+            .spawn_job(
+                "do something",
+                Some("ext"),
+                None,
+                7,
+                Vec::new(),
+                Some("fake-drv"),
+            )
+            .unwrap();
+        assert_eq!(spawned.driver, "fake-drv");
+        assert_eq!(spawned.status, "running");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let statuses = mgr.status(Some(&spawned.job_id)).unwrap();
+            if statuses[0].status == "done" || statuses[0].status == "failed" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "external driver job did not finish"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let s = &mgr.status(Some(&spawned.job_id)).unwrap()[0];
+        assert_eq!(s.driver, "fake-drv");
+        assert_eq!(s.status, "failed");
+        assert_eq!(s.ok, Some(false));
+        assert!(
+            s.summary
+                .contains("failed to spawn external driver `fake-drv`"),
+            "summary must be actionable, got: {}",
+            s.summary
+        );
+        assert!(!s.touched_files.iter().any(|f| f == "sub.txt"));
+        assert!(
+            s.worktree_path.is_dir(),
+            "worktree stays until discard/merge"
+        );
+        let _ = mgr.discard_job(&spawned.job_id);
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&repo);
     }
@@ -2078,7 +2399,7 @@ mod tests {
         let mut mgr =
             SubagentManager::with_worktree_base_dir(policy, 3, sub_factory, Some(&wt_base));
         let spawned = mgr
-            .spawn_job("write file", Some("toctou"), Some(16), 4, Vec::new())
+            .spawn_job("write file", Some("toctou"), Some(16), 4, Vec::new(), None)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -2147,7 +2468,7 @@ mod tests {
         let mut mgr =
             SubagentManager::with_worktree_base_dir(policy, 7, sub_factory, Some(&wt_base));
         let spawned = mgr
-            .spawn_job("write file", Some("keyed"), Some(16), 5, Vec::new())
+            .spawn_job("write file", Some("keyed"), Some(16), 5, Vec::new(), None)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -2251,7 +2572,14 @@ mod tests {
         let mut mgr =
             SubagentManager::with_worktree_base_dir(policy, 5, sub_factory, Some(&wt_base));
         let spawned = mgr
-            .spawn_job("edit sub.txt", Some("conflict"), Some(16), 6, Vec::new())
+            .spawn_job(
+                "edit sub.txt",
+                Some("conflict"),
+                Some(16),
+                6,
+                Vec::new(),
+                None,
+            )
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(15);

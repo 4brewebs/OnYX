@@ -6,11 +6,12 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value as JsonValue;
 
+use crate::external_driver::{builtin_external_driver_presets, load_external_drivers};
 use crate::impact::ImpactConfig;
 use crate::sandbox::{NetworkPolicy, SandboxConfig, SandboxMode};
 use crate::state::WorkspaceMode;
 use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
-use crate::worktree::SubagentNetworkPolicy;
+use crate::worktree::{ExternalDriverConfig, SubagentNetworkPolicy};
 
 /// Resultado de evaluar las reglas de permisos para una herramienta y sus argumentos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,6 +698,7 @@ pub struct WorkspacePolicy {
     pub impact: ImpactConfig,
     pub trust: WorkspaceTrustReport,
     pub trust_warnings: Vec<String>,
+    external_drivers: Vec<ExternalDriverConfig>,
 }
 
 impl WorkspacePolicy {
@@ -719,7 +721,19 @@ impl WorkspacePolicy {
             impact: ImpactConfig::default(),
             trust: WorkspaceTrustReport::no_project_config(),
             trust_warnings: Vec::new(),
+            external_drivers: builtin_external_driver_presets(),
         })
+    }
+
+    /// Drivers de harness CLI externos cargados (`preset < global < workspace (trusted)`; `SDD-10` Fase 1).
+    pub fn external_drivers(&self) -> &[ExternalDriverConfig] {
+        &self.external_drivers
+    }
+
+    /// Establece la lista de drivers externos explícitamente (tests, overrides de serie).
+    pub fn with_external_drivers(mut self, drivers: Vec<ExternalDriverConfig>) -> Self {
+        self.external_drivers = drivers;
+        self
     }
 
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
@@ -833,6 +847,19 @@ impl WorkspacePolicy {
             Err(err) => warnings.push(format!("failed to parse `[impact]`: {err}")),
         }
 
+        // `[[external_drivers]]` (`SDD-10` Fase 1): parse error → warning + presets intactos.
+        match load_external_drivers(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((drivers, drv_warns)) => {
+                self.external_drivers = drivers;
+                warnings.extend(drv_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[[external_drivers]]`: {err}")),
+        }
+
         self.trust = trust;
         self.trust_warnings = warnings;
         self
@@ -894,6 +921,53 @@ impl WorkspacePolicy {
     /// Evalúa las reglas de permisos configuradas (sin tener en cuenta `WorkspaceMode`).
     pub fn evaluate_permission(&self, tool: &str, args_json: &str) -> PermissionDecision {
         self.permissions.evaluate(tool, args_json, self.ignore_deny)
+    }
+
+    /// Gate de aprobación/trust para `spawn_subagent` con driver externo no-nativo (`SDD-10` Fase 1).
+    ///
+    /// Devuelve la decisión y un motivo accionable (no vacío en `Deny`/`Ask`):
+    /// - Workspace no confiado → `Deny` absoluto (límite de confianza; ni `ignore_deny` lo anula).
+    /// - Regla `deny` explícita `spawn_subagent(<driver>)` → `Deny`.
+    /// - Regla `allow` explícita `spawn_subagent(<driver>)` → `Allow`.
+    /// - En cualquier otro caso → `Ask` (nunca cae en el fallback estático `Allow` de
+    ///   herramientas no mutantes, que aplicaría a `spawn_subagent` sin driver).
+    pub fn external_driver_gate(&self, driver_id: &str) -> (PermissionDecision, String) {
+        if !self.trust.config_trusted {
+            return (
+                PermissionDecision::Deny,
+                format!(
+                    "blocked: external harness driver `{driver_id}` requires a trusted workspace (run `openonyx trust` or `/trust` to approve)"
+                ),
+            );
+        }
+        if !self.ignore_deny
+            && self
+                .permissions
+                .deny
+                .iter()
+                .any(|rule| match_permission_rule(rule, "spawn_subagent", driver_id).is_some())
+        {
+            return (
+                PermissionDecision::Deny,
+                format!(
+                    "blocked by permission policy (deny rule): `spawn_subagent` with external driver `{driver_id}`"
+                ),
+            );
+        }
+        if self
+            .permissions
+            .allow
+            .iter()
+            .any(|rule| match_permission_rule(rule, "spawn_subagent", driver_id).is_some())
+        {
+            return (PermissionDecision::Allow, String::new());
+        }
+        (
+            PermissionDecision::Ask,
+            format!(
+                "external harness driver `{driver_id}` will run an external CLI process in an isolated Git worktree"
+            ),
+        )
     }
 
     /// Evalúa las reglas de permisos aplicando las invariantes de seguridad:

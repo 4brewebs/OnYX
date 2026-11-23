@@ -14,7 +14,7 @@ use crate::state::{
     capture_git_tree_checkpoint, file_read_tick, graph_workspace_mode, is_file_read,
     normalize_rel_path, restore_git_tree_checkpoint_for_targets, undone_effects,
 };
-use crate::tools::{WorkspaceTools, is_async_subagent_tool};
+use crate::tools::{WorkspaceTools, is_async_subagent_tool, spawn_subagent_driver_from_args};
 
 /// Driver que observa agentes en `AgentState::Acting` con herramientas del
 /// workspace pendientes, valida políticas de modo/lectura previa, las ejecuta
@@ -247,6 +247,17 @@ impl PlatformDriver for WorkspaceToolBridge {
                                 "blocked by permission policy (deny rule): `{}`",
                                 pending.tool
                             )
+                        } else if let Some(driver) = pending
+                            .tool
+                            .eq("spawn_subagent")
+                            .then(|| spawn_subagent_driver_from_args(&pending.args))
+                            .flatten()
+                            .filter(|d| !d.eq_ignore_ascii_case("native"))
+                        {
+                            // Gate de drivers externos (`SDD-10`): workspace no confiado o regla `deny`.
+                            let (_, gate_reason) =
+                                self.tools.policy().external_driver_gate(&driver);
+                            gate_reason
                         } else {
                             format!(
                                 "blocked by control-plane protection (read-only): `{}`",

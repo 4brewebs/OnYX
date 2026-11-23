@@ -59,6 +59,23 @@ pub fn is_async_subagent_tool(tool: &str) -> bool {
     )
 }
 
+/// Extrae el campo `driver` (opcional) de los argumentos JSON de `spawn_subagent` (`SDD-10` Fase 1).
+/// Devuelve `None` si el JSON no parsea, no hay campo `driver`, o el valor no es un string no vacío.
+pub fn spawn_subagent_driver_from_args(args_json: &str) -> Option<String> {
+    let raw = if args_json.trim().is_empty() {
+        "{}"
+    } else {
+        args_json
+    };
+    let value: JsonValue = serde_json::from_str(raw).ok()?;
+    value
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+}
+
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
         let sprout = SproutSupervisor::new(policy.clone());
@@ -126,12 +143,24 @@ impl WorkspaceTools {
 
     /// Evalúa `WorkspaceMode` + `PermissionRules` estáticas + escalado monótono *Scent-Heated Approval*
     /// (`Allow → Ask`, nunca debilitando `Deny` ni `Ask`).
+    ///
+    /// `SDD-10` Fase 1: `spawn_subagent` con un driver externo no-nativo se decide por el gate
+    /// [`WorkspacePolicy::external_driver_gate`] (trust + regla `allow`/`deny` explícita por driver),
+    /// sin aplicar ni el escalado de impacto ni el fallback estático de no-mutantes.
     pub fn evaluate_permission_with_impact(
         &self,
         mode: WorkspaceMode,
         tool: &str,
         args_json: &str,
     ) -> (PermissionDecision, Option<ImpactAssessment>) {
+        if tool == "spawn_subagent" {
+            if let Some(driver) = spawn_subagent_driver_from_args(args_json) {
+                if !driver.eq_ignore_ascii_case("native") {
+                    let (decision, _reason) = self.policy.external_driver_gate(&driver);
+                    return (decision, None);
+                }
+            }
+        }
         let static_decision = self
             .policy
             .evaluate_permission_in_mode(mode, tool, args_json);
@@ -285,6 +314,21 @@ impl WorkspaceTools {
     }
 
     pub fn async_subagent_schemas() -> Vec<ToolSchema> {
+        Self::async_subagent_schemas_with_drivers(&[])
+    }
+
+    /// Variantes de `async_subagent_schemas` con la lista dinámica de drivers de harness CLI
+    /// externos habilitados (`SDD-10` Fase 1): el parámetro opcional `driver` de
+    /// `spawn_subagent` describe `native` (default) y los ids configurados.
+    pub fn async_subagent_schemas_with_drivers(driver_ids: &[String]) -> Vec<ToolSchema> {
+        let available = driver_ids.join(", ");
+        let driver_desc = if available.is_empty() {
+            "Optional execution backend for the subagent. `native` (default) runs the in-process OnYX engine; an external CLI harness id (e.g. `opencode`) delegates the goal to that external tool inside the same isolated Git worktree and requires explicit approval or an `allow spawn_subagent(<driver>)` rule.".to_string()
+        } else {
+            format!(
+                "Optional execution backend for the subagent. `native` (default) runs the in-process OnYX engine; an external CLI harness id (available: {available}) delegates the goal to that external tool inside the same isolated Git worktree and requires explicit approval or an `allow spawn_subagent(<driver>)` rule."
+            )
+        };
         vec![
             ToolSchema {
                 name: "spawn_subagent",
@@ -294,7 +338,8 @@ impl WorkspaceTools {
                     "properties": {
                         "name": { "type": "STRING", "description": "Optional short label for the background subagent." },
                         "goal": { "type": "STRING", "description": "Clear, bounded goal to execute inside the isolated worktree." },
-                        "max_steps": { "type": "INTEGER", "description": "Optional max reasoning steps for the subagent (default 32, max 128)." }
+                        "max_steps": { "type": "INTEGER", "description": "Optional max reasoning steps for the subagent (default 32, max 128)." },
+                        "driver": { "type": "STRING", "description": driver_desc }
                     },
                     "required": ["goal"]
                 }),
@@ -339,10 +384,18 @@ impl WorkspaceTools {
     }
 
     pub fn schemas_with_subagents(include_subagents: bool) -> Vec<ToolSchema> {
+        Self::schemas_with_subagents_and_drivers(include_subagents, &[])
+    }
+
+    /// Schemas completos con la lista dinámica de drivers externos habilitados (`SDD-10` Fase 1).
+    pub fn schemas_with_subagents_and_drivers(
+        include_subagents: bool,
+        driver_ids: &[String],
+    ) -> Vec<ToolSchema> {
         let mut out = Self::schemas();
         if include_subagents {
             out.push(Self::subagent_schema());
-            out.extend(Self::async_subagent_schemas());
+            out.extend(Self::async_subagent_schemas_with_drivers(driver_ids));
         }
         out
     }

@@ -137,6 +137,7 @@ pub struct WorkspaceVocab {
     pub effect_undone: Attr,
     pub effect_symbols: Attr,
     pub subagent_job_id: Attr,
+    pub subagent_driver: Attr,
     pub subagent_branch: Attr,
     pub subagent_status: Attr,
     pub subagent_ok: Attr,
@@ -170,6 +171,7 @@ impl WorkspaceVocab {
             effect_undone: reg("ws.effect.undone"),
             effect_symbols: reg("ws.effect.symbols"),
             subagent_job_id: reg("ws.subagent.job_id"),
+            subagent_driver: reg("ws.subagent.driver"),
             subagent_branch: reg("ws.subagent.branch"),
             subagent_status: reg("ws.subagent.status"),
             subagent_ok: reg("ws.subagent.ok"),
@@ -186,6 +188,7 @@ impl WorkspaceVocab {
 pub struct RecordedSubagent {
     pub id: ConceptId,
     pub job_id: String,
+    pub driver: String,
     pub branch: String,
     pub status: String,
     pub ok: bool,
@@ -593,6 +596,7 @@ pub fn upsert_subagent_record<G: Graph + ?Sized>(
     let id = existing.unwrap_or_else(|| graph.create());
 
     graph.set(id, ws.subagent_job_id, Value::Text(proposal.job_id.clone()));
+    graph.set(id, ws.subagent_driver, Value::Text(proposal.driver.clone()));
     graph.set(
         id,
         ws.subagent_branch,
@@ -657,6 +661,7 @@ pub fn graph_subagent_records<G: GraphView + ?Sized>(
         let Some(job_id) = prop_text(graph, id, ws.subagent_job_id) else {
             continue;
         };
+        let driver = prop_text(graph, id, ws.subagent_driver).unwrap_or_else(|| "native".into());
         let branch = prop_text(graph, id, ws.subagent_branch).unwrap_or_default();
         let status = prop_text(graph, id, ws.subagent_status).unwrap_or_else(|| "unknown".into());
         let ok = matches!(graph.get(id, ws.subagent_ok), Some(Value::Bool(true)));
@@ -677,6 +682,7 @@ pub fn graph_subagent_records<G: GraphView + ?Sized>(
         out.push(RecordedSubagent {
             id,
             job_id,
+            driver,
             branch,
             status,
             ok,
@@ -1201,6 +1207,7 @@ mod tests {
         let existing_file = ensure_file_node(&mut graph, &ws, "src/lib.rs");
         let proposal = SubagentProposal {
             job_id: "worker-1".to_string(),
+            driver: "native".to_string(),
             spawn_tick: 14,
             branch_name: "onyx/sub/worker-1".to_string(),
             base_commit: "aaa".to_string(),
@@ -1220,6 +1227,7 @@ mod tests {
         let records = graph_subagent_records(&graph, &ws);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].job_id, "worker-1");
+        assert_eq!(records[0].driver, "native");
         assert_eq!(records[0].status, "merged");
         assert_eq!(records[0].summary, "refined foo helper");
         assert_eq!(

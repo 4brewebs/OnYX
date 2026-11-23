@@ -2104,6 +2104,7 @@ mod tests {
         }];
         let bg_jobs = vec![crate::subagent::SubagentJobSummary {
             job_id: "bg-1".to_string(),
+            driver: "native".to_string(),
             name: "worker".to_string(),
             goal: "refactor parser".to_string(),
             spawn_tick: 7,

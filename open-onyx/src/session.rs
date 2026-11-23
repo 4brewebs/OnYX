@@ -19,6 +19,7 @@ use onyx_workspace::{
 };
 
 use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
+use crate::external_driver::ExternalDriverApprovalPolicy;
 use crate::ops::reconcile_rewind_effects_report;
 use crate::pack::{
     MilestoneSnapshotSystem, PackSnapshotStore, SharedPackStore, default_fork_dir,
@@ -732,7 +733,10 @@ pub fn build_host_with_shared_store(
     let mut builder = AgentHost::builder(seed)
         .config(config.clone())
         .system(Box::new(SubagentSystem::new(config)))
-        .system(Box::new(ledger));
+        .system(Box::new(ledger))
+        // `SDD-10` Fase 1: fuerza `WaitingApproval` solo para `spawn_subagent` con un
+        // driver externo no-nativo (el gate de trust/reglas decide Allow/Deny/Ask después).
+        .approval(Box::new(ExternalDriverApprovalPolicy));
     if let Some(sys) = extra_system {
         builder = builder.system(sys);
     }

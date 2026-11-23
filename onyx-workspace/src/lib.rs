@@ -1,6 +1,7 @@
 //! Capacidades de código, estado en grafo EAV y sandbox de workspace para harnesses sobre `onyx-soul-agents`.
 
 pub mod bridge;
+pub mod external_driver;
 pub mod impact;
 pub mod policy;
 pub mod sandbox;
@@ -11,6 +12,10 @@ pub mod trust;
 pub mod worktree;
 
 pub use bridge::WorkspaceToolBridge;
+pub use external_driver::{
+    builtin_external_driver_presets, load_external_drivers, merge_external_drivers,
+    parse_external_drivers_toml,
+};
 pub use impact::{
     ImpactAssessment, ImpactConfig, ImpactPatch, apply_impact_escalation,
     extract_unified_diff_line_ranges,
@@ -42,7 +47,8 @@ pub use state::{
 };
 pub use tools::{
     FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,
-    format_plan_steps, is_async_subagent_tool, preview_tool_diff,
+    format_plan_steps, is_async_subagent_tool, preview_tool_diff, scrub_secrets,
+    spawn_subagent_driver_from_args,
 };
 pub use trust::{
     ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,
@@ -50,7 +56,8 @@ pub use trust::{
     normalize_workspace_key, revoke_workspace_trust, trust_workspace,
 };
 pub use worktree::{
-    GitVersion, MIN_GIT_VERSION, ONYX_WT_DIR_ENV, SubagentNetworkPolicy, SubagentProposal,
-    WorktreeHandle, WorktreeInfo, WorktreeManager, WorktreeMergeOutcome, check_git_version,
-    parse_git_version, resolve_worktree_base_dir, validate_job_id,
+    ExternalDriverConfig, GitVersion, MIN_GIT_VERSION, ONYX_WT_DIR_ENV, PromptTransport,
+    SubagentNetworkPolicy, SubagentProposal, WorktreeHandle, WorktreeInfo, WorktreeManager,
+    WorktreeMergeOutcome, check_git_version, parse_git_version, resolve_worktree_base_dir,
+    validate_job_id,
 };
