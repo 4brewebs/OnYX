@@ -539,21 +539,36 @@ impl PlatformDriver for CliApprovalDriver {
                 let job_id = serde_json::from_str::<serde_json::Value>(&pending.args)
                     .ok()
                     .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
-                let imp = job_id.and_then(|jid| {
+                let preview = job_id.and_then(|jid| {
                     self.subagents.as_ref().and_then(|h| {
-                        match h.preview_merge_for_approval(&jid).ok()? {
-                            MergePreviewState::Clean(ticket) => {
-                                preview_diff = Some(ticket.unified_diff);
-                                ticket.impact
-                            }
-                            _ => None,
-                        }
+                        h.preview_merge_for_request(&jid, view.agent.0, view.request)
+                            .ok()
                     })
                 });
-                if apply_impact_escalation(static_dec, imp.as_ref()) != PermissionDecision::Ask {
-                    continue;
+                match preview {
+                    Some(MergePreviewState::Clean(ticket)) => {
+                        let imp = ticket.impact;
+                        preview_diff = Some(ticket.unified_diff);
+                        if apply_impact_escalation(static_dec, imp.as_ref())
+                            != PermissionDecision::Ask
+                        {
+                            continue;
+                        }
+                        imp
+                    }
+                    Some(MergePreviewState::NoOp) => {
+                        if static_dec != PermissionDecision::Ask {
+                            continue;
+                        }
+                        None
+                    }
+                    // `Conflict`, `Err` o `job_id` ausente: no pedir `y/n`.
+                    // `SubagentManagerDriver` auto-aprueba la solicitud para que
+                    // `subagent_merge` se ejecute y devuelva el error exacto (rutas en
+                    // conflicto, estado del job) a `root`, conservando el worktree
+                    // (igual que TUI y Web; `SDD-10` Paso 0).
+                    Some(MergePreviewState::Conflict { .. }) | None => continue,
                 }
-                imp
             } else if let Some(tools) = &self.tools {
                 let (decision, imp) = tools.evaluate_permission_with_impact(
                     WorkspaceMode::Build,

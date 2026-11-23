@@ -715,9 +715,9 @@ impl TuiInner {
                         .ok()
                         .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
                     let preview = job_id.and_then(|jid| {
-                        self.subagents
-                            .as_ref()
-                            .and_then(|h| h.preview_merge_for_approval(&jid).ok())
+                        self.subagents.as_ref().and_then(|h| {
+                            h.preview_merge_for_request(&jid, a.agent.0, a.request).ok()
+                        })
                     });
                     match preview {
                         Some(MergePreviewState::Clean(ticket)) => {

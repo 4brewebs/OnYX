@@ -218,6 +218,13 @@ pub struct SubagentJobSummary {
 pub struct MergePreviewTicket {
     #[allow(dead_code)]
     pub job_id: String,
+    /// Clave `(agent_id, request_id)` de la solicitud de aprobación que selló este ticket.
+    /// Permite a los redibujados periódicos de `TuiDriver`/`WebDriver` (`pump_idle`/SSE) y
+    /// al propio `SubagentManagerDriver` reutilizarlo mientras el usuario decide, sin
+    /// re-sellar `root_now_tree` ni relanzar `git write-tree` en cada frame. `None` en
+    /// previews sin solicitud asociada. La guarda anti-TOCTOU de `apply_clean_merge_checked`
+    /// sigue validando el árbol en el momento de aplicar (`SDD-10` Paso 0).
+    pub approval_key: Option<(u64, u64)>,
     pub root_now_commit: String,
     pub root_now_tree: String,
     pub sub_commit: String,
@@ -228,6 +235,10 @@ pub struct MergePreviewTicket {
 }
 
 /// Estado de la reconciliación 3-way previa a la aprobación y aplicación en disco.
+/// `Clean` lleva el ticket completo por valor (diff, archivos e impacto) porque los
+/// drivers lo renderizan antes de pedir la aprobación; el sobredimensionado respecto a
+/// `NoOp`/`Conflict` es intencional (`SDD-10` Paso 0 añade `approval_key` al ticket).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum MergePreviewState {
     NoOp,
@@ -646,6 +657,7 @@ impl SubagentManager {
                     .and_then(|t| t.assess_unified_diff_impact(&unified_diff));
                 let ticket = MergePreviewTicket {
                     job_id: id.to_string(),
+                    approval_key: None,
                     root_now_commit,
                     root_now_tree,
                     sub_commit: proposal.sub_commit,
@@ -670,6 +682,36 @@ impl SubagentManager {
                 })
             }
         }
+    }
+
+    /// Vista previa 3-way ligada a una solicitud de aprobación concreta `(agent_id,
+    /// request_id)`: si ya existe un [`MergePreviewTicket`] sellado para esa misma solicitud,
+    /// lo devuelve tal cual **sin** lanzar `git` (ni `current_working_tree_sha`/`write-tree`
+    /// ni `merge-tree`), de modo que los redibujados periódicos de `TuiDriver`/`WebDriver`
+    /// (`pump_idle`/SSE) y el propio `SubagentManagerDriver` no sobrescriban `root_now_tree`
+    /// en cada frame mientras el usuario decide. La guarda anti-TOCTOU de
+    /// `apply_clean_merge_checked` sigue validando el árbol en el momento de aplicar
+    /// (`SDD-10` Paso 0).
+    pub fn preview_merge_for_request(
+        &mut self,
+        job_id: &str,
+        agent_id: u64,
+        request_id: u64,
+    ) -> Result<MergePreviewState, String> {
+        let key = (agent_id, request_id);
+        let id = job_id.trim();
+        if let Some(existing) = self.pending_merge_tickets.get(id) {
+            if existing.approval_key == Some(key) {
+                return Ok(MergePreviewState::Clean(existing.clone()));
+            }
+        }
+        let mut state = self.prepare_merge_preview(job_id)?;
+        if let MergePreviewState::Clean(ticket) = &mut state {
+            ticket.approval_key = Some(key);
+            self.pending_merge_tickets
+                .insert(ticket.job_id.clone(), ticket.clone());
+        }
+        Ok(state)
     }
 
     /// Reconcilia en 3 vías el resultado de un subagente terminado sobre el *working tree* de
@@ -757,6 +799,7 @@ impl SubagentManager {
                         .and_then(|t| t.assess_unified_diff_impact(&unified_diff));
                     MergePreviewTicket {
                         job_id: id.to_string(),
+                        approval_key: None,
                         root_now_commit,
                         root_now_tree,
                         sub_commit: proposal.sub_commit.clone(),
@@ -915,12 +958,20 @@ impl SubagentHandle {
             .unwrap_or_default()
     }
 
-    pub fn preview_merge_for_approval(&self, job_id: &str) -> Result<MergePreviewState, String> {
+    /// Vista previa 3-way para la solicitud de aprobación `(agent_id, request_id)`:
+    /// reutiliza el [`MergePreviewTicket`] sellado para esa misma solicitud sin relanzar
+    /// `git write-tree`/`merge-tree` en cada redibujado (`SDD-10` Paso 0).
+    pub fn preview_merge_for_request(
+        &self,
+        job_id: &str,
+        agent_id: u64,
+        request_id: u64,
+    ) -> Result<MergePreviewState, String> {
         let mut mgr = self
             .0
             .lock()
             .map_err(|_| "subagent manager lock poisoned".to_string())?;
-        mgr.prepare_merge_preview(job_id)
+        mgr.preview_merge_for_request(job_id, agent_id, request_id)
     }
 
     pub fn merge_job(&self, job_id: &str) -> Result<SubagentMergeReport, String> {
@@ -1419,15 +1470,27 @@ impl PlatformDriver for SubagentManagerDriver {
             };
             let parsed_job = serde_json::from_str::<SubagentJobIdArgs>(raw);
             let decision = match parsed_job {
-                Ok(args) => match self.handle.preview_merge_for_approval(&args.job_id) {
-                    Ok(MergePreviewState::Clean(ticket)) => {
-                        apply_impact_escalation(static_decision, ticket.impact.as_ref())
+                Ok(args) => {
+                    // Preview ligado a la solicitud `(agent_id, request_id)`: los ticks
+                    // posteriores mientras la aprobación sigue pendiente reutilizan el
+                    // ticket sellado sin relanzar `git write-tree` (`SDD-10` Paso 0).
+                    let preview = self.handle.preview_merge_for_request(
+                        &args.job_id,
+                        view.agent.0,
+                        view.request,
+                    );
+                    match preview {
+                        Ok(MergePreviewState::Clean(ticket)) => {
+                            apply_impact_escalation(static_decision, ticket.impact.as_ref())
+                        }
+                        Ok(MergePreviewState::NoOp) => static_decision,
+                        // Conflictos o errores de estado se aprueban para que `subagent_merge` los
+                        // ejecute enseguida y devuelva la ruta exacta en conflicto a `root` (conservando worktree).
+                        Ok(MergePreviewState::Conflict { .. }) | Err(_) => {
+                            PermissionDecision::Allow
+                        }
                     }
-                    Ok(MergePreviewState::NoOp) => static_decision,
-                    // Conflictos o errores de estado se aprueban para que `subagent_merge` los
-                    // ejecute enseguida y devuelva la ruta exacta en conflicto a `root` (conservando worktree).
-                    Ok(MergePreviewState::Conflict { .. }) | Err(_) => PermissionDecision::Allow,
-                },
+                }
                 Err(_) => PermissionDecision::Allow,
             };
 
@@ -2055,6 +2118,105 @@ mod tests {
     }
 
     #[test]
+    fn preview_merge_for_request_reuses_sealed_ticket_per_approval_key() {
+        let repo = init_temp_git_repo("approval_key");
+        let wt_base = repo.parent().unwrap().join(format!(
+            "openonyx_wt_base_approval_key_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        let sub_factory: ResponderFactory = Arc::new(|| {
+            let mut step = 0usize;
+            Box::new(move |req: &AgentView| {
+                step += 1;
+                if step == 1 {
+                    Some(Reply::call_structured(
+                        req.agent,
+                        req.request,
+                        "fs_write",
+                        r#"{"path":"from_sub.txt","content":"subagent payload\n"}"#,
+                    ))
+                } else {
+                    Some(Reply::done(req.agent, req.request, "wrote from_sub.txt"))
+                }
+            })
+        });
+
+        let policy = WorkspacePolicy::new(&repo).unwrap();
+        let mut mgr =
+            SubagentManager::with_worktree_base_dir(policy, 7, sub_factory, Some(&wt_base));
+        let spawned = mgr
+            .spawn_job("write file", Some("keyed"), Some(16), 5, Vec::new())
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let statuses = mgr.status(Some(&spawned.job_id)).unwrap();
+            if statuses[0].status == "done" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for worker");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // 1º redibujado: sella el ticket para la solicitud de aprobación (11, 1).
+        let first = match mgr
+            .preview_merge_for_request(&spawned.job_id, 11, 1)
+            .unwrap()
+        {
+            MergePreviewState::Clean(t) => t,
+            other => panic!("expected Clean preview, got {other:?}"),
+        };
+        assert_eq!(first.approval_key, Some((11, 1)));
+        let sealed_tree = first.root_now_tree.clone();
+
+        // Edición externa concurrente: el árbol de root cambia mientras "el usuario decide".
+        fs::write(repo.join("late_edit.txt"), "concurrent root edit\n").unwrap();
+
+        // Mismo `(agent_id, request_id)`: reutiliza el ticket sellado sin re-sellar
+        // `root_now_tree` (ni `git write-tree` ni `merge-tree` en cada frame).
+        let redraw = match mgr
+            .preview_merge_for_request(&spawned.job_id, 11, 1)
+            .unwrap()
+        {
+            MergePreviewState::Clean(t) => t,
+            other => panic!("expected Clean preview, got {other:?}"),
+        };
+        assert_eq!(redraw.approval_key, Some((11, 1)));
+        assert_eq!(
+            redraw.root_now_tree, sealed_tree,
+            "redraw must reuse the sealed ticket, not re-scale root_now_tree"
+        );
+
+        // Nueva solicitud (11, 2): re-evalúa y sella un ticket fresco contra el árbol actual.
+        let second = match mgr
+            .preview_merge_for_request(&spawned.job_id, 11, 2)
+            .unwrap()
+        {
+            MergePreviewState::Clean(t) => t,
+            other => panic!("expected Clean preview, got {other:?}"),
+        };
+        assert_eq!(second.approval_key, Some((11, 2)));
+        assert_ne!(
+            second.root_now_tree, sealed_tree,
+            "a new approval request must re-scale against the current working tree"
+        );
+
+        // La guarda anti-TOCTOU sigue protegiendo el apply: un cambio posterior al
+        // último sello debe abortar el merge sin tocar el disco de root.
+        fs::write(repo.join("post_seal.txt"), "another root edit\n").unwrap();
+        let err = mgr.merge_job(&spawned.job_id).unwrap_err();
+        assert!(err.contains("TOCTOU guard aborted merge"), "{err}");
+        assert!(!repo.join("from_sub.txt").exists());
+
+        let _ = mgr.discard_job(&spawned.job_id).unwrap();
+        drop(mgr);
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn subagent_merge_conflict_preserves_worktree_and_returns_conflicting_paths() {
         let repo = init_temp_git_repo("conflict");
         let wt_base = repo
@@ -2301,7 +2463,7 @@ mod tests {
             Some(AgentState::WaitingApproval),
             "scent heat on public `hot_api` must escalate Allow -> Ask"
         );
-        match handle.preview_merge_for_approval("scent-1").unwrap() {
+        match handle.preview_merge_for_request("scent-1", 0, 0).unwrap() {
             MergePreviewState::Clean(ticket) => {
                 let impact = ticket.impact.expect("ticket must carry Scent impact");
                 assert!(impact.escalates_allow_to_ask, "{impact:?}");
