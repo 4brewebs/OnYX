@@ -92,6 +92,10 @@ pub(crate) struct LlmConfig {
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
+    /// Presupuesto explícito de extended thinking Anthropic (`REQ-04.2`):
+    /// `--thinking-budget` / `ANTHROPIC_THINKING_BUDGET` (`Some(0)` = off
+    /// explícito; `None` = se deriva de `--effort`). Solo aplica a Anthropic.
+    pub(crate) thinking_budget: Option<u64>,
     pub(crate) api_base: Option<String>,
     pub(crate) project_instructions: String,
 }
@@ -204,6 +208,9 @@ pub(crate) struct ResolvedLlmTarget {
     pub(crate) provider: LlmProvider,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
+    /// Presupuesto explícito de extended thinking Anthropic (`REQ-04.2`),
+    /// conservado en caliente al cambiar provider/modelo/esfuerzo.
+    pub(crate) thinking_budget: Option<u64>,
     pub(crate) api_key: String,
     pub(crate) api_base: Option<String>,
     pub(crate) is_local_endpoint: bool,
@@ -274,6 +281,7 @@ struct LlmActiveState {
     provider: LlmProvider,
     model: String,
     effort: Option<ReasoningEffort>,
+    thinking_budget: Option<u64>,
     api_key: String,
     api_base: Option<String>,
 }
@@ -460,6 +468,7 @@ impl LlmProfileHandle {
                 provider: cfg.provider,
                 model: cfg.model.clone(),
                 effort: cfg.effort,
+                thinking_budget: cfg.thinking_budget,
                 api_key: cfg.api_key.clone(),
                 api_base: cfg.api_base.clone(),
             },
@@ -559,6 +568,7 @@ impl LlmProfileHandle {
             provider: st.active.provider,
             model: st.active.model.clone(),
             effort: st.active.effort,
+            thinking_budget: st.active.thinking_budget,
             api_key: st.active.api_key.clone(),
             api_base: st.active.api_base.clone(),
             is_local_endpoint,
@@ -611,6 +621,7 @@ impl LlmProfileHandle {
             provider: entry.provider,
             model: entry.model.clone(),
             effort: entry.effort,
+            thinking_budget: st.active.thinking_budget,
             api_key,
             api_base: entry.api_base.clone(),
         };
@@ -651,6 +662,7 @@ impl LlmProfileHandle {
                 provider,
                 model: entry.model.clone(),
                 effort: st.active.effort,
+                thinking_budget: st.active.thinking_budget,
                 api_key,
                 api_base: entry.api_base.clone(),
             };
@@ -687,6 +699,7 @@ impl LlmProfileHandle {
                 provider,
                 model: provider.default_model().to_string(),
                 effort: st.active.effort,
+                thinking_budget: st.active.thinking_budget,
                 api_key,
                 api_base,
             };
@@ -816,6 +829,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: model.to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: api_base.map(|s| s.to_string()),
             project_instructions: String::new(),
         }

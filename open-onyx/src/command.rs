@@ -136,7 +136,7 @@ pub enum SlashCommand {
     Trust(Option<String>),
     /// `/profile [id]` (`SDD-03` Fase 2): cambia a un perfil LLM registrado o lista los disponibles.
     Profile(Option<String>),
-    /// `/provider <gemini|openai>` (`SDD-03` Fase 2): conmuta el provider LLM en caliente.
+    /// `/provider <gemini|openai|anthropic>` (`SDD-03` Fase 2): conmuta el provider LLM en caliente.
     Provider(Option<String>),
     /// `/model <name>` (`SDD-03` Fase 2): cambia el modelo del objetivo LLM activo.
     Model(Option<String>),

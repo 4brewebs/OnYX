@@ -23,7 +23,8 @@ use onyx_soul_agents::{
 
 use crate::anthropic::{
     AnthropicSharedState, AnthropicStreamTarget, DEFAULT_ANTHROPIC_API_BASE,
-    build_anthropic_request_body, execute_anthropic_stream_http,
+    anthropic_messages_url, build_anthropic_request_body, effective_thinking_budget,
+    execute_anthropic_stream_http,
 };
 use crate::context::{SessionTelemetryHandle, TieredContextConfig};
 use crate::gemini::{
@@ -262,18 +263,30 @@ impl PlatformDriver for DynamicLlmDriver {
                         .api_base
                         .clone()
                         .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_BASE.to_string());
-                    let url = format!("{base}/v1/messages");
+                    let url = anthropic_messages_url(&base);
                     let mut shared = self.anthropic_shared.clone();
                     shared.context_config = ctx_cfg;
                     shared.project_instructions = project_instructions.clone();
-                    let body = build_anthropic_request_body(
-                        &req,
-                        &model,
-                        ctx_cfg,
-                        &shared.project_instructions,
-                        true,
-                        &shared.driver_ids,
-                    );
+                    shared.thinking_budget = target.thinking_budget;
+                    let body = {
+                        let thinking_blocks = shared
+                            .thinking_blocks
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        let thinking_budget =
+                            effective_thinking_budget(shared.thinking_budget, effort);
+                        build_anthropic_request_body(
+                            &req,
+                            &model,
+                            ctx_cfg,
+                            &shared.project_instructions,
+                            true,
+                            &shared.driver_ids,
+                            &thinking_blocks,
+                            thinking_budget,
+                        )
+                    };
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
                     thread::spawn(move || {
@@ -284,6 +297,7 @@ impl PlatformDriver for DynamicLlmDriver {
                                 api_key: &api_key,
                                 agent,
                                 request,
+                                call_index,
                                 shared: &shared,
                                 preview: thread_preview.as_ref(),
                                 model: &model,

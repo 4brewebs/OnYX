@@ -287,6 +287,9 @@ pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
         || lower.contains("connection aborted")
         || lower.contains("broken pipe")
         || lower.contains("timed out")
+        // `REQ-04.1`: `error` event in-stream de Anthropic con
+        // `error.type == "overloaded_error"` (p. ej. 529) es reintenable.
+        || lower.contains("overloaded_error")
 }
 
 fn can_accept_partial_sse_eof(

@@ -1183,6 +1183,8 @@ pub fn model_context_window(model: &str) -> usize {
         1_000_000
     } else if lower.starts_with("gpt-4o") || lower.starts_with("o1") || lower.starts_with("o3") {
         128_000
+    } else if lower.starts_with("claude-") {
+        200_000
     } else {
         DEFAULT_MODEL_CONTEXT_TOKENS
     }
@@ -1204,6 +1206,10 @@ pub fn estimate_usage_cost_usd(model: &str, usage: TokenUsage) -> f64 {
         (2.50, 1.25, 10.00)
     } else if lower.starts_with("o1") || lower.starts_with("o3") {
         (3.00, 1.50, 12.00)
+    } else if lower.starts_with("claude-opus") {
+        (15.00, 1.50, 75.00)
+    } else if lower.starts_with("claude-") {
+        (3.00, 0.30, 15.00)
     } else {
         return 0.0;
     };
@@ -1583,5 +1589,32 @@ mod tests {
                 && summary.contains("evaluate_permission"),
             "{summary}"
         );
+    }
+
+    #[test]
+    fn claude_models_get_native_window_and_cost_rates() {
+        // `REQ-04.1`: ventana de 200k y tarifas aprox. $/1M para `claude-*`.
+        assert_eq!(model_context_window("claude-sonnet-4-5"), 200_000);
+        assert_eq!(model_context_window("claude-opus-4"), 200_000);
+
+        let usage = TokenUsage {
+            input_tokens: 2_000_000,
+            cached_input_tokens: 500_000,
+            output_tokens: 1_000_000,
+            reasoning_tokens: 0,
+        };
+        // sonnet/haiku: (1.5M uncached * 3.00) + (0.5M cached * 0.30) + (1M * 15.00) = 19.65
+        let sonnet = estimate_usage_cost_usd("claude-sonnet-4-5", usage);
+        assert!((sonnet - 19.65).abs() < 1e-9, "{sonnet}");
+
+        let opus_usage = TokenUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            output_tokens: 1_000_000,
+            reasoning_tokens: 0,
+        };
+        // opus: (1M * 15.00) + (1M * 75.00) = 90.0
+        let opus = estimate_usage_cost_usd("claude-opus-4", opus_usage);
+        assert!((opus - 90.0).abs() < 1e-9, "{opus}");
     }
 }

@@ -1,12 +1,22 @@
 //! Adaptador nativo para la API Anthropic Messages (`/v1/messages`) síncrono y streaming SSE.
-//! (`SDD-04` `REQ-04.1`.)
+//! (`SDD-04` `REQ-04.1` + `REQ-04.2`.)
 //!
 //! Cabeceras obligatorias: `x-api-key`, `anthropic-version: 2023-06-01` y
 //! `content-type: application/json`. El streaming usa eventos `event:` + `data:`
 //! (`message_start` / `content_block_delta` / `message_delta`), reutilizando
 //! `ContextBudget`, cola secuencial de tool calls y `StreamPreviewHandle` sin
 //! mutar el determinismo del grafo. Los reintentos ante `429` / `529`
-//! (`overloaded_error`) respetan `Retry-After`.
+//! (`overloaded_error`) respetan `Retry-After` (acotado a [`MAX_RETRY_AFTER_MS`]).
+//!
+//! `REQ-04.2` (Fase 2): prompt caching `cache_control: ephemeral` en el bloque de
+//! `system` y la última definición de tool, y extended thinking
+//! (`thinking.budget_tokens` vía `--thinking-budget` / `ANTHROPIC_THINKING_BUDGET`,
+//! con mapeo de `--effort` si no hay presupuesto explícito). Los bloques de
+//! `thinking` (con su `signature`) y `redacted_thinking` se capturan en el stream
+//! y se cachean en [`AnthropicSharedState`] para reinyectarlos antes del
+//! `tool_use` en el turno de continuación; si la firma no está en caché (p. ej.
+//! tras `--resume` o hot-swap de proveedor) se omite el parámetro `thinking`
+//! (fallback seguro, sin 400).
 //!
 //! Nota de ids: la API Anthropic exige que cada `tool_result.tool_use_id` coincida
 //! con el `tool_use.id` de la respuesta asistente **previa en la misma historia**.
@@ -14,9 +24,9 @@
 //! la memoria de la sesión (coherente por construcción) y no desde el id `toolu_*`
 //! emitido en el stream.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::BufReader;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -25,7 +35,8 @@ use onyx_workspace::WorkspaceTools;
 use serde_json::{Value as JsonValue, json};
 
 use crate::context::{
-    ProjectedTurn, SessionTelemetryHandle, TieredContextConfig, TokenUsage, project_memory,
+    ProjectedTurn, ReasoningEffort, SessionTelemetryHandle, TieredContextConfig, TokenUsage,
+    project_memory,
 };
 use crate::gemini::{
     PendingCallQueue, QueuedToolCall, StreamPreviewHandle, next_queued_call, push_queued_calls,
@@ -40,15 +51,39 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
 pub const DEFAULT_ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
-/// `max_tokens` por defecto (obligatorio en la API Messages; sin override en Fase 1).
-const DEFAULT_MAX_TOKENS: u64 = 8192;
+/// `max_tokens` por defecto (obligatorio en la API Messages).
+pub(crate) const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 8192;
+
+/// Tope del `max_tokens` auto-ajustado cuando extended thinking está activo.
+const MAX_THINKING_MAX_TOKENS: u64 = 64_000;
+
+/// `thinking.budget_tokens` mínimo explícito (0 = desactivado).
+pub(crate) const MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
+
+/// Tope del `Retry-After` sugerido por el servidor (ms): evita que un proxy
+/// malicioso/lento bloquee el bucle de reintentos indefinidamente.
+const MAX_RETRY_AFTER_MS: u64 = 60_000;
+
+/// Bloques de `thinking`/`redacted_thinking` (con `signature`) capturados por
+/// `(agente, call_index)`, para reinyectarlos en el turno de continuación del
+/// tool loop (`REQ-04.2`). Mismo patrón que `GeminiSharedState::thought_signatures`.
+pub(crate) type ThinkingBlockMap = Arc<Mutex<HashMap<(u64, usize), Vec<JsonValue>>>>;
 
 /// Estado compartido por los hilos de despacho Anthropic (cola secuencial de tool
-/// calls, telemetría). `pub(crate)` para que `DynamicLlmDriver` lo construya con la
-/// cola de tool calls compartida con Gemini y OpenAI.
+/// calls, bloques de thinking caché, telemetría). `pub(crate)` para que
+/// `DynamicLlmDriver` lo construya con la cola de tool calls compartida con Gemini
+/// y OpenAI.
 #[derive(Clone, Default)]
 pub(crate) struct AnthropicSharedState {
     pub(crate) pending_calls: PendingCallQueue,
+    /// Bloques de thinking (`signature` incluido) por `(agente, call_index)`.
+    pub(crate) thinking_blocks: ThinkingBlockMap,
+    /// Presupuesto explícito de `--thinking-budget` / `ANTHROPIC_THINKING_BUDGET`
+    /// (`Some(0)` = desactivado explícitamente; `None` = se deriva de `--effort`).
+    pub(crate) thinking_budget: Option<u64>,
+    /// `--effort` activo: se mapea a `thinking.budget_tokens` si no hay
+    /// presupuesto explícito (`REQ-04.2`).
+    pub(crate) effort: Option<ReasoningEffort>,
     pub(crate) project_instructions: Arc<String>,
     pub(crate) telemetry: Option<SessionTelemetryHandle>,
     pub(crate) context_config: TieredContextConfig,
@@ -60,8 +95,17 @@ pub(crate) struct AnthropicSharedState {
 /// Bloque de contenido asistente en curso de un stream `content_block_*`.
 enum BlockState {
     Text,
-    Thinking,
-    ToolUse { name: String, args: String },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        name: String,
+        args: String,
+    },
 }
 
 /// Resultado normalizado de una respuesta Anthropic (SSE acumulado u objeto
@@ -71,6 +115,9 @@ pub(crate) struct AnthropicStreamResult {
     pub(crate) text: String,
     pub(crate) thought: String,
     pub(crate) tool_calls: Vec<QueuedToolCall>,
+    /// Bloques `thinking` (con `signature`) / `redacted_thinking` en orden de
+    /// índice, listos para reinyectar en el turno de continuación.
+    pub(crate) thinking_blocks: Vec<JsonValue>,
     pub(crate) stop_reason: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
 }
@@ -84,22 +131,79 @@ fn tool_call_args_as_string(args: &str) -> String {
 }
 
 /// Extrae `TokenUsage` desde el `usage` de `message_start` (input/cache).
+///
+/// La API Anthropic reporta `input_tokens` **excluyendo** los tokens de caché
+/// (`cache_creation_input_tokens` / `cache_read_input_tokens`): se normaliza al
+/// total para que `estimate_usage_cost_usd` (que resta `cached_input_tokens`) y
+/// el `ctx %` no doble-cuenten ni colapsen.
 fn extract_anthropic_start_usage(usage: &JsonValue) -> Option<TokenUsage> {
+    let raw_input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     Some(TokenUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        cached_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        input_tokens: raw_input
+            .saturating_add(cache_creation)
+            .saturating_add(cache_read),
+        cached_input_tokens: cache_read,
         output_tokens: usage
             .get("output_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         reasoning_tokens: 0,
     })
+}
+
+/// Valida un presupuesto de extended thinking: `0` (desactivado) o >= 1024 tokens.
+pub(crate) fn parse_thinking_budget(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let value: u64 = trimmed.parse().map_err(|_| {
+        format!("--thinking-budget must be a non-negative integer number of tokens, got `{raw}`")
+    })?;
+    if value != 0 && value < MIN_THINKING_BUDGET_TOKENS {
+        return Err(format!(
+            "--thinking-budget must be 0 (disabled) or at least {MIN_THINKING_BUDGET_TOKENS} tokens, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Presupuesto efectivo de thinking para una llamada Anthropic (`REQ-04.2`):
+/// el valor explícito (`--thinking-budget` / `ANTHROPIC_THINKING_BUDGET`, donde
+/// `0` = desactivado explícito) tiene prioridad; sin él, `--effort` mapea a
+/// low → 2048, medium → 8192, high → 16384.
+pub(crate) fn effective_thinking_budget(
+    explicit: Option<u64>,
+    effort: Option<ReasoningEffort>,
+) -> Option<u64> {
+    if let Some(value) = explicit {
+        return Some(value);
+    }
+    match effort {
+        Some(ReasoningEffort::Low) => Some(2048),
+        Some(ReasoningEffort::Medium) => Some(8192),
+        Some(ReasoningEffort::High) => Some(16384),
+        _ => None,
+    }
+}
+
+/// URL `{base}/v1/messages` normalizada: una `api_base` que ya termina en
+/// `/v1` no genera `/v1/v1/messages`.
+pub(crate) fn anthropic_messages_url(api_base: &str) -> String {
+    let base = api_base.trim().trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
 }
 
 /// Fusiona mensajes consecutivos del mismo rol (Anthropic los rechaza):
@@ -137,6 +241,34 @@ fn push_user_message(messages: &mut Vec<JsonValue>, content: JsonValue) {
     messages.push(json!({"role": "user", "content": content}));
 }
 
+/// `true` si la historia proyectada contiene un `tool_use` cuya respuesta no
+/// tiene bloques de thinking en caché (con `signature`) — p. ej. tras
+/// `--resume` o un hot-swap de proveedor. En ese caso se omite el parámetro
+/// `thinking` de esta petición (fallback seguro) para que la API no devuelva
+/// 400 por bloques de thinking ausentes en la historia.
+fn history_missing_thinking(
+    turns: &[ProjectedTurn],
+    agent: u64,
+    cache: &HashMap<(u64, usize), Vec<JsonValue>>,
+) -> bool {
+    let mut prev_was_tool_call = false;
+    for turn in turns {
+        let is_tool_call = matches!(turn, ProjectedTurn::ToolCall { .. });
+        if is_tool_call && !prev_was_tool_call {
+            let call_index = match turn {
+                ProjectedTurn::ToolCall { call_index, .. } => *call_index,
+                _ => unreachable!("matched as ToolCall"),
+            };
+            if !cache.contains_key(&(agent, call_index)) {
+                return true;
+            }
+        }
+        prev_was_tool_call = is_tool_call;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_anthropic_request_body(
     req: &AgentView,
     model: &str,
@@ -144,9 +276,27 @@ pub(crate) fn build_anthropic_request_body(
     project_instructions: &str,
     stream: bool,
     driver_ids: &[String],
+    thinking_blocks: &HashMap<(u64, usize), Vec<JsonValue>>,
+    thinking_budget_tokens: Option<u64>,
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut messages: Vec<JsonValue> = Vec::with_capacity(projected.turns.len() + 1);
+
+    // `REQ-04.2`: extended thinking. El presupuesto explícito (`0` = off) manda;
+    // si no hay, `effective_thinking_budget` ya mapeó `--effort`. Se omite el
+    // parámetro en un tool loop con firmas ausentes (fallback seguro, sin 400).
+    // Se calcula **antes** del loop de turns: `projected.turns` se mueve allí.
+    let thinking_budget = thinking_budget_tokens.filter(|b| *b > 0);
+    let enable_thinking = thinking_budget
+        .is_some_and(|_| !history_missing_thinking(&projected.turns, req.agent.0, thinking_blocks));
+    // La API exige `max_tokens > budget_tokens`: se auto-ajusta hacia arriba.
+    let max_tokens = thinking_budget
+        .map(|b| {
+            DEFAULT_ANTHROPIC_MAX_TOKENS
+                .max(b.saturating_add(4096))
+                .min(MAX_THINKING_MAX_TOKENS)
+        })
+        .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS);
 
     for turn in projected.turns {
         match turn {
@@ -155,21 +305,36 @@ pub(crate) fn build_anthropic_request_body(
                 messages.push(json!({"role": "assistant", "content": text}));
             }
             ProjectedTurn::ToolCall {
+                call_index,
                 call_id,
                 name,
                 args_json,
                 ..
             } => {
-                let input =
-                    serde_json::from_str::<JsonValue>(&args_json).unwrap_or_else(|_| json!({}));
+                // La API exige `tool_use.input` como objeto JSON: cualquier
+                // args no-objecto cae a `{}`.
+                let input = serde_json::from_str::<JsonValue>(&args_json)
+                    .ok()
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| json!({}));
+                // `REQ-04.2`: se reinyectan los bloques de thinking (con
+                // `signature`) cacheados de la respuesta original al inicio de
+                // la secuencia de tool calls. Fallback seguro: sin caché → sin
+                // bloques (solo se cachea el primer call de cada respuesta, así
+                // la fusión de roles los coloca una sola vez).
+                let mut blocks = thinking_blocks
+                    .get(&(req.agent.0, call_index))
+                    .cloned()
+                    .unwrap_or_default();
+                blocks.push(json!({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": input
+                }));
                 messages.push(json!({
                     "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": name,
-                        "input": input
-                    }]
+                    "content": blocks
                 }));
             }
             ProjectedTurn::ToolObserve {
@@ -207,7 +372,7 @@ pub(crate) fn build_anthropic_request_body(
     }
     merge_consecutive_roles(&mut messages);
 
-    let tools: Vec<JsonValue> =
+    let mut tools: Vec<JsonValue> =
         WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
             .into_iter()
             .filter(|s| req.tools.iter().any(|t| t == s.name))
@@ -221,16 +386,31 @@ pub(crate) fn build_anthropic_request_body(
                 })
             })
             .collect();
+    // `REQ-04.2`: prompt caching `ephemeral` en la última definición de tool
+    // (el prefijo anterior queda cubierto por la ventana de 20 bloques).
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
 
-    let system = json!([{ "type": "text", "text": system_instruction_text(project_instructions) }]);
+    // `REQ-04.2`: prompt caching `ephemeral` en el bloque de `system`.
+    let system = json!([{
+        "type": "text",
+        "text": system_instruction_text(project_instructions),
+        "cache_control": {"type": "ephemeral"}
+    }]);
 
     let mut body = json!({
         "model": model,
-        "max_tokens": DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "system": system,
         "messages": messages,
         "stream": stream
     });
+    if enable_thinking {
+        if let Some(budget_tokens) = thinking_budget {
+            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget_tokens});
+        }
+    }
     if !tools.is_empty() {
         body["tools"] = JsonValue::Array(tools);
     }
@@ -244,6 +424,7 @@ pub(crate) fn parse_anthropic_message(json: &JsonValue) -> AnthropicStreamResult
         text: String::new(),
         thought: String::new(),
         tool_calls: Vec::new(),
+        thinking_blocks: Vec::new(),
         stop_reason: None,
         usage: None,
     };
@@ -262,8 +443,32 @@ pub(crate) fn parse_anthropic_message(json: &JsonValue) -> AnthropicStreamResult
                     }
                 }
                 Some("thinking") => {
-                    if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
-                        result.thought.push_str(t);
+                    let text = block
+                        .get("thinking")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    result.thought.push_str(&text);
+                    // Solo se puede reenviar un bloque de thinking si trae su
+                    // `signature` cifrada (sin ella la API rechazaría la historia).
+                    if !text.is_empty() {
+                        if let Some(sig) = block.get("signature").and_then(|v| v.as_str()) {
+                            result.thinking_blocks.push(json!({
+                                "type": "thinking",
+                                "thinking": text,
+                                "signature": sig
+                            }));
+                        }
+                    }
+                }
+                Some("redacted_thinking") => {
+                    if let Some(data) = block.get("data").and_then(|v| v.as_str()) {
+                        if !data.is_empty() {
+                            result.thinking_blocks.push(json!({
+                                "type": "redacted_thinking",
+                                "data": data
+                            }));
+                        }
                     }
                 }
                 Some("tool_use") => {
@@ -307,6 +512,7 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
         text: String::new(),
         thought: String::new(),
         tool_calls: Vec::new(),
+        thinking_blocks: Vec::new(),
         stop_reason: None,
         usage: None,
     };
@@ -319,15 +525,17 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
         let line = match line_res {
             Ok(l) => l,
             Err(err) => {
-                // Un stream que termina tras haber entregado texto, razonamiento
-                // o tool calls completos (y `message_delta`) se acepta como parcial.
-                if result.text.is_empty()
-                    && result.thought.is_empty()
-                    && result.tool_calls.is_empty()
-                {
-                    return Err(err.to_string());
+                // Un stream que se corta tras un `message_delta` completo
+                // (`stop_reason`) **y** contenido entregado se acepta como
+                // parcial; sin `stop_reason` se devuelve `Err` para que la capa
+                // HTTP reintente (no hay garantía de entrega completa).
+                let delivered = !result.text.is_empty()
+                    || !result.thought.is_empty()
+                    || !result.tool_calls.is_empty();
+                if result.stop_reason.is_some() && delivered {
+                    break;
                 }
-                break;
+                return Err(err.to_string());
             }
         };
         let trimmed = line.trim();
@@ -379,7 +587,21 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
                             }
                         }
                         Some("thinking") => {
-                            blocks.insert(index, BlockState::Thinking);
+                            blocks.insert(
+                                index,
+                                BlockState::Thinking {
+                                    text: String::new(),
+                                    signature: None,
+                                },
+                            );
+                        }
+                        Some("redacted_thinking") => {
+                            let data = block
+                                .get("data")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            blocks.insert(index, BlockState::RedactedThinking { data });
                         }
                         _ => {
                             blocks.insert(index, BlockState::Text);
@@ -407,9 +629,36 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default();
                             result.thought.push_str(t);
-                            blocks.insert(index, BlockState::Thinking);
+                            match blocks.get_mut(&index) {
+                                Some(BlockState::Thinking { text, .. }) => text.push_str(t),
+                                _ => {
+                                    blocks.insert(
+                                        index,
+                                        BlockState::Thinking {
+                                            text: t.to_string(),
+                                            signature: None,
+                                        },
+                                    );
+                                }
+                            }
                             if let Some(prev) = preview {
                                 prev.set_thought(agent.0, request, &result.thought);
+                            }
+                        }
+                        Some("signature_delta") => {
+                            // Firma cifrada del bloque de thinking: sin ella el
+                            // bloque no puede reenviarse en el tool loop.
+                            let sig = delta
+                                .get("data")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if let Some(BlockState::Thinking { signature, .. }) =
+                                blocks.get_mut(&index)
+                            {
+                                if !sig.is_empty() {
+                                    *signature = Some(sig);
+                                }
                             }
                         }
                         Some("input_json_delta") => {
@@ -444,11 +693,17 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
                     }
                 }
                 "error" => {
+                    let etype = payload
+                        .pointer("/error/type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown_error");
                     let msg = payload
                         .pointer("/error/message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
-                    return Err(format!("anthropic stream error: {msg}"));
+                    // El `type` va en el mensaje: `overloaded_error` (529) es
+                    // reintenable para la capa HTTP vía `is_retryable_stream_error`.
+                    return Err(format!("anthropic stream error ({etype}): {msg}"));
                 }
                 _ => {} // `ping`, `content_block_stop`, `message_stop`, `signature_delta`…
             }
@@ -473,26 +728,57 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
         return Err("anthropic: empty or non-SSE response".to_string());
     }
 
+    // `BTreeMap`: los bloques se recogen en orden de índice (thinking antes
+    // que `tool_use`, igual que la API los emitió).
     for block in blocks.into_values() {
-        if let BlockState::ToolUse { name, args } = block {
-            if !name.trim().is_empty() {
-                result.tool_calls.push(QueuedToolCall {
-                    name,
-                    args: tool_call_args_as_string(&args),
-                });
+        match block {
+            BlockState::ToolUse { name, args } => {
+                if !name.trim().is_empty() {
+                    result.tool_calls.push(QueuedToolCall {
+                        name,
+                        args: tool_call_args_as_string(&args),
+                    });
+                }
             }
+            BlockState::Thinking { text, signature } => {
+                // Sin `signature` el bloque no puede reenviarse: se descarta
+                // (aparece en `thought` pero no en `thinking_blocks`).
+                if !text.is_empty() {
+                    if let Some(sig) = signature {
+                        result.thinking_blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": text,
+                            "signature": sig
+                        }));
+                    }
+                }
+            }
+            BlockState::RedactedThinking { data } => {
+                if !data.is_empty() {
+                    result.thinking_blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": data
+                    }));
+                }
+            }
+            BlockState::Text => {}
         }
     }
     Ok(result)
 }
 
-/// Normaliza [`AnthropicStreamResult`] a `Reply` y registra telemetría por la
-/// llamada real (modelo/endpoint despachados, no los del handle).
+/// Normaliza [`AnthropicStreamResult`] a `Reply`, registra telemetría por la
+/// llamada real (modelo/endpoint despachados, no los del handle) y, si la
+/// respuesta trae bloques de thinking (con `signature`), los cachea bajo el
+/// `call_index` del **primer** tool call de la respuesta para reinyectarlos en
+/// el turno de continuación (`REQ-04.2`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn parse_anthropic_result(
     result: AnthropicStreamResult,
     agent: ConceptId,
     request: u64,
-    pending_calls: &PendingCallQueue,
+    shared: &AnthropicSharedState,
+    call_index: usize,
     telemetry: Option<&SessionTelemetryHandle>,
     model: &str,
     is_local_endpoint: bool,
@@ -503,9 +789,14 @@ pub(crate) fn parse_anthropic_result(
         }
     }
     if !result.tool_calls.is_empty() {
+        if !result.thinking_blocks.is_empty() {
+            if let Ok(mut cache) = shared.thinking_blocks.lock() {
+                cache.insert((agent.0, call_index), result.thinking_blocks.clone());
+            }
+        }
         let mut iter = result.tool_calls.into_iter();
         let first = iter.next().expect("non-empty tool_calls");
-        push_queued_calls(pending_calls, agent, iter);
+        push_queued_calls(&shared.pending_calls, agent, iter);
         return Reply::call_structured(agent, request, first.name, first.args);
     }
     if result.text.trim().is_empty() {
@@ -576,12 +867,17 @@ fn post_anthropic_json(
 }
 
 fn retry_delay_ms(attempt: usize, retry_after_ms: Option<u64>) -> Option<Duration> {
-    let backoff_ms = RETRY_BACKOFF_MS.get(attempt).copied();
-    let ms = backoff_ms
-        .zip(retry_after_ms)
-        .map(|(b, r)| b.max(r))
-        .or_else(|| backoff_ms.or(retry_after_ms));
-    ms.map(Duration::from_millis)
+    // Sin backoff definido para el intento (el último): se devuelve `None`
+    // para no dormir y que el caller devuelva directamente el `Reply` de error.
+    let backoff_ms = RETRY_BACKOFF_MS.get(attempt).copied()?;
+    // El `Retry-After` sugerido por el servidor se acota: un proxy lento no
+    // puede bloquear el bucle de reintentos indefinidamente.
+    let retry_after_ms = retry_after_ms.map(|ms| ms.min(MAX_RETRY_AFTER_MS));
+    let ms = match retry_after_ms {
+        Some(r) => backoff_ms.max(r),
+        None => backoff_ms,
+    };
+    Some(Duration::from_millis(ms))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -591,6 +887,7 @@ pub(crate) fn execute_anthropic_http(
     body: JsonValue,
     agent: ConceptId,
     request: u64,
+    call_index: usize,
     shared: &AnthropicSharedState,
     model: &str,
     is_local_endpoint: bool,
@@ -625,7 +922,8 @@ pub(crate) fn execute_anthropic_http(
             parse_anthropic_message(&json),
             agent,
             request,
-            &shared.pending_calls,
+            shared,
+            call_index,
             shared.telemetry.as_ref(),
             model,
             is_local_endpoint,
@@ -641,6 +939,7 @@ pub(crate) struct AnthropicStreamTarget<'a> {
     pub(crate) api_key: &'a str,
     pub(crate) agent: ConceptId,
     pub(crate) request: u64,
+    pub(crate) call_index: usize,
     pub(crate) shared: &'a AnthropicSharedState,
     pub(crate) preview: Option<&'a StreamPreviewHandle>,
     pub(crate) model: &'a str,
@@ -706,7 +1005,8 @@ pub(crate) fn execute_anthropic_stream_http(
             result,
             target.agent,
             target.request,
-            &target.shared.pending_calls,
+            target.shared,
+            target.call_index,
             target.shared.telemetry.as_ref(),
             target.model,
             target.is_local_endpoint,
@@ -766,6 +1066,16 @@ impl AnthropicResponder {
         self.shared.driver_ids = driver_ids;
         self
     }
+
+    pub fn with_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.shared.effort = effort;
+        self
+    }
+
+    pub fn with_thinking_budget(mut self, thinking_budget: Option<u64>) -> Self {
+        self.shared.thinking_budget = thinking_budget;
+        self
+    }
 }
 
 impl Responder for AnthropicResponder {
@@ -774,21 +1084,35 @@ impl Responder for AnthropicResponder {
             return Some(queued_reply);
         }
         let is_local = is_loopback_host(api_base_host(&self.api_base));
-        let url = format!("{}/v1/messages", self.api_base);
-        let body = build_anthropic_request_body(
-            req,
-            &self.model,
-            self.shared.context_config,
-            &self.shared.project_instructions,
-            false,
-            &self.shared.driver_ids,
-        );
+        let url = anthropic_messages_url(&self.api_base);
+        let body = {
+            let thinking_blocks = self
+                .shared
+                .thinking_blocks
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let thinking_budget =
+                effective_thinking_budget(self.shared.thinking_budget, self.shared.effort);
+            build_anthropic_request_body(
+                req,
+                &self.model,
+                self.shared.context_config,
+                &self.shared.project_instructions,
+                false,
+                &self.shared.driver_ids,
+                &thinking_blocks,
+                thinking_budget,
+            )
+        };
+        let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
         Some(execute_anthropic_http(
             &url,
             &self.api_key,
             body,
             req.agent,
             req.request,
+            call_index,
             &self.shared,
             &self.model,
             is_local,
@@ -837,11 +1161,14 @@ mod tests {
             "Project notes.",
             true,
             &[],
+            &HashMap::new(),
+            None,
         );
         assert_eq!(body["model"], "claude-sonnet-4-5");
-        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
         assert_eq!(body["stream"], true);
-        // `system` es un array de bloques (soporte futuro de `cache_control`).
+        // `system` es un array de bloques con prompt caching `ephemeral`
+        // (`REQ-04.2`) en el último bloque.
         let system = body["system"].as_array().unwrap();
         assert_eq!(system[0]["type"], "text");
         assert!(
@@ -850,6 +1177,7 @@ mod tests {
                 .unwrap()
                 .contains("Project notes.")
         );
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
 
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
@@ -881,6 +1209,9 @@ mod tests {
             tools[0].get("function").is_none(),
             "Anthropic usa `input_schema`"
         );
+        // `REQ-04.2`: `cache_control` solo en la última definición de tool.
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
@@ -932,18 +1263,21 @@ mod tests {
         assert_eq!(result.thought, "plan first ");
         assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
         let usage = result.usage.unwrap();
-        assert_eq!(usage.input_tokens, 25);
+        // `REQ-04.2`: `input_tokens` total (25 + 0 creación + 12 lectura).
+        assert_eq!(usage.input_tokens, 37);
         assert_eq!(usage.cached_input_tokens, 12);
         assert_eq!(
             usage.output_tokens, 18,
             "output_tokens llega en `message_delta`"
         );
 
+        let shared = AnthropicSharedState::default();
         let reply = parse_anthropic_result(
             result,
             ConceptId(2),
             5,
-            &PendingCallQueue::default(),
+            &shared,
+            0,
             None,
             "claude-sonnet-4-5",
             false,
@@ -990,18 +1324,24 @@ mod tests {
         assert_eq!(result.tool_calls[1].name, "git_status");
         assert_eq!(result.tool_calls[1].args, "{}");
         let usage = result.usage.unwrap();
-        assert_eq!(usage.input_tokens, 40);
+        // `REQ-04.2`: `input_tokens` total (40 + 8 lectura de caché).
+        assert_eq!(usage.input_tokens, 48);
         assert_eq!(
             usage.cached_input_tokens, 8,
             "TEST-04.1: `cache_read_input_tokens`"
         );
         assert_eq!(usage.output_tokens, 30);
 
+        let shared = AnthropicSharedState {
+            pending_calls: Arc::clone(&pending),
+            ..AnthropicSharedState::default()
+        };
         let reply = parse_anthropic_result(
             result,
             ConceptId(2),
             6,
-            &pending,
+            &shared,
+            0,
             None,
             "claude-sonnet-4-5",
             false,
@@ -1056,7 +1396,21 @@ mod tests {
         let err = accumulate_anthropic_sse_reader(reader_err, ConceptId(2), 2, None).unwrap_err();
         assert!(is_retryable_stream_error(&err), "{err}");
 
-        // Evento `error` de la API: fallo inmediato.
+        // Texto entregado pero **sin** `message_delta` (`stop_reason` ausente):
+        // no hay garantía de entrega completa → `Err` reintenable.
+        let text_no_stop = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+        );
+        let reader_no_stop = BufReader::new(ChunkErrorReader {
+            data: text_no_stop.as_bytes().to_vec(),
+            pos: 0,
+        });
+        let err =
+            accumulate_anthropic_sse_reader(reader_no_stop, ConceptId(2), 4, None).unwrap_err();
+        assert!(is_retryable_stream_error(&err), "{err}");
+
+        // Evento `error` de la API con `overloaded_error`: reintenable (529).
         let err_event = concat!(
             "event: error\n",
             "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n"
@@ -1069,6 +1423,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Overloaded"), "{err}");
+        assert!(err.contains("overloaded_error"), "{err}");
+        assert!(is_retryable_stream_error(&err), "{err}");
     }
 
     #[test]
@@ -1088,7 +1444,8 @@ mod tests {
         assert_eq!(result.text, "Let me read it.");
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         let usage = result.usage.unwrap();
-        assert_eq!(usage.input_tokens, 10);
+        // `REQ-04.2`: `input_tokens` total (10 + 2 lectura de caché).
+        assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.cached_input_tokens, 2);
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(result.tool_calls.len(), 1);
@@ -1104,8 +1461,16 @@ mod tests {
             ("user".to_string(), "follow-up question".to_string()),
             ("denied".to_string(), "user declined write".to_string()),
         ];
-        let body =
-            build_anthropic_request_body(&req, "m", TieredContextConfig::default(), "", false, &[]);
+        let body = build_anthropic_request_body(
+            &req,
+            "m",
+            TieredContextConfig::default(),
+            "",
+            false,
+            &[],
+            &HashMap::new(),
+            None,
+        );
         let msgs = body["messages"].as_array().unwrap();
         // `Goal:` (user) + `follow-up` (user) + `denied` sin emparejar (user) se funden
         // en un solo mensaje con bloques de texto (Anthropic rechaza roles repetidos).
@@ -1117,6 +1482,260 @@ mod tests {
         assert_eq!(
             blocks[2]["text"],
             "Tool call denied: user declined write. Adjust your plan."
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_parse_and_effort_mapping() {
+        // `REQ-04.2`: validación 0 (off) o >= 1024.
+        assert_eq!(parse_thinking_budget("0").unwrap(), 0);
+        assert_eq!(parse_thinking_budget("1024").unwrap(), 1024);
+        assert_eq!(parse_thinking_budget(" 2048 ").unwrap(), 2048);
+        assert!(parse_thinking_budget("512").is_err());
+        assert!(parse_thinking_budget("abc").is_err());
+        assert!(parse_thinking_budget("-1").is_err());
+
+        // El explícito manda (incluso `0` = off contra `--effort`).
+        assert_eq!(
+            effective_thinking_budget(Some(0), Some(ReasoningEffort::High)),
+            Some(0)
+        );
+        assert_eq!(
+            effective_thinking_budget(Some(4096), Some(ReasoningEffort::Low)),
+            Some(4096)
+        );
+        // Sin explícito: `--effort` mapea low → 2048, medium → 8192, high → 16384.
+        assert_eq!(
+            effective_thinking_budget(None, Some(ReasoningEffort::Low)),
+            Some(2048)
+        );
+        assert_eq!(
+            effective_thinking_budget(None, Some(ReasoningEffort::Medium)),
+            Some(8192)
+        );
+        assert_eq!(
+            effective_thinking_budget(None, Some(ReasoningEffort::High)),
+            Some(16384)
+        );
+        assert_eq!(effective_thinking_budget(None, None), None);
+    }
+
+    #[test]
+    fn anthropic_request_body_thinking_budget_adjusts_max_tokens() {
+        let req = dummy_agent_view(1, 3);
+        // high → 16384: `max_tokens` se auto-ajusta a > `budget_tokens`.
+        let budget = effective_thinking_budget(None, Some(ReasoningEffort::High)).unwrap();
+        let body = build_anthropic_request_body(
+            &req,
+            "claude-sonnet-4-5",
+            TieredContextConfig::default(),
+            "",
+            false,
+            &[],
+            &HashMap::new(),
+            Some(budget),
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 16384);
+        assert!(
+            body["max_tokens"].as_u64().unwrap() > 16384,
+            "`max_tokens` debe superar `budget_tokens`"
+        );
+        assert_eq!(body["max_tokens"], 20480);
+
+        // `--thinking-budget 0` = off explícito: sin `thinking` ni ajuste.
+        let body = build_anthropic_request_body(
+            &req,
+            "claude-sonnet-4-5",
+            TieredContextConfig::default(),
+            "",
+            false,
+            &[],
+            &HashMap::new(),
+            Some(0),
+        );
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
+
+        // Sin presupuesto ni esfuerzo: sin `thinking`.
+        let body = build_anthropic_request_body(
+            &req,
+            "claude-sonnet-4-5",
+            TieredContextConfig::default(),
+            "",
+            false,
+            &[],
+            &HashMap::new(),
+            None,
+        );
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
+    }
+
+    #[test]
+    fn anthropic_sse_reader_captures_thinking_signature_and_reinjected_in_tool_loop() {
+        // `REQ-04.2`: thinking (con `signature_delta`) + `redacted_thinking` +
+        // `tool_use` → bloques cacheados para el turno de continuación.
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think \"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"data\":\"sig_abc\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"red_1\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"fs_read\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n"
+        );
+        let result =
+            accumulate_anthropic_sse_reader(BufReader::new(sse.as_bytes()), ConceptId(7), 1, None)
+                .unwrap();
+        assert_eq!(result.thought, "think ");
+        assert_eq!(result.thinking_blocks.len(), 2);
+        assert_eq!(result.thinking_blocks[0]["type"], "thinking");
+        assert_eq!(result.thinking_blocks[0]["thinking"], "think ");
+        assert_eq!(result.thinking_blocks[0]["signature"], "sig_abc");
+        assert_eq!(result.thinking_blocks[1]["type"], "redacted_thinking");
+        assert_eq!(result.thinking_blocks[1]["data"], "red_1");
+        assert_eq!(result.tool_calls.len(), 1);
+
+        let shared = AnthropicSharedState::default();
+        let reply = parse_anthropic_result(
+            result,
+            ConceptId(7),
+            1,
+            &shared,
+            0,
+            None,
+            "claude-sonnet-4-5",
+            false,
+        );
+        let _ = reply; // `call_structured` (primer tool call)
+        let cache = shared.thinking_blocks.lock().unwrap();
+        let cached = cache
+            .get(&(7u64, 0usize))
+            .expect("caché bajo (agente, call_index 0)");
+        assert_eq!(cached.len(), 2);
+        drop(cache);
+
+        // Turno de continuación: la historia tiene el `tool_use` `call_0` y su
+        // resultado; los bloques cacheados se reinyectan **antes** del tool_use
+        // y `thinking` se habilita (firma presente en caché).
+        let mut cont = dummy_agent_view(7, 2);
+        cont.memory = vec![
+            ("call".to_string(), r#"fs_read {"path":"a.rs"}"#.to_string()),
+            ("observe".to_string(), "1: fn main() {}".to_string()),
+        ];
+        let cache = shared.thinking_blocks.lock().unwrap().clone();
+        let body = build_anthropic_request_body(
+            &cont,
+            "claude-sonnet-4-5",
+            TieredContextConfig::default(),
+            "",
+            false,
+            &[],
+            &cache,
+            Some(2048),
+        );
+        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+        let msgs = body["messages"].as_array().unwrap();
+        let assistant = &msgs[1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "sig_abc");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[2]["type"], "tool_use");
+        assert_eq!(content[2]["id"], "call_0");
+
+        // Fallback seguro: sin firmas en caché (p. ej. `--resume`) se omite el
+        // parámetro `thinking` — sin bloques inyectados, solo el `tool_use`.
+        let body = build_anthropic_request_body(
+            &cont,
+            "claude-sonnet-4-5",
+            TieredContextConfig::default(),
+            "",
+            false,
+            &[],
+            &HashMap::new(),
+            Some(2048),
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "fallback: sin firmas → sin `thinking`"
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        let content = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_start_usage_normalizes_cache_tokens() {
+        // La API reporta `input_tokens` sin los tokens de caché: se suma el
+        // total y `cached_input_tokens` refleja solo los leídos (coste reducido).
+        let usage: JsonValue = json!({
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 5,
+            "cache_read_input_tokens": 3,
+            "output_tokens": 4
+        });
+        let u = extract_anthropic_start_usage(&usage).unwrap();
+        assert_eq!(u.input_tokens, 18);
+        assert_eq!(u.cached_input_tokens, 3);
+        assert_eq!(u.output_tokens, 4);
+    }
+
+    #[test]
+    fn anthropic_retry_delay_caps_retry_after_and_stops_on_last_attempt() {
+        // Backoff base; `Retry-After` mayor manda (acotado a 60s).
+        assert_eq!(retry_delay_ms(0, None), Some(Duration::from_millis(400)));
+        assert_eq!(
+            retry_delay_ms(0, Some(90_000)),
+            Some(Duration::from_millis(MAX_RETRY_AFTER_MS))
+        );
+        assert_eq!(
+            retry_delay_ms(1, Some(2_000)),
+            Some(Duration::from_millis(2_000))
+        );
+        // Último intento: sin backoff → `None` (no se duerme; se devuelve el error).
+        assert_eq!(retry_delay_ms(2, Some(90_000)), None);
+        assert_eq!(retry_delay_ms(2, None), None);
+    }
+
+    #[test]
+    fn anthropic_messages_url_avoids_double_v1() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://localhost:8080/v1"),
+            "https://localhost:8080/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://localhost:8080/v1/"),
+            "https://localhost:8080/v1/messages"
         );
     }
 }

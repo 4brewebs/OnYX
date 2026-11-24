@@ -2399,6 +2399,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };

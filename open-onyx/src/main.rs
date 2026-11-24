@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::{Duration, SystemTime};
 
-use anthropic::{AnthropicResponder, DEFAULT_ANTHROPIC_MODEL};
+use anthropic::{AnthropicResponder, DEFAULT_ANTHROPIC_MODEL, parse_thinking_budget};
 use command::{CommandSpawnerSystem, PendingSessionAction, PendingSystemNotes};
 use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
@@ -69,6 +69,9 @@ struct CliArgs {
     provider: Option<LlmProvider>,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    /// `--thinking-budget <tokens>` (Anthropic extended thinking, `REQ-04.2`):
+    /// `Some(0)` = off explícito, `Some(n)` = >= 1024, `None` = se deriva de `--effort`.
+    thinking_budget: Option<u64>,
     api_base: Option<String>,
     allow_custom_auth_host: bool,
     trust_workspace: bool,
@@ -100,6 +103,7 @@ impl CliArgs {
             provider: None,
             model: None,
             effort: None,
+            thinking_budget: None,
             api_base: None,
             allow_custom_auth_host: false,
             trust_workspace: false,
@@ -175,6 +179,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut provider: Option<LlmProvider> = None;
     let mut model: Option<String> = None;
     let mut effort: Option<ReasoningEffort> = None;
+    let mut thinking_budget: Option<u64> = None;
     let mut api_base: Option<String> = None;
     let mut allow_custom_auth_host = false;
     let mut trust_workspace_flag = false;
@@ -230,6 +235,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     .next()
                     .ok_or("--effort requires `low`, `medium`, or `high`")?;
                 effort = Some(ReasoningEffort::parse(&e)?);
+            }
+            "--thinking-budget" => {
+                let s = args
+                    .next()
+                    .ok_or("--thinking-budget requires a token count (0 or >= 1024)")?;
+                thinking_budget = Some(parse_thinking_budget(&s)?);
             }
             "--api-base" => {
                 let u = args.next().ok_or("--api-base requires a URL")?;
@@ -491,6 +502,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         provider,
         model,
         effort,
+        thinking_budget,
         api_base,
         allow_custom_auth_host,
         trust_workspace: trust_workspace_flag,
@@ -516,7 +528,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -536,7 +548,9 @@ OPTIONS:
   -w, --workspace <dir>    Target workspace directory (default: current working directory)
       --provider <name>    LLM backend: `gemini` (default), `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio) or `anthropic` (native Messages API)
       --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`, Anthropic `__ANTHROPIC_MODEL__`)
-      --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`)
+      --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`); for `anthropic` it maps to a thinking budget (low 2048 / medium 8192 / high 16384) when no explicit budget is set
+      --thinking-budget <n>
+                            Anthropic extended thinking budget in tokens (`0` = off, or >= 1024; or `ANTHROPIC_THINKING_BUDGET`). Raises `max_tokens` above the budget; without it, `--effort` maps to a budget for `anthropic`
       --api-base <url>     Custom API base URL (`http://` allowed on loopback only; remote hosts require `https://`)
       --allow-custom-auth-host
                            Explicit opt-in to send API keys to non-official remote HTTPS `--api-base` hosts (or `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`)
@@ -638,7 +652,9 @@ ENVIRONMENT VARIABLES:
   GEMINI_API_BASE          Custom Gemini API endpoint
   OPENAI_API_BASE / OPENAI_BASE_URL
                            Custom OpenAI-compatible API endpoint
-  ANTHROPIC_API_BASE       Custom Anthropic API endpoint (default `https://api.anthropic.com`)"#
+  ANTHROPIC_API_BASE       Custom Anthropic API endpoint (default `https://api.anthropic.com`)
+  ANTHROPIC_THINKING_BUDGET
+                           Anthropic extended thinking budget in tokens (`0` = off, or >= 1024); overrides the `--effort`-derived budget"#
         .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
         .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL)
         .replace("__ANTHROPIC_MODEL__", DEFAULT_ANTHROPIC_MODEL);
@@ -682,7 +698,8 @@ fn resolve_llm_config(
                     LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
                         .ok()
                         .filter(|s| !s.trim().is_empty()),
-                    // Anthropic: `--thinking-budget` llega en Fase 2 (`SDD-04`).
+                    // Anthropic: el thinking lo gobierna `--thinking-budget` /
+                    // `ANTHROPIC_THINKING_BUDGET` (no hay env de effort).
                     LlmProvider::Anthropic => None,
                 });
             match env_val {
@@ -728,6 +745,7 @@ fn resolve_llm_config(
                 api_key,
                 model,
                 effort,
+                thinking_budget: None,
                 api_base,
                 project_instructions,
             })
@@ -768,6 +786,7 @@ fn resolve_llm_config(
                 api_key,
                 model,
                 effort,
+                thinking_budget: None,
                 api_base,
                 project_instructions,
             })
@@ -800,11 +819,20 @@ fn resolve_llm_config(
                         .filter(|s| !s.trim().is_empty())
                 })
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string());
+            // `REQ-04.2`: presupuesto explícito (`--thinking-budget` / env);
+            // `None` → se deriva de `--effort` (low 2048 / medium 8192 / high 16384).
+            let thinking_budget = cli.thinking_budget.or_else(|| {
+                env::var("ANTHROPIC_THINKING_BUDGET")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .and_then(|raw| parse_thinking_budget(&raw).ok())
+            });
             Ok(LlmConfig {
                 provider,
                 api_key,
                 model,
                 effort,
+                thinking_budget,
                 api_base,
                 project_instructions,
             })
@@ -855,7 +883,8 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
                 LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
                     .ok()
                     .filter(|s| !s.trim().is_empty()),
-                // Anthropic: `--thinking-budget` llega en Fase 2 (`SDD-04`).
+                // Anthropic: el thinking lo gobierna `--thinking-budget` /
+                // `ANTHROPIC_THINKING_BUDGET` (no hay env de effort).
                 LlmProvider::Anthropic => None,
             })
             .and_then(|raw| ReasoningEffort::parse(&raw).ok()),
@@ -882,6 +911,7 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
         api_key: String::new(),
         model,
         effort,
+        thinking_budget: None,
         api_base,
         project_instructions: String::new(),
     })
@@ -923,6 +953,8 @@ fn build_sync_responder(
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
+                .with_effort(llm.effort)
+                .with_thinking_budget(llm.thinking_budget)
                 .with_external_driver_ids(driver_ids.to_vec());
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
@@ -940,6 +972,7 @@ fn llm_config_from_target(target: &ResolvedLlmTarget) -> LlmConfig {
         api_key: target.api_key.clone(),
         model: target.model.clone(),
         effort: target.effort,
+        thinking_budget: target.thinking_budget,
         api_base: target.api_base.clone(),
         project_instructions: target.project_instructions.to_string(),
     }
@@ -2475,6 +2508,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2636,6 +2670,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2741,6 +2776,7 @@ mod tests {
             api_key: "live-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2795,6 +2831,7 @@ mod tests {
             api_key: "replay-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
