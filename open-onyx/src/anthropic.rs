@@ -31,7 +31,7 @@ use std::thread;
 use std::time::Duration;
 
 use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
-use onyx_workspace::WorkspaceTools;
+use onyx_workspace::{ToolSchema, WorkspaceTools};
 use serde_json::{Value as JsonValue, json};
 
 use crate::context::{
@@ -95,6 +95,9 @@ pub(crate) struct AnthropicSharedState {
     /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
     /// esquema dinámico de `spawn_subagent` (`driver` opcional).
     pub(crate) driver_ids: Vec<String>,
+    /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el body filtradas por los tools del spec del agente.
+    pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
 }
 
 /// Bloque de contenido asistente en curso de un stream `content_block_*`.
@@ -297,6 +300,7 @@ pub(crate) fn build_anthropic_request_body(
     driver_ids: &[String],
     thinking_blocks: &HashMap<(u64, usize), Vec<JsonValue>>,
     thinking_budget_tokens: Option<u64>,
+    mcp_schemas: &[ToolSchema],
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut messages: Vec<JsonValue> = Vec::with_capacity(projected.turns.len() + 1);
@@ -411,6 +415,20 @@ pub(crate) fn build_anthropic_request_body(
                 })
             })
             .collect();
+    // `SDD-04 REQ-04.3`: tools MCP `mcp__*` (schemas del registro, filtradas por
+    // los tools del spec; `type` normalizadas a minúsculas, que exige la API).
+    for s in mcp_schemas
+        .iter()
+        .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
+    {
+        let mut params = s.parameters.clone();
+        lowercase_json_schema_types(&mut params);
+        tools.push(json!({
+            "name": s.name,
+            "description": s.description,
+            "input_schema": params
+        }));
+    }
     // `REQ-04.2`: prompt caching `ephemeral` en la última definición de tool
     // (el prefijo anterior queda cubierto por la ventana de 20 bloques).
     if let Some(last) = tools.last_mut() {
@@ -1102,6 +1120,12 @@ impl AnthropicResponder {
         self.shared.thinking_budget = thinking_budget;
         self
     }
+
+    /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
+    pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
+        self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
 }
 
 impl Responder for AnthropicResponder {
@@ -1129,6 +1153,7 @@ impl Responder for AnthropicResponder {
                 &self.shared.driver_ids,
                 &thinking_blocks,
                 thinking_budget,
+                &self.shared.mcp_schemas,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -1189,6 +1214,7 @@ mod tests {
             &[],
             &HashMap::new(),
             None,
+            &[],
         );
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
@@ -1496,6 +1522,7 @@ mod tests {
             &[],
             &HashMap::new(),
             None,
+            &[],
         );
         let msgs = body["messages"].as_array().unwrap();
         // `Goal:` (user) + `follow-up` (user) + `denied` sin emparejar (user) se funden
@@ -1563,6 +1590,7 @@ mod tests {
             &[],
             &HashMap::new(),
             Some(budget),
+            &[],
         );
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 16384);
@@ -1582,6 +1610,7 @@ mod tests {
             &[],
             &HashMap::new(),
             Some(0),
+            &[],
         );
         assert!(body.get("thinking").is_none());
         assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
@@ -1596,6 +1625,7 @@ mod tests {
             &[],
             &HashMap::new(),
             None,
+            &[],
         );
         assert!(body.get("thinking").is_none());
         assert_eq!(body["max_tokens"], DEFAULT_ANTHROPIC_MAX_TOKENS);
@@ -1741,6 +1771,7 @@ mod tests {
             &[],
             &cache,
             Some(2048),
+            &[],
         );
         assert_eq!(body["thinking"]["budget_tokens"], 2048);
         let msgs = body["messages"].as_array().unwrap();
@@ -1764,6 +1795,7 @@ mod tests {
             &[],
             &HashMap::new(),
             Some(2048),
+            &[],
         );
         assert!(
             body.get("thinking").is_none(),

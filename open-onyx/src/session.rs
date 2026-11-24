@@ -831,12 +831,12 @@ pub fn build_host_with_shared_store(
     Ok((host, ws_vocab))
 }
 
-pub fn make_spec(goal: &str, auto_approve: bool) -> AgentSpec {
-    let mut spec = AgentSpec::new("openonyx", goal).with_tools(
-        WorkspaceTools::all_tool_names_with_subagents()
-            .iter()
-            .copied(),
-    );
+pub fn make_spec(goal: &str, auto_approve: bool, mcp_tools: &[String]) -> AgentSpec {
+    let mut tool_names: Vec<&str> = WorkspaceTools::all_tool_names_with_subagents().to_vec();
+    // `SDD-04 REQ-04.3`: tools MCP `mcp__*` del registro de arranque (orden
+    // determinista: built-in primero, MCP después).
+    tool_names.extend(mcp_tools.iter().map(|t| t.as_str()));
+    let mut spec = AgentSpec::new("openonyx", goal).with_tools(tool_names);
     if !auto_approve {
         spec = spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
     }

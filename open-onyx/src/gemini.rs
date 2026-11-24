@@ -11,8 +11,8 @@ use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
 use onyx_soul_agents::{
     EventBus, GraphView, PlatformDriver, SurfaceBinding, Vocab, pending_requests,
 };
-use onyx_workspace::WorkspaceTools;
 use onyx_workspace::tools::{discover_skills_summary, scrub_secrets};
+use onyx_workspace::{ToolSchema, WorkspaceTools};
 use serde_json::{Value as JsonValue, json};
 #[cfg(test)]
 use std::collections::HashSet;
@@ -26,6 +26,7 @@ use crate::context::{
     extract_gemini_usage, project_memory,
 };
 use crate::llm_profile::{api_base_host, is_loopback_host};
+use crate::openai::lowercase_json_schema_types;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -118,6 +119,9 @@ pub(crate) struct GeminiSharedState {
     /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
     /// esquema dinámico de `spawn_subagent` (`driver` opcional).
     pub(crate) driver_ids: Vec<String>,
+    /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el body filtradas por los tools del spec del agente.
+    pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
 }
 
 /// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
@@ -233,7 +237,7 @@ fn build_request_body_with_budget(
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: ContextBudget,
 ) -> JsonValue {
-    build_request_body_with_context(req, thought_signatures, budget.into(), "", None, &[])
+    build_request_body_with_context(req, thought_signatures, budget.into(), "", None, &[], &[])
 }
 
 const BASE_INSTRUCTION: &str = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Do not re-read unchanged files or repeat `scent_outline` queries already summarized in your history unless the file was modified. Never create temporary helper scripts or scratch directories inside the workspace repository; use built-in tools (`glob_files`, `code_search`, `scent_outline`) for counting and inspection. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step workspace tasks, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`), but never call `plan_update` multiple times in a row without executing real workspace tools in between; for purely conceptual questions or single-step answers that do not inspect or modify the workspace, omit `plan_update` (or call it at most once). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
@@ -268,6 +272,7 @@ pub(crate) fn build_request_body_with_context(
     project_instructions: &str,
     effort: Option<ReasoningEffort>,
     driver_ids: &[String],
+    mcp_schemas: &[ToolSchema],
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut contents: Vec<JsonValue> = Vec::with_capacity(projected.turns.len());
@@ -333,7 +338,7 @@ pub(crate) fn build_request_body_with_context(
         }
     }
 
-    let declarations: Vec<JsonValue> =
+    let mut declarations: Vec<JsonValue> =
         WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
             .into_iter()
             .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
@@ -345,6 +350,20 @@ pub(crate) fn build_request_body_with_context(
                 })
             })
             .collect();
+    // `SDD-04 REQ-04.3`: declaraciones MCP `mcp__*` (schemas del registro,
+    // filtradas por los tools del spec; los `type` se normalizan a minúsculas).
+    for s in mcp_schemas
+        .iter()
+        .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
+    {
+        let mut params = s.parameters.clone();
+        lowercase_json_schema_types(&mut params);
+        declarations.push(json!({
+            "name": s.name,
+            "description": s.description,
+            "parameters": params
+        }));
+    }
 
     let system_text = system_instruction_text(project_instructions);
 
@@ -718,6 +737,12 @@ impl GeminiResponder {
         self.shared.driver_ids = driver_ids;
         self
     }
+
+    /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
+    pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
+        self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
 }
 
 impl Responder for GeminiResponder {
@@ -741,6 +766,7 @@ impl Responder for GeminiResponder {
                 &self.shared.project_instructions,
                 self.shared.effort,
                 &self.shared.driver_ids,
+                &self.shared.mcp_schemas,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -854,6 +880,7 @@ impl AsyncGeminiDriver {
                 &self.shared.project_instructions,
                 self.shared.effort,
                 &self.shared.driver_ids,
+                &self.shared.mcp_schemas,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -1218,6 +1245,7 @@ mod tests {
             TieredContextConfig::default(),
             &loaded,
             Some(ReasoningEffort::High),
+            &[],
             &[],
         );
         let serialized = serde_json::to_string(&body).unwrap();

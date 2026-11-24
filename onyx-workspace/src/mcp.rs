@@ -1779,6 +1779,29 @@ impl McpRegistry {
         }
     }
 
+    /// Crea un registro con un único servidor **ya conectado**, inyectando el
+    /// cliente y sus schemas sin spawn ni red (tests herméticos de despacho y
+    /// replay, `SDD-04 REQ-04.5`). No es parte del contrato público estable.
+    #[doc(hidden)]
+    pub fn with_client(
+        max_output_bytes: usize,
+        name: impl Into<String>,
+        client: Arc<dyn McpClient>,
+        tools: Vec<ToolSchema>,
+    ) -> Self {
+        Self {
+            max_output_bytes,
+            servers: vec![McpServerHandle {
+                name: name.into(),
+                status: McpServerStatus::Connected {
+                    tool_count: tools.len(),
+                },
+                client: Some(client),
+                tools,
+            }],
+        }
+    }
+
     /// Schemas `mcp__*` de los servidores conectados (para inyectar al LLM).
     pub fn tool_schemas(&self) -> Vec<ToolSchema> {
         self.servers

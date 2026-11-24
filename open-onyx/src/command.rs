@@ -425,6 +425,9 @@ pub struct CommandSpawnerSystem {
     max_steps_per_turn: i64,
     force_new_agent: bool,
     counter: usize,
+    /// Nombres de tools MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`):
+    /// se añaden a los tools del spec de cada agente (orden determinista).
+    mcp_tool_names: Vec<String>,
 }
 
 impl CommandSpawnerSystem {
@@ -445,6 +448,7 @@ impl CommandSpawnerSystem {
             max_steps_per_turn: 128,
             force_new_agent: false,
             counter: 0,
+            mcp_tool_names: Vec::new(),
         }
     }
 
@@ -501,6 +505,13 @@ impl CommandSpawnerSystem {
         self
     }
 
+    /// Tools MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el spec de cada agente nuevo.
+    pub fn with_mcp_tool_names(mut self, mcp_tool_names: Vec<String>) -> Self {
+        self.mcp_tool_names = mcp_tool_names;
+        self
+    }
+
     fn spawn_spec<G: GraphView + ?Sized>(
         &mut self,
         graph: &G,
@@ -509,11 +520,10 @@ impl CommandSpawnerSystem {
     ) -> AgentSpec {
         let existing = graph.query(&[v.state]).len();
         self.counter = self.counter.max(existing) + 1;
-        let mut spec = AgentSpec::new(format!("openonyx-{}", self.counter), goal).with_tools(
-            WorkspaceTools::all_tool_names_with_subagents()
-                .iter()
-                .copied(),
-        );
+        let mut tool_names: Vec<&str> = WorkspaceTools::all_tool_names_with_subagents().to_vec();
+        tool_names.extend(self.mcp_tool_names.iter().map(|t| t.as_str()));
+        let mut spec =
+            AgentSpec::new(format!("openonyx-{}", self.counter), goal).with_tools(tool_names);
         if !self.auto_approve {
             spec =
                 spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());

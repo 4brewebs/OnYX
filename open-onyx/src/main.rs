@@ -36,9 +36,10 @@ use onyx_soul_agents::{
     AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
 };
 use onyx_workspace::{
-    NetworkPolicy, PendingCheckpoints, SandboxMode, WorkspaceMode, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, evaluate_workspace_trust,
-    graph_workspace_mode, list_trusted_workspaces, revoke_workspace_trust, trust_workspace,
+    McpRegistry, McpServerStatus, NetworkPolicy, PendingCheckpoints, SandboxMode, ToolSchema,
+    WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
+    evaluate_workspace_trust, graph_workspace_mode, list_trusted_workspaces, load_mcp_config,
+    revoke_workspace_trust, trust_workspace,
 };
 use openai::{DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
@@ -927,6 +928,7 @@ fn build_sync_responder(
     llm: &LlmConfig,
     telemetry: Option<SessionTelemetryHandle>,
     driver_ids: &[String],
+    mcp_schemas: &Arc<Vec<ToolSchema>>,
 ) -> Box<dyn Responder> {
     let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     match llm.provider {
@@ -936,7 +938,8 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
-                .with_external_driver_ids(driver_ids.to_vec());
+                .with_external_driver_ids(driver_ids.to_vec())
+                .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -948,7 +951,8 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
-                .with_external_driver_ids(driver_ids.to_vec());
+                .with_external_driver_ids(driver_ids.to_vec())
+                .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -961,7 +965,8 @@ fn build_sync_responder(
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
                 .with_thinking_budget(llm.thinking_budget)
-                .with_external_driver_ids(driver_ids.to_vec());
+                .with_external_driver_ids(driver_ids.to_vec())
+                .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -993,7 +998,7 @@ fn pin_subagent_responder_factory(handle: LlmProfileHandle) -> PinnedResponderFa
     Arc::new(move || {
         let target = handle.active_target();
         let llm = llm_config_from_target(&target);
-        Box::new(move || build_sync_responder(&llm, None, &[]))
+        Box::new(move || build_sync_responder(&llm, None, &[], &Arc::default()))
     })
 }
 
@@ -1124,6 +1129,7 @@ fn resolve_max_subagents(cli: Option<usize>) -> usize {
     .max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_interactive_chat(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -1132,6 +1138,8 @@ fn launch_interactive_chat(
     base_opts: &SessionOptions,
     resume_override: Option<(&Path, Option<u64>)>,
     driver_ids: &[String],
+    mcp_schemas: &Arc<Vec<ToolSchema>>,
+    mcp_tool_names: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
@@ -1227,8 +1235,10 @@ fn launch_interactive_chat(
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
     let bridge_ready = Arc::new(AtomicBool::new(false));
     let sub_llm = llm.clone();
-    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
-    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids
+    // ni MCP (los subagentes no reciben tools `mcp__*` en su spec).
+    let sub_factory: ResponderFactory =
+        Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
         .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
@@ -1237,6 +1247,7 @@ fn launch_interactive_chat(
     let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(chat_config.default_max_steps)
+        .with_mcp_tool_names(mcp_tool_names.to_vec())
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_root(cli.workspace.clone())
@@ -1343,6 +1354,7 @@ fn launch_interactive_chat(
         .with_stream_preview(stream_preview)
         .with_telemetry(telemetry)
         .with_external_driver_ids(driver_ids.to_vec())
+        .with_mcp_schemas(Arc::clone(mcp_schemas))
         .wrapping(sub_driver),
     );
 
@@ -1364,6 +1376,7 @@ fn launch_interactive_chat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_web_serve(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -1372,6 +1385,8 @@ fn launch_web_serve(
     base_opts: &SessionOptions,
     web_cfg: WebServerConfig,
     driver_ids: &[String],
+    mcp_schemas: &Arc<Vec<ToolSchema>>,
+    mcp_tool_names: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
@@ -1460,8 +1475,10 @@ fn launch_web_serve(
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
     let bridge_ready = Arc::new(AtomicBool::new(false));
     let sub_llm = llm.clone();
-    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
-    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids
+    // ni MCP (los subagentes no reciben tools `mcp__*` en su spec).
+    let sub_factory: ResponderFactory =
+        Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
         .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
@@ -1470,6 +1487,7 @@ fn launch_web_serve(
     let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(serve_config.default_max_steps)
+        .with_mcp_tool_names(mcp_tool_names.to_vec())
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_root(cli.workspace.clone())
@@ -1591,6 +1609,7 @@ fn launch_web_serve(
         .with_stream_preview(stream_preview)
         .with_telemetry(telemetry)
         .with_external_driver_ids(driver_ids.to_vec())
+        .with_mcp_schemas(Arc::clone(mcp_schemas))
         .wrapping(sub_driver),
     );
 
@@ -1687,6 +1706,48 @@ fn run_trust_command(
     Ok(())
 }
 
+/// Tope de salida de una llamada a tool MCP en sesión en vivo (`SDD-04 REQ-04.4`):
+/// los resultados se truncan a 32 KiB antes de llegar al LLM.
+const MCP_LIVE_MAX_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// `SDD-04 REQ-04.3`: registro MCP de arranque con **descubrimiento vivo**. Solo
+/// los modos interactivos/en vivo (chat, run, serve, rewind en vivo) lo cargan;
+/// `doctor` audita los servidores con su propio timeout corto (TEST-04.4) y
+/// `replay`/`inspect` no hacen I/O. `None` si no hay configuración MCP.
+///
+/// Ningún fallo aborta la sesión: cada servidor fallido/untrusted solo emite un
+/// aviso en `stderr` y se descarta.
+fn load_mcp_registry(policy: &WorkspacePolicy, workspace: &Path) -> Option<Arc<McpRegistry>> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    let (configs, warnings) = load_mcp_config(
+        home.as_deref(),
+        Some(workspace),
+        policy.trust.config_trusted,
+    )
+    .ok()?;
+    for w in &warnings {
+        eprintln!("[openOnyx mcp] {w}");
+    }
+    if configs.is_empty() {
+        return None;
+    }
+    let registry = McpRegistry::discover_from_config(&configs, MCP_LIVE_MAX_OUTPUT_BYTES);
+    for (name, status) in registry.server_statuses() {
+        match status {
+            McpServerStatus::Failed(msg) => {
+                eprintln!("[openOnyx mcp] server `{name}` unavailable: {msg}");
+            }
+            McpServerStatus::Disabled => {
+                eprintln!("[openOnyx mcp] server `{name}` disabled in config; not loaded.");
+            }
+            _ => {}
+        }
+    }
+    Some(Arc::new(registry))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = match parse_args() {
         Ok(c) => c,
@@ -1742,7 +1803,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sandbox
             .elevate_for_auto_approve(cli.sandbox_mode.is_some());
     }
-    let tools = WorkspaceTools::new(policy.clone());
+    // `SDD-04 REQ-04.3`: descubrimiento MCP vivo solo en modos interactivos/en
+    // vivo; `doctor` (auditoría propia) y los modos offline no lo cargan.
+    let mcp_registry: Option<Arc<McpRegistry>> = match &cli.mode {
+        Mode::Doctor { .. } | Mode::Replay(_) | Mode::Inspect { .. } => None,
+        _ => load_mcp_registry(&policy, &cli.workspace),
+    };
+    let tools = match mcp_registry.as_ref() {
+        Some(registry) => {
+            WorkspaceTools::new(policy.clone()).with_mcp_registry(Arc::clone(registry))
+        }
+        None => WorkspaceTools::new(policy.clone()),
+    };
+    // Schemas `mcp__*` conectados (vacío si no hay registro) para los bodies LLM.
+    let mcp_schemas: Arc<Vec<ToolSchema>> = mcp_registry
+        .as_ref()
+        .map(|r| Arc::new(r.tool_schemas()))
+        .unwrap_or_default();
+    let mcp_tool_names: Vec<String> = mcp_schemas.iter().map(|s| s.name.to_string()).collect();
 
     // `SDD-10`: ids de los drivers de harness CLI registrados (siempre al menos
     // el preset integrado `opencode`), para los esquemas de `spawn_subagent` y el manager.
@@ -1804,12 +1882,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (mut host, ws_vocab) =
                 build_host_with_options(1, config, &run_opts, None, Some(checkpoints.clone()))?;
 
-            host.spawn(&make_spec(goal, cli.auto_approve));
+            host.spawn(&make_spec(goal, cli.auto_approve, &mcp_tool_names));
 
             let sub_llm = llm.clone();
-            // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+            // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids
+            // ni MCP (los subagentes no reciben tools `mcp__*` en su spec).
             let sub_factory: ResponderFactory =
-                Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+                Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
             let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
                 .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
                 .with_root_tools(tools.clone());
@@ -1831,7 +1910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),
-                build_sync_responder(&llm, Some(telemetry.clone()), &driver_ids),
+                build_sync_responder(&llm, Some(telemetry.clone()), &driver_ids, &mcp_schemas),
             )
             .wrapping(sub_driver);
 
@@ -1865,6 +1944,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &session_opts,
                 resume_arg,
                 &driver_ids,
+                &mcp_schemas,
+                &mcp_tool_names,
             )?;
         }
         Mode::Replay(path) => {
@@ -1920,7 +2001,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(PendingCheckpoints::default()),
             )?;
             if !has_commands {
-                host.spawn(&make_spec("replay", cli.auto_approve));
+                host.spawn(&make_spec("replay", cli.auto_approve, &[]));
             }
 
             // Replay determinista puro: NO toca disco ni llama a Gemini.
@@ -1965,6 +2046,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &session_opts,
                     Some((resolved_dir.as_path(), Some(*tick))),
                     &driver_ids,
+                    &mcp_schemas,
+                    &mcp_tool_names,
                 )?;
                 return Ok(());
             }
@@ -2005,9 +2088,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 LlmProfileHandle::new(&rewind_llm, policy.llm_profiles(), allow_custom_auth_host)
             };
+            // En la rama en vivo el spec necesita las tools `mcp__*` para poder
+            // invocarlas; en la rama `--transcript` el spec debe incluirlas igual
+            // para que el replay valide las llamadas grabadas en la sesión original.
             let spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(128)
-                .with_llm_profile(llm_handle);
+                .with_llm_profile(llm_handle)
+                .with_mcp_tool_names(mcp_tool_names.to_vec());
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
@@ -2047,10 +2134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_checkpoints(checkpoints)
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
-                let mut driver =
-                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None, &[]))
-                        .starting_at(next_tick)
-                        .wrapping(ws_bridge);
+                let mut driver = RecordingBridge::new(
+                    host.vocab(),
+                    build_sync_responder(&llm, None, &[], &mcp_schemas),
+                )
+                .starting_at(next_tick)
+                .wrapping(ws_bridge);
 
                 run_session(
                     &mut host,
@@ -2099,6 +2188,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &session_opts,
                 web_cfg,
                 &driver_ids,
+                &mcp_schemas,
+                &mcp_tool_names,
             )?;
         }
         Mode::Help | Mode::Version | Mode::Trust { .. } => unreachable!(),
@@ -2919,7 +3010,7 @@ mod tests {
         fs::create_dir_all(&snap_dir).unwrap();
 
         let (mut host, _) = build_host(1, AgentConfig::default(), Some(&snap_dir), None).unwrap();
-        host.spawn(&make_spec("check doctor", true));
+        host.spawn(&make_spec("check doctor", true, &[]));
         host.request_snapshot("0");
         host.step(&mut HeadlessDriver::new());
 
@@ -4479,5 +4570,151 @@ ready_log = "READY_BUS"
         )));
         assert!(host.run_until_settled(&mut driver, 12));
         assert_eq!(host.result(root).as_deref(), Some("recovered after cancel"));
+    }
+
+    /// `SDD-04` REQ-04.5: una llamada en vivo a una tool `mcp__<server>__<tool>`
+    /// (con `McpClient` in-memoria inyectado vía `McpRegistry::with_client`, sin
+    /// red) y su observación quedan grabadas en el transcript ONYXTR2, y
+    /// `ReplayBridge` reproduce la sesión con **0 I/O**: el contador de calls
+    /// del mock no cambia durante el replay y el resultado final es idéntico.
+    #[test]
+    fn mcp_tool_call_and_its_observation_replay_without_io() {
+        use onyx_workspace::{McpClient, McpError, McpRegistry, ToolSchema};
+        use std::borrow::Cow;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MockMcpClient {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl McpClient for MockMcpClient {
+            fn handshake(&self) -> Result<Vec<ToolSchema>, McpError> {
+                Ok(vec![ToolSchema {
+                    name: Cow::Owned("mcp__mock__echo".to_string()),
+                    description: Cow::Owned("echo de texto".to_string()),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }),
+                    requires_approval: true,
+                }])
+            }
+
+            fn call_tool(&self, tool: &str, args: &serde_json::Value) -> Result<String, McpError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                Ok(format!("mcp-echo:{tool}:{text}"))
+            }
+        }
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-mcp-replay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let client = Arc::new(MockMcpClient {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let schemas = client.handshake().expect("mock handshake");
+        let registry = Arc::new(McpRegistry::with_client(
+            2048,
+            "mock",
+            client.clone(),
+            schemas,
+        ));
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_mode_handle(mode_handle.clone())
+            .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
+        let (mut live_host, live_ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "use the mock echo".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(live_host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(live_ws_vocab)
+            .wrapping(headless);
+        let mut turn = 0usize;
+        let mut driver = RecordingBridge::new(live_host.vocab(), |req: &AgentView| {
+            turn += 1;
+            if turn == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "mcp__mock__echo",
+                    r#"{"text":"hola mcp"}"#,
+                ))
+            } else {
+                Some(Reply::done(req.agent, req.request, "mcp echo done"))
+            }
+        })
+        .wrapping(ws_bridge);
+
+        live_host.step(&mut driver);
+        live_host.step(&mut driver);
+        assert!(live_host.run_until_settled(&mut driver, 32));
+        let root = live_host.agents()[0];
+        assert_eq!(live_host.result(root).as_deref(), Some("mcp echo done"));
+        // El despacho en vivo llamó al mock exactamente una vez (I/O real).
+        assert_eq!(client.calls.load(Ordering::Acquire), 1);
+        // La observación quedó grabada en el transcript.
+        let tr_bytes = driver.transcript().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&tr_bytes).contains("mcp-echo:echo:hola mcp"),
+            "el transcript debe contener la observación MCP"
+        );
+
+        // Replay: mismo spec (con las tools `mcp__*`) y 0 I/O.
+        let decoded = Transcript::from_bytes(&tr_bytes).expect("decodificar ONYXTR2");
+        let (mut replay_host, _) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(
+                CommandSpawnerSystem::new(true)
+                    .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]),
+            )),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(decoded).wrapping(HeadlessDriver::new());
+        // `run_session` + `ReplayExhausted`: `run_until_settled` devolvería
+        // "asentado" en el primer tick (sin agentes) antes de que el comando
+        // reinyectado se convierta en `spawn_event` y en agente.
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 64 },
+        )
+        .unwrap();
+        let rroot = replay_host.agents()[0];
+        assert_eq!(replay_host.result(rroot).as_deref(), Some("mcp echo done"));
+        // 0 I/O durante el replay: el contador del mock no cambia.
+        assert_eq!(
+            client.calls.load(Ordering::Acquire),
+            1,
+            "el replay no debe volver a llamar al cliente MCP"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

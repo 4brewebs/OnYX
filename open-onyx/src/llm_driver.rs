@@ -117,6 +117,15 @@ impl DynamicLlmDriver {
         self.anthropic_shared.driver_ids = driver_ids;
         self
     }
+
+    /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el body de los tres providers.
+    pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<onyx_workspace::ToolSchema>>) -> Self {
+        self.gemini_shared.mcp_schemas = Arc::clone(&mcp_schemas);
+        self.openai_shared.mcp_schemas = Arc::clone(&mcp_schemas);
+        self.anthropic_shared.mcp_schemas = mcp_schemas;
+        self
+    }
 }
 
 impl PlatformDriver for DynamicLlmDriver {
@@ -192,6 +201,7 @@ impl PlatformDriver for DynamicLlmDriver {
                             &shared.project_instructions,
                             shared.effort,
                             &shared.driver_ids,
+                            &shared.mcp_schemas,
                         )
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
@@ -235,6 +245,7 @@ impl PlatformDriver for DynamicLlmDriver {
                         shared.effort,
                         true,
                         &shared.driver_ids,
+                        &shared.mcp_schemas,
                     );
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
@@ -285,6 +296,7 @@ impl PlatformDriver for DynamicLlmDriver {
                             &shared.driver_ids,
                             &thinking_blocks,
                             thinking_budget,
+                            &shared.mcp_schemas,
                         )
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
