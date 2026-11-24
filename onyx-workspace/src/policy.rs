@@ -6,10 +6,13 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value as JsonValue;
 
+use crate::external_driver::{builtin_external_driver_presets, load_external_drivers};
 use crate::impact::ImpactConfig;
-use crate::sandbox::SandboxConfig;
+use crate::llm_profile::{LlmProfileConfig, load_llm_profiles};
+use crate::sandbox::{SandboxConfig, SandboxMode};
 use crate::state::WorkspaceMode;
 use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
+use crate::worktree::{ExternalDriverConfig, SubagentNetworkPolicy};
 
 /// Resultado de evaluar las reglas de permisos para una herramienta y sus argumentos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +230,13 @@ impl PermissionRules {
 pub fn is_mutating_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "fs_write" | "fs_edit" | "shell_exec" | "service_start" | "service_stop" | "service_exec"
+        "fs_write"
+            | "fs_edit"
+            | "shell_exec"
+            | "service_start"
+            | "service_stop"
+            | "service_exec"
+            | "subagent_merge"
     )
 }
 
@@ -670,6 +679,49 @@ pub fn is_control_plane_rel_path(raw: &str) -> bool {
     file_name == ".env" || file_name.starts_with(".env.")
 }
 
+/// Veredicto de la clasificación del delta de un merge 3-way (`SDD-10` Fase 3):
+/// - [`MergeDeltaVerdict::Safe`]: el delta no toca superficies sensibles → aprobación
+///   estándar por impacto (`apply_impact_escalation`).
+/// - [`MergeDeltaVerdict::Ask`]: el delta toca `sprout.toml` o `.github/workflows/**`
+///   (gobernanza) → la aprobación del merge debe ser explícita (`Ask`), nunca auto-aprobada.
+/// - [`MergeDeltaVerdict::Deny`]: el delta toca el *Control Plane* solo lectura
+///   (`.onyx/config.toml`, `.env*`, `.git/hooks/**`, ...) → el merge debe bloquearse sin
+///   tocar el disco de `root`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeDeltaVerdict {
+    Safe,
+    Ask,
+    Deny,
+}
+
+/// Ruta de gobernanza no crítica (`SDD-10` Fase 3): un subagente (especialmente uno con
+/// driver externo) que la toca fuerza aprobación explícita (`Ask`) en el merge.
+pub fn is_governance_rel_path(raw: &str) -> bool {
+    let norm = raw.trim().replace('\\', "/");
+    let lower = norm
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    lower == "sprout.toml" || lower.starts_with(".github/workflows/")
+}
+
+/// Clasifica el delta `<root_now_commit>..<merged_tree>` de un merge 3-way contra el
+/// *Control Plane* (Deny) y las superficies de gobernanza (Ask). `Deny` corta a la primera
+/// ruta de Control Plane: un solo `.onyx/config.toml` o `.env*` bloquea el merge entero
+/// (`SDD-10` Fase 3).
+pub fn classify_merge_delta(changed_files: &[String]) -> MergeDeltaVerdict {
+    let mut verdict = MergeDeltaVerdict::Safe;
+    for f in changed_files {
+        if is_control_plane_rel_path(f) {
+            return MergeDeltaVerdict::Deny;
+        }
+        if verdict == MergeDeltaVerdict::Safe && is_governance_rel_path(f) {
+            verdict = MergeDeltaVerdict::Ask;
+        }
+    }
+    verdict
+}
+
 fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -690,6 +742,8 @@ pub struct WorkspacePolicy {
     pub impact: ImpactConfig,
     pub trust: WorkspaceTrustReport,
     pub trust_warnings: Vec<String>,
+    external_drivers: Vec<ExternalDriverConfig>,
+    llm_profiles: Vec<LlmProfileConfig>,
 }
 
 impl WorkspacePolicy {
@@ -712,12 +766,73 @@ impl WorkspacePolicy {
             impact: ImpactConfig::default(),
             trust: WorkspaceTrustReport::no_project_config(),
             trust_warnings: Vec::new(),
+            external_drivers: builtin_external_driver_presets(),
+            // Sin presets: el perfil implícito de arranque CLI vive en el anfitrión
+            // (`LlmProfileHandle`, perfil `"default"`); aquí solo hay perfiles declarados.
+            llm_profiles: Vec::new(),
         })
+    }
+
+    /// Drivers de harness CLI externos cargados (`preset < global < workspace (trusted)`; `SDD-10` Fase 1).
+    pub fn external_drivers(&self) -> &[ExternalDriverConfig] {
+        &self.external_drivers
+    }
+
+    /// Establece la lista de drivers externos explícitamente (tests, overrides de serie).
+    pub fn with_external_drivers(mut self, drivers: Vec<ExternalDriverConfig>) -> Self {
+        self.external_drivers = drivers;
+        self
+    }
+
+    /// Perfiles LLM declarados en `[[llm_profiles]]` (`global < workspace (trusted)`; `SDD-03` hot-swap).
+    pub fn llm_profiles(&self) -> &[LlmProfileConfig] {
+        &self.llm_profiles
+    }
+
+    /// Establece la lista de perfiles LLM explícitamente (tests, overrides de arranque).
+    pub fn with_llm_profiles(mut self, profiles: Vec<LlmProfileConfig>) -> Self {
+        self.llm_profiles = profiles;
+        self
     }
 
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = timeout;
         self
+    }
+
+    /// Deriva una política confinada para ejecutar un subagente nativo dentro de un *worktree*
+    /// desechable (`SDD-09` Fase 2):
+    /// - Re-enraiza `root` en `worktree_root` canonizado.
+    /// - Fuerza al menos `SandboxMode::WorkspaceWrite` (preservando `StrictContainer` si ya es más estricto).
+    /// - Aplica [`SubagentNetworkPolicy::derived_network_policy`] (`NativeOffline` -> `Offline`;
+    ///   `ExternalHarnessAllowlist` -> no-`Offline` para que el harness hable con su API).
+    /// - Concede auto-aprobación confinada al worktree (`fs_write`/`fs_edit`/`shell_exec`)
+    ///   preservando intactas todas las reglas `deny` y la protección del Control Plane.
+    pub fn for_worktree(
+        &self,
+        worktree_root: impl AsRef<Path>,
+        network_policy: &SubagentNetworkPolicy,
+    ) -> io::Result<Self> {
+        let canonical = fs::canonicalize(worktree_root)?;
+        let mut derived = self.clone();
+        derived.root = canonical;
+        if derived.sandbox.mode == SandboxMode::Off {
+            derived.sandbox.mode = SandboxMode::WorkspaceWrite;
+        }
+        // `SDD-10` Fase 2: el harness CLI externo deriva una política **no-`Offline`** (sin
+        // hints `*_OFFLINE`/`NO_PROXY`) para poder hablar con su API; el allowlist de hosts
+        // es declarativo (ver [`SubagentNetworkPolicy::derived_network_policy`]).
+        derived.sandbox.network = network_policy.derived_network_policy();
+        derived.permissions = PermissionRules {
+            deny: self.permissions.deny.clone(),
+            allow: vec![
+                "fs_write(*)".to_string(),
+                "fs_edit(*)".to_string(),
+                "shell_exec(*)".to_string(),
+            ],
+            ask: Vec::new(),
+        };
+        Ok(derived)
     }
 
     /// Carga secciones `[permissions]`, `[sandbox]` e `[impact]` desde `~/.onyx/config.toml` y
@@ -790,6 +905,32 @@ impl WorkspacePolicy {
             Err(err) => warnings.push(format!("failed to parse `[impact]`: {err}")),
         }
 
+        // `[[external_drivers]]` (`SDD-10` Fase 1): parse error → warning + presets intactos.
+        match load_external_drivers(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((drivers, drv_warns)) => {
+                self.external_drivers = drivers;
+                warnings.extend(drv_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[[external_drivers]]`: {err}")),
+        }
+
+        // `[[llm_profiles]]` (`SDD-03` hot-swap): parse error → warning sin perfiles declarados.
+        match load_llm_profiles(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((profiles, llm_warns)) => {
+                self.llm_profiles = profiles;
+                warnings.extend(llm_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[[llm_profiles]]`: {err}")),
+        }
+
         self.trust = trust;
         self.trust_warnings = warnings;
         self
@@ -851,6 +992,76 @@ impl WorkspacePolicy {
     /// Evalúa las reglas de permisos configuradas (sin tener en cuenta `WorkspaceMode`).
     pub fn evaluate_permission(&self, tool: &str, args_json: &str) -> PermissionDecision {
         self.permissions.evaluate(tool, args_json, self.ignore_deny)
+    }
+
+    /// Gate de aprobación/trust para `spawn_subagent` con driver externo no-nativo (`SDD-10`).
+    ///
+    /// Devuelve la decisión y un motivo accionable (no vacío en `Deny`/`Ask`):
+    /// - Workspace no confiado → `Deny` absoluto (límite de confianza; ni `ignore_deny` lo anula).
+    /// - Regla `deny` explícita `spawn_subagent(<driver>)` → `Deny`.
+    /// - Precedencia `ask` vs `allow` idéntica a [`PermissionRules::evaluate`] (especificidad;
+    ///   ante igual o mayor especificidad gana `ask`).
+    /// - Sin reglas `ask`/`allow` → `Ask` (nunca cae en el fallback estático `Allow` de
+    ///   herramientas no mutantes, que aplicaría a `spawn_subagent` sin driver).
+    pub fn external_driver_gate(&self, driver_id: &str) -> (PermissionDecision, String) {
+        if !self.trust.config_trusted {
+            return (
+                PermissionDecision::Deny,
+                format!(
+                    "blocked: external harness driver `{driver_id}` requires a trusted workspace (run `openonyx trust` or `/trust` to approve)"
+                ),
+            );
+        }
+        if !self.ignore_deny
+            && self
+                .permissions
+                .deny
+                .iter()
+                .any(|rule| match_permission_rule(rule, "spawn_subagent", driver_id).is_some())
+        {
+            return (
+                PermissionDecision::Deny,
+                format!(
+                    "blocked by permission policy (deny rule): `spawn_subagent` with external driver `{driver_id}`"
+                ),
+            );
+        }
+        // Misma semántica de especificidad que `PermissionRules::evaluate`: ante igual o
+        // mayor especificidad, `ask >= allow`; un `allow` más específico vence al `ask` genérico.
+        let best_ask = self
+            .permissions
+            .ask
+            .iter()
+            .filter_map(|rule| match_permission_rule(rule, "spawn_subagent", driver_id))
+            .max();
+        let best_allow = self
+            .permissions
+            .allow
+            .iter()
+            .filter_map(|rule| match_permission_rule(rule, "spawn_subagent", driver_id))
+            .max();
+        let decision = match (best_ask, best_allow) {
+            (Some(ask_spec), Some(allow_spec)) => {
+                if ask_spec >= allow_spec {
+                    PermissionDecision::Ask
+                } else {
+                    PermissionDecision::Allow
+                }
+            }
+            (Some(_), None) => PermissionDecision::Ask,
+            (None, Some(_)) => PermissionDecision::Allow,
+            (None, None) => PermissionDecision::Ask,
+        };
+        if decision == PermissionDecision::Allow {
+            (PermissionDecision::Allow, String::new())
+        } else {
+            (
+                PermissionDecision::Ask,
+                format!(
+                    "external harness driver `{driver_id}` will run an external CLI process in an isolated Git worktree"
+                ),
+            )
+        }
     }
 
     /// Evalúa las reglas de permisos aplicando las invariantes de seguridad:
@@ -972,5 +1183,93 @@ impl WorkspacePolicy {
             return Err(format!("path `{raw}` escapes workspace root"));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod merge_delta_tests {
+    use super::*;
+
+    fn files(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_merge_delta_denies_control_plane_short_circuit() {
+        // `.onyx/config.toml` → Deny, aunque vayan otras rutas inofensivas.
+        assert_eq!(
+            classify_merge_delta(&files(&[".onyx/config.toml", "src/main.rs"])),
+            MergeDeltaVerdict::Deny
+        );
+        // `.env` / `.env.local` → Deny.
+        assert_eq!(
+            classify_merge_delta(&files(&[".env"])),
+            MergeDeltaVerdict::Deny
+        );
+        assert_eq!(
+            classify_merge_delta(&files(&[".env.local"])),
+            MergeDeltaVerdict::Deny
+        );
+        // `.git/hooks/**` y `.git/config` → Deny.
+        assert_eq!(
+            classify_merge_delta(&files(&[".git/hooks/pre-commit"])),
+            MergeDeltaVerdict::Deny
+        );
+        assert_eq!(
+            classify_merge_delta(&files(&[".git/config"])),
+            MergeDeltaVerdict::Deny
+        );
+        // `.onyx/vault/**` → Deny.
+        assert_eq!(
+            classify_merge_delta(&files(&[".onyx/vault/sess/a.tr"])),
+            MergeDeltaVerdict::Deny
+        );
+        // Deny corta a la primera: no importa el orden ni las rutas Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&["sprout.toml", ".env", "src/a.rs"])),
+            MergeDeltaVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn classify_merge_delta_asks_for_governance_paths() {
+        // `sprout.toml` → Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&["sprout.toml"])),
+            MergeDeltaVerdict::Ask
+        );
+        // `.github/workflows/**` → Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&[".github/workflows/ci.yml"])),
+            MergeDeltaVerdict::Ask
+        );
+        // Ask + inofensivo sigue siendo Ask.
+        assert_eq!(
+            classify_merge_delta(&files(&["sprout.toml", "src/main.rs"])),
+            MergeDeltaVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn classify_merge_delta_safe_for_normal_sources() {
+        assert_eq!(classify_merge_delta(&files(&[])), MergeDeltaVerdict::Safe);
+        assert_eq!(
+            classify_merge_delta(&files(&["src/main.rs", "docs/readme.md"])),
+            MergeDeltaVerdict::Safe
+        );
+        // Un `workflows/` suelto (sin `.github/`) NO es gobernanza.
+        assert_eq!(
+            classify_merge_delta(&files(&["workflows/ci.yml"])),
+            MergeDeltaVerdict::Safe
+        );
+        // Separadores Windows se normalizan.
+        assert_eq!(
+            classify_merge_delta(&files(&[".github\\workflows\\ci.yml"])),
+            MergeDeltaVerdict::Ask
+        );
+        assert_eq!(
+            classify_merge_delta(&files(&[".onyx\\config.toml"])),
+            MergeDeltaVerdict::Deny
+        );
     }
 }

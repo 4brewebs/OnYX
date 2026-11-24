@@ -11,6 +11,7 @@
 //!   y política de red configurable (`offline`, `localhost`, `unrestricted`).
 
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -850,6 +851,154 @@ pub fn apply_sanitized_env(
     }
 }
 
+/// Aplica sanitización estricta de variables de entorno al subproceso de un **harness CLI
+/// externo** (`SDD-10` Fase 2). Mismo espíritu que [`apply_sanitized_env`], con las
+/// diferencias del contrato del harness:
+/// - **Nunca** hereda `NODE_OPTIONS` (vector de inyección `--require=...`) salvo opt-in
+///   explícito en `passthrough` (el `allowed_env` del driver).
+/// - El home del usuario (`HOME` / `USERPROFILE` / `APPDATA` / `LOCALAPPDATA`) solo se hereda
+///   con `inherit_home = true`; en caso contrario se redirige a `sandbox_tmp` (sin `~/.ssh`,
+///   `~/.aws`, configs del harness, etc.).
+/// - No inyecta hints `*_OFFLINE`/`NO_PROXY` salvo `NetworkPolicy::Offline`: un harness con
+///   `network_allowlist` deriva una política no-Offline (p. ej. `Unrestricted`) y necesita
+///   llegar a su propia API.
+pub fn apply_sanitized_env_for_external_harness(
+    cmd: &mut Command,
+    network: NetworkPolicy,
+    workspace_root: &Path,
+    sandbox_tmp: &Path,
+    passthrough: &[String],
+    inherit_home: bool,
+) {
+    cmd.env_clear();
+
+    // Allowlist base de runtime/toolchains, **sin** `NODE_OPTIONS` (ver doc del función).
+    const SAFE_BASE_KEYS: &[&str] = &[
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CLICOLOR",
+        "TZ",
+        "RUSTUP_HOME",
+        "CARGO_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "CARGO_TARGET_DIR",
+        "RUSTFLAGS",
+        "JAVA_HOME",
+        "MAVEN_HOME",
+        "M2_HOME",
+        "GRADLE_HOME",
+        "GOPATH",
+        "GOROOT",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+    ];
+
+    // Claves de SO **sin** las de home (`USERPROFILE`, `APPDATA`, ...): se tratan aparte
+    // según `inherit_home`.
+    #[cfg(windows)]
+    const SAFE_OS_KEYS: &[&str] = &[
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
+        "SYSTEMDRIVE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "PROGRAMDATA",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+    ];
+
+    #[cfg(not(windows))]
+    const SAFE_OS_KEYS: &[&str] = &["SHELL", "XDG_CACHE_HOME"];
+
+    for (k, v) in std::env::vars() {
+        let in_default_allow = SAFE_BASE_KEYS
+            .iter()
+            .chain(SAFE_OS_KEYS.iter())
+            .any(|a| a.eq_ignore_ascii_case(&k));
+        let in_passthrough = passthrough.iter().any(|p| p.eq_ignore_ascii_case(&k));
+        if in_passthrough || (in_default_allow && !is_sensitive_env_key(&k)) {
+            cmd.env(&k, v);
+        }
+    }
+
+    // Toolchains bajo el home real siguen funcionando con home aislado.
+    if let Some(real_home) = user_home_dir() {
+        if std::env::var_os("CARGO_HOME").is_none() {
+            let cargo_home = real_home.join(".cargo");
+            if cargo_home.exists() {
+                cmd.env("CARGO_HOME", cargo_home);
+            }
+        }
+        if std::env::var_os("RUSTUP_HOME").is_none() {
+            let rustup_home = real_home.join(".rustup");
+            if rustup_home.exists() {
+                cmd.env("RUSTUP_HOME", rustup_home);
+            }
+        }
+    }
+
+    // Home: aislado en `sandbox_tmp` salvo opt-in explícito del driver.
+    // `clean_process_path` (sin prefijo verbatim `\\?\`) ya que estos valores pasan a
+    // interpretes que no lo entienden, igual que `TMP`/`TEMP` más abajo.
+    let clean_tmp = clean_process_path(sandbox_tmp);
+    #[cfg(not(windows))]
+    {
+        if inherit_home {
+            if let Some(real_home) = user_home_dir() {
+                cmd.env("HOME", real_home);
+            }
+        } else {
+            cmd.env("HOME", &clean_tmp);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if inherit_home {
+            for key in [
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "HOMEDRIVE",
+                "HOMEPATH",
+            ] {
+                if let Ok(v) = std::env::var(key) {
+                    cmd.env(key, v);
+                }
+            }
+        } else {
+            cmd.env("USERPROFILE", &clean_tmp);
+            cmd.env("APPDATA", clean_tmp.join("appdata"));
+            cmd.env("LOCALAPPDATA", clean_tmp.join("localappdata"));
+        }
+    }
+
+    // Directorio temporal acotado a la sesión + marcadores del workspace (el worktree).
+    let clean_ws = clean_process_path(workspace_root);
+    cmd.env("TMPDIR", &clean_tmp);
+    cmd.env("TMP", &clean_tmp);
+    cmd.env("TEMP", &clean_tmp);
+    cmd.env("ONYX_SANDBOX_NET", network.as_str());
+    cmd.env("ONYX_WORKSPACE_ROOT", &clean_ws);
+
+    if network == NetworkPolicy::Offline {
+        cmd.env("CARGO_NET_OFFLINE", "true");
+        cmd.env("PIP_NO_INDEX", "1");
+        cmd.env("NPM_CONFIG_OFFLINE", "true");
+        cmd.env("NO_PROXY", "127.0.0.1,localhost");
+    }
+}
+
 /// Normaliza rutas canónicas para pasarlas como `current_dir` / variables de entorno a procesos
 /// hijos: en Windows elimina el prefijo verbatim `\\?\` (p. ej. `\\?\C:\...` -> `C:\...`) para
 /// que `pwsh`, `cmd.exe`, `mvn`, `java` y `node` operen sin errores de proveedor de rutas.
@@ -869,6 +1018,134 @@ pub fn clean_process_path(path: &Path) -> PathBuf {
     {
         path.to_path_buf()
     }
+}
+
+/// Binario resuelto explícitamente contra `PATH`/`PATHEXT` antes de `Command::new`
+/// (`SDD-10` Fase 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProcessBinary {
+    /// Ruta del ejecutable encontrado (sin re-resolución implícita de `Command`).
+    pub path: PathBuf,
+    /// `true` si resuelve a un wrapper de shell (`.cmd`/`.bat`): su argv pasa por `cmd.exe`
+    /// y reinterpreta metacaracteres, por lo que `PromptTransport::Arg` se rechaza para ellos.
+    pub is_shell_wrapper: bool,
+}
+
+/// Resuelve `bin` explícitamente contra `PATH` (`PATHEXT` en Windows) **antes** de
+/// `Command::new` (`SDD-10` Fase 2, criterio de inyección): si `bin` contiene separador de
+/// ruta se usa como camino directo (absoluto o relativo al CWD); si no, se busca por
+/// entradas de `PATH` (en Windows probando además cada extensión de `PATHEXT`).
+///
+/// En Windows, un nombre **sin extensión** (p. ej. `opencode` de un install de npm) solo se
+/// resuelve vía `PATHEXT`: junto al wrapper real `opencode.cmd`, npm instala un script POSIX
+/// `opencode` (`#!/bin/sh`) que no es un Win32 ejecutable (el spawn fallaría con os error 193)
+/// y además daría un falso negativo de `is_shell_wrapper` para el bloqueo de `PromptTransport::Arg`.
+pub fn resolve_process_binary(bin: &str) -> Option<ResolvedProcessBinary> {
+    resolve_process_binary_in(bin, std::env::var_os("PATH").as_deref())
+}
+
+/// Variante con `PATH` explícito (tests herméticos sin mutar el entorno del proceso).
+pub fn resolve_process_binary_in(
+    bin: &str,
+    path_value: Option<&std::ffi::OsStr>,
+) -> Option<ResolvedProcessBinary> {
+    let trimmed = bin.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Con separador es una ruta directa, no un nombre de PATH.
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        let p = PathBuf::from(trimmed);
+        let p = if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().ok()?.join(p)
+        };
+        return classify_candidate(&p);
+    }
+
+    let path = path_value?;
+    for dir in env::split_paths(path) {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            std::env::current_dir().ok()?.join(dir)
+        };
+        if let Some(r) = classify_candidate(&dir.join(trimmed)) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Clasifica un candidato concreto a binario según la semántica de extensión de la plataforma
+/// (ver [`resolve_process_binary`]):
+/// - **Con** extensión: se clasifica tal cual (p. ej. `node.exe`, `cli.cmd`).
+/// - **Sin** extensión en Windows: solo se prueban las variantes `PATHEXT`
+///   (`.COM`/`.EXE`/`.BAT`/`.CMD`/...); nunca al fichero sin extensión (script POSIX de npm).
+/// - **Sin** extensión en Unix: se clasifica tal cual (lo que cuenta es el bit de ejecución).
+fn classify_candidate(name: &Path) -> Option<ResolvedProcessBinary> {
+    #[cfg(not(windows))]
+    {
+        classify_resolved_binary(name)
+    }
+    #[cfg(windows)]
+    {
+        if name.extension().is_some() {
+            return classify_resolved_binary(name);
+        }
+        for ext in pathext_list() {
+            let candidate = name.with_extension(ext.trim_start_matches('.'));
+            if let Some(r) = classify_resolved_binary(&candidate) {
+                return Some(r);
+            }
+        }
+        None
+    }
+}
+
+/// Lista de extensiones de `PATHEXT` (con su punto), con default de Windows si no está definida.
+#[cfg(windows)]
+fn pathext_list() -> Vec<String> {
+    let raw = std::env::var_os("PATHEXT").map(|p| p.to_string_lossy().into_owned());
+    raw.map(|p| {
+        p.split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.starts_with('.') {
+                    s.to_string()
+                } else {
+                    format!(".{s}")
+                }
+            })
+            .collect()
+    })
+    .filter(|v: &Vec<String>| !v.is_empty())
+    .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()])
+}
+
+fn classify_resolved_binary(p: &Path) -> Option<ResolvedProcessBinary> {
+    let meta = fs::metadata(p).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    Some(ResolvedProcessBinary {
+        path: p.to_path_buf(),
+        is_shell_wrapper: matches!(ext.as_str(), "cmd" | "bat"),
+    })
 }
 
 /// Crea (si no existe) un directorio temporal seguro específico para el sandbox del workspace.
@@ -1572,3 +1849,85 @@ pub use win::ProcessJob;
 
 #[cfg(not(windows))]
 pub use unix_job::ProcessJob;
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_process_binary_in;
+
+    /// `SDD-10` Fase 2: layout de npm, donde `mycli` (script POSIX `#!/bin/sh`, sin
+    /// extensión) y `mycli.cmd` (wrapper real) conviven en el mismo directorio. El nombre
+    /// debe resolverse:
+    /// - **Windows**: a `mycli.cmd` vía `PATHEXT`, con `is_shell_wrapper == true`. El
+    ///   fichero sin extensión no es un Win32 ejecutable (spawn con os error 193) y daría
+    ///   un falso negativo para el bloqueo de `PromptTransport::Arg`.
+    /// - **Unix**: a `mycli` tal cual (lo decide el bit de ejecución; `.cmd` no aplica).
+    #[test]
+    fn resolve_process_binary_in_resolves_npm_style_extensionless_via_pathext_on_windows() {
+        let dir = std::env::temp_dir().join(format!(
+            "onyx_resolve_pathext_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let posix = dir.join("mycli");
+        let wrapper = dir.join("mycli.cmd");
+        std::fs::write(&posix, "#!/bin/sh\necho posix\n").unwrap();
+        std::fs::write(&wrapper, "@echo off\r\necho wrapper\r\n").unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&posix, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 1) Nombre en `PATH` explícito (hermético, sin mutar el entorno del proceso).
+        let r = resolve_process_binary_in("mycli", Some(dir.as_os_str()))
+            .expect("debe resolver `mycli`");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                r.path.canonicalize().unwrap(),
+                wrapper.canonicalize().unwrap(),
+                "sin extensión debe resolver al wrapper `mycli.cmd` vía PATHEXT, no al script POSIX"
+            );
+            assert!(
+                r.is_shell_wrapper,
+                "el wrapper `.cmd` debe marcar `is_shell_wrapper`"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                r.path.canonicalize().unwrap(),
+                posix.canonicalize().unwrap(),
+                "en Unix el nombre exacto (bit de ejecución) gana"
+            );
+            assert!(!r.is_shell_wrapper);
+        }
+
+        // 2) Ruta directa con separador y sin extensión (p. ej. `C:\...\npm\mycli`): misma regla.
+        let direct = dir.join("mycli").to_string_lossy().into_owned();
+        let r2 = resolve_process_binary_in(&direct, None).expect("ruta directa debe resolver");
+        #[cfg(windows)]
+        {
+            assert!(
+                r2.path
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&wrapper.to_string_lossy()),
+                "la ruta directa sin extensión debe resolverse vía PATHEXT: {:?}",
+                r2.path
+            );
+            assert!(r2.is_shell_wrapper);
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(!r2.is_shell_wrapper);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

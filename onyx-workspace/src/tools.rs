@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -12,7 +12,10 @@ use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-use crate::impact::{ImpactAssessment, apply_impact_escalation, evaluate_mutation_impact};
+use crate::impact::{
+    ImpactAssessment, apply_impact_escalation, evaluate_mutation_impact,
+    evaluate_unified_diff_impact,
+};
 use crate::policy::{PermissionDecision, WorkspacePolicy, compile_glob_regex};
 use crate::sandbox::{
     ProcessJob, clean_process_path, configure_process_isolation, ensure_sandbox_tmp_dir,
@@ -41,10 +44,36 @@ pub struct WorkspaceTools {
     seen_reads: SeenReadsMap,
     read_seq: Arc<AtomicU64>,
     sprout: SproutSupervisor,
+    cancel_flag: Option<Arc<AtomicBool>>,
     #[cfg(feature = "scent")]
     scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
     #[cfg(feature = "scent")]
     seen_outlines: SeenOutlinesMap,
+}
+
+/// Indica si el nombre de herramienta corresponde al protocolo de subagentes asíncronos (`SDD-09`).
+pub fn is_async_subagent_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "spawn_subagent" | "subagent_status" | "subagent_merge" | "subagent_discard"
+    )
+}
+
+/// Extrae el campo `driver` (opcional) de los argumentos JSON de `spawn_subagent` (`SDD-10` Fase 1).
+/// Devuelve `None` si el JSON no parsea, no hay campo `driver`, o el valor no es un string no vacío.
+pub fn spawn_subagent_driver_from_args(args_json: &str) -> Option<String> {
+    let raw = if args_json.trim().is_empty() {
+        "{}"
+    } else {
+        args_json
+    };
+    let value: JsonValue = serde_json::from_str(raw).ok()?;
+    value
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
 }
 
 impl WorkspaceTools {
@@ -55,11 +84,23 @@ impl WorkspaceTools {
             seen_reads: Arc::new(Mutex::new(BTreeMap::new())),
             read_seq: Arc::new(AtomicU64::new(1)),
             sprout,
+            cancel_flag: None,
             #[cfg(feature = "scent")]
             scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
             #[cfg(feature = "scent")]
             seen_outlines: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub fn with_cancel_flag(mut self, cancel_flag: Arc<AtomicBool>) -> Self {
+        self.cancel_flag = Some(cancel_flag);
+        self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
     pub fn with_sprout(mut self, sprout: SproutSupervisor) -> Self {
@@ -87,14 +128,44 @@ impl WorkspaceTools {
         }
     }
 
+    /// Evalúa en best-effort el impacto AST (`onyx-scent`) de un diff unificado completo
+    /// (p. ej. el resultado de un merge 3-way de subagente en `subagent_merge`).
+    pub fn assess_unified_diff_impact(&self, unified_diff: &str) -> Option<ImpactAssessment> {
+        #[cfg(feature = "scent")]
+        {
+            evaluate_unified_diff_impact(&self.policy, unified_diff, &self.scent_index)
+        }
+        #[cfg(not(feature = "scent"))]
+        {
+            evaluate_unified_diff_impact(&self.policy, unified_diff)
+        }
+    }
+
     /// Evalúa `WorkspaceMode` + `PermissionRules` estáticas + escalado monótono *Scent-Heated Approval*
     /// (`Allow → Ask`, nunca debilitando `Deny` ni `Ask`).
+    ///
+    /// `SDD-10`: `spawn_subagent` con un driver externo no-nativo se decide por el gate
+    /// [`WorkspacePolicy::external_driver_gate`] (trust + regla `allow`/`deny`/`ask` por driver),
+    /// sin aplicar ni el escalado de impacto ni el fallback estático de no-mutantes; y en
+    /// modo `Plan`/`Explore` (`!mode.allows_mutation()`) queda **siempre** `Deny`, porque un
+    /// harness externo ejecuta procesos y red fuera del control de `WorkspaceToolBridge`.
     pub fn evaluate_permission_with_impact(
         &self,
         mode: WorkspaceMode,
         tool: &str,
         args_json: &str,
     ) -> (PermissionDecision, Option<ImpactAssessment>) {
+        if tool == "spawn_subagent" {
+            if let Some(driver) = spawn_subagent_driver_from_args(args_json) {
+                if !driver.eq_ignore_ascii_case("native") {
+                    if !mode.allows_mutation() {
+                        return (PermissionDecision::Deny, None);
+                    }
+                    let (decision, _reason) = self.policy.external_driver_gate(&driver);
+                    return (decision, None);
+                }
+            }
+        }
         let static_decision = self
             .policy
             .evaluate_permission_in_mode(mode, tool, args_json);
@@ -176,6 +247,10 @@ impl WorkspaceTools {
                 "scent_outline",
                 "scent_impact",
                 "spawn_agent",
+                "spawn_subagent",
+                "subagent_status",
+                "subagent_merge",
+                "subagent_discard",
             ]
         }
         #[cfg(not(feature = "scent"))]
@@ -198,8 +273,21 @@ impl WorkspaceTools {
                 "service_logs",
                 "service_exec",
                 "spawn_agent",
+                "spawn_subagent",
+                "subagent_status",
+                "subagent_merge",
+                "subagent_discard",
             ]
         }
+    }
+
+    pub fn async_subagent_tool_names() -> &'static [&'static str] {
+        &[
+            "spawn_subagent",
+            "subagent_status",
+            "subagent_merge",
+            "subagent_discard",
+        ]
     }
 
     pub fn approval_required_names() -> &'static [&'static str] {
@@ -210,6 +298,7 @@ impl WorkspaceTools {
             "service_start",
             "service_stop",
             "service_exec",
+            "subagent_merge",
         ]
     }
 
@@ -229,10 +318,89 @@ impl WorkspaceTools {
         }
     }
 
+    pub fn async_subagent_schemas() -> Vec<ToolSchema> {
+        Self::async_subagent_schemas_with_drivers(&[])
+    }
+
+    /// Variantes de `async_subagent_schemas` con la lista dinámica de drivers de harness CLI
+    /// externos habilitados (`SDD-10` Fase 1): el parámetro opcional `driver` de
+    /// `spawn_subagent` describe `native` (default) y los ids configurados.
+    pub fn async_subagent_schemas_with_drivers(driver_ids: &[String]) -> Vec<ToolSchema> {
+        let available = driver_ids.join(", ");
+        let driver_desc = if available.is_empty() {
+            "Optional execution backend for the subagent. `native` (default) runs the in-process OnYX engine; an external CLI harness id (e.g. `opencode`) delegates the goal to that external tool inside the same isolated Git worktree and requires explicit approval or an `allow spawn_subagent(<driver>)` rule.".to_string()
+        } else {
+            format!(
+                "Optional execution backend for the subagent. `native` (default) runs the in-process OnYX engine; an external CLI harness id (available: {available}) delegates the goal to that external tool inside the same isolated Git worktree and requires explicit approval or an `allow spawn_subagent(<driver>)` rule."
+            )
+        };
+        vec![
+            ToolSchema {
+                name: "spawn_subagent",
+                description: "Launch an asynchronous subagent in an isolated Git worktree without blocking the root agent. Returns `job_id` immediately.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": { "type": "STRING", "description": "Optional short label for the background subagent." },
+                        "goal": { "type": "STRING", "description": "Clear, bounded goal to execute inside the isolated worktree." },
+                        "max_steps": { "type": "INTEGER", "description": "Optional max reasoning steps for the subagent (default 32, max 128)." },
+                        "driver": { "type": "STRING", "description": driver_desc }
+                    },
+                    "required": ["goal"]
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "subagent_status",
+                description: "Inspect the status, touched files, and summary of one (`job_id`) or all asynchronous worktree subagents.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "job_id": { "type": "STRING", "description": "Optional subagent job_id to inspect; omit to list all jobs." }
+                    }
+                }),
+                requires_approval: false,
+            },
+            ToolSchema {
+                name: "subagent_merge",
+                description: "Perform a 3-way Git merge-tree reconciliation of a finished async subagent's worktree into the root working tree without moving HEAD, then clean up the worktree and temporary branch.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "job_id": { "type": "STRING", "description": "Finished subagent job_id to reconcile and merge." }
+                    },
+                    "required": ["job_id"]
+                }),
+                requires_approval: true,
+            },
+            ToolSchema {
+                name: "subagent_discard",
+                description: "Cancel (if running) and permanently discard an async subagent's worktree and temporary branch, terminating any child processes cleanly first.",
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "job_id": { "type": "STRING", "description": "Subagent job_id to cancel and discard." }
+                    },
+                    "required": ["job_id"]
+                }),
+                requires_approval: false,
+            },
+        ]
+    }
+
     pub fn schemas_with_subagents(include_subagents: bool) -> Vec<ToolSchema> {
+        Self::schemas_with_subagents_and_drivers(include_subagents, &[])
+    }
+
+    /// Schemas completos con la lista dinámica de drivers externos habilitados (`SDD-10` Fase 1).
+    pub fn schemas_with_subagents_and_drivers(
+        include_subagents: bool,
+        driver_ids: &[String],
+    ) -> Vec<ToolSchema> {
         let mut out = Self::schemas();
         if include_subagents {
             out.push(Self::subagent_schema());
+            out.extend(Self::async_subagent_schemas_with_drivers(driver_ids));
         }
         out
     }
@@ -1208,7 +1376,8 @@ impl WorkspaceTools {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
-                    if Instant::now() >= deadline {
+                    let cancelled = self.is_cancelled();
+                    if cancelled || Instant::now() >= deadline {
                         if let Some(ref mut j) = job {
                             j.terminate();
                         } else {
@@ -1223,8 +1392,12 @@ impl WorkspaceTools {
                         }
                         let _ = child.kill();
                         let _ = child.wait();
+                        drop(job);
                         let _ = out_handle.join();
                         let _ = err_handle.join();
+                        if cancelled {
+                            return Err(format!("{label} cancelled"));
+                        }
                         return Err(format!(
                             "{label} timed out after {:?}",
                             self.policy.command_timeout
@@ -1232,11 +1405,21 @@ impl WorkspaceTools {
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => return Err(format!("wait failed: {e}")),
+                Err(e) => {
+                    if let Some(ref mut j) = job {
+                        j.terminate();
+                    }
+                    drop(job);
+                    return Err(format!("wait failed: {e}"));
+                }
             }
         };
 
-        // Soltar `job` limpia cualquier subproceso huérfano que el comando haya dejado en segundo plano.
+        // Termina explícitamente el `ProcessJob` RAII antes de devolver para que ningún
+        // subproceso nieto huérfano retenga handles en el worktree (crítico en Windows).
+        if let Some(ref mut j) = job {
+            j.terminate();
+        }
         drop(job);
         let stdout = scrub_secrets(&out_handle.join().unwrap_or_default());
         let stderr = scrub_secrets(&err_handle.join().unwrap_or_default());

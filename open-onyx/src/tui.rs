@@ -43,14 +43,31 @@ use crate::context::{
     project_memory,
 };
 use crate::gemini::StreamPreviewHandle;
+use crate::llm_profile::LlmProfileHandle;
 use crate::pack::SharedPackStore;
+use crate::subagent::{
+    MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentJobSummary,
+    effective_merge_decision,
+};
 use crate::tui_input::{
     InputBuffer, InputHistory, PopupState, QueuedPrompts, WorkspaceFileIndex, render_input_popup,
 };
+use crate::tui_palette::{
+    PaletteAction, PaletteItem, PaletteState, build_palette_items, render_palette,
+};
+use crate::tui_views::{
+    ApprovalKeyAction, EffectRow, SproutGate, SproutServiceRow, TuiView, ViewCommandOutcome,
+    approval_key_action, parse_sprout_panel_lines, parse_view_command, render_agents_view,
+    render_plan_diff_view, render_sprout_view, render_timeline_view, sprout_mutation_gate,
+    view_tabs_line,
+};
 use crate::vault::session_display_label;
+use onyx_workspace::{all_recorded_effects, is_effect_undone};
 
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(90);
 const SPINNER_STEP_RAD: f64 = 0.35;
+/// Caducidad de los avisos transitorios (`status_hint`) en la cabecera de input.
+const STATUS_HINT_TTL: Duration = Duration::from_secs(4);
 
 enum FocusSwitch {
     Next,
@@ -74,6 +91,7 @@ struct TuiInner {
     policy: Option<WorkspacePolicy>,
     tools: Option<WorkspaceTools>,
     sprout: Option<SproutSupervisor>,
+    subagents: Option<SubagentHandle>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
@@ -105,6 +123,30 @@ struct TuiInner {
     scroll_from_bottom: usize,
     last_viewport_height: usize,
     quit: Arc<AtomicBool>,
+    /// `SDD-03` Fase 3 (`REQ-03.6`): vista efímera activa (`F1..F5`).
+    view: TuiView,
+    /// Paleta `Ctrl+K` (views + LLM + agents) con filtro fuzzy en vivo.
+    palette: PaletteState,
+    /// Handle LLM vivo: la cabecera muestra `provider/model (effort:...)`
+    /// actual y se refresca en `pump_idle` vía `take_dirty()`.
+    llm_profile: Option<LlmProfileHandle>,
+    /// Selección de fila en `F2 Agents` (agentes + jobs `[bg]`).
+    agents_selected: usize,
+    /// Selección de servicio en `F3 Sprout`.
+    sprout_selected: usize,
+    /// `F3 Sprout`: logs anclados al final del servicio seleccionado.
+    sprout_follow: bool,
+    /// Selección de hito en `F5 Timeline`.
+    timeline_selected: usize,
+    /// Scroll de `F4 Plan & Diff` (líneas).
+    plan_scroll: usize,
+    /// Últimos datos de agentes/jobs calculados en `render` (para `Ctrl+K`
+    /// y `F2 Agents` fuera del render).
+    last_agent_rows: Vec<AgentRow>,
+    last_bg_jobs: Vec<SubagentJobSummary>,
+    /// Aviso transitorio (gate F3, `/view` inválido) con su instante de emisión.
+    status_hint: Option<String>,
+    status_hint_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -129,6 +171,20 @@ impl TuiHandle {
         let ui_event = inner.poll_crossterm();
         let stream_dirty = inner.stream_preview.take_dirty();
         let telemetry_dirty = inner.telemetry.take_dirty();
+        // `SDD-03` Fase 3: un cambio LLM en caliente marca dirty → refresca la
+        // cabecera viva sin tocar el bucle determinista.
+        let llm_dirty = inner
+            .llm_profile
+            .as_ref()
+            .is_some_and(LlmProfileHandle::take_dirty);
+        let mut hint_expired = false;
+        if let Some(at) = inner.status_hint_at {
+            if at.elapsed() >= STATUS_HINT_TTL {
+                inner.status_hint = None;
+                inner.status_hint_at = None;
+                hint_expired = true;
+            }
+        }
         let busy = inner.is_any_agent_busy(graph);
         let root_busy = inner.is_root_agent_busy(graph);
         inner.root_busy = root_busy;
@@ -145,7 +201,12 @@ impl TuiHandle {
             }
         }
         let spinner_dirty = inner.advance_spinner_if_due(busy);
-        if (ui_event || stream_dirty || telemetry_dirty || spinner_dirty)
+        if (ui_event
+            || stream_dirty
+            || telemetry_dirty
+            || llm_dirty
+            || hint_expired
+            || spinner_dirty)
             && inner.queued.is_empty()
             && !inner.quit.load(Ordering::Relaxed)
         {
@@ -188,6 +249,7 @@ impl TuiDriver {
                 policy: None,
                 tools: None,
                 sprout: None,
+                subagents: None,
                 mode_handle: WorkspaceModeHandle::default(),
                 stream_preview: StreamPreviewHandle::default(),
                 telemetry: SessionTelemetryHandle::default(),
@@ -219,6 +281,18 @@ impl TuiDriver {
                 scroll_from_bottom: 0,
                 last_viewport_height: 20,
                 quit: Arc::new(AtomicBool::new(false)),
+                view: TuiView::Chat,
+                palette: PaletteState::closed(),
+                llm_profile: None,
+                agents_selected: 0,
+                sprout_selected: 0,
+                sprout_follow: true,
+                timeline_selected: 0,
+                plan_scroll: 0,
+                last_agent_rows: Vec::new(),
+                last_bg_jobs: Vec::new(),
+                status_hint: None,
+                status_hint_at: None,
             })),
         })
     }
@@ -252,6 +326,14 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.sprout = Some(sprout);
+        }
+        self
+    }
+
+    pub fn with_subagents(self, subagents: SubagentHandle) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.subagents = Some(subagents);
         }
         self
     }
@@ -297,6 +379,18 @@ impl TuiDriver {
             let mut inner = self.inner.borrow_mut();
             inner.model_name = model.into();
             inner.reasoning_effort = effort;
+        }
+        self
+    }
+
+    /// `SDD-03` Fase 3 (`REQ-03.6`): handle LLM vivo — la cabecera de `F1 Chat`
+    /// muestra el objetivo actual (`provider/model (effort:...)`) y se
+    /// refresca en `pump_idle` vía `take_dirty()`; la paleta `Ctrl+K` expone el
+    /// catálogo de perfiles/providers/esfuerzos.
+    pub fn with_llm_profile(self, profile: LlmProfileHandle) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.llm_profile = Some(profile);
         }
         self
     }
@@ -412,6 +506,418 @@ impl TuiInner {
         self.agent_picker_idx = 0;
     }
 
+    /// `SDD-03` Fase 3: aviso transitorio (gate `F3`, `/view` inválido, etc.).
+    fn set_status_hint(&mut self, hint: String) {
+        self.status_hint = Some(hint);
+        self.status_hint_at = Some(Instant::now());
+    }
+
+    /// `SDD-03` Fase 3: cambia la vista efímera (`F1..F5` / `/view` / paleta).
+    /// 100 % efímera: no toca el grafo ni el bucle determinista.
+    fn switch_view(&mut self, view: TuiView) {
+        self.view = view;
+        self.popup.close();
+        self.status_hint = None;
+        self.status_hint_at = None;
+    }
+
+    /// Abre la paleta `Ctrl+K` con un catálogo fresco (views + LLM + agentes).
+    fn open_palette(&mut self) {
+        self.popup.close();
+        let profiles = self
+            .llm_profile
+            .as_ref()
+            .map(LlmProfileHandle::public_snapshot);
+        let items = build_palette_items(profiles.as_ref(), &self.last_agent_rows);
+        self.palette.open_with(items);
+    }
+
+    /// Paleta abierta: traga todas las teclas (Esc/Ctrl+K cierra, `F1..F5`
+    /// cierra y cambia de vista, Up/Down o Ctrl+P/Ctrl+N navegan, Enter
+    /// ejecuta). **Todos** los caracteres imprimibles filtran (`insert_char`)
+    /// — `j`/`k` incluidos, nunca navegan.
+    fn handle_palette_key(&mut self, code: CtKeyCode, modifiers: KeyModifiers) {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        match code {
+            CtKeyCode::Esc => {
+                self.palette.close();
+            }
+            CtKeyCode::Char('k' | 'K') if ctrl => {
+                self.palette.close();
+            }
+            CtKeyCode::F(n) => {
+                if let Some(view) = TuiView::from_key(n) {
+                    self.palette.close();
+                    self.switch_view(view);
+                }
+            }
+            CtKeyCode::Up => {
+                self.palette.move_up();
+            }
+            CtKeyCode::Down => {
+                self.palette.move_down();
+            }
+            CtKeyCode::Char('p' | 'P') if ctrl => {
+                self.palette.move_up();
+            }
+            CtKeyCode::Char('n' | 'N') if ctrl => {
+                self.palette.move_down();
+            }
+            CtKeyCode::Enter => {
+                if let Some(item) = self.palette.selected_item() {
+                    self.apply_palette_action(item.action().clone());
+                }
+                self.palette.close();
+            }
+            CtKeyCode::Char(c) if !ctrl && !modifiers.contains(KeyModifiers::ALT) => {
+                self.palette.insert_char(c);
+            }
+            CtKeyCode::Backspace => {
+                self.palette.backspace();
+            }
+            _ => {}
+        }
+    }
+
+    /// Ejecuta la selección de la paleta `Ctrl+K`: views/agentes son
+    /// navegación local; los comandos LLM pasan por el bus determinista.
+    fn apply_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::View(view) => {
+                self.switch_view(view);
+            }
+            PaletteAction::Command(cmd) => {
+                // Slash LLM (Fase 2): inmediato en la frontera de tick, sellado en `ONYXTR2`.
+                self.queued
+                    .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
+            }
+            PaletteAction::Agent(id) => {
+                self.focused_agent = Some(id);
+                self.switch_view(TuiView::Chat);
+                self.scroll_from_bottom = 0;
+            }
+        }
+    }
+
+    /// `F3 Sprout`: filas de servicio parseadas del panel de texto.
+    fn sprout_service_rows(&self) -> Vec<SproutServiceRow> {
+        let Some(text) = self.sprout.as_ref().and_then(|s| s.render_panel_text()) else {
+            return Vec::new();
+        };
+        parse_sprout_panel_lines(&text)
+    }
+
+    fn sprout_untrusted(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|p| !p.trust.is_fully_trusted())
+    }
+
+    /// `F3 Sprout`: aplica una tecla mutante (`s`/`x`/`r`/`a`) encolando el
+    /// comando `/service ...` correspondiente por el bus (el turno de root lo
+    /// re-valida contra el modo). Bloqueado por el gate ⇒ aviso, sin mutar.
+    fn sprout_mutate(&mut self, key: char) {
+        // `SDD-03` Fase 4: el gate antes que la selección — en `[UNTRUSTED]`
+        // el panel no lista filas y el aviso real es el de trust, no
+        // "no service selected".
+        let gate = sprout_mutation_gate(self.mode_handle.get(), self.sprout_untrusted());
+        if !matches!(gate, SproutGate::Allowed) {
+            self.set_status_hint(gate.notice());
+            return;
+        }
+        let rows = self.sprout_service_rows();
+        let Some(row) = rows.get(self.sprout_selected) else {
+            self.set_status_hint("F3 Sprout: no service selected.".to_string());
+            return;
+        };
+        let cmd = match key {
+            's' | 'S' => format!("/service start {}", row.id),
+            'x' | 'X' => format!("/service stop {}", row.id),
+            'r' | 'R' => {
+                // Reinicio = stop + start, en orden, por el mismo bus.
+                self.queued
+                    .push(OnyxEvent::Ingress(IngressEvent::Command(format!(
+                        "/service stop {}",
+                        row.id
+                    ))));
+                format!("/service start {}", row.id)
+            }
+            'a' | 'A' => "/service start all".to_string(),
+            _ => return,
+        };
+        self.queued
+            .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
+    }
+
+    /// `F2 Agents`: Up/Down/k/j sobre agentes + jobs `[bg]`; Enter enfoca y
+    /// vuelve a `F1 Chat`.
+    fn handle_agents_view_key(&mut self, code: CtKeyCode) -> bool {
+        let total = self.last_agent_rows.len() + self.last_bg_jobs.len();
+        if total == 0 {
+            return false;
+        }
+        match code {
+            CtKeyCode::Up | CtKeyCode::Char('k') => {
+                self.agents_selected = if self.agents_selected == 0 {
+                    total - 1
+                } else {
+                    self.agents_selected - 1
+                };
+                true
+            }
+            CtKeyCode::Down | CtKeyCode::Char('j') => {
+                self.agents_selected = (self.agents_selected + 1) % total;
+                true
+            }
+            CtKeyCode::Enter => {
+                if let Some(row) = self.last_agent_rows.get(self.agents_selected) {
+                    self.focused_agent = Some(row.id);
+                }
+                self.view = TuiView::Chat;
+                self.scroll_from_bottom = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `F3 Sprout`: Up/Down/PgUp/PgDn seleccionan; `s`/`x`/`r`/`a` mutan (con
+    /// gate); `f` alterna `follow` de logs.
+    fn handle_sprout_view_key(&mut self, code: CtKeyCode) -> bool {
+        let count = self.sprout_service_rows().len();
+        match code {
+            CtKeyCode::Up => {
+                if count > 0 {
+                    self.sprout_selected = if self.sprout_selected == 0 {
+                        count - 1
+                    } else {
+                        self.sprout_selected - 1
+                    };
+                }
+                true
+            }
+            CtKeyCode::Down => {
+                if count > 0 {
+                    self.sprout_selected = (self.sprout_selected + 1) % count;
+                }
+                true
+            }
+            CtKeyCode::PageUp => {
+                self.sprout_selected = self.sprout_selected.saturating_sub(10);
+                if count > 0 {
+                    self.sprout_selected = self.sprout_selected.min(count - 1);
+                }
+                true
+            }
+            CtKeyCode::PageDown => {
+                if count > 0 {
+                    self.sprout_selected = (self.sprout_selected + 10) % count;
+                }
+                true
+            }
+            CtKeyCode::Char(c @ ('s' | 'S' | 'x' | 'X' | 'r' | 'R' | 'a' | 'A')) => {
+                self.sprout_mutate(c);
+                true
+            }
+            CtKeyCode::Char('f' | 'F') => {
+                self.sprout_follow = !self.sprout_follow;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `F4 Plan & Diff`: Up/Down ±1, PgUp/PgDn ±10 (scroll del ledger).
+    fn handle_plan_diff_key(&mut self, code: CtKeyCode) -> bool {
+        match code {
+            CtKeyCode::Up => {
+                self.plan_scroll = self.plan_scroll.saturating_sub(1);
+                true
+            }
+            CtKeyCode::Down => {
+                self.plan_scroll += 1;
+                true
+            }
+            CtKeyCode::PageUp => {
+                self.plan_scroll = self.plan_scroll.saturating_sub(10);
+                true
+            }
+            CtKeyCode::PageDown => {
+                self.plan_scroll += 10;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `F5 Timeline`: Up/Down selecciona hito; Enter encola `/rewind <tick>`;
+    /// `f` encola `/fork` (todo por el bus determinista).
+    fn handle_timeline_view_key(&mut self, code: CtKeyCode) -> bool {
+        let count = self
+            .snapshot_store
+            .as_ref()
+            .map_or(0, |s| s.entries().len());
+        match code {
+            CtKeyCode::Up => {
+                if count > 0 {
+                    self.timeline_selected = if self.timeline_selected == 0 {
+                        count - 1
+                    } else {
+                        self.timeline_selected - 1
+                    };
+                }
+                true
+            }
+            CtKeyCode::Down => {
+                if count > 0 {
+                    self.timeline_selected = (self.timeline_selected + 1) % count;
+                }
+                true
+            }
+            CtKeyCode::Enter => {
+                let entries = self
+                    .snapshot_store
+                    .as_ref()
+                    .map(SharedPackStore::entries)
+                    .unwrap_or_default();
+                if let Some(meta) = entries.get(self.timeline_selected) {
+                    self.queued
+                        .push(OnyxEvent::Ingress(IngressEvent::Command(format!(
+                            "/rewind {}",
+                            meta.tick
+                        ))));
+                } else {
+                    self.set_status_hint("F5 Timeline: no snapshot selected.".to_string());
+                }
+                true
+            }
+            CtKeyCode::Char('f' | 'F') => {
+                self.queued.push(OnyxEvent::Ingress(IngressEvent::Command(
+                    "/fork".to_string(),
+                )));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `F1 Chat`: input actual (buffer, popup, history, Tab de modo) con
+    /// interceptación TUI de `/view` (nunca llega al bus).
+    fn handle_chat_view_key(&mut self, code: CtKeyCode, modifiers: KeyModifiers) {
+        match code {
+            CtKeyCode::Tab if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pending_focus_switch = Some(FocusSwitch::Next);
+                self.scroll_from_bottom = 0;
+            }
+            CtKeyCode::Tab => {
+                let next_cmd = match self.mode_handle.get() {
+                    WorkspaceMode::Build => "/mode plan",
+                    WorkspaceMode::Plan | WorkspaceMode::Explore => "/mode build",
+                };
+                self.queued.push(OnyxEvent::Ingress(IngressEvent::Command(
+                    next_cmd.to_string(),
+                )));
+            }
+            CtKeyCode::Left => {
+                self.input.move_left();
+                self.sync_popup();
+            }
+            CtKeyCode::Right => {
+                self.input.move_right();
+                self.sync_popup();
+            }
+            CtKeyCode::Char(c)
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.input.insert_char(c);
+                self.history.reset_navigation();
+                self.popup.reset_dismiss();
+                self.sync_popup();
+            }
+            CtKeyCode::Backspace => {
+                self.input.backspace();
+                self.history.reset_navigation();
+                self.popup.reset_dismiss();
+                self.sync_popup();
+            }
+            CtKeyCode::Delete => {
+                self.input.delete();
+                self.history.reset_navigation();
+                self.popup.reset_dismiss();
+                self.sync_popup();
+            }
+            CtKeyCode::Enter => {
+                let cmd = self.input.as_str().trim().to_string();
+                self.input.clear();
+                self.popup.close();
+                // `SDD-03` Fase 3: `/view` es un comando de nivel TUI — cambia
+                // de vista sin tocar el bus ni la historia.
+                if let Some(outcome) = parse_view_command(&cmd) {
+                    let view_names = TuiView::ALL
+                        .iter()
+                        .map(|v| v.as_slash())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    match outcome {
+                        ViewCommandOutcome::Usage => {
+                            self.set_status_hint(format!("Usage: /view <{view_names}>"));
+                        }
+                        ViewCommandOutcome::Switch(view) => {
+                            self.switch_view(view);
+                        }
+                        ViewCommandOutcome::Unknown(arg) => {
+                            self.set_status_hint(format!(
+                                "Unknown view `{arg}` — use {view_names}"
+                            ));
+                        }
+                    }
+                    return;
+                }
+                if !cmd.is_empty()
+                    && !cmd.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX.trim_end())
+                    && !cmd.starts_with("/__onyx_")
+                {
+                    self.history.push(cmd.clone());
+                    self.scroll_from_bottom = 0;
+                    if cmd == "/agent" || cmd == "/agents" {
+                        if self.last_agent_ids.len() > 1 {
+                            self.open_agent_picker();
+                        } else {
+                            self.pending_focus_switch = Some(FocusSwitch::Next);
+                        }
+                    } else if let Some(rest) = cmd
+                        .strip_prefix("/agent ")
+                        .or_else(|| cmd.strip_prefix("/agents "))
+                    {
+                        let target = rest.trim();
+                        if target.is_empty() {
+                            self.open_agent_picker();
+                        } else {
+                            self.pending_focus_switch =
+                                Some(FocusSwitch::Target(target.to_string()));
+                        }
+                    } else if self.root_busy && !is_immediate_slash_cmd(&cmd) {
+                        self.pending_prompts.push(cmd);
+                    } else {
+                        let lower = cmd.trim().to_ascii_lowercase();
+                        if lower == "/cancel"
+                            || lower.starts_with("/cancel ")
+                            || lower == "/stop"
+                            || lower.starts_with("/stop ")
+                        {
+                            self.pending_prompts.clear();
+                            self.active_approval = None;
+                        }
+                        self.queued
+                            .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Returns `true` if a UI or brain event occurred.
     fn poll_crossterm(&mut self) -> bool {
         if !event::poll(Duration::from_millis(16)).unwrap_or(false) {
@@ -438,6 +944,18 @@ impl TuiInner {
                     && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
                 if is_ctrl_c {
                     self.quit.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                // `SDD-03` Fase 3: paleta `Ctrl+K` — prioridad máxima (salvo
+                // Ctrl+C) y traga todas las teclas mientras está abierta.
+                if self.palette.is_open() {
+                    self.handle_palette_key(code, modifiers);
+                    return true;
+                }
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, CtKeyCode::Char('k' | 'K'))
+                {
+                    self.open_palette();
                     return true;
                 }
                 if self.agent_picker_open {
@@ -472,6 +990,14 @@ impl TuiInner {
                     }
                     return true;
                 }
+                // `SDD-03` Fase 3: `F1..F5` — cambio de vista efímera
+                // (cierra popup y aviso; `F6+` cae al resto de la cadena).
+                if let CtKeyCode::F(n) = code {
+                    if let Some(view) = TuiView::from_key(n) {
+                        self.switch_view(view);
+                        return true;
+                    }
+                }
                 if self.popup.is_open() && self.active_approval.is_none() {
                     match code {
                         CtKeyCode::Esc => {
@@ -497,11 +1023,15 @@ impl TuiInner {
                     }
                 }
                 if matches!(code, CtKeyCode::Esc) {
-                    self.quit.store(true, Ordering::Relaxed);
-                } else if matches!(code, CtKeyCode::F(2)) {
-                    self.popup.close();
-                    self.open_agent_picker();
-                } else if self.active_approval.is_none()
+                    // `SDD-03` Fase 3: Esc sale solo desde `F1 Chat`; en el
+                    // resto de vistas vuelve a `F1 Chat`.
+                    if self.view == TuiView::Chat {
+                        self.quit.store(true, Ordering::Relaxed);
+                    } else {
+                        self.switch_view(TuiView::Chat);
+                    }
+                } else if self.view == TuiView::Chat
+                    && self.active_approval.is_none()
                     && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Up))
                         || (modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(code, CtKeyCode::Char('p' | 'P'))))
@@ -510,7 +1040,8 @@ impl TuiInner {
                         self.input.set_text(prev);
                         self.popup.close();
                     }
-                } else if self.active_approval.is_none()
+                } else if self.view == TuiView::Chat
+                    && self.active_approval.is_none()
                     && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Down))
                         || (modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(code, CtKeyCode::Char('n' | 'N'))))
@@ -524,7 +1055,8 @@ impl TuiInner {
                     && matches!(code, CtKeyCode::Char('x' | 'X'))
                 {
                     self.pending_prompts.clear();
-                } else if self.active_approval.is_none()
+                } else if self.view == TuiView::Chat
+                    && self.active_approval.is_none()
                     && !self.input.is_empty()
                     && matches!(code, CtKeyCode::Home | CtKeyCode::End)
                 {
@@ -534,116 +1066,64 @@ impl TuiInner {
                         self.input.move_end();
                     }
                     self.sync_popup();
-                } else if apply_scroll_key(
-                    &mut self.scroll_from_bottom,
-                    self.last_viewport_height,
-                    code,
-                    modifiers,
-                ) {
+                } else if self.view == TuiView::Chat
+                    && apply_scroll_key(
+                        &mut self.scroll_from_bottom,
+                        self.last_viewport_height,
+                        code,
+                        modifiers,
+                    )
+                {
                     return true;
-                } else if let Some((agent, req, _, _)) = self.active_approval.clone() {
-                    match code {
-                        CtKeyCode::Char('y') | CtKeyCode::Char('Y') => {
-                            self.queued.push(Reply::approve(agent, req).to_event());
-                            self.active_approval = None;
-                            self.approval_diff = None;
-                            self.approval_impact = None;
-                        }
-                        CtKeyCode::Char('n') | CtKeyCode::Char('N') => {
-                            self.queued
-                                .push(Reply::deny(agent, req, "denied by user in TUI").to_event());
-                            self.active_approval = None;
-                            self.approval_diff = None;
-                            self.approval_impact = None;
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match code {
-                        CtKeyCode::Tab if modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.pending_focus_switch = Some(FocusSwitch::Next);
-                            self.scroll_from_bottom = 0;
-                        }
-                        CtKeyCode::Tab => {
-                            let next_cmd = match self.mode_handle.get() {
-                                WorkspaceMode::Build => "/mode plan",
-                                WorkspaceMode::Plan | WorkspaceMode::Explore => "/mode build",
-                            };
-                            self.queued.push(OnyxEvent::Ingress(IngressEvent::Command(
-                                next_cmd.to_string(),
-                            )));
-                        }
-                        CtKeyCode::Left => {
-                            self.input.move_left();
-                            self.sync_popup();
-                        }
-                        CtKeyCode::Right => {
-                            self.input.move_right();
-                            self.sync_popup();
-                        }
-                        CtKeyCode::Char(c)
-                            if !modifiers.contains(KeyModifiers::CONTROL)
-                                && !modifiers.contains(KeyModifiers::ALT) =>
-                        {
-                            self.input.insert_char(c);
-                            self.history.reset_navigation();
-                            self.popup.reset_dismiss();
-                            self.sync_popup();
-                        }
-                        CtKeyCode::Backspace => {
-                            self.input.backspace();
-                            self.history.reset_navigation();
-                            self.popup.reset_dismiss();
-                            self.sync_popup();
-                        }
-                        CtKeyCode::Delete => {
-                            self.input.delete();
-                            self.history.reset_navigation();
-                            self.popup.reset_dismiss();
-                            self.sync_popup();
-                        }
-                        CtKeyCode::Enter => {
-                            let cmd = self.input.as_str().trim().to_string();
-                            self.input.clear();
-                            self.popup.close();
-                            if !cmd.is_empty() {
-                                self.history.push(cmd.clone());
-                                self.scroll_from_bottom = 0;
-                                if cmd == "/agent" || cmd == "/agents" {
-                                    if self.last_agent_ids.len() > 1 {
-                                        self.open_agent_picker();
-                                    } else {
-                                        self.pending_focus_switch = Some(FocusSwitch::Next);
-                                    }
-                                } else if let Some(rest) = cmd
-                                    .strip_prefix("/agent ")
-                                    .or_else(|| cmd.strip_prefix("/agents "))
-                                {
-                                    let target = rest.trim();
-                                    if target.is_empty() {
-                                        self.open_agent_picker();
-                                    } else {
-                                        self.pending_focus_switch =
-                                            Some(FocusSwitch::Target(target.to_string()));
-                                    }
-                                } else if self.root_busy && !is_immediate_slash_cmd(&cmd) {
-                                    self.pending_prompts.push(cmd);
-                                } else {
-                                    let lower = cmd.trim().to_ascii_lowercase();
-                                    if lower == "/cancel"
-                                        || lower.starts_with("/cancel ")
-                                        || lower == "/stop"
-                                        || lower.starts_with("/stop ")
-                                    {
-                                        self.pending_prompts.clear();
-                                        self.active_approval = None;
-                                    }
-                                    self.queued
-                                        .push(OnyxEvent::Ingress(IngressEvent::Command(cmd)));
-                                }
+                } else if self.view == TuiView::Chat && self.active_approval.is_some() {
+                    // `REQ-03.6` (OBLIGATORIO): `y`/`n` solo en `F1 Chat` con
+                    // aprobación pendiente. En Chat cualquier otra tecla se
+                    // traga (arm de swallow).
+                    if let (Some(action), Some((agent, req, _, _))) = (
+                        approval_key_action(self.view, code),
+                        self.active_approval.clone(),
+                    ) {
+                        match action {
+                            ApprovalKeyAction::Approve => {
+                                self.queued.push(Reply::approve(agent, req).to_event());
+                            }
+                            ApprovalKeyAction::Deny => {
+                                self.queued.push(
+                                    Reply::deny(agent, req, "denied by user in TUI").to_event(),
+                                );
                             }
                         }
-                        _ => {}
+                        self.active_approval = None;
+                        self.approval_diff = None;
+                        self.approval_impact = None;
+                    }
+                } else if self.active_approval.is_some()
+                    && matches!(code, CtKeyCode::Char('y' | 'Y' | 'n' | 'N'))
+                {
+                    // `SDD-03` Fase 4: fuera de Chat, `y`/`n` a ciegas **nunca**
+                    // emiten Reply — aviso accionable; el resto de teclas
+                    // (Up/Down/PgUp/PgDn/f) sigue navegando F2..F5 libremente.
+                    self.set_status_hint(
+                        "Approval pending — press F1 to review diff in Chat before deciding"
+                            .to_string(),
+                    );
+                } else {
+                    match self.view {
+                        TuiView::Chat => {
+                            self.handle_chat_view_key(code, modifiers);
+                        }
+                        TuiView::Agents => {
+                            self.handle_agents_view_key(code);
+                        }
+                        TuiView::Sprout => {
+                            self.handle_sprout_view_key(code);
+                        }
+                        TuiView::PlanDiff => {
+                            self.handle_plan_diff_key(code);
+                        }
+                        TuiView::Timeline => {
+                            self.handle_timeline_view_key(code);
+                        }
                     }
                 }
                 true
@@ -687,7 +1167,52 @@ impl TuiInner {
                 let Some(p) = &a.pending_approval else {
                     continue;
                 };
-                let impact_assessment = if let Some(tools) = &self.tools {
+                let mut merge_preview_diff: Option<String> = None;
+                let impact_assessment = if p.tool == "subagent_merge" {
+                    let static_dec = self.policy.as_ref().map_or(PermissionDecision::Ask, |pol| {
+                        pol.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                    });
+                    if static_dec == PermissionDecision::Deny {
+                        continue;
+                    }
+                    let job_id = serde_json::from_str::<serde_json::Value>(&p.args)
+                        .ok()
+                        .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
+                    let preview = job_id.and_then(|jid| {
+                        self.subagents.as_ref().and_then(|h| {
+                            h.preview_merge_for_request(&jid, a.agent.0, a.request).ok()
+                        })
+                    });
+                    match preview {
+                        // `SDD-10` Fase 4: misma decisión efectiva que
+                        // `SubagentManagerDriver` (gobernanza → `Ask` obligatorio); si no es
+                        // `Ask`, el driver auto-aprueba y el prompt no debe mostrarse.
+                        Some(MergePreviewState::Clean(ticket)) => {
+                            if effective_merge_decision(static_dec, &ticket)
+                                != PermissionDecision::Ask
+                            {
+                                continue;
+                            }
+                            merge_preview_diff =
+                                Some(truncate_diff_lines(&ticket.unified_diff, 14));
+                            ticket.impact
+                        }
+                        Some(MergePreviewState::NoOp) => {
+                            if static_dec != PermissionDecision::Ask {
+                                continue;
+                            }
+                            None
+                        }
+                        Some(MergePreviewState::Conflict { .. }) => continue,
+                        // `SDD-10` Fase 3: Control Plane → sin banner; `SubagentManagerDriver`
+                        // niega la solicitud de plano (disco de `root` intacto).
+                        Some(MergePreviewState::ControlPlaneDenied { .. }) => continue,
+                        // `SDD-10` Fase 4: alineado con `CliApprovalDriver`: sin preview no hay
+                        // `y/n`; el driver auto-aprueba para que `subagent_merge` devuelva el
+                        // error exacto a `root` (evita un prompt que el driver no espera).
+                        None => continue,
+                    }
+                } else if let Some(tools) = &self.tools {
                     let (decision, impact) =
                         tools.evaluate_permission_with_impact(current_mode, &p.tool, &p.args);
                     if decision != PermissionDecision::Ask {
@@ -706,10 +1231,11 @@ impl TuiInner {
                     None
                 };
                 if self.seen_approvals.insert((a.agent.0, a.request)) {
-                    self.approval_diff = self
-                        .workspace_root
-                        .as_deref()
-                        .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14));
+                    self.approval_diff = merge_preview_diff.or_else(|| {
+                        self.workspace_root
+                            .as_deref()
+                            .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 14))
+                    });
                     self.approval_impact = impact_assessment;
                     self.active_approval =
                         Some((a.agent, a.request, p.tool.clone(), p.args.clone()));
@@ -717,6 +1243,13 @@ impl TuiInner {
                 }
             }
         }
+
+        let bg_jobs: Vec<SubagentJobSummary> = self
+            .subagents
+            .as_ref()
+            .map(SubagentHandle::list_summaries)
+            .unwrap_or_default();
+        let active_bg_jobs = bg_jobs.iter().filter(|j| j.status == "running").count();
 
         let agents = graph.query(&[self.vocab.state]);
         let agent_rows: Vec<AgentRow> = agents
@@ -733,6 +1266,10 @@ impl TuiInner {
         if self.agent_picker_idx >= agent_rows.len() {
             self.agent_picker_idx = agent_rows.len().saturating_sub(1);
         }
+        // `SDD-03` Fase 3: caches para `Ctrl+K` / `F2 Agents` fuera del render
+        // (`poll_crossterm` no recibe `graph`).
+        self.last_agent_rows = agent_rows.clone();
+        self.last_bg_jobs = bg_jobs.clone();
 
         let explicit_switch = self.pending_focus_switch.take();
         if let Some(switch) = explicit_switch {
@@ -807,15 +1344,20 @@ impl TuiInner {
         let mut log_lines: Vec<Line<'static>> = Vec::new();
         let mut latest_agent_memory: Option<(String, Vec<(String, String)>)> = None;
         let mut compact_count = 0usize;
-        let model_display = if self.model_name.is_empty() {
+        // `SDD-03` Fase 3: cabecera LLM viva (`F1`) — si hay handle, el
+        // objetivo actual (`/profile`/`/provider`/`/model`/`/effort` en
+        // caliente); si no, el arranque/telemetría.
+        let fallback_model = if self.model_name.is_empty() {
             self.telemetry.snapshot().model
         } else {
             self.model_name.clone()
         };
-        let effort_display = self
-            .reasoning_effort
-            .map(ReasoningEffort::as_str)
-            .unwrap_or("auto");
+        let (model_display, live_effort) = resolve_live_llm_header(
+            self.llm_profile.as_ref(),
+            &fallback_model,
+            self.reasoning_effort,
+        );
+        let effort_display = live_effort.map(ReasoningEffort::as_str).unwrap_or("auto");
 
         if let Some(id) = active_agent {
             let active_row = agent_rows.iter().find(|r| r.id == id);
@@ -862,14 +1404,20 @@ impl TuiInner {
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
-            if active_subagents > 0 {
+            if active_subagents > 0 || active_bg_jobs > 0 {
+                let total_sub = active_subagents + active_bg_jobs;
+                let tag = if active_bg_jobs > 0 {
+                    format!("  [subagents:{total_sub} · bg:{active_bg_jobs} · F2]")
+                } else {
+                    format!("  [subagents:{active_subagents} · F2]")
+                };
                 phase_spans.push(Span::styled(
-                    format!("  [subagents:{active_subagents} · F2]"),
+                    tag,
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
-            } else if agent_rows.len() > 1 {
+            } else if agent_rows.len() > 1 || !bg_jobs.is_empty() {
                 let active_count = agent_rows
                     .iter()
                     .filter(|r| {
@@ -1087,16 +1635,110 @@ impl TuiInner {
             sandbox_badge,
             untrusted,
             &model_display,
-            self.reasoning_effort,
+            live_effort,
         );
         let picker_open = self.agent_picker_open;
         let picker_idx = self.agent_picker_idx;
+        // `SDD-03` Fase 3: datos de las vistas efímeras (`F2..F5`) y de la
+        // paleta `Ctrl+K` — se calculan aquí para que el closure de `draw`
+        // no capture `self`.
+        let view = self.view;
+        let agents_total = agent_rows.len() + bg_jobs.len();
+        let agents_selected = if agents_total == 0 {
+            0
+        } else {
+            self.agents_selected.min(agents_total - 1)
+        };
+        let sprout_view_data = (view == TuiView::Sprout).then(|| {
+            let rows = self.sprout_service_rows();
+            if rows.is_empty() {
+                self.sprout_selected = 0;
+            } else {
+                self.sprout_selected = self.sprout_selected.min(rows.len() - 1);
+            }
+            let gate = sprout_mutation_gate(self.mode_handle.get(), self.sprout_untrusted());
+            let logs = rows
+                .get(self.sprout_selected)
+                .and_then(|row| {
+                    self.sprout
+                        .as_ref()
+                        .and_then(|s| s.logs(&row.id, Some(200), None, false).ok())
+                })
+                .unwrap_or_default();
+            (rows, self.sprout_selected, self.sprout_follow, logs, gate)
+        });
+        let plan_view_effects = (view == TuiView::PlanDiff).then(|| {
+            self.ws_vocab
+                .as_ref()
+                .map(|wv| {
+                    all_recorded_effects(graph, wv)
+                        .into_iter()
+                        .map(|e| EffectRow {
+                            tick: e.tick,
+                            tool: e.tool,
+                            target: e.target,
+                            reversibility: e.reversibility,
+                            undone: is_effect_undone(graph, wv, e.id),
+                            symbols: e.symbols,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        let plan_scroll = if view == TuiView::PlanDiff {
+            let max = plan_view_effects.as_ref().map_or(0, |e| e.len());
+            self.plan_scroll.min(max)
+        } else {
+            0
+        };
+        let timeline_view_data = (view == TuiView::Timeline).then(|| {
+            let entries = self
+                .snapshot_store
+                .as_ref()
+                .map(SharedPackStore::entries)
+                .unwrap_or_default();
+            if entries.is_empty() {
+                self.timeline_selected = 0;
+            } else {
+                self.timeline_selected = self.timeline_selected.min(entries.len() - 1);
+            }
+            let latest_tick = entries.iter().map(|m| m.tick).max();
+            (entries, self.timeline_selected, latest_tick)
+        });
+        let status_hint_snapshot = self.status_hint.clone();
+        let palette_open = self.palette.is_open();
+        let palette_visible: Vec<PaletteItem> = if palette_open {
+            self.palette.visible_items().into_iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let palette_selected = self.palette.selected;
+        let palette_query = self.palette.query.clone();
         let terminal = &mut self.terminal;
         let scroll_from_bottom = &mut self.scroll_from_bottom;
         let last_viewport_height = &mut self.last_viewport_height;
         let _ = terminal.draw(|f| {
             let is_approval = approval_snapshot.is_some();
-            let (bottom_title, bottom_lines, border_color) = match &approval_snapshot {
+            let (bottom_title, bottom_lines, border_color) = if view != TuiView::Chat {
+                // `SDD-03` Fase 3: en vistas efímeras la franja inferior muestra
+                // la ayuda de teclas de la vista (+ aviso transitorio).
+                let hint = match view {
+                    TuiView::Agents => " F2 Agents — Up/Down select · Enter focus → F1 Chat · Esc back ",
+                    TuiView::Sprout => " F3 Sprout — Up/Down · s start · x stop · r restart · a all · f follow · Esc back ",
+                    TuiView::PlanDiff => " F4 Plan & Diff — Up/Down scroll · Esc back ",
+                    TuiView::Timeline => " F5 Timeline — Up/Down select · Enter /rewind · f /fork · Esc back ",
+                    TuiView::Chat => unreachable!(),
+                };
+                let mut lines = Vec::new();
+                if let Some(h) = &status_hint_snapshot {
+                    lines.push(Line::from(Span::styled(
+                        h.clone(),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                (hint.to_string(), lines, Color::White)
+            } else {
+                match &approval_snapshot {
                 Some((_, _, tool, args)) => {
                     let lines = build_approval_lines(
                         tool,
@@ -1130,7 +1772,17 @@ impl TuiInner {
                     } else {
                         String::new()
                     };
-                    let mut lines = vec![input_snapshot.render_line("> ")];
+                    // `SDD-03` Fase 4: el aviso transitorio (`/view` inválido,
+                    // gate F3, …) también se ve en Chat — línea amarilla sobre
+                    // el input, TTL en `pump_idle`.
+                    let mut lines = Vec::new();
+                    if let Some(h) = &status_hint_snapshot {
+                        lines.push(Line::from(Span::styled(
+                            h.clone(),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    }
+                    lines.push(input_snapshot.render_line("> "));
                     if input_snapshot.is_empty() {
                         if let Some(next_q) = &queued_preview {
                             lines.push(Line::from(Span::styled(
@@ -1150,6 +1802,7 @@ impl TuiInner {
                             Color::White
                         },
                     )
+                }
                 }
             };
 
@@ -1185,13 +1838,9 @@ impl TuiInner {
 
             let header_block = Block::default()
                 .title(header_title)
-                .title_top(
-                    Line::from(Span::styled(
-                        " F2:Agents · Esc:Quit ",
-                        Style::default().fg(Color::DarkGray),
-                    ))
-                    .right_aligned(),
-                )
+                // `SDD-03` Fase 3: tira de pestañas `F1..F5` (+ badge
+                // `[F1 Chat !APPROVAL]` fuera de Chat con aprobación pendiente).
+                .title_top(view_tabs_line(view, is_approval).right_aligned())
                 .title_bottom(
                     Line::from(Span::styled(
                         format!(" {telemetry_bar} "),
@@ -1218,8 +1867,9 @@ impl TuiInner {
             let header_text = Paragraph::new(header_lines);
             f.render_widget(header_text, header_cols[2]);
 
-            let has_side_panel = plan_snapshot.is_some() || services_snapshot.is_some();
-            let (trace_area, side_area) = if has_side_panel && f.area().width >= 100 {
+            if view == TuiView::Chat {
+                let has_side_panel = plan_snapshot.is_some() || services_snapshot.is_some();
+                let (trace_area, side_area) = if has_side_panel && f.area().width >= 100 {
                 let hsplit = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
@@ -1308,6 +1958,42 @@ impl TuiInner {
                     f.render_widget(svc_widget, s_area);
                 }
             }
+            } else {
+                // `SDD-03` Fase 3: vista efímera a pantalla completa (sin traza).
+                match view {
+                    TuiView::Agents => {
+                        render_agents_view(
+                            f,
+                            chunks[1],
+                            &agent_rows,
+                            &bg_jobs,
+                            active_agent,
+                            agents_selected,
+                        );
+                    }
+                    TuiView::Sprout => {
+                        if let Some((rows, sel, follow, logs, gate)) = &sprout_view_data {
+                            render_sprout_view(f, chunks[1], rows, *sel, *follow, logs, *gate);
+                        }
+                    }
+                    TuiView::PlanDiff => {
+                        let effects = plan_view_effects.as_deref().unwrap_or(&[]);
+                        render_plan_diff_view(
+                            f,
+                            chunks[1],
+                            plan_snapshot.as_deref(),
+                            effects,
+                            plan_scroll,
+                        );
+                    }
+                    TuiView::Timeline => {
+                        if let Some((entries, sel, latest)) = &timeline_view_data {
+                            render_timeline_view(f, chunks[1], entries, *sel, *latest);
+                        }
+                    }
+                    TuiView::Chat => unreachable!(),
+                }
+            }
 
             let mut bottom = Paragraph::new(bottom_lines)
                 .wrap(Wrap { trim: false })
@@ -1322,10 +2008,23 @@ impl TuiInner {
             }
             f.render_widget(bottom, chunks[2]);
 
-            if picker_open {
-                render_agent_picker(f, f.area(), &agent_rows, active_agent, picker_idx);
-            } else if !is_approval && popup_snapshot.is_open() {
-                render_input_popup(f, f.area(), chunks[2], &popup_snapshot);
+            if !palette_open {
+                if picker_open {
+                    render_agent_picker_with_subagents(
+                        f,
+                        f.area(),
+                        &agent_rows,
+                        &bg_jobs,
+                        active_agent,
+                        picker_idx,
+                    );
+                } else if !is_approval && popup_snapshot.is_open() {
+                    render_input_popup(f, f.area(), chunks[2], &popup_snapshot);
+                }
+            }
+            // `SDD-03` Fase 3: la paleta `Ctrl+K` se dibuja por encima de todo.
+            if palette_open {
+                render_palette(f, f.area(), &palette_visible, palette_selected, &palette_query);
             }
         });
     }
@@ -1393,10 +2092,24 @@ fn is_immediate_slash_cmd(cmd: &str) -> bool {
     let lower = cmd.trim().to_ascii_lowercase();
     lower == "/mode"
         || lower.starts_with("/mode ")
+        || lower == "/profile"
+        || lower.starts_with("/profile ")
+        || lower == "/provider"
+        || lower.starts_with("/provider ")
+        || lower == "/model"
+        || lower.starts_with("/model ")
+        || lower == "/effort"
+        || lower.starts_with("/effort ")
         || lower == "/services"
         || lower.starts_with("/services ")
         || lower == "/service"
         || lower.starts_with("/service ")
+        || lower == "/subagents"
+        || lower == "/subagent"
+        || lower == "/spawn"
+        || lower.starts_with("/spawn ")
+        || lower.starts_with("/merge ")
+        || lower.starts_with("/discard ")
         || lower == "/trust"
         || lower.starts_with("/trust ")
         || lower == "/undo"
@@ -1443,6 +2156,31 @@ pub(crate) fn format_header_title_with_trust(
     }
 }
 
+/// `SDD-03` Fase 3: cabecera LLM **viva**. Con handle presente, el objetivo
+/// actual (`/profile`/`/provider`/`/model`/`/effort` aplicados en caliente en
+/// la frontera de tick) opaca al campo estático de arranque; sin handle, se
+/// degrada al arranque/telemetría (`fallback_model`/`fallback_effort`).
+pub(crate) fn resolve_live_llm_header(
+    handle: Option<&LlmProfileHandle>,
+    fallback_model: &str,
+    fallback_effort: Option<ReasoningEffort>,
+) -> (String, Option<ReasoningEffort>) {
+    match handle {
+        Some(h) => {
+            let snap = h.public_snapshot();
+            let effort = if snap.effort == "auto" {
+                None
+            } else {
+                ReasoningEffort::parse(&snap.effort).ok()
+            };
+            // `SDD-03` Fase 4: `provider/model` — el cambio de proveedor al
+            // vuelo se ve en la cabecera sin abrir la paleta.
+            (format!("{}/{}", snap.provider, snap.model), effort)
+        }
+        None => (fallback_model.to_string(), fallback_effort),
+    }
+}
+
 /// Resolves which agent the TUI should display:
 /// - Automatically follows a newly created root agent (e.g. after `/new`).
 /// - Never lets a spawned subagent hijack focus away from the currently viewed agent.
@@ -1465,7 +2203,8 @@ pub(crate) fn resolve_focused_agent(
     (resolved, false)
 }
 
-/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`).
+/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`), keeping backward compatibility.
+#[allow(dead_code)]
 pub(crate) fn render_agent_picker(
     f: &mut Frame<'_>,
     area: Rect,
@@ -1473,13 +2212,26 @@ pub(crate) fn render_agent_picker(
     focused: Option<ConceptId>,
     selected_idx: usize,
 ) {
+    render_agent_picker_with_subagents(f, area, rows, &[], focused, selected_idx);
+}
+
+/// Renders the centered ephemeral Agent Selector popup (`F2` / `/agent`) including background worktree jobs.
+pub(crate) fn render_agent_picker_with_subagents(
+    f: &mut Frame<'_>,
+    area: Rect,
+    rows: &[AgentRow],
+    bg_jobs: &[SubagentJobSummary],
+    focused: Option<ConceptId>,
+    selected_idx: usize,
+) {
     if area.width < 20 || area.height < 6 {
         return;
     }
     let popup_w = area.width.saturating_sub(6).clamp(32, 82).min(area.width);
-    let desired_h = u16::try_from(rows.len().saturating_add(4)).unwrap_or(14);
+    let desired_h =
+        u16::try_from(rows.len().saturating_add(bg_jobs.len()).saturating_add(5)).unwrap_or(18);
     let popup_h = desired_h
-        .clamp(6, 16)
+        .clamp(6, 20)
         .min(area.height.saturating_sub(2).max(5));
     let x = area.x + area.width.saturating_sub(popup_w) / 2;
     let y = area.y + area.height.saturating_sub(popup_h) / 2;
@@ -1488,7 +2240,7 @@ pub(crate) fn render_agent_picker(
     f.render_widget(Clear, popup_area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if rows.is_empty() {
+    if rows.is_empty() && bg_jobs.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no agents yet — enter a goal to start)",
             Style::default().fg(Color::DarkGray),
@@ -1542,14 +2294,76 @@ pub(crate) fn render_agent_picker(
                 Span::styled(goal_preview, dim_style),
             ]));
         }
+        for job in bg_jobs {
+            let state_color = match job.status {
+                "running" => Color::Cyan,
+                "done" | "merged" => Color::Green,
+                "failed" => Color::Red,
+                _ => Color::Gray,
+            };
+            let clean_goal = sanitize_display_line(&job.goal);
+            let goal_preview = if clean_goal.chars().count() > max_goal_chars {
+                let head: String = clean_goal
+                    .chars()
+                    .take(max_goal_chars.saturating_sub(1))
+                    .collect();
+                format!("{head}…")
+            } else {
+                clean_goal
+            };
+            let mut spans = vec![
+                Span::styled(
+                    "  [bg] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("#{} ", job.job_id),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("({}) ", job.status),
+                    Style::default().fg(state_color),
+                ),
+            ];
+            // `SDD-10` Fase 4: badge del driver (`→ opencode`); el driver nativo es el
+            // default y no se muestra (ni se empuja Span vacío) para no ensuciar la línea.
+            if job.driver != "native" {
+                spans.push(Span::styled(
+                    format!("→ {} ", job.driver),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{} — ", job.branch_name),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                goal_preview,
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(spans));
+        }
     }
 
     let block = Block::default()
-        .title(" Select Agent (Up/Down · Enter focus · Esc/F2 close) ")
+        .title(" Select Agent (Up/Down · Enter focus · /merge /discard · Esc/F2 close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let widget = Paragraph::new(lines).block(block);
     f.render_widget(widget, popup_area);
+}
+
+fn truncate_diff_lines(diff: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= max_lines {
+        diff.to_string()
+    } else {
+        let mut head = lines[..max_lines].join("\n");
+        head.push_str(&format!("\n... (+{} more lines)", lines.len() - max_lines));
+        head
+    }
 }
 
 /// Renders the parametric openOnyx emblem in Braille sub-pixels (`6x3` cells = `12x12` dots).
@@ -1860,6 +2674,49 @@ mod tests {
         );
     }
 
+    /// `SDD-03` Fase 3: la cabecera viva de la TUI sigue el objetivo LLM
+    /// hot-swap (el handle opaca al campo estático de arranque, que solo es
+    /// fallback sin handle). Regresión: el header "mentía" hasta reiniciar.
+    #[test]
+    fn live_llm_header_follows_hot_swapped_target() {
+        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider};
+
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let handle = LlmProfileHandle::new(&startup, &[], false);
+
+        // Con handle presente opaca el campo estático (aunque esté pueblado).
+        let (model, effort) = resolve_live_llm_header(
+            Some(&handle),
+            "stale-static-model",
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(model, "gemini/gemini-4-hydrogen");
+        assert_eq!(effort, None);
+
+        // Hot-swap (lo que hace `apply_llm_target` en la frontera de tick):
+        // la cabecera refleja el objetivo nuevo en el siguiente render.
+        handle
+            .set_model("gemini-4-deuterium")
+            .expect("set_model sobre el perfil por defecto");
+        handle.set_effort(Some(ReasoningEffort::High));
+        let (model, effort) = resolve_live_llm_header(Some(&handle), "stale-static-model", None);
+        assert_eq!(model, "gemini/gemini-4-deuterium");
+        assert_eq!(effort, Some(ReasoningEffort::High));
+
+        // Sin handle: se degrada al arranque estático (fallback).
+        let (model, effort) =
+            resolve_live_llm_header(None, "static-model", Some(ReasoningEffort::Low));
+        assert_eq!(model, "static-model");
+        assert_eq!(effort, Some(ReasoningEffort::Low));
+    }
+
     #[test]
     fn focus_resolution_follows_new_root_and_ignores_subagents() {
         let mut last_root = None;
@@ -1945,6 +2802,53 @@ mod tests {
         assert!(rendered.contains("auditor"), "{rendered}");
         assert!(rendered.contains("[root]"), "{rendered}");
         assert!(rendered.contains("[sub ]"), "{rendered}");
+    }
+
+    #[test]
+    fn agent_picker_popup_renders_background_worktree_subagents() {
+        let rows = vec![AgentRow {
+            id: ConceptId(1),
+            name: "openonyx-1".to_string(),
+            is_root: true,
+            state: "thinking".to_string(),
+            goal: "coordinate background tasks".to_string(),
+        }];
+        let bg_jobs = vec![crate::subagent::SubagentJobSummary {
+            job_id: "bg-1".to_string(),
+            driver: "native".to_string(),
+            name: "worker".to_string(),
+            goal: "refactor parser".to_string(),
+            spawn_tick: 7,
+            branch_name: "onyx/sub/bg-1".to_string(),
+            worktree_path: std::path::PathBuf::from("wt/bg-1"),
+            status: "running",
+            ok: None,
+            touched_files: vec!["src/lib.rs".to_string()],
+            summary: String::new(),
+        }];
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_agent_picker_with_subagents(
+                    f,
+                    f.area(),
+                    &rows,
+                    &bg_jobs,
+                    Some(ConceptId(1)),
+                    0,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rendered: String = (0..20)
+            .map(|y| (0..90).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("[bg]"), "{rendered}");
+        assert!(rendered.contains("#bg-1"), "{rendered}");
+        assert!(rendered.contains("(running)"), "{rendered}");
+        assert!(rendered.contains("onyx/sub/bg-1"), "{rendered}");
     }
 
     #[test]

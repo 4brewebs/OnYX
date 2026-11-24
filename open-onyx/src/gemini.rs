@@ -1,29 +1,37 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{Arc, Mutex};
 
+use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
+
+#[cfg(test)]
 use onyx_soul_agents::{
-    AgentView, ConceptId, EventBus, GraphView, PlatformDriver, Reply, Responder, SurfaceBinding,
-    Vocab, pending_requests,
+    EventBus, GraphView, PlatformDriver, SurfaceBinding, Vocab, pending_requests,
 };
 use onyx_workspace::WorkspaceTools;
 use onyx_workspace::tools::{discover_skills_summary, scrub_secrets};
 use serde_json::{Value as JsonValue, json};
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use std::sync::mpsc;
+#[cfg(test)]
+use std::thread;
 
 use crate::context::{
     ContextBudget, ProjectedTurn, ReasoningEffort, SessionTelemetryHandle, TieredContextConfig,
     extract_gemini_usage, project_memory,
 };
+use crate::llm_profile::{api_base_host, is_loopback_host};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 
-type SignatureMap = Arc<Mutex<HashMap<(u64, usize), JsonValue>>>;
+pub(crate) type SignatureMap = Arc<Mutex<HashMap<(u64, usize), JsonValue>>>;
 pub(crate) type PendingCallQueue = Arc<Mutex<HashMap<u64, VecDeque<(String, String)>>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,14 +104,20 @@ impl StreamPreviewHandle {
     }
 }
 
+/// Estado compartido por los hilos de despacho Gemini (firmas de pensamiento, cola
+/// secuencial de tool calls, telemetría). `pub(crate)` para que `DynamicLlmDriver`
+/// (`SDD-03` Fase 2) lo construya con la cola de tool calls compartida con OpenAI.
 #[derive(Clone, Default)]
-struct GeminiSharedState {
-    thought_signatures: SignatureMap,
-    pending_calls: PendingCallQueue,
-    project_instructions: Arc<String>,
-    telemetry: Option<SessionTelemetryHandle>,
-    context_config: TieredContextConfig,
-    effort: Option<ReasoningEffort>,
+pub(crate) struct GeminiSharedState {
+    pub(crate) thought_signatures: SignatureMap,
+    pub(crate) pending_calls: PendingCallQueue,
+    pub(crate) project_instructions: Arc<String>,
+    pub(crate) telemetry: Option<SessionTelemetryHandle>,
+    pub(crate) context_config: TieredContextConfig,
+    pub(crate) effort: Option<ReasoningEffort>,
+    /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
+    /// esquema dinámico de `spawn_subagent` (`driver` opcional).
+    pub(crate) driver_ids: Vec<String>,
 }
 
 /// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
@@ -218,7 +232,7 @@ fn build_request_body_with_budget(
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: ContextBudget,
 ) -> JsonValue {
-    build_request_body_with_context(req, thought_signatures, budget.into(), "", None)
+    build_request_body_with_context(req, thought_signatures, budget.into(), "", None, &[])
 }
 
 const BASE_INSTRUCTION: &str = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Do not re-read unchanged files or repeat `scent_outline` queries already summarized in your history unless the file was modified. Never create temporary helper scripts or scratch directories inside the workspace repository; use built-in tools (`glob_files`, `code_search`, `scent_outline`) for counting and inspection. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step workspace tasks, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`), but never call `plan_update` multiple times in a row without executing real workspace tools in between; for purely conceptual questions or single-step answers that do not inspect or modify the workspace, omit `plan_update` (or call it at most once). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
@@ -242,12 +256,17 @@ pub(crate) fn system_instruction_text(project_instructions: &str) -> String {
     }
 }
 
-fn build_request_body_with_context(
+/// Construye el body `generateContent` con proyección jerárquica de contexto,
+/// firmas de pensamiento y esfuerzo de razonamiento. `pub(crate)` para
+/// `DynamicLlmDriver` (`SDD-03` Fase 2), que construye el body síncrono en el
+/// hilo principal antes de `thread::spawn`.
+pub(crate) fn build_request_body_with_context(
     req: &AgentView,
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: TieredContextConfig,
     project_instructions: &str,
     effort: Option<ReasoningEffort>,
+    driver_ids: &[String],
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut contents: Vec<JsonValue> = Vec::with_capacity(projected.turns.len());
@@ -313,17 +332,18 @@ fn build_request_body_with_context(
         }
     }
 
-    let declarations: Vec<JsonValue> = WorkspaceTools::schemas_with_subagents(true)
-        .into_iter()
-        .filter(|s| req.tools.iter().any(|t| t == s.name))
-        .map(|s| {
-            json!({
-                "name": s.name,
-                "description": s.description,
-                "parameters": s.parameters
+    let declarations: Vec<JsonValue> =
+        WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
+            .into_iter()
+            .filter(|s| req.tools.iter().any(|t| t == s.name))
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "parameters": s.parameters
+                })
             })
-        })
-        .collect();
+            .collect();
 
     let system_text = system_instruction_text(project_instructions);
 
@@ -349,16 +369,22 @@ fn build_request_body_with_context(
     body
 }
 
-fn parse_gemini_response(
+/// Parsea una respuesta `generateContent` (REST o SSE acumulada) y registra
+/// telemetría por la **llamada real** (`SDD-03` Fase 2: `record_turn_for` con el
+/// modelo/endpoint despachados, no los del handle, que pueden haber cambiado
+/// en caliente entre el despacho y la respuesta).
+pub(crate) fn parse_gemini_response(
     json: &JsonValue,
     agent: ConceptId,
     request: u64,
     call_index: usize,
     shared: &GeminiSharedState,
+    model: &str,
+    is_local_endpoint: bool,
 ) -> Reply {
     if let Some(usage) = extract_gemini_usage(json) {
         if let Some(telemetry) = &shared.telemetry {
-            telemetry.record_turn(usage);
+            telemetry.record_turn_for(model, is_local_endpoint, usage);
         }
     }
     let parts = json["candidates"][0]["content"]["parts"]
@@ -545,7 +571,8 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
     }
 }
 
-fn execute_gemini_http(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_gemini_http(
     url: &str,
     api_key: &str,
     body: JsonValue,
@@ -553,6 +580,8 @@ fn execute_gemini_http(
     request: u64,
     call_index: usize,
     shared: &GeminiSharedState,
+    model: &str,
+    is_local_endpoint: bool,
 ) -> Reply {
     let resp = match post_gemini_json(url, api_key, body, agent, request) {
         Ok(r) => r,
@@ -565,20 +594,33 @@ fn execute_gemini_http(
         }
     };
 
-    parse_gemini_response(&json, agent, request, call_index, shared)
+    parse_gemini_response(
+        &json,
+        agent,
+        request,
+        call_index,
+        shared,
+        model,
+        is_local_endpoint,
+    )
 }
 
-struct GeminiStreamTarget<'a> {
-    url: &'a str,
-    api_key: &'a str,
-    agent: ConceptId,
-    request: u64,
-    call_index: usize,
-    shared: &'a GeminiSharedState,
-    preview: Option<&'a StreamPreviewHandle>,
+/// Parámetros inmutables de una llamada SSE `streamGenerateContent`
+/// (`SDD-03` Fase 2: incluye el modelo/endpoint reales de la llamada para
+/// telemetría por llamada). `pub(crate)` para `DynamicLlmDriver`.
+pub(crate) struct GeminiStreamTarget<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) api_key: &'a str,
+    pub(crate) agent: ConceptId,
+    pub(crate) request: u64,
+    pub(crate) call_index: usize,
+    pub(crate) shared: &'a GeminiSharedState,
+    pub(crate) preview: Option<&'a StreamPreviewHandle>,
+    pub(crate) model: &'a str,
+    pub(crate) is_local_endpoint: bool,
 }
 
-fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: JsonValue) -> Reply {
+pub(crate) fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: JsonValue) -> Reply {
     let resp = match post_gemini_json(
         target.url,
         target.api_key,
@@ -618,6 +660,8 @@ fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: JsonValue) -
         target.request,
         target.call_index,
         target.shared,
+        target.model,
+        target.is_local_endpoint,
     )
 }
 
@@ -668,6 +712,11 @@ impl GeminiResponder {
         self.shared.effort = effort;
         self
     }
+
+    pub fn with_external_driver_ids(mut self, driver_ids: Vec<String>) -> Self {
+        self.shared.driver_ids = driver_ids;
+        self
+    }
 }
 
 impl Responder for GeminiResponder {
@@ -675,6 +724,7 @@ impl Responder for GeminiResponder {
         if let Some(queued_reply) = next_queued_call(&self.shared.pending_calls, req) {
             return Some(queued_reply);
         }
+        let is_local = is_loopback_host(api_base_host(&self.api_base));
         let url = format!("{}/models/{}:generateContent", self.api_base, self.model);
         let body = {
             let sigs = self
@@ -689,6 +739,7 @@ impl Responder for GeminiResponder {
                 self.shared.context_config,
                 &self.shared.project_instructions,
                 self.shared.effort,
+                &self.shared.driver_ids,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -700,15 +751,19 @@ impl Responder for GeminiResponder {
             req.request,
             call_index,
             &self.shared,
+            &self.model,
+            is_local,
         ))
     }
 }
 
-/// Driver asíncrono no bloqueante para la TUI de `Mode::Chat`.
+/// Driver asíncrono no bloqueante para la TUI de `Mode::Chat` (solo tests).
 ///
-/// Despacha peticiones SSE en `present()` actualizando `StreamPreviewHandle` y entrega
-/// el `Reply` consolidado en `poll()`, de modo que `RecordingBridge` lo grabe vía
-/// `RecordingBus` sin violar el determinismo ni ensuciar el grafo con deltas parciales.
+/// En producción (`SDD-03` Fase 2) `DynamicLlmDriver` sustituye a este driver en
+/// `chat`/`serve`: el objetivo LLM se congela por petición en el hilo principal,
+/// mientras que `AsyncGeminiDriver` se mantenía fijo al modelo de arranque.
+/// Sigue existiendo bajo `#[cfg(test)]` como fixture de despacho SSE.
+#[cfg(test)]
 pub struct AsyncGeminiDriver {
     vocab: Vocab,
     api_key: String,
@@ -724,6 +779,7 @@ pub struct AsyncGeminiDriver {
     inner: Option<Box<dyn PlatformDriver>>,
 }
 
+#[cfg(test)]
 impl AsyncGeminiDriver {
     pub fn new(
         vocab: Vocab,
@@ -747,46 +803,6 @@ impl AsyncGeminiDriver {
             tx,
             inner: None,
         }
-    }
-
-    pub fn wrapping(mut self, inner: impl PlatformDriver + 'static) -> Self {
-        self.inner = Some(Box::new(inner));
-        self
-    }
-
-    pub fn with_api_base(mut self, api_base: Option<String>) -> Self {
-        if let Some(base) = api_base {
-            let trimmed = base.trim().trim_end_matches('/');
-            if !trimmed.is_empty() {
-                self.api_base = trimmed.to_string();
-            }
-        }
-        self
-    }
-
-    pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.shared.project_instructions = Arc::new(instructions.into());
-        self
-    }
-
-    pub fn with_stream_preview(mut self, preview: StreamPreviewHandle) -> Self {
-        self.stream_preview = Some(preview);
-        self
-    }
-
-    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
-        self.shared.telemetry = Some(telemetry);
-        self
-    }
-
-    pub fn with_context_config(mut self, cfg: TieredContextConfig) -> Self {
-        self.shared.context_config = cfg;
-        self
-    }
-
-    pub fn with_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
-        self.shared.effort = effort;
-        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -836,6 +852,7 @@ impl AsyncGeminiDriver {
                 self.shared.context_config,
                 &self.shared.project_instructions,
                 self.shared.effort,
+                &self.shared.driver_ids,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -855,6 +872,7 @@ impl AsyncGeminiDriver {
     }
 }
 
+#[cfg(test)]
 impl PlatformDriver for AsyncGeminiDriver {
     fn poll(&mut self, bus: &mut dyn EventBus) {
         if let Some(inner) = self.inner.as_mut() {
@@ -876,6 +894,8 @@ impl PlatformDriver for AsyncGeminiDriver {
         let preview = self.stream_preview.clone();
         for req in pending_requests(graph, &self.vocab) {
             let thread_preview = preview.clone();
+            let model = self.model.clone();
+            let is_local = is_loopback_host(api_base_host(&self.api_base));
             self.dispatch_with(
                 &req,
                 |url, api_key, body, agent, request, call_index, shared, guard, ready_flag, tx| {
@@ -890,6 +910,8 @@ impl PlatformDriver for AsyncGeminiDriver {
                                 call_index,
                                 shared: &shared,
                                 preview: thread_preview.as_ref(),
+                                model: &model,
+                                is_local_endpoint: is_local,
                             },
                             body,
                         );
@@ -1008,7 +1030,7 @@ mod tests {
             }]
         });
 
-        let first = parse_gemini_response(&json, ConceptId(1), 10, 0, &shared);
+        let first = parse_gemini_response(&json, ConceptId(1), 10, 0, &shared, "test-model", false);
         let first_dbg = format!("{first:?}");
         assert!(first_dbg.contains("a.rs"), "{first_dbg}");
 
@@ -1077,7 +1099,7 @@ mod tests {
             }]
         });
 
-        let _ = parse_gemini_response(&json, ConceptId(1), 1, 0, &shared);
+        let _ = parse_gemini_response(&json, ConceptId(1), 1, 0, &shared, "test-model", false);
         let sig_guard = shared.thought_signatures.lock().unwrap();
         assert_eq!(sig_guard.get(&(1, 0)), Some(&json!("sig-batch")));
         assert_eq!(sig_guard.get(&(1, 1)), Some(&json!("sig-batch")));
@@ -1195,6 +1217,7 @@ mod tests {
             TieredContextConfig::default(),
             &loaded,
             Some(ReasoningEffort::High),
+            &[],
         );
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(serialized.contains("Follow-up question."), "{serialized}");
@@ -1242,7 +1265,7 @@ mod tests {
         assert!(preview.take_dirty());
         assert!(!preview.take_dirty());
 
-        let reply = parse_gemini_response(&json, ConceptId(3), 9, 0, &shared);
+        let reply = parse_gemini_response(&json, ConceptId(3), 9, 0, &shared, "test-model", false);
         assert_eq!(reply, Reply::done(ConceptId(3), 9, "Hola OnYX!"));
         let tel_snap = telemetry.snapshot();
         assert_eq!(tel_snap.last_turn.input_tokens, 12_000);
@@ -1265,7 +1288,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preview.get().unwrap().text, "[calling `fs_read`...]");
-        let tool_reply = parse_gemini_response(&tool_json, ConceptId(3), 10, 0, &shared);
+        let tool_reply = parse_gemini_response(
+            &tool_json,
+            ConceptId(3),
+            10,
+            0,
+            &shared,
+            "test-model",
+            false,
+        );
         assert!(
             matches!(tool_reply.verb, onyx_soul_agents::Verb::Call),
             "{tool_reply:?}"

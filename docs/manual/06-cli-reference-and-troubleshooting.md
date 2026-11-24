@@ -41,6 +41,7 @@ openonyx [--help | -h | --version | -V]
 | `--auto-approve` | `chat`, `run`, `rewind` | Skip interactive approvals for mutating tools (`deny` rules still apply; sandbox elevates `off` → `workspace-write` + `offline` unless `--sandbox off`). |
 | `--ignore-deny` | `chat`, `run`, `rewind` | Explicitly bypass `[permissions].deny` rules from `.onyx/config.toml`. |
 | `--max-steps <n>` | `chat`, `run` | Max root agent steps per turn (default: `128` in `chat`, `64` in `run`; subagents capped at `32` by default). |
+| `--max-subagents <n>` | `chat`, `run`, `serve`, `rewind --interactive` | Max parallel async subagent Git worktrees (default: `3`, or `ONYX_MAX_SUBAGENTS`). |
 | `--shell-timeout <secs>` | `chat`, `run` | Timeout in seconds per `shell_exec` command (default: `30s`). |
 | `--auto-save` | `chat`, `run` | Auto-create `.onyx/vault/<YYYYMMDD-HHMMSS>_<model>[_<branch\|goal>]/` storing both `snapshots.onyxpack` and `<id>.tr` together (or `ONYX_AUTO_SAVE=1`). |
 | `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Save deterministic `ONYXTR2` transcript (short names go inside `--snapshot-dir`, or `.onyx/vault/unassigned/` if no snapshot dir). |
@@ -71,8 +72,11 @@ openonyx [--help | -h | --version | -V]
 | `ONYX_MODEL` | Both | Default model override (fallbacks: `ONYX_GEMINI_MODEL`, `OPENAI_MODEL`). |
 | `ONYX_EFFORT` | Both | Default reasoning effort (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`). |
 | `ONYX_AUTO_SAVE` | Both | Enable `--auto-save` by default (`1` \| `true` \| `yes` \| `on`) storing sessions in `.onyx/vault/`. |
+| `ONYX_MAX_SUBAGENTS` | Both | Max parallel async subagent worktrees (used when `--max-subagents <n>` is omitted; default: `3`). |
 | `GEMINI_API_BASE` | Gemini | Custom Gemini API base URL. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Custom OpenAI-compatible API endpoint (default: `https://api.openai.com/v1`). |
+
+> **LLM & driver config in `config.toml`:** beyond flags and environment variables, `.onyx/config.toml` accepts `[[llm_profiles]]` (chapter 03, section 2.6) and `[[external_drivers]]` (chapter 03, section 2.7) blocks. A profile's key resolves in the order `api_key_env` → the provider's standard variable → `ONYX_API_KEY`.
 
 ---
 
@@ -105,7 +109,7 @@ The default sandbox policy is `--sandbox-net offline` (also injecting `CARGO_NET
 Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor. `openonyx` probes `bwrap_is_usable()` at runtime and automatically falls back cleanly so `shell_exec` keeps working. Verify your host driver with `openonyx doctor`.
 
 ### 5. `Ctrl+Tab` does not switch agents in my terminal
-Some terminal emulators (Windows Terminal, tmux, SSH) swallow `Ctrl+Tab`. Use **`F2`** (interactive **Agent Selector** popup) or **`/agent [id|name]`**, which work across all terminals.
+Some terminal emulators (Windows Terminal, tmux, SSH) swallow `Ctrl+Tab`. Use the **`F2`** key (which now opens the **Agents** view, chapter 02) or **`/agent [id|name]`**, which work across all terminals.
 
 ### 6. `/rewind` refuses to run while an agent is busy
 Live `/rewind <tick>` requires no active agents (`thinking`, `acting`, `waiting_children`) and no in-flight LLM calls. Wait for `Settled`, or quit with `Esc` and run `openonyx chat --resume <session> --tick <n>`.
@@ -117,6 +121,14 @@ Live `/rewind <tick>` requires no active agents (`thinking`, `acting`, `waiting_
 1. Run `openonyx doctor --snapshot-dir <session>` to check for any truncated tail bytes in `snapshots.onyxpack`.
 2. Inspect intact milestones with `openonyx inspect <session> --list`.
 3. Resume with `openonyx chat --resume <session>` — truncated tail bytes are safely ignored on read and healed automatically on the next append.
+
+### 9. `openonyx doctor` warns or errors on an external driver (`[[external_drivers]]`)
+`doctor` audits the `[[external_drivers]]` declarations (chapter 03, section 2.7):
+- Built-in `opencode` preset: `[WARN]` when the `opencode` binary is not on `PATH` (the preset is skipped).
+- Declared driver whose `bin` is missing: `[ERR]` — `/spawn --driver <id> will fail at runtime`.
+- `bin` found but the `--version` probe (3 s deadline, sanitized environment) times out: `[ERR]`; if it errors out instead (e.g., wrong flags): `[WARN]`.
+- `prompt_transport = "arg"` on Windows: `[WARN]` when the binary resolves to a `.cmd`/`.bat` wrapper (rejected at spawn time).
+- `network_allowlist` without `--sandbox strict-container`: `[WARN]` — the allowlist is advisory outside `strict-container`; a declared driver without `network_allowlist` is `LocalhostOnly` unless the sandbox relaxes it.
 
 ---
 

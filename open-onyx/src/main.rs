@@ -1,12 +1,18 @@
 mod command;
 mod context;
+mod external_driver;
 mod gemini;
+mod llm_driver;
+mod llm_profile;
 mod openai;
 mod ops;
 mod pack;
 mod session;
+mod subagent;
 mod tui;
 mod tui_input;
+mod tui_palette;
+mod tui_views;
 mod vault;
 mod web;
 
@@ -20,9 +26,10 @@ use std::time::{Duration, SystemTime};
 use command::{CommandSpawnerSystem, PendingSessionAction, PendingSystemNotes};
 use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
-    AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
-    load_project_instructions,
+    DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle, load_project_instructions,
 };
+use llm_driver::DynamicLlmDriver;
+use llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider, ResolvedLlmTarget, validate_api_base};
 use onyx_soul_agents::{
     AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
 };
@@ -31,7 +38,7 @@ use onyx_workspace::{
     WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, evaluate_workspace_trust,
     graph_workspace_mode, list_trusted_workspaces, revoke_workspace_trust, trust_workspace,
 };
-use openai::{AsyncOpenAiDriver, DEFAULT_OPENAI_MODEL, OpenAiResponder};
+use openai::{DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
 use pack::{
     PackSnapshotStore, SharedPackStore, default_fork_dir, fork_pack_until_tick,
@@ -42,39 +49,17 @@ use session::{
     build_host_with_checkpoints, build_host_with_options, build_host_with_shared_store, make_spec,
     run_session,
 };
+use subagent::{
+    DEFAULT_MAX_CONCURRENT_SUBAGENTS, ONYX_MAX_SUBAGENTS_ENV, PinnedResponderFactory,
+    ResponderFactory, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentManager,
+    SubagentManagerDriver,
+};
 use tui::TuiDriver;
 use vault::{
     auto_save_from_env, ensure_vault_gitignore, resolve_fork_dir, resolve_read_snapshot_dir,
     resolve_read_transcript, resolve_write_storage, session_display_label,
 };
 use web::{DEFAULT_WEB_BIND, WebDriver, WebServerConfig};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LlmProvider {
-    Gemini,
-    OpenAi,
-}
-
-impl LlmProvider {
-    fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "gemini" => Ok(Self::Gemini),
-            "openai" => Ok(Self::OpenAi),
-            other => Err(format!(
-                "unsupported provider `{other}` (expected `gemini` or `openai`)"
-            )),
-        }
-    }
-}
-
-struct LlmConfig {
-    provider: LlmProvider,
-    api_key: String,
-    model: String,
-    effort: Option<ReasoningEffort>,
-    api_base: Option<String>,
-    project_instructions: String,
-}
 
 struct CliArgs {
     mode: Mode,
@@ -91,6 +76,7 @@ struct CliArgs {
     sandbox_network: Option<NetworkPolicy>,
     dry_run: bool,
     max_steps: Option<i64>,
+    max_subagents: Option<usize>,
     shell_timeout_secs: Option<u64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
@@ -121,6 +107,7 @@ impl CliArgs {
             sandbox_network: None,
             dry_run: false,
             max_steps: None,
+            max_subagents: None,
             shell_timeout_secs: None,
             save_transcript: None,
             snapshot_dir: None,
@@ -195,6 +182,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut sandbox_network: Option<NetworkPolicy> = None;
     let mut dry_run = false;
     let mut max_steps: Option<i64> = None;
+    let mut max_subagents: Option<usize> = None;
     let mut shell_timeout_secs: Option<u64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
@@ -309,6 +297,18 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--max-steps must be > 0".to_string());
                 }
                 max_steps = Some(parsed);
+            }
+            "--max-subagents" => {
+                let s = args
+                    .next()
+                    .ok_or("--max-subagents requires a positive integer")?;
+                let parsed = s
+                    .parse::<usize>()
+                    .map_err(|_| "--max-subagents must be a positive integer")?;
+                if parsed == 0 {
+                    return Err("--max-subagents must be > 0".to_string());
+                }
+                max_subagents = Some(parsed);
             }
             "--shell-timeout" => {
                 let s = args
@@ -498,6 +498,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         sandbox_network,
         dry_run,
         max_steps,
+        max_subagents,
         shell_timeout_secs,
         save_transcript,
         snapshot_dir,
@@ -513,14 +514,14 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let usage_str = usage();
     let body = r#"SUBCOMMANDS:
-  chat                     Launch interactive TUI with SSE streaming, diff approvals, Plan/Build toggle, and Live Plan
+  chat                     Launch interactive TUI with SSE streaming, diff approvals, F1..F5 views + Ctrl+K palette, Plan/Build toggle, and Live Plan
   run <goal>               Run a single headless turn toward <goal> and print the final result
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
@@ -546,6 +547,7 @@ OPTIONS:
       --sandbox <mode>     OS sandbox profile for `shell_exec`: `workspace-write` (default), `strict-container`, or `off`
       --sandbox-net <pol>  Network policy inside sandbox: `offline` (default), `localhost`, or `unrestricted`
       --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
+      --max-subagents <n>  Max parallel async subagent worktrees (default: 3, or `ONYX_MAX_SUBAGENTS`)
       --shell-timeout <s>  Timeout in seconds per `shell_exec` command
       --auto-save          Auto-save snapshots + ONYXTR2 transcript together in `.onyx/vault/<timestamp>_<model>[_<branch|goal>]/` (or `ONYX_AUTO_SAVE=1`)
       --save-transcript <f>, --record <f>
@@ -576,12 +578,20 @@ TUI CONTROLS & SLASH COMMANDS (chat):
                            Browse prompt input history (preserving unsent draft)
   Ctrl+X                   Clear queued follow-up prompts
   Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
-  F2                       Open/close interactive Agent Selector popup (focus root or subagents)
-  Ctrl+Tab                 Quick-cycle focused agent (optional terminal-dependent alias for F2 / /agent)
-  y / n                    Approve or deny a pending mutating tool diff
+  F1..F5                   Switch ephemeral views: F1 Chat · F2 Agents · F3 Sprout · F4 Plan & Diff · F5 Timeline
+  Ctrl+K                   Command palette: filter views, LLM slash commands, and agents (Up/Down + Enter)
+  /view <chat|agents|sprout|plan|timeline>
+                           Switch views from the prompt (ephemeral: no bus event, no tick, no graph write)
+  Ctrl+Tab                 Quick-cycle focused agent (terminal-dependent alias; `F2`/`/agent` work everywhere)
+  y / n                    Approve or deny a pending mutating tool diff (only in `F1 Chat`; other views hint to press `F1`)
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
   /agent [id|name]         Open agent selector or focus a specific agent by ID or name
+  /subagents               List background async subagent worktree jobs and touched files
+  /merge <job_id>          Reconcile 3-way and merge a finished async subagent into root
+  /discard <job_id>        Cancel and remove an async subagent worktree and temporary branch
+  /spawn [--driver <id>] <task>
+                          Launch a background subagent worktree job without spending a root turn
   /undo                    Revert the latest reversible git checkpoint (also removes newly created untracked `fs_write` files)
   /rewind [tick]           List milestones or rewind in-place to `<tick>` (forks snapshots safely + restores git tree)
   /fork [name]             Branch snapshots up to the current tick into a sibling directory without mutating the original
@@ -592,8 +602,15 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /trust [status|revoke]   Approve, inspect, or revoke Workspace Trust for the current workspace
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
+  /profile [id]             List LLM profiles or switch to a registered one (`[[llm_profiles]]`)
+  /provider <gemini|openai>
+                          Hot-swap the LLM provider without restarting the session
+  /model <name>             Change the LLM model of the active target (custom model)
+  /effort [auto|low|medium|high]
+                          Change the reasoning/thinking effort of the active target
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
-  Esc / Ctrl+C             Close popup or quit cleanly (flushing exit snapshot & transcript if configured)
+  Esc                      Close popup/palette; from F2..F5 back to F1 Chat; in F1 Chat quit cleanly
+  Ctrl+C                   Quit cleanly (flushing exit snapshot & transcript if configured)
 
 PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
   ONYX.md / AGENTS.md      Loaded from ~/.onyx/ and the workspace root into system instructions
@@ -612,6 +629,7 @@ ENVIRONMENT VARIABLES:
   ONYX_ALLOW_CUSTOM_AUTH_HOST
                            Allow sending API keys to custom remote HTTPS `--api-base` hosts (`1` | `true`)
   ONYX_TRUST_FILE          Optional override path for `trusted_workspaces.toml`
+  ONYX_MAX_SUBAGENTS       Max parallel async subagent worktrees (default: 3)
   ONYX_WEB_BIND            Default bind address for `openonyx serve` (default: `127.0.0.1:8787`)
   ONYX_WEB_API_KEY         Explicit API key for `openonyx serve` (required when binding non-loopback addresses)
   ONYX_WEB_CORS_ORIGIN     Optional allowed browser origin for external SPAs (e.g. `http://localhost:5173`)
@@ -633,100 +651,6 @@ fn allow_custom_auth_host_from_env() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower.ends_with(".localhost")
-}
-
-fn is_official_provider_host(provider: LlmProvider, host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    match provider {
-        LlmProvider::Gemini => lower == "generativelanguage.googleapis.com",
-        LlmProvider::OpenAi => lower == "api.openai.com",
-    }
-}
-
-/// Valida `--api-base` (y variables `*_API_BASE`):
-/// - Permite `http://` **solo** en loopback (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`).
-/// - Exige `https://` para cualquier host remoto.
-/// - Bloquea envío de credenciales (`api_key` no vacía) a hosts remotos no oficiales salvo
-///   opt-in explícito (`--allow-custom-auth-host` o `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`).
-fn validate_api_base(
-    provider: LlmProvider,
-    raw_url: &str,
-    has_api_key: bool,
-    allow_custom_auth_host: bool,
-) -> Result<String, String> {
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("--api-base must not be empty".to_string());
-    }
-    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!(
-            "invalid --api-base `{trimmed}`: whitespace/control characters not allowed"
-        ));
-    }
-
-    let (is_https, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
-        (false, r)
-    } else {
-        return Err(format!(
-            "invalid --api-base `{trimmed}`: scheme must be `https://` (or `http://` for loopback hosts)"
-        ));
-    };
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(format!("invalid --api-base `{trimmed}`: missing host"));
-    }
-    if authority.contains('@') {
-        return Err(format!(
-            "invalid --api-base `{trimmed}`: embedded credentials (`user:pass@host`) are not allowed"
-        ));
-    }
-
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((ipv6, tail)) = bracketed.split_once(']') else {
-            return Err(format!(
-                "invalid --api-base `{trimmed}`: unclosed IPv6 bracket"
-            ));
-        };
-        if !tail.is_empty() && !tail.starts_with(':') {
-            return Err(format!(
-                "invalid --api-base `{trimmed}`: invalid authority after `]`"
-            ));
-        }
-        ipv6
-    } else {
-        authority.split(':').next().unwrap_or("")
-    };
-
-    if host.is_empty() {
-        return Err(format!("invalid --api-base `{trimmed}`: empty host"));
-    }
-
-    let loopback = is_loopback_host(host);
-    if !is_https && !loopback {
-        return Err(format!(
-            "refusing insecure `http://` --api-base for remote host `{host}`: use `https://` (`http://` is only permitted for loopback hosts like `localhost`, `127.0.0.1`, or `[::1]`)"
-        ));
-    }
-
-    if !loopback
-        && !is_official_provider_host(provider, host)
-        && has_api_key
-        && !allow_custom_auth_host
-    {
-        return Err(format!(
-            "refusing to send API key to non-official remote host `{host}`: pass `--allow-custom-auth-host` (or set `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`) to explicitly authorize sending credentials to this endpoint"
-        ));
-    }
-
-    Ok(trimmed.to_string())
 }
 
 fn resolve_llm_config(
@@ -845,9 +769,80 @@ fn resolve_llm_config(
     }
 }
 
+/// Configuración LLM **leniente** para `replay`/`rewind --transcript`
+/// (`SDD-03` Fase 2): no se hace ninguna llamada LLM — solo se debe reproducir el
+/// estado modal `ws.llm.*`. Misma precedencia que [`resolve_llm_config`]
+/// (provider/modelo/esfuerzo/`api_base`) pero **sin credenciales**: una API key
+/// ausente no bloquea el replay.
+fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::error::Error>> {
+    let provider = match cli.provider {
+        Some(p) => p,
+        None => match env::var("ONYX_PROVIDER") {
+            Ok(s) if !s.trim().is_empty() => LlmProvider::parse(&s)?,
+            _ => LlmProvider::Gemini,
+        },
+    };
+    let model = cli
+        .model
+        .clone()
+        .or_else(|| env::var("ONYX_MODEL").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| match provider {
+            LlmProvider::Gemini => env::var("ONYX_GEMINI_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            LlmProvider::OpenAi => env::var("OPENAI_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        })
+        .unwrap_or_else(|| provider.default_model().to_string());
+    // Misma precedencia que [`resolve_llm_config`]: `--effort` de CLI primero — el
+    // sellado de tick 0 del replay debe igualar al de la sesión en vivo.
+    let effort = match cli.effort {
+        Some(e) => Some(e),
+        None => env::var("ONYX_EFFORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| match provider {
+                LlmProvider::Gemini => env::var("GEMINI_THINKING_LEVEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+                LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+            })
+            .and_then(|raw| ReasoningEffort::parse(&raw).ok()),
+    };
+    let raw_api_base = cli.api_base.clone().or_else(|| {
+        provider
+            .api_base_envs()
+            .iter()
+            .find_map(|v| env::var(*v).ok())
+            .filter(|s| !s.trim().is_empty())
+    });
+    let allow_custom_auth_host = cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+    let api_base = match raw_api_base {
+        Some(raw) => Some(validate_api_base(
+            provider,
+            &raw,
+            false,
+            allow_custom_auth_host,
+        )?),
+        None => None,
+    };
+    Ok(LlmConfig {
+        provider,
+        api_key: String::new(),
+        model,
+        effort,
+        api_base,
+        project_instructions: String::new(),
+    })
+}
+
 fn build_sync_responder(
     llm: &LlmConfig,
     telemetry: Option<SessionTelemetryHandle>,
+    driver_ids: &[String],
 ) -> Box<dyn Responder> {
     let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     match llm.provider {
@@ -856,7 +851,8 @@ fn build_sync_responder(
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
-                .with_effort(llm.effort);
+                .with_effort(llm.effort)
+                .with_external_driver_ids(driver_ids.to_vec());
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -867,13 +863,40 @@ fn build_sync_responder(
                 .with_api_base(llm.api_base.clone())
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
-                .with_effort(llm.effort);
+                .with_effort(llm.effort)
+                .with_external_driver_ids(driver_ids.to_vec());
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
             Box::new(r)
         }
     }
+}
+
+/// `LlmConfig` desde un objetivo de despacho congelado (subagentes pinneados,
+/// `SDD-03` Fase 2).
+fn llm_config_from_target(target: &ResolvedLlmTarget) -> LlmConfig {
+    LlmConfig {
+        provider: target.provider,
+        api_key: target.api_key.clone(),
+        model: target.model.clone(),
+        effort: target.effort,
+        api_base: target.api_base.clone(),
+        project_instructions: target.project_instructions.to_string(),
+    }
+}
+
+/// Fábrica pinneada de subagentes (`SDD-03` Fase 2): `spawn_job` la invoca
+/// **síncrono en el hilo principal** (congela el objetivo LLM activo en ese
+/// instante) y devuelve la fábrica interna que el worker thread usa para
+/// construir su `Responder` — un cambio en caliente posterior no aplica a un
+/// subagente ya lanzado.
+fn pin_subagent_responder_factory(handle: LlmProfileHandle) -> PinnedResponderFactory {
+    Arc::new(move || {
+        let target = handle.active_target();
+        let llm = llm_config_from_target(&target);
+        Box::new(move || build_sync_responder(&llm, None, &[]))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -992,6 +1015,17 @@ fn print_vault_summary(
     }
 }
 
+fn resolve_max_subagents(cli: Option<usize>) -> usize {
+    cli.or_else(|| {
+        env::var(ONYX_MAX_SUBAGENTS_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+    .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS)
+    .max(1)
+}
+
 fn launch_interactive_chat(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -999,8 +1033,17 @@ fn launch_interactive_chat(
     base_config: &AgentConfig,
     base_opts: &SessionOptions,
     resume_override: Option<(&Path, Option<u64>)>,
+    driver_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
+    // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
+    // caliente). La telemetría se conmuta con `set_active_model` en cada cambio.
+    let allow_custom_auth_host = cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+    let profile_handle = LlmProfileHandle::new(&llm, policy.llm_profiles(), allow_custom_auth_host);
+    let startup_target = profile_handle.active_target();
+    let ctx_cfg = TieredContextConfig::for_model(&startup_target.model);
+    let telemetry =
+        SessionTelemetryHandle::new(&startup_target.model, startup_target.is_local_endpoint);
     let checkpoints = PendingCheckpoints::default();
     let chat_config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(128),
@@ -1084,13 +1127,26 @@ fn launch_interactive_chat(
     let pending_action = PendingSessionAction::new();
     let pending_notes = PendingSystemNotes::new();
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    let bridge_ready = Arc::new(AtomicBool::new(false));
+    let sub_llm = llm.clone();
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+    let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
+        .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
+        .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_root_tools(tools.clone());
+    let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(chat_config.default_max_steps)
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
-        .with_pending_notes(pending_notes.clone());
+        .with_pending_notes(pending_notes.clone())
+        .with_subagents(sub_handle.clone())
+        .with_llm_profile(profile_handle.clone())
+        .with_telemetry(telemetry.clone());
     if !policy.trust.is_fully_trusted() {
         let mut msg = format!(
             "[Workspace Trust: {}] Project `allow` rules, `[sandbox]`/`[impact]` relaxations, and `sprout.toml` execution are blocked until you run `/trust` or `openonyx trust`.",
@@ -1132,8 +1188,6 @@ fn launch_interactive_chat(
     }
 
     let stream_preview = StreamPreviewHandle::new();
-    let ctx_cfg = TieredContextConfig::for_model(&llm.model);
-    let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
 
     let tui = TuiDriver::new(host.vocab())?
         .with_workspace(cli.workspace.clone(), mode_handle.clone())
@@ -1145,10 +1199,11 @@ fn launch_interactive_chat(
         .with_telemetry(telemetry.clone())
         .with_context_config(ctx_cfg)
         .with_model_info(llm.model.clone(), llm.effort)
-        .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone());
+        .with_llm_profile(profile_handle.clone())
+        .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
+        .with_subagents(sub_handle.clone());
     let tui_handle = tui.handle();
     let quit = tui.quit_flag();
-    let bridge_ready = Arc::new(AtomicBool::new(false));
     let action_ctx = SessionActionContext {
         workspace_root: cli.workspace.clone(),
         config: chat_config,
@@ -1158,52 +1213,40 @@ fn launch_interactive_chat(
         snapshot_store: shared_store.clone(),
         pending_action,
         pending_notes,
+        subagents: Some(sub_handle.clone()),
     };
     let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
-        .with_mode_handle(mode_handle)
+        .with_mode_handle(mode_handle.clone())
         .with_workspace_vocab(ws_vocab)
         .sync_existing_undos(host.graph())
         .with_checkpoints(checkpoints)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .require_read_before_edit(true)
         .wrapping(tui);
+    let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
+        .with_policy(policy.clone())
+        .with_mode_handle(mode_handle)
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_proactive_notifications(true)
+        .wrapping(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
-    let mut driver = match llm.provider {
-        LlmProvider::Gemini => rec_bridge.wrapping(
-            AsyncGeminiDriver::new(
-                host.vocab(),
-                llm.api_key,
-                llm.model,
-                Arc::clone(&llm_in_flight),
-                Arc::clone(&llm_ready),
-            )
-            .with_api_base(llm.api_base)
-            .with_project_instructions(llm.project_instructions)
-            .with_stream_preview(stream_preview)
-            .with_telemetry(telemetry)
-            .with_context_config(ctx_cfg)
-            .with_effort(llm.effort)
-            .wrapping(ws_bridge),
-        ),
-        LlmProvider::OpenAi => rec_bridge.wrapping(
-            AsyncOpenAiDriver::new(
-                host.vocab(),
-                llm.api_key,
-                llm.model,
-                Arc::clone(&llm_in_flight),
-                Arc::clone(&llm_ready),
-            )
-            .with_api_base(llm.api_base)
-            .with_project_instructions(llm.project_instructions)
-            .with_stream_preview(stream_preview)
-            .with_telemetry(telemetry)
-            .with_context_config(ctx_cfg)
-            .with_effort(llm.effort)
-            .wrapping(ws_bridge),
-        ),
-    };
+    // `SDD-03` Fase 2: objetivo LLM dinámico (hot-swap por `/profile`/`/provider`/
+    // `/model`/`/effort` en frontera de tick); el `LlmConfig` de arranque solo
+    // semilla el registro (`"default"`).
+    let mut driver = rec_bridge.wrapping(
+        DynamicLlmDriver::new(
+            host.vocab(),
+            profile_handle,
+            Arc::clone(&llm_in_flight),
+            Arc::clone(&llm_ready),
+        )
+        .with_stream_preview(stream_preview)
+        .with_telemetry(telemetry)
+        .with_external_driver_ids(driver_ids.to_vec())
+        .wrapping(sub_driver),
+    );
 
     run_session(
         &mut host,
@@ -1230,8 +1273,16 @@ fn launch_web_serve(
     base_config: &AgentConfig,
     base_opts: &SessionOptions,
     web_cfg: WebServerConfig,
+    driver_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
+    // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
+    // caliente), idéntico a `launch_interactive_chat`.
+    let allow_custom_auth_host = cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+    let profile_handle = LlmProfileHandle::new(&llm, policy.llm_profiles(), allow_custom_auth_host);
+    let startup_target = profile_handle.active_target();
+    let telemetry =
+        SessionTelemetryHandle::new(&startup_target.model, startup_target.is_local_endpoint);
     let checkpoints = PendingCheckpoints::default();
     let serve_config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(128),
@@ -1309,13 +1360,26 @@ fn launch_web_serve(
     let pending_action = PendingSessionAction::new();
     let pending_notes = PendingSystemNotes::new();
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+    let bridge_ready = Arc::new(AtomicBool::new(false));
+    let sub_llm = llm.clone();
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+    let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
+        .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
+        .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_root_tools(tools.clone());
+    let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(serve_config.default_max_steps)
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
-        .with_pending_notes(pending_notes.clone());
+        .with_pending_notes(pending_notes.clone())
+        .with_subagents(sub_handle.clone())
+        .with_llm_profile(profile_handle.clone())
+        .with_telemetry(telemetry.clone());
     if !policy.trust.is_fully_trusted() {
         pending_notes.push(format!(
             "[Workspace Trust: {}] Project `allow` rules, `[sandbox]`/`[impact]` relaxations, and `sprout.toml` execution are blocked until you run `/trust` or `openonyx trust`.",
@@ -1345,8 +1409,6 @@ fn launch_web_serve(
     }
 
     let stream_preview = StreamPreviewHandle::new();
-    let ctx_cfg = TieredContextConfig::for_model(&llm.model);
-    let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
 
     let web_driver = WebDriver::start(
         host.vocab(),
@@ -1361,7 +1423,9 @@ fn launch_web_serve(
     .with_stream_preview(stream_preview.clone())
     .with_telemetry(telemetry.clone())
     .with_model_info(llm.model.clone(), llm.effort)
-    .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone());
+    .with_llm_profile(profile_handle.clone())
+    .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
+    .with_subagents(sub_handle.clone());
 
     let bound = web_driver.local_addr();
     let web_handle = web_driver.handle();
@@ -1390,7 +1454,6 @@ fn launch_web_serve(
     println!("  API State:  GET http://{bound}/api/v1/state (Authorization: Bearer <key>)");
     println!("  Press Ctrl+C to stop cleanly.");
 
-    let bridge_ready = Arc::new(AtomicBool::new(false));
     let action_ctx = SessionActionContext {
         workspace_root: cli.workspace.clone(),
         config: serve_config,
@@ -1400,52 +1463,38 @@ fn launch_web_serve(
         snapshot_store: shared_store.clone(),
         pending_action,
         pending_notes,
+        subagents: Some(sub_handle.clone()),
     };
     let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
-        .with_mode_handle(mode_handle)
+        .with_mode_handle(mode_handle.clone())
         .with_workspace_vocab(ws_vocab)
         .sync_existing_undos(host.graph())
         .with_checkpoints(checkpoints)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .require_read_before_edit(true)
         .wrapping(web_driver);
+    let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
+        .with_policy(policy.clone())
+        .with_mode_handle(mode_handle)
+        .with_ready_flag(Arc::clone(&bridge_ready))
+        .with_proactive_notifications(true)
+        .wrapping(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
-    let mut driver = match llm.provider {
-        LlmProvider::Gemini => rec_bridge.wrapping(
-            AsyncGeminiDriver::new(
-                host.vocab(),
-                llm.api_key,
-                llm.model,
-                Arc::clone(&llm_in_flight),
-                Arc::clone(&llm_ready),
-            )
-            .with_api_base(llm.api_base)
-            .with_project_instructions(llm.project_instructions)
-            .with_stream_preview(stream_preview)
-            .with_telemetry(telemetry)
-            .with_context_config(ctx_cfg)
-            .with_effort(llm.effort)
-            .wrapping(ws_bridge),
-        ),
-        LlmProvider::OpenAi => rec_bridge.wrapping(
-            AsyncOpenAiDriver::new(
-                host.vocab(),
-                llm.api_key,
-                llm.model,
-                Arc::clone(&llm_in_flight),
-                Arc::clone(&llm_ready),
-            )
-            .with_api_base(llm.api_base)
-            .with_project_instructions(llm.project_instructions)
-            .with_stream_preview(stream_preview)
-            .with_telemetry(telemetry)
-            .with_context_config(ctx_cfg)
-            .with_effort(llm.effort)
-            .wrapping(ws_bridge),
-        ),
-    };
+    // `SDD-03` Fase 2: objetivo LLM dinámico (hot-swap por slash en frontera de tick).
+    let mut driver = rec_bridge.wrapping(
+        DynamicLlmDriver::new(
+            host.vocab(),
+            profile_handle,
+            Arc::clone(&llm_in_flight),
+            Arc::clone(&llm_ready),
+        )
+        .with_stream_preview(stream_preview)
+        .with_telemetry(telemetry)
+        .with_external_driver_ids(driver_ids.to_vec())
+        .wrapping(sub_driver),
+    );
 
     run_session(
         &mut host,
@@ -1597,6 +1646,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let tools = WorkspaceTools::new(policy.clone());
 
+    // `SDD-10`: ids de los drivers de harness CLI registrados (siempre al menos
+    // el preset integrado `opencode`), para los esquemas de `spawn_subagent` y el manager.
+    // Fase 2: en un workspace **no confiado** no se expone ni un driver externo
+    // (defense in depth: `external_driver_gate` y `spawn_job` lo bloquean además).
+    let driver_ids: Vec<String> = if policy.trust.config_trusted {
+        policy
+            .external_drivers()
+            .iter()
+            .map(|d| d.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let config = AgentConfig {
         default_max_steps: cli.max_steps.unwrap_or(64),
         default_timeout_ticks: 128,
@@ -1645,21 +1708,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             host.spawn(&make_spec(goal, cli.auto_approve));
 
+            let sub_llm = llm.clone();
+            // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+            let sub_factory: ResponderFactory =
+                Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+            let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
+                .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
+                .with_root_tools(tools.clone());
+            let sub_handle = SubagentHandle::new(sub_manager);
             let cli_driver = CliApprovalDriver::new(host.vocab(), HeadlessDriver::new())
                 .with_policy(policy.clone())
-                .with_tools(tools.clone());
+                .with_tools(tools.clone())
+                .with_subagents(sub_handle.clone());
             let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
                 .with_mode(WorkspaceMode::Build)
                 .with_workspace_vocab(ws_vocab)
                 .with_checkpoints(checkpoints)
                 .require_read_before_edit(true)
                 .wrapping(cli_driver);
+            let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
+                .with_policy(policy.clone())
+                .with_proactive_notifications(false)
+                .wrapping(ws_bridge);
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),
-                build_sync_responder(&llm, Some(telemetry.clone())),
+                build_sync_responder(&llm, Some(telemetry.clone()), &driver_ids),
             )
-            .wrapping(ws_bridge);
+            .wrapping(sub_driver);
 
             run_session(
                 &mut host,
@@ -1683,7 +1759,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Mode::Chat => {
             let resume_arg = cli.resume_dir.as_deref().map(|dir| (dir, cli.resume_tick));
-            launch_interactive_chat(&cli, &policy, tools, &config, &session_opts, resume_arg)?;
+            launch_interactive_chat(
+                &cli,
+                &policy,
+                tools,
+                &config,
+                &session_opts,
+                resume_arg,
+                &driver_ids,
+            )?;
         }
         Mode::Replay(path) => {
             let resolved_tr = resolve_read_transcript(&cli.workspace, path);
@@ -1709,14 +1793,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let bytes = fs::read(&resolved_tr)?;
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
-            let has_commands = !transcript.commands.is_empty();
+            let has_commands = transcript
+                .commands
+                .iter()
+                .any(|c| !c.command.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX));
             let replay_config = AgentConfig {
                 default_max_steps: cli.max_steps.unwrap_or(128),
                 default_timeout_ticks: 512,
                 ..config
             };
+            // `SDD-03` Fase 2 (Fase 3: registro leniente): handle **sin credenciales**
+            // y con todos los perfiles disponibles para que el replay reproduzca el
+            // estado modal `ws.llm.*` idéntico al `chat` en vivo en **cualquier
+            // máquina** (0 llamadas HTTP, 0 variables de entorno necesarias).
+            let replay_llm = resolve_replay_llm_config(&cli)?;
             let replay_spawner = CommandSpawnerSystem::new(cli.auto_approve)
-                .with_max_steps(replay_config.default_max_steps);
+                .with_max_steps(replay_config.default_max_steps)
+                .with_llm_profile(LlmProfileHandle::new_for_replay(
+                    &replay_llm,
+                    policy.llm_profiles(),
+                ));
 
             let (mut host, _ws_vocab) = build_host_with_options(
                 1,
@@ -1770,6 +1866,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &config,
                     &session_opts,
                     Some((resolved_dir.as_path(), Some(*tick))),
+                    &driver_ids,
                 )?;
                 return Ok(());
             }
@@ -1797,7 +1894,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let checkpoints = PendingCheckpoints::default();
-            let spawner = CommandSpawnerSystem::new(cli.auto_approve).with_max_steps(128);
+            // `SDD-03` Fase 2: handle LLM best-effort (sin credenciales): la rama
+            // `--transcript` reproduce `ws.llm.*` y la rama en vivo mantiene el estado
+            // modal coherente tras `on_restore`.
+            let rewind_llm = resolve_replay_llm_config(&cli)?;
+            let allow_custom_auth_host =
+                cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+            // Rama `--transcript`: replay 0-I/O → registro leniente (no exige
+            // credenciales en la máquina de replay). Rama en vivo: registro normal.
+            let llm_handle = if transcript.is_some() {
+                LlmProfileHandle::new_for_replay(&rewind_llm, policy.llm_profiles())
+            } else {
+                LlmProfileHandle::new(&rewind_llm, policy.llm_profiles(), allow_custom_auth_host)
+            };
+            let spawner = CommandSpawnerSystem::new(cli.auto_approve)
+                .with_max_steps(128)
+                .with_llm_profile(llm_handle);
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
@@ -1838,7 +1950,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
                 let mut driver =
-                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None))
+                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None, &[]))
                         .starting_at(next_tick)
                         .wrapping(ws_bridge);
 
@@ -1881,7 +1993,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cors_origin,
         } => {
             let web_cfg = WebServerConfig::resolve(bind, api_key.clone(), cors_origin.clone())?;
-            launch_web_serve(&cli, &policy, tools, &config, &session_opts, web_cfg)?;
+            launch_web_serve(
+                &cli,
+                &policy,
+                tools,
+                &config,
+                &session_opts,
+                web_cfg,
+                &driver_ids,
+            )?;
         }
         Mode::Help | Mode::Version | Mode::Trust { .. } => unreachable!(),
     }
@@ -1894,10 +2014,13 @@ mod tests {
     use std::process::Command;
 
     use onyx_soul_agents::{AgentHost, AgentState, IngressEvent, OnyxEvent, Reply};
-    use onyx_workspace::{graph_workspace_mode, latest_undoable_effect};
+    use onyx_workspace::{
+        graph_workspace_llm_profile, graph_workspace_mode, latest_undoable_effect,
+    };
     use ops::render_inspect;
     use session::{
-        SURFACE_APPROVAL, SURFACE_PLAN, active_surfaces, all_live_waiting_approval, build_host,
+        SURFACE_APPROVAL, SURFACE_PLAN, SURFACE_SERVICES, active_surfaces,
+        all_live_waiting_approval, build_host,
     };
 
     use super::*;
@@ -1933,7 +2056,8 @@ mod tests {
         assert_eq!(host.agent_state(id), Some(AgentState::WaitingApproval));
         assert!(all_live_waiting_approval(host.graph(), &host.vocab()));
 
-        let surfaces = active_surfaces(host.graph(), &host.vocab());
+        let ws_vocab = onyx_workspace::WorkspaceVocab::resolve_with(|name| host.attr(name));
+        let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
         let approval_surface = surfaces
             .iter()
             .find(|s| s.surface == SURFACE_APPROVAL)
@@ -1942,6 +2066,39 @@ mod tests {
         assert!(
             surfaces.iter().any(|s| s.surface == SURFACE_PLAN),
             "plan surface must be declared"
+        );
+    }
+
+    #[test]
+    fn active_surfaces_includes_services_surface_only_with_sprout_state() {
+        use onyx_soul_agents::{AgentGraph, AttrRegistry, Vocab};
+        use onyx_workspace::{WorkspaceVocab, set_workspace_services};
+
+        let mut graph = AgentGraph::new();
+        let vocab = Vocab::resolve(&mut graph);
+        let ws_vocab = WorkspaceVocab::resolve_with(|name| graph.attr(name));
+
+        // Sin servicios: solo las 4 superficies base, sin `SURFACE_SERVICES`.
+        let surfaces = active_surfaces(&graph, &vocab, &ws_vocab);
+        assert_eq!(surfaces.len(), 4, "{surfaces:?}");
+        assert!(
+            !surfaces.iter().any(|s| s.surface == SURFACE_SERVICES),
+            "services surface must be absent without ws.services.text"
+        );
+
+        // Con `ws.services.text` no vacío: se añade al final (orden estable).
+        set_workspace_services(&mut graph, &ws_vocab, "[READY] api (process :8080)");
+        let surfaces = active_surfaces(&graph, &vocab, &ws_vocab);
+        assert_eq!(surfaces.len(), 5, "{surfaces:?}");
+        let svc = surfaces
+            .iter()
+            .find(|s| s.surface == SURFACE_SERVICES)
+            .expect("services surface must be declared");
+        assert!(!svc.focused);
+        assert_eq!(
+            surfaces.last().map(|s| s.surface),
+            Some(SURFACE_SERVICES),
+            "services surface must keep the stable trailing position"
         );
     }
 
@@ -2237,6 +2394,418 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-03` Fase 2: los comandos modales de LLM se aplican en la frontera de tick:
+    /// el sellado de tick 0 escribe `ws.llm.*` (idempotente) y cada slash actualiza a la
+    /// vez el grafo determinista, el `LlmProfileHandle` en caliente y la telemetría efímera.
+    #[test]
+    fn llm_slash_commands_update_graph_and_handle_at_tick_boundary() {
+        let fast_key_env = "OPENONIX_TEST_LLM_S1_FAST";
+        let oai_key_env = "OPENONIX_TEST_LLM_S1_OAI";
+        let saved_fast = env::var(fast_key_env).ok();
+        let saved_oai = env::var(oai_key_env).ok();
+        // La disponibilidad de cada perfil se calcula en el constructor del handle.
+        unsafe {
+            env::set_var(fast_key_env, "fast-test-key");
+            env::set_var(oai_key_env, "oai-test-key");
+        }
+
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let profiles = vec![
+            onyx_workspace::LlmProfileConfig {
+                id: "fast".to_string(),
+                provider: "gemini".to_string(),
+                model: "gemini-4-deuterium".to_string(),
+                effort: None,
+                api_base: None,
+                api_key_env: Some(fast_key_env.to_string()),
+            },
+            onyx_workspace::LlmProfileConfig {
+                id: "oai".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                effort: None,
+                api_base: None,
+                api_key_env: Some(oai_key_env.to_string()),
+            },
+        ];
+        let handle = LlmProfileHandle::new(&startup, &profiles, false);
+        let telemetry = SessionTelemetryHandle::new("gemini-4-hydrogen", false);
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_llm_profile(handle.clone())
+            .with_telemetry(telemetry.clone());
+        let (mut host, ws_vocab) =
+            build_host(1, AgentConfig::default(), None, Some(Box::new(spawner))).unwrap();
+        let mut driver = HeadlessDriver::new();
+        let rec = |h: &AgentHost| -> onyx_workspace::RecordedLlmProfile {
+            graph_workspace_llm_profile(h.graph(), &ws_vocab)
+                .expect("ws.llm.* must be sealed from tick 0")
+        };
+
+        // Sellado de tick 0: el primer tick ya lleva el perfil de arranque.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("/profile".into())));
+        host.step(&mut driver);
+        let r0 = rec(&host);
+        assert_eq!(r0.profile_id, "default");
+        assert_eq!(r0.provider, "gemini");
+        assert_eq!(r0.model, "gemini-4-hydrogen");
+        assert!(r0.effort.is_none());
+        assert_eq!(handle.active_target().model, "gemini-4-hydrogen");
+
+        // `/effort high`: el esfuerzo difiere del preset `default` → objetivo "custom".
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/effort high".into(),
+        )));
+        host.step(&mut driver);
+        let r1 = rec(&host);
+        assert_eq!(r1.profile_id, "custom");
+        assert_eq!(r1.model, "gemini-4-hydrogen");
+        assert_eq!(r1.effort.as_deref(), Some("high"));
+        assert_eq!(handle.active_target().effort, Some(ReasoningEffort::High));
+        // El effort no cambia el modelo → la telemetría conserva el modelo activo.
+        assert_eq!(telemetry.snapshot().model, "gemini-4-hydrogen");
+
+        // `/model`: un modelo distinto del preset → el objetivo sigue siendo "custom".
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/model gemini-4-helium".into(),
+        )));
+        host.step(&mut driver);
+        let r2 = rec(&host);
+        assert_eq!(r2.profile_id, "custom");
+        assert_eq!(r2.model, "gemini-4-helium");
+        assert_eq!(telemetry.snapshot().model, "gemini-4-helium");
+
+        // `/profile fast`: conmuta a un perfil declarado (modelo y esfuerzo del preset).
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/profile fast".into(),
+        )));
+        host.step(&mut driver);
+        let r3 = rec(&host);
+        assert_eq!(r3.profile_id, "fast");
+        assert_eq!(r3.model, "gemini-4-deuterium");
+        assert!(r3.effort.is_none());
+        assert_eq!(handle.active_target().profile_id, "fast");
+        assert_eq!(telemetry.snapshot().model, "gemini-4-deuterium");
+
+        // `/provider openai`: conmuta el provider y adopta el modelo del perfil (el effort se conserva).
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/provider openai".into(),
+        )));
+        host.step(&mut driver);
+        let r4 = rec(&host);
+        assert_eq!(r4.profile_id, "oai");
+        assert_eq!(r4.provider, "openai");
+        assert_eq!(r4.model, "gpt-4o");
+        assert!(r4.effort.is_none());
+        assert_eq!(handle.active_target().provider, LlmProvider::OpenAi);
+        assert_eq!(telemetry.snapshot().model, "gpt-4o");
+
+        // Perfil desconocido → error accionable y sin cambios de estado.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/profile nope".into(),
+        )));
+        host.step(&mut driver);
+        let r5 = rec(&host);
+        assert_eq!(r5.profile_id, "oai");
+        assert_eq!(r5.model, "gpt-4o");
+        assert_eq!(handle.active_target().model, "gpt-4o");
+
+        unsafe {
+            match saved_fast {
+                Some(v) => env::set_var(fast_key_env, v),
+                None => env::remove_var(fast_key_env),
+            }
+            match saved_oai {
+                Some(v) => env::set_var(oai_key_env, v),
+                None => env::remove_var(oai_key_env),
+            }
+        }
+    }
+
+    /// `SDD-03` Fase 2: un `/rewind <tick>` en vivo restaura el `ws.llm.*` del milestone
+    /// en el grafo y `on_restore` re-sincroniza el `LlmProfileHandle` y la telemetría
+    /// efímera. Un perfil grabado que ya no existe degrada a proveedor → modelo/esfuerzo
+    /// (best-effort, nunca falla).
+    #[test]
+    fn rewind_restores_ws_llm_state_into_handle() {
+        use onyx_soul_agents::Graph;
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-sdd03-rewind-llm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git must run");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "core.autocrlf", "false"]);
+        fs::write(dir.join("note.txt"), "v1\n").unwrap();
+        run_git(&["add", "note.txt"]);
+        run_git(&["commit", "-m", "init"]);
+
+        let fast_key_env = "OPENONIX_TEST_LLM_R2_FAST";
+        let saved_fast = env::var(fast_key_env).ok();
+        unsafe {
+            env::set_var(fast_key_env, "fast-test-key");
+        }
+        let snap_dir = dir.join("snaps_main");
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_transcript: None,
+            save_step_snapshots: false,
+            snapshot_every: None,
+            max_snapshots: None,
+        };
+        let cfg = AgentConfig::default();
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let profiles = vec![onyx_workspace::LlmProfileConfig {
+            id: "fast".to_string(),
+            provider: "gemini".to_string(),
+            model: "gemini-4-deuterium".to_string(),
+            effort: None,
+            api_base: None,
+            api_key_env: Some(fast_key_env.to_string()),
+        }];
+        let handle = LlmProfileHandle::new(&startup, &profiles, false);
+        let telemetry = SessionTelemetryHandle::new("gemini-4-hydrogen", false);
+        let shared_store = SharedPackStore::new(&snap_dir, None);
+        let spawner = CommandSpawnerSystem::new(true)
+            .with_llm_profile(handle.clone())
+            .with_telemetry(telemetry.clone());
+        let (mut host, ws_vocab) = build_host_with_shared_store(
+            1,
+            cfg.clone(),
+            &opts,
+            Some(Box::new(spawner)),
+            None,
+            Some(shared_store.clone()),
+        )
+        .unwrap();
+        let mut driver = HeadlessDriver::new();
+
+        // Tick 1: `/effort high` → `ws.llm.*` = {custom, gemini, hydrogen, high}.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/effort high".into(),
+        )));
+        host.step(&mut driver);
+        assert_eq!(host.ticks(), 1);
+        // Milestone con el estado modal LLM previo al cambio.
+        let _ = shared_store.save_milestone(1, "llm-ckpt", &host.graph().export());
+
+        // Tick 2: hot-swap a un perfil declarado.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/profile fast".into(),
+        )));
+        host.step(&mut driver);
+        assert_eq!(handle.active_target().profile_id, "fast");
+        assert_eq!(handle.active_target().model, "gemini-4-deuterium");
+        assert_eq!(telemetry.snapshot().model, "gemini-4-deuterium");
+
+        // `/rewind 1` en vivo (host asentado, sin llamadas LLM en vuelo).
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let action_ctx = SessionActionContext {
+            workspace_root: dir.clone(),
+            config: cfg,
+            ws_vocab,
+            mode_handle: WorkspaceModeHandle::new(WorkspaceMode::Build),
+            tools: WorkspaceTools::new(policy),
+            snapshot_store: Some(shared_store.clone()),
+            pending_action: PendingSessionAction::new(),
+            pending_notes: PendingSystemNotes::new(),
+            subagents: None,
+        };
+        let msg = session::apply_session_action(
+            &mut host,
+            command::SessionAction::Rewind { requested_tick: 1 },
+            &action_ctx,
+        );
+        assert!(msg.contains("Restored milestone tick 1"), "{msg}");
+        assert_eq!(host.ticks(), 2);
+
+        // El grafo trae el `ws.llm.*` del milestone…
+        let rec =
+            graph_workspace_llm_profile(host.graph(), &ws_vocab).expect("ws.llm.* restaurado");
+        assert_eq!(rec.profile_id, "custom");
+        assert_eq!(rec.model, "gemini-4-hydrogen");
+        assert_eq!(rec.effort.as_deref(), Some("high"));
+        // …y `on_restore` re-sincroniza el handle (el perfil "custom" degrada a
+        // proveedor → modelo/esfuerzo) y la telemetría efímera.
+        let target = handle.active_target();
+        assert_eq!(target.model, "gemini-4-hydrogen");
+        assert_eq!(target.effort, Some(ReasoningEffort::High));
+        assert_eq!(target.provider, LlmProvider::Gemini);
+        assert_eq!(telemetry.snapshot().model, "gemini-4-hydrogen");
+
+        unsafe {
+            match saved_fast {
+                Some(v) => env::set_var(fast_key_env, v),
+                None => env::remove_var(fast_key_env),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-03` Fase 2: `openonyx replay` reproduce una traza con cambios de perfil LLM
+    /// con 0-I/O (sin credenciales, sin llamadas): el grafo del replay — incluido
+    /// `ws.llm.*` — es idéntico al del `chat` en vivo (mismo fingerprint).
+    #[test]
+    fn replay_with_llm_profile_switch_matches_live_fingerprint() {
+        let fast_key_env = "OPENONIX_TEST_LLM_P3_FAST";
+        let saved_fast = env::var(fast_key_env).ok();
+        unsafe {
+            env::set_var(fast_key_env, "fast-test-key");
+        }
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "live-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let profiles = vec![onyx_workspace::LlmProfileConfig {
+            id: "fast".to_string(),
+            provider: "gemini".to_string(),
+            model: "gemini-4-deuterium".to_string(),
+            effort: None,
+            api_base: None,
+            api_key_env: Some(fast_key_env.to_string()),
+        }];
+
+        // Sesión en vivo: `/effort high` → `/profile fast` → `/effort` (vuelve a auto).
+        let live_handle = LlmProfileHandle::new(&startup, &profiles, false);
+        let live_spawner = CommandSpawnerSystem::new(true)
+            .with_llm_profile(live_handle.clone())
+            .with_telemetry(SessionTelemetryHandle::new("gemini-4-hydrogen", false));
+        let (mut live_host, live_ws) = build_host(
+            1,
+            AgentConfig::default(),
+            None,
+            Some(Box::new(live_spawner)),
+        )
+        .unwrap();
+        let mut live_driver = HeadlessDriver::new();
+        for cmd in ["/effort high", "/profile fast", "/effort"] {
+            live_host.push(OnyxEvent::Ingress(IngressEvent::Command(cmd.into())));
+            live_host.step(&mut live_driver);
+        }
+        // Estado final: perfil `fast` (modelo y esfuerzo del preset).
+        assert_eq!(live_handle.active_target().profile_id, "fast");
+        assert_eq!(live_handle.active_target().model, "gemini-4-deuterium");
+        assert!(live_handle.active_target().effort.is_none());
+        let live_rec =
+            graph_workspace_llm_profile(live_host.graph(), &live_ws).expect("ws.llm.* sellado");
+        assert_eq!(live_rec.model, "gemini-4-deuterium");
+
+        // La "máquina de replay" no tiene credenciales: se restaura el entorno
+        // antes del replay (replay 0-credenciales real, `SDD-03` Fase 3).
+        unsafe {
+            match saved_fast {
+                Some(v) => env::set_var(fast_key_env, v),
+                None => env::remove_var(fast_key_env),
+            }
+        }
+
+        // Replay: registro **leniente** con el **mismo shape** que el live (mismo
+        // provider/modelo/esfuerzo/base) para que el sellado de tick 0 escriba
+        // el mismo `ws.llm.*` y la asignación EAV sea idéntica.
+        let replay_startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "replay-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let replay_handle = LlmProfileHandle::new_for_replay(&replay_startup, &profiles);
+        // Sin `fast_key_env` en el entorno, el perfil sigue disponible: en replay
+        // hay 0 llamadas HTTP y la disponibilidad por credenciales no aplica.
+        assert!(
+            replay_handle
+                .public_snapshot()
+                .profiles
+                .iter()
+                .all(|p| p.available),
+            "{:?}",
+            replay_handle.public_snapshot().profiles
+        );
+        let replay_spawner = CommandSpawnerSystem::new(true)
+            .with_llm_profile(replay_handle.clone())
+            .with_telemetry(SessionTelemetryHandle::new("gemini-4-hydrogen", false));
+        let (mut replay_host, replay_ws) = build_host(
+            1,
+            AgentConfig::default(),
+            None,
+            Some(Box::new(replay_spawner)),
+        )
+        .unwrap();
+        // 0-I/O: sin entradas LLM, solo los comandos reinyectados en su `poll`.
+        let replay_tr = Transcript {
+            commands: vec![
+                onyx_soul_agents::LoggedCommand {
+                    poll: 0,
+                    command: "/effort high".to_string(),
+                },
+                onyx_soul_agents::LoggedCommand {
+                    poll: 1,
+                    command: "/profile fast".to_string(),
+                },
+                onyx_soul_agents::LoggedCommand {
+                    poll: 2,
+                    command: "/effort".to_string(),
+                },
+            ],
+            ..Transcript::default()
+        };
+        let mut replay_driver = ReplayBridge::new(replay_tr).wrapping(HeadlessDriver::new());
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 32 },
+        )
+        .unwrap();
+
+        // Replay determinista: el grafo completo (incluido `ws.llm.*`) es idéntico.
+        assert_eq!(replay_host.fingerprint(), live_host.fingerprint());
+        let replay_rec =
+            graph_workspace_llm_profile(replay_host.graph(), &replay_ws).expect("ws.llm.* replay");
+        assert_eq!(replay_rec, live_rec);
+        // El handle del replay termina en el mismo estado modal que el live.
+        assert_eq!(
+            replay_handle.active_target().profile_id,
+            live_handle.active_target().profile_id
+        );
+        assert_eq!(
+            replay_handle.active_target().model,
+            live_handle.active_target().model
+        );
+        assert_eq!(
+            replay_handle.active_target().effort,
+            live_handle.active_target().effort
+        );
     }
 
     #[test]
@@ -3366,6 +3935,7 @@ ready_log = "READY_BUS"
             snapshot_store: Some(shared_store.clone()),
             pending_action,
             pending_notes,
+            subagents: None,
         };
         let fork_msg = session::apply_session_action(
             &mut host,

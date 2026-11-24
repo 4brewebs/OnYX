@@ -7,8 +7,16 @@
   const SLASH_HINTS = [
     { key: '/cancel', desc: 'Stop active subagent or interrupt current turn' },
     { key: '/cancel all', desc: 'Interrupt both subagents and root turn' },
+    { key: '/subagents', desc: 'List background worktree subagent jobs' },
+    { key: '/spawn', desc: 'Launch background subagent without a root turn (`[--driver <id>] <task>`)' },
+    { key: '/merge', desc: '3-way merge finished async subagent (`<job_id>`)' },
+    { key: '/discard', desc: 'Cancel & discard async subagent worktree (`<job_id>`)' },
     { key: '/mode plan', desc: 'Switch to read-only PLAN mode' },
     { key: '/mode build', desc: 'Switch to BUILD mode (edits enabled)' },
+    { key: '/profile', desc: 'List LLM profiles or switch to a registered one (`<id>`)' },
+    { key: '/provider openai', desc: 'Hot-swap LLM provider (`gemini|openai`)' },
+    { key: '/model <name>', desc: 'Change the LLM model of the active target' },
+    { key: '/effort high', desc: 'Set LLM reasoning effort (`auto|low|medium|high`)' },
     { key: '/undo', desc: 'Revert latest reversible Git checkpoint' },
     { key: '/compact', desc: 'Compact older turns into verified summary' },
     { key: '/fork', desc: 'Branch snapshots into sibling folder' },
@@ -26,7 +34,16 @@
     brandOrbitBtn: document.getElementById('brand-orbit-btn'),
     brandLogo: document.getElementById('brand-logo'),
     connPill: document.getElementById('conn-pill'),
-    modelSubtitle: document.getElementById('model-subtitle'),
+    llmConfigBtn: document.getElementById('llm-config-btn'),
+    llmModal: document.getElementById('llm-modal'),
+    llmModalClose: document.getElementById('llm-modal-close'),
+    llmModalCancel: document.getElementById('llm-modal-cancel'),
+    llmModalApply: document.getElementById('llm-modal-apply'),
+    llmProfileList: document.getElementById('llm-profile-list'),
+    llmProviderSelect: document.getElementById('llm-provider-select'),
+    llmEffortSelect: document.getElementById('llm-effort-select'),
+    llmModelInput: document.getElementById('llm-model-input'),
+    llmModalStatus: document.getElementById('llm-modal-status'),
     modeBtn: document.getElementById('mode-btn'),
     sandboxPill: document.getElementById('sandbox-pill'),
     trustPill: document.getElementById('trust-pill'),
@@ -64,6 +81,7 @@
     queueClearBtn: document.getElementById('queue-clear-btn'),
     autocomplete: document.getElementById('autocomplete'),
     composerForm: document.getElementById('composer-form'),
+    driverSelect: document.getElementById('driver-select'),
     promptInput: document.getElementById('prompt-input'),
     sendBtn: document.getElementById('send-btn'),
     planBadge: document.getElementById('plan-badge'),
@@ -71,6 +89,9 @@
     servicesBody: document.getElementById('services-body'),
     svcStartAll: document.getElementById('svc-start-all'),
     svcStopAll: document.getElementById('svc-stop-all'),
+    subagentsCard: document.getElementById('subagents-card'),
+    subagentsBadge: document.getElementById('subagents-badge'),
+    subagentsBody: document.getElementById('subagents-body'),
     costBadge: document.getElementById('cost-badge'),
     telIn: document.getElementById('tel-in'),
     telCache: document.getElementById('tel-cache'),
@@ -135,7 +156,7 @@
     }
   }
 
-  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog]) {
+  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog, dom.llmModal]) {
     dlg.addEventListener('close', () => { dlg.returnValue = ''; });
   }
 
@@ -350,17 +371,63 @@
     });
   }
 
+  // `SDD-10` Fase 4: el composer refleja el driver seleccionado: `native` → "Send" (turno
+  // de root); driver externo → "Spawn" + placeholder indicando que la tarea corre como
+  // subagente en background sin gastar turno de root.
+  const NATIVE_PLACEHOLDER = 'Ask openOnyx, type / for commands, or @ for workspace files…';
+  function updateComposerDriverUI() {
+    const driver = dom.driverSelect.value || 'native';
+    const spawning = driver !== 'native';
+    dom.sendBtn.textContent = spawning ? 'Spawn' : 'Send';
+    dom.sendBtn.setAttribute('aria-label', spawning ? 'Spawn background task' : 'Send message');
+    dom.promptInput.placeholder = spawning
+      ? `Background task for ${driver} (no root turn)…`
+      : NATIVE_PLACEHOLDER;
+  }
+  dom.driverSelect.addEventListener('change', updateComposerDriverUI);
+  updateComposerDriverUI();
+
   dom.composerForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = dom.promptInput.value.trim();
     if (!text) return;
+    // `SDD-10` Fase 4: driver no nativo + texto libre (no slash) → `/spawn --driver <id> <task>`,
+    // sin gastar un turno de root. Un slash command explítico siempre se envía tal cual.
+    const driver = dom.driverSelect.value || 'native';
+    const command =
+      driver !== 'native' && !text.startsWith('/') ? `/spawn --driver ${driver} ${text}` : text;
     closeAutocomplete();
     dom.promptInput.value = '';
     autoResizeTextarea();
+    let sent = false;
     try {
-      await sendCommand(text);
+      await sendCommand(command);
+      sent = true;
     } catch (_) {}
+    if (sent) {
+      // La selección de driver es de un solo uso: tras el envío exitoso vuelve a `native`.
+      dom.driverSelect.value = 'native';
+      updateComposerDriverUI();
+    }
   });
+
+  let renderedDriversKey = null;
+  function renderDriverSelect(s) {
+    const drivers = Array.isArray(s.drivers) && s.drivers.length > 0 ? s.drivers : ['native'];
+    const key = drivers.join('\u0000');
+    if (key === renderedDriversKey) return;
+    renderedDriversKey = key;
+    const prev = dom.driverSelect.value;
+    dom.driverSelect.replaceChildren();
+    for (const d of drivers) {
+      const opt = document.createElement('option');
+      opt.value = d;
+      opt.textContent = d;
+      dom.driverSelect.append(opt);
+    }
+    if (drivers.includes(prev)) dom.driverSelect.value = prev;
+    updateComposerDriverUI();
+  }
 
   dom.modeBtn.addEventListener('click', () => {
     if (!state) return;
@@ -403,6 +470,142 @@
     dom.agentDialog.showModal();
   });
   dom.agentDialogClose.addEventListener('click', () => dom.agentDialog.close());
+
+  // LLM target selector (`SDD-03` Fase 4): el objetivo sale del snapshot SSE
+  // (fuente live `LlmProfileHandle`); los cambios se aplican con los slash
+  // estándar por `/api/v1/command` — sin endpoints nuevos, sellado en
+  // ONYXTR2 por el mismo túnel que la TUI.
+  let llmProfilesKey = '';
+  function llmProfilesKeyOf(s) {
+    const p = Array.isArray(s.profiles) ? s.profiles : [];
+    // `s.profile_id` en la clave: si cambia el perfil activo (hot-swap con
+    // el modal abierto) se refresca el resaltado `.is-focused`.
+    return (
+      `${s.profile_id || ''}|` +
+      p
+        .map((x) => `${x.id}|${x.provider}|${x.model}|${x.effort}|${x.available ? 1 : 0}|${x.unavailable_reason || ''}`)
+        .join(';')
+    );
+  }
+
+  function renderLlmProfiles(s) {
+    // Idempotente: no reconstruir si los datos de perfiles no cambiaron.
+    const key = llmProfilesKeyOf(s);
+    if (key === llmProfilesKey) return;
+    llmProfilesKey = key;
+    dom.llmProfileList.replaceChildren();
+    const profiles = Array.isArray(s.profiles) ? s.profiles : [];
+    if (profiles.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'dialog-sub';
+      empty.textContent = 'No registered profiles — using the CLI startup target.';
+      dom.llmProfileList.append(empty);
+      return;
+    }
+    for (const p of profiles) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'agent-row-btn llm-profile-btn';
+      if (p.id === s.profile_id) btn.classList.add('is-focused');
+      const title = document.createElement('span');
+      title.className = 'agent-row-title';
+      title.textContent = p.id;
+      const meta = document.createElement('span');
+      meta.className = 'agent-row-goal';
+      meta.textContent = `${p.provider}/${p.model} · effort:${p.effort}`;
+      btn.append(title, meta);
+      if (!p.available) {
+        btn.disabled = true;
+        btn.title = p.unavailable_reason || 'Profile unavailable';
+      } else {
+        btn.addEventListener('click', () => {
+          applyLlmCommands([`/profile ${p.id}`]);
+        });
+      }
+      dom.llmProfileList.append(btn);
+    }
+  }
+
+  function syncLlmProviderAvailability(s) {
+    const providers = Array.isArray(s.available_providers) ? s.available_providers : null;
+    for (const opt of dom.llmProviderSelect.options) {
+      opt.disabled = !!(providers && providers.length) && !providers.includes(opt.value);
+    }
+  }
+
+  // Solo al abrir el modal: puebla provider/effort/modelo desde el snapshot
+  // actual (con la sesión en reposo no hay push SSE que lo haga).
+  function populateLlmModalInputs(s) {
+    dom.llmProviderSelect.value = s.provider || 'gemini';
+    dom.llmEffortSelect.value = s.effort || 'auto';
+    dom.llmModelInput.value = s.model || '';
+  }
+
+  function renderLlmModal(s) {
+    // La etiqueta del botón es de solo lectura: siempre al día (hot-swap).
+    // Sin `provider` (snapshot sin handle, perfil CLI degradado) no se
+    // antepone el prefijo literal `provider/`.
+    dom.llmConfigBtn.textContent =
+      `${s.provider ? `${s.provider}/${s.model || 'model'}` : (s.model || 'model')} · effort:${s.effort || 'auto'}`;
+    if (!dom.llmModal.open) return;
+    // Re-render idempotente (push SSE con el dialog abierto): lista de
+    // perfiles + disponibilidad de providers. **Nunca** se tocan los valores
+    // del formulario — si el usuario cambia Provider a `openai` y mueve el
+    // foco, el siguiente push no revierte su edición a espaldas (los valores
+    // solo se pueblan al abrir, en `populateLlmModalInputs`).
+    renderLlmProfiles(s);
+    syncLlmProviderAvailability(s);
+  }
+
+  async function applyLlmCommands(commands) {
+    for (const c of commands) {
+      try {
+        await sendCommand(c);
+      } catch (_) {
+        if (dom.llmModal.open) dom.llmModalStatus.textContent = `Command failed: ${c}`;
+        return;
+      }
+    }
+    if (dom.llmModal.open) {
+      dom.llmModalStatus.textContent = '';
+      dom.llmModal.close();
+    }
+  }
+
+  dom.llmConfigBtn.addEventListener('click', () => {
+    if (!state) return;
+    llmProfilesKey = '';
+    dom.llmModalStatus.textContent = '';
+    dom.llmModalApply.disabled = false;
+    dom.llmModal.showModal();
+    // Poblar al abrir: con la sesión en reposo no llega push SSE.
+    populateLlmModalInputs(state);
+    syncLlmProviderAvailability(state);
+    renderLlmProfiles(state);
+  });
+  dom.llmModalClose.addEventListener('click', () => dom.llmModal.close());
+  dom.llmModalCancel.addEventListener('click', () => dom.llmModal.close());
+  dom.llmModal.addEventListener('close', () => { llmProfilesKey = ''; });
+  dom.llmModalApply.addEventListener('click', () => {
+    if (!state) return;
+    const s = state;
+    const commands = [];
+    const provider = dom.llmProviderSelect.value;
+    const effort = dom.llmEffortSelect.value;
+    const model = dom.llmModelInput.value.trim();
+    // Solo los campos modificados — cada uno es un slash estándar.
+    if (provider && provider !== s.provider) commands.push(`/provider ${provider}`);
+    if (model && model !== s.model) commands.push(`/model ${model}`);
+    if (effort && effort !== (s.effort || 'auto')) commands.push(`/effort ${effort}`);
+    if (commands.length === 0) {
+      dom.llmModalStatus.textContent = 'No changes to apply.';
+      return;
+    }
+    dom.llmModalApply.disabled = true;
+    applyLlmCommands(commands).finally(() => {
+      dom.llmModalApply.disabled = false;
+    });
+  });
 
   // Workspace Trust Dialog
   dom.trustPill.addEventListener('click', () => dom.trustDialog.showModal());
@@ -587,16 +790,76 @@
     }
   }
 
+  function buildSubagentCard(job, showTitlePrefix) {
+    const card = document.createElement('article');
+    card.className = 'bg-subagent-card';
+
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.className = 'bg-subagent-id';
+    // `SDD-10` Fase 4: badge del driver en tarjetas externas (`[bg #job_id] → opencode`);
+    // el driver nativo es el default y no se muestra.
+    const driverSuffix = job.driver && job.driver !== 'native' ? ` → ${job.driver}` : '';
+    title.textContent = `${showTitlePrefix ? '[bg #' : '#'}${job.job_id}${showTitlePrefix ? ']' : ''}${driverSuffix}`;
+    const badge = document.createElement('span');
+    badge.className = 'pill pill-mono';
+    if (job.status === 'done' || job.status === 'merged') badge.classList.add('pill-live');
+    else if (job.status === 'failed') badge.classList.add('pill-danger');
+    badge.textContent = job.status;
+    header.append(title, badge);
+
+    const filesCount = Array.isArray(job.touched_files) ? job.touched_files.length : 0;
+    const meta = document.createElement('p');
+    meta.className = 'bg-subagent-meta';
+    meta.textContent = `${job.branch || ''} · ${filesCount} file(s)${job.goal ? ` · ${job.goal}` : ''}`;
+
+    card.append(header, meta);
+
+    const canMerge = job.status === 'done' || (job.status === 'failed' && filesCount > 0);
+    const canDiscard = ['running', 'done', 'failed'].includes(job.status);
+    if (canMerge || canDiscard) {
+      const footer = document.createElement('footer');
+      if (canMerge) {
+        const mergeBtn = document.createElement('button');
+        mergeBtn.type = 'button';
+        mergeBtn.className = 'chip-btn is-active';
+        mergeBtn.textContent = 'Merge';
+        mergeBtn.title = `3-way merge ${job.job_id} into root`;
+        mergeBtn.addEventListener('click', () => {
+          dom.agentDialog.close();
+          sendCommand(`/merge ${job.job_id}`).catch(() => {});
+        });
+        footer.append(mergeBtn);
+      }
+      if (canDiscard) {
+        const discardBtn = document.createElement('button');
+        discardBtn.type = 'button';
+        discardBtn.className = 'chip-btn chip-btn-stop';
+        discardBtn.textContent = job.status === 'running' ? 'Stop' : 'Discard';
+        discardBtn.title = `Discard worktree ${job.job_id}`;
+        discardBtn.addEventListener('click', () => {
+          dom.agentDialog.close();
+          sendCommand(`/discard ${job.job_id}`).catch(() => {});
+        });
+        footer.append(discardBtn);
+      }
+      card.append(footer);
+    }
+    return card;
+  }
+
   function renderAgentPicker(s) {
     dom.agentList.replaceChildren();
-    if (!s.agents || s.agents.length === 0) {
+    const hasGraphAgents = Array.isArray(s.agents) && s.agents.length > 0;
+    const hasBg = Array.isArray(s.subagents) && s.subagents.length > 0;
+    if (!hasGraphAgents && !hasBg) {
       const p = document.createElement('p');
       p.className = 'empty-note';
       p.textContent = 'No active agents yet.';
       dom.agentList.append(p);
       return;
     }
-    for (const ag of s.agents) {
+    for (const ag of (s.agents || [])) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = ag.id === s.focused_agent_id ? 'agent-row-btn is-focused' : 'agent-row-btn';
@@ -624,16 +887,22 @@
       });
       dom.agentList.append(btn);
     }
+    if (hasBg) {
+      for (const job of s.subagents) {
+        dom.agentList.append(buildSubagentCard(job, true));
+      }
+    }
   }
 
   function renderState(s) {
-    // Top bar
-    dom.modelSubtitle.textContent = `${s.model || 'model'} · effort:${s.effort || 'auto'}`;
+    // Top bar — `SDD-03` Fase 4: botón LLM vivo (etiqueta + modal idempotente)
+    renderLlmModal(s);
     dom.modeBtn.textContent = s.mode || 'BUILD';
     dom.modeBtn.classList.toggle('is-plan', s.mode !== 'BUILD');
     dom.sandboxPill.textContent = `SANDBOX:${s.sandbox_badge || 'workspace'}`;
     dom.trustPill.classList.toggle('hidden', !s.untrusted);
     dom.tickPill.textContent = `tick ${s.tick || 0}`;
+    renderDriverSelect(s);
 
     if (s.vault_label) {
       dom.vaultPill.textContent = `vault:${s.vault_label}`;
@@ -643,11 +912,14 @@
     }
 
     const agents = s.agents || [];
+    const bgJobs = Array.isArray(s.subagents) ? s.subagents : [];
+    const activeBgCount = bgJobs.filter((j) => j.status === 'running').length;
     const subCount = agents.filter((a) => !a.is_root).length;
     const focused = agents.find((a) => a.id === s.focused_agent_id) || agents[0] || null;
-    dom.agentsBtn.textContent = subCount > 0
-      ? `Agent #${focused ? focused.id : 1} · sub:${subCount}`
-      : `Agent #${focused ? focused.id : 1}`;
+    const agentParts = [`Agent #${focused ? focused.id : 1}`];
+    if (subCount > 0) agentParts.push(`sub:${subCount}`);
+    if (activeBgCount > 0) agentParts.push(`bg:${activeBgCount}`);
+    dom.agentsBtn.textContent = agentParts.join(' · ');
 
     // Any agent busy rotates the real orbital openOnyx emblem (like the TUI!)
     const anyActive = agents.some((a) =>
@@ -777,6 +1049,21 @@
       p.className = 'empty-note';
       p.textContent = 'No sprout.toml services loaded.';
       dom.servicesBody.replaceChildren(p);
+    }
+
+    if (bgJobs.length > 0) {
+      dom.subagentsCard.classList.remove('hidden');
+      dom.subagentsBadge.textContent = `${activeBgCount} active`;
+      dom.subagentsBadge.classList.toggle('pill-live', activeBgCount > 0);
+      const list = document.createElement('div');
+      list.className = 'bg-subagents-list';
+      for (const job of bgJobs) {
+        list.append(buildSubagentCard(job, false));
+      }
+      dom.subagentsBody.replaceChildren(list);
+    } else {
+      dom.subagentsCard.classList.add('hidden');
+      dom.subagentsBody.replaceChildren();
     }
 
     // Conversation & transparent trace stream

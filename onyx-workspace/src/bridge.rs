@@ -14,7 +14,7 @@ use crate::state::{
     capture_git_tree_checkpoint, file_read_tick, graph_workspace_mode, is_file_read,
     normalize_rel_path, restore_git_tree_checkpoint_for_targets, undone_effects,
 };
-use crate::tools::WorkspaceTools;
+use crate::tools::{WorkspaceTools, is_async_subagent_tool, spawn_subagent_driver_from_args};
 
 /// Driver que observa agentes en `AgentState::Acting` con herramientas del
 /// workspace pendientes, valida políticas de modo/lectura previa, las ejecuta
@@ -216,6 +216,12 @@ impl PlatformDriver for WorkspaceToolBridge {
                 &pending.tool,
                 &pending.args,
             );
+            // Para `subagent_merge`, solo hacemos cumplir `Deny` aquí (p. ej. modo PLAN o regla deny).
+            // Nunca auto-aprobamos `Allow`/`Ask` aquí: `SubagentManagerDriver` evalúa el diff
+            // 3-way real con `onyx-scent` y sella el ticket anti-TOCTOU antes de aprobar.
+            if pending.tool == "subagent_merge" && decision != PermissionDecision::Deny {
+                continue;
+            }
             match decision {
                 PermissionDecision::Allow => {
                     if self.handled_approvals.insert((view.agent.0, view.request)) {
@@ -241,6 +247,25 @@ impl PlatformDriver for WorkspaceToolBridge {
                                 "blocked by permission policy (deny rule): `{}`",
                                 pending.tool
                             )
+                        } else if let Some(driver) = pending
+                            .tool
+                            .eq("spawn_subagent")
+                            .then(|| spawn_subagent_driver_from_args(&pending.args))
+                            .flatten()
+                            .filter(|d| !d.eq_ignore_ascii_case("native"))
+                        {
+                            // Gate de drivers externos (`SDD-10`): modo de solo lectura,
+                            // workspace no confiado o regla `deny`/`ask`.
+                            if !current_mode.allows_mutation() {
+                                format!(
+                                    "blocked by workspace mode `{:?}`: external harness driver `{driver}` cannot run CLI processes in read-only mode",
+                                    current_mode
+                                )
+                            } else {
+                                let (_, gate_reason) =
+                                    self.tools.policy().external_driver_gate(&driver);
+                                gate_reason
+                            }
                         } else {
                             format!(
                                 "blocked by control-plane protection (read-only): `{}`",
@@ -258,7 +283,7 @@ impl PlatformDriver for WorkspaceToolBridge {
             inner.present(graph, surfaces);
         }
         for (agent, request, pending) in pending_tool_calls(graph, &self.vocab) {
-            if pending.tool == "spawn_agent" {
+            if pending.tool == "spawn_agent" || is_async_subagent_tool(&pending.tool) {
                 continue;
             }
             if !self.dispatched.insert((agent.0, request)) {

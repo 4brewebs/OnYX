@@ -2589,3 +2589,113 @@ fn sandbox_effective_badge_is_honest_and_process_job_terminates_process_tree() {
     job.terminate();
     let _ = child.wait();
 }
+
+#[test]
+fn external_driver_gate_honors_trust_deny_and_ask_allow_precedence() {
+    use onyx_workspace::WorkspaceTrustReport;
+
+    let dir = TempDir::new("extdrv_gate");
+    fs::create_dir_all(dir.0.join(".onyx")).unwrap();
+    fs::write(
+        dir.0.join(".onyx/config.toml"),
+        r#"
+[permissions]
+deny = ["spawn_subagent(denied-drv)"]
+ask = ["spawn_subagent(*)", "spawn_subagent(tied-drv)"]
+allow = ["spawn_subagent(opencode)", "spawn_subagent(tied-drv)"]
+"#,
+    )
+    .unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0)
+        .unwrap()
+        .with_loaded_config_trusted(true);
+
+    // Workspace no confiado → `Deny` absoluto, incluso con `allow` explícita.
+    let mut untrusted = WorkspaceTrustReport::no_project_config();
+    untrusted.config_trusted = false;
+    let untrusted_policy = policy.clone().with_trust_report(untrusted);
+    let (d, reason) = untrusted_policy.external_driver_gate("opencode");
+    assert_eq!(d, PermissionDecision::Deny);
+    assert!(reason.contains("trusted workspace"), "{reason}");
+
+    // Regla `deny` → `Deny` (precedencia máxima entre reglas).
+    let (d, reason) = policy.external_driver_gate("denied-drv");
+    assert_eq!(d, PermissionDecision::Deny);
+    assert!(reason.contains("deny rule"), "{reason}");
+
+    // `allow` específico (`opencode`, spec 8) vence al `ask` genérico (`*`, spec 0).
+    let (d, reason) = policy.external_driver_gate("opencode");
+    assert_eq!(d, PermissionDecision::Allow, "reason: {reason}");
+    assert!(reason.is_empty());
+
+    // Especificidad igual en `ask` y `allow` (`tied-drv`) → gana `ask` (ask >= allow).
+    let (d, reason) = policy.external_driver_gate("tied-drv");
+    assert_eq!(d, PermissionDecision::Ask);
+    assert!(!reason.is_empty(), "Ask debe traer motivo accionable");
+
+    // Solo `ask` genérico (`other-drv` no tiene `allow`) → `Ask`.
+    let (d, _) = policy.external_driver_gate("other-drv");
+    assert_eq!(d, PermissionDecision::Ask);
+
+    // `WorkspaceMode`: en `Plan`/`Explore` un driver externo es siempre `Deny`
+    // (ejecuta procesos y red fuera de `WorkspaceToolBridge`), aunque haya `allow`.
+    let tools = WorkspaceTools::new(policy.clone());
+    let ext_args = r#"{"goal":"x","driver":"opencode"}"#;
+    assert_eq!(
+        tools
+            .evaluate_permission_with_impact(WorkspaceMode::Build, "spawn_subagent", ext_args)
+            .0,
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        tools
+            .evaluate_permission_with_impact(WorkspaceMode::Plan, "spawn_subagent", ext_args)
+            .0,
+        PermissionDecision::Deny
+    );
+    assert_eq!(
+        tools
+            .evaluate_permission_with_impact(WorkspaceMode::Explore, "spawn_subagent", ext_args)
+            .0,
+        PermissionDecision::Deny
+    );
+    // El driver `native` sigue su flujo habitual (fuera del gate).
+    let native_args = r#"{"goal":"x","driver":"native"}"#;
+    let (native_decision, _) =
+        tools.evaluate_permission_with_impact(WorkspaceMode::Plan, "spawn_subagent", native_args);
+    assert_ne!(native_decision, PermissionDecision::Deny);
+}
+
+#[test]
+fn for_worktree_derives_non_offline_network_for_external_harness_allowlist() {
+    let dir = TempDir::new("extdrv_net");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let wt = TempDir::new("extdrv_net_wt");
+
+    // `NativeOffline` → `Offline` (comportamiento SDD-09 intacto).
+    let derived = policy
+        .for_worktree(&wt.0, &onyx_workspace::SubagentNetworkPolicy::NativeOffline)
+        .unwrap();
+    assert_eq!(derived.sandbox.network, NetworkPolicy::Offline);
+
+    // Allowlist declarada → `Unrestricted` (no-Offline: sin hints `*_OFFLINE`).
+    let derived = policy
+        .for_worktree(
+            &wt.0,
+            &onyx_workspace::SubagentNetworkPolicy::ExternalHarnessAllowlist(vec![
+                "api.openai.com".to_string(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(derived.sandbox.network, NetworkPolicy::Unrestricted);
+
+    // Allowlist vacía → `LocalhostOnly` (tampoco `Offline`).
+    let derived = policy
+        .for_worktree(
+            &wt.0,
+            &onyx_workspace::SubagentNetworkPolicy::ExternalHarnessAllowlist(Vec::new()),
+        )
+        .unwrap();
+    assert_eq!(derived.sandbox.network, NetworkPolicy::LocalhostOnly);
+}

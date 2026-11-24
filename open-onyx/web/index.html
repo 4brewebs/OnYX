@@ -38,7 +38,13 @@
             <h1 class="brand-title">openOnyx</h1>
             <span id="conn-pill" class="pill pill-muted" title="SSE connection status">Connecting</span>
           </div>
-          <p id="model-subtitle" class="brand-subtitle">Initializing session…</p>
+          <button
+            id="llm-config-btn"
+            type="button"
+            class="brand-subtitle llm-config-btn"
+            title="Configure the LLM target (profile / provider / model / effort)"
+            aria-haspopup="dialog"
+          >Initializing session…</button>
         </div>
       </div>
 
@@ -129,6 +135,14 @@
           <div id="autocomplete" class="autocomplete hidden" role="listbox" aria-label="Autocomplete suggestions"></div>
 
           <form id="composer-form" class="composer-form" autocomplete="off">
+            <label class="sr-only" for="driver-select">Subagent driver</label>
+            <select
+              id="driver-select"
+              class="driver-select"
+              title="Driver for background tasks (native or configured external harness CLI)"
+            >
+              <option value="native">native</option>
+            </select>
             <label class="sr-only" for="prompt-input">Message or slash command</label>
             <textarea
               id="prompt-input"
@@ -163,6 +177,14 @@
           <div id="services-body" class="side-card-body">
             <p class="empty-note">No <code>sprout.toml</code> services loaded.</p>
           </div>
+        </section>
+
+        <section id="subagents-card" class="side-card side-subagents hidden" data-panel="subagents">
+          <div class="side-card-header">
+            <h2>Background Subagents</h2>
+            <span id="subagents-badge" class="pill pill-mono">0 active</span>
+          </div>
+          <div id="subagents-body" class="side-card-body"></div>
         </section>
 
         <section class="side-card side-telemetry">
@@ -226,6 +248,57 @@
         <button id="agent-dialog-close" type="button" class="icon-btn" aria-label="Close">✕</button>
       </div>
       <div id="agent-list" class="agent-list"></div>
+    </div>
+  </dialog>
+
+  <!-- Native modal dialog: LLM target selector (SDD-03 Fase 4) — changes are applied with the standard slash commands through the authenticated /api/v1/command endpoint -->
+  <dialog id="llm-modal" closedby="any" aria-labelledby="llm-modal-title">
+    <div class="dialog-body">
+      <div class="dialog-head-row">
+        <h2 id="llm-modal-title">LLM target</h2>
+        <button id="llm-modal-close" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="dialog-sub">
+        Applied through standard slash commands, sealed on the tick boundary (same tunnel as the TUI).
+      </p>
+      <div>
+        <p class="field-label" id="llm-profiles-label">Registered profiles</p>
+        <div id="llm-profile-list" class="agent-list" role="group" aria-labelledby="llm-profiles-label"></div>
+      </div>
+      <div class="llm-fields">
+        <div class="llm-field">
+          <label class="field-label" for="llm-provider-select">Provider</label>
+          <select id="llm-provider-select" class="text-input">
+            <option value="gemini">gemini</option>
+            <option value="openai">openai</option>
+          </select>
+        </div>
+        <div class="llm-field">
+          <label class="field-label" for="llm-effort-select">Effort</label>
+          <select id="llm-effort-select" class="text-input">
+            <option value="auto">auto</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </div>
+        <div class="llm-field llm-field-wide">
+          <label class="field-label" for="llm-model-input">Model</label>
+          <input
+            id="llm-model-input"
+            class="text-input"
+            type="text"
+            placeholder="model name"
+            spellcheck="false"
+            autocomplete="off"
+          >
+        </div>
+      </div>
+      <p id="llm-modal-status" class="form-error" aria-live="polite"></p>
+      <div class="dialog-footer">
+        <button id="llm-modal-cancel" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="llm-modal-apply" type="button" class="btn btn-primary">Apply</button>
+      </div>
     </div>
   </dialog>
 

@@ -1006,11 +1006,39 @@ impl SessionTelemetry {
         }
     }
 
-    pub fn record_turn(&mut self, usage: TokenUsage) {
+    /// `SDD-03` Fase 2: conmuta el modelo activo en caliente (cambio de perfil entre
+    /// fronteras de tick). Rederiva la ventana de contexto y recalcula
+    /// `context_fill_pct` desde el último turno registrado.
+    pub fn set_active_model(&mut self, model: &str, is_local_endpoint: bool) {
+        if self.model == model && self.is_local_endpoint == is_local_endpoint {
+            return;
+        }
+        self.model = model.to_string();
+        self.is_local_endpoint = is_local_endpoint;
+        self.model_context_tokens = model_context_window(model);
+        if self.model_context_tokens == 0 || self.last_turn.input_tokens == 0 {
+            self.context_fill_pct = 0;
+        } else {
+            let pct = ((self.last_turn.input_tokens as f64) / (self.model_context_tokens as f64)
+                * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as u8;
+            self.context_fill_pct = pct;
+        }
+    }
+
+    /// `SDD-03` Fase 2 (corregido Fase 3): registra un turno usando el
+    /// modelo/endpoint **de esa llamada** solo para imputar el coste estimado —
+    /// la llamada en vuelo puede ser de otro modelo si hubo hot-swap antes de que
+    /// llegara la respuesta. El modelo **activo** (`model`/`is_local_endpoint`/
+    /// `model_context_tokens`) lo gestiona únicamente [`Self::set_active_model`]:
+    /// una respuesta tardía de una llamada vieja nunca lo revierte (la barra de
+    /// estado refleja el modelo al que se enviará la próxima llamada).
+    pub fn record_turn_for(&mut self, model: &str, is_local_endpoint: bool, usage: TokenUsage) {
         self.last_turn = usage;
         self.cumulative.add_assign(usage);
-        if !self.is_local_endpoint {
-            self.estimated_cost_usd += estimate_usage_cost_usd(&self.model, usage);
+        if !is_local_endpoint {
+            self.estimated_cost_usd += estimate_usage_cost_usd(model, usage);
         }
         if self.model_context_tokens > 0 && usage.input_tokens > 0 {
             let pct = ((usage.input_tokens as f64) / (self.model_context_tokens as f64) * 100.0)
@@ -1018,6 +1046,14 @@ impl SessionTelemetry {
                 .clamp(0.0, 100.0) as u8;
             self.context_fill_pct = pct;
         }
+    }
+
+    /// Atajo legacy (tests): registra con el modelo de arranque del handle.
+    #[cfg(test)]
+    pub fn record_turn(&mut self, usage: TokenUsage) {
+        let model = self.model.clone();
+        let is_local = self.is_local_endpoint;
+        self.record_turn_for(&model, is_local, usage);
     }
 
     pub fn update_estimated_context_bytes(&mut self, projected_bytes: usize) {
@@ -1083,6 +1119,28 @@ impl SessionTelemetryHandle {
         }
     }
 
+    /// `SDD-03` Fase 2: conmuta el modelo activo en caliente (hot-swap LLM). Marca
+    /// `dirty` solo si realmente cambió (refresco de cabecera TUI/Web sin polling).
+    pub fn set_active_model(&self, model: &str, is_local_endpoint: bool) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let changed = guard.model != model || guard.is_local_endpoint != is_local_endpoint;
+            guard.set_active_model(model, is_local_endpoint);
+            if changed {
+                self.dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// `SDD-03` Fase 2: registra un turno con el modelo/endpoint de esa llamada.
+    pub fn record_turn_for(&self, model: &str, is_local_endpoint: bool, usage: TokenUsage) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.record_turn_for(model, is_local_endpoint, usage);
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Atajo legacy (tests): registra con el modelo de arranque del handle.
+    #[cfg(test)]
     pub fn record_turn(&self, usage: TokenUsage) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.record_turn(usage);
@@ -1396,6 +1454,93 @@ mod tests {
             small.snapshot().format_status_bar().starts_with("ctx: <1%"),
             "{}",
             small.snapshot().format_status_bar()
+        );
+    }
+
+    /// `SDD-03` Fase 2: `record_turn_for` imputa el coste al modelo **de la llamada**
+    /// (el objetivo en vuelo), aunque el modelo activo haya cambiado por hot-swap
+    /// antes de que llegara la respuesta. Un endpoint local (Ollama/vLLM) no
+    /// acumula coste estimado.
+    #[test]
+    fn telemetry_record_turn_for_charges_the_call_model_after_hot_swap() {
+        // `gpt-4o`: input $2.50/1M, output $10.00/1M, ventana 128k.
+        let handle = SessionTelemetryHandle::new("gpt-4o", false);
+        handle.record_turn_for(
+            "gpt-4o",
+            false,
+            TokenUsage {
+                input_tokens: 128_000,
+                cached_input_tokens: 0,
+                output_tokens: 100_000,
+                reasoning_tokens: 0,
+            },
+        );
+        let snap = handle.snapshot();
+        assert_eq!(snap.model, "gpt-4o");
+        // 128k in → $0.32; 100k out → $1.00.
+        assert!(
+            (snap.estimated_cost_usd - 1.32).abs() < 1e-9,
+            "{}",
+            snap.estimated_cost_usd
+        );
+
+        // Hot-swap entre frontera de tick: el activo pasa a Gemini (ventana 1M).
+        handle.set_active_model("gemini-2.5-pro", false);
+        let swapped = handle.snapshot();
+        assert_eq!(swapped.model, "gemini-2.5-pro");
+        assert_eq!(swapped.model_context_tokens, 1_000_000);
+
+        // Llega la respuesta de la llamada gpt-4o en vuelo: el coste se imputa a
+        // `gpt-4o` (tarifa $1.32), no al modelo activo Gemini ($0.16 + $0.50 = $0.66).
+        handle.record_turn_for(
+            "gpt-4o",
+            false,
+            TokenUsage {
+                input_tokens: 128_000,
+                cached_input_tokens: 0,
+                output_tokens: 100_000,
+                reasoning_tokens: 0,
+            },
+        );
+        let snap = handle.snapshot();
+        // El coste se imputó a `gpt-4o`, pero el modelo **activo** sigue siendo el
+        // del hot-swap: una respuesta tardía nunca revierte `set_active_model`.
+        assert_eq!(snap.model, "gemini-2.5-pro");
+        assert_eq!(snap.model_context_tokens, 1_000_000);
+        assert_eq!(snap.cumulative.input_tokens, 256_000);
+        assert!(
+            (snap.estimated_cost_usd - 2.64).abs() < 1e-9,
+            "{}",
+            snap.estimated_cost_usd
+        );
+
+        // Una llamada de un endpoint local no acumula coste y tampoco toca el
+        // modelo activo (no es un hot-swap: la siguiente llamada sigue usando el
+        // modelo activo actual).
+        handle.record_turn_for(
+            "qwen3-local",
+            true,
+            TokenUsage {
+                input_tokens: 5_000,
+                cached_input_tokens: 0,
+                output_tokens: 100,
+                reasoning_tokens: 0,
+            },
+        );
+        let snap = handle.snapshot();
+        assert_eq!(snap.model, "gemini-2.5-pro");
+        assert!(!snap.is_local_endpoint);
+        assert!(
+            (snap.estimated_cost_usd - 2.64).abs() < 1e-9,
+            "{}",
+            snap.estimated_cost_usd
+        );
+        assert_eq!(snap.cumulative.input_tokens, 261_000);
+        // La barra sigue mostrando el coste estimado del modelo activo remoto.
+        assert!(
+            snap.format_status_bar().contains("~$"),
+            "{}",
+            snap.format_status_bar()
         );
     }
 

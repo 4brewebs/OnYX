@@ -20,6 +20,10 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const VAULT_UNASSIGNED_DIR: &str = "unassigned";
+/// Directorio del vault donde se sellan los logs crudos (pasados por `scrub_secrets`) de los
+/// drivers de subagentes CLI externos, uno por job (`SDD-10` Fase 3):
+/// `.onyx/vault/subagent-logs/<job_id>.log`.
+pub const VAULT_SUBAGENT_LOGS_DIR: &str = "subagent-logs";
 
 /// Devuelve `<workspace>/.onyx/vault`.
 pub fn vault_root(workspace: &Path) -> PathBuf {
@@ -29,6 +33,11 @@ pub fn vault_root(workspace: &Path) -> PathBuf {
 /// Devuelve `<workspace>/.onyx/vault/unassigned`.
 pub fn vault_unassigned_dir(workspace: &Path) -> PathBuf {
     vault_root(workspace).join(VAULT_UNASSIGNED_DIR)
+}
+
+/// Devuelve `<workspace>/.onyx/vault/subagent-logs` (logs de drivers externos, `SDD-10` Fase 3).
+pub fn vault_subagent_logs_dir(workspace: &Path) -> PathBuf {
+    vault_root(workspace).join(VAULT_SUBAGENT_LOGS_DIR)
 }
 
 /// Crea `<workspace>/.onyx/vault/.gitignore` con `*` si aún no existe,
@@ -370,7 +379,9 @@ pub fn audit_vault(workspace: &Path) -> VaultAudit {
             let path = entry.path();
             if path.is_dir() {
                 let name = entry.file_name();
-                if name != VAULT_UNASSIGNED_DIR {
+                // Ni `unassigned` ni `subagent-logs` (logs de drivers externos, `SDD-10`
+                // Fase 3) cuentan como sesiones.
+                if name != VAULT_UNASSIGNED_DIR && name != VAULT_SUBAGENT_LOGS_DIR {
                     session_dirs += 1;
                 }
             }
@@ -543,6 +554,31 @@ mod tests {
         assert!(audit.gitignore_present);
         assert_eq!(audit.session_dirs, 1);
         assert_eq!(audit.unassigned_transcripts, 1);
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// `SDD-10` Fase 3: el directorio `subagent-logs` (logs crudos de drivers externos) no
+    /// cuenta como sesión en la auditoría del vault.
+    #[test]
+    fn audit_vault_excludes_subagent_logs_dir_from_session_count() {
+        let ws = temp_ws("sublogs_audit");
+        ensure_vault_gitignore(&ws).unwrap();
+
+        // Una sesión real + el directorio de logs de subagentes con un log por job.
+        let sess = vault_root(&ws).join("mi-sesion");
+        fs::create_dir_all(&sess).unwrap();
+        let logs = vault_subagent_logs_dir(&ws);
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("writer-1.log"), b"driver log").unwrap();
+
+        let audit = audit_vault(&ws);
+        assert!(audit.exists);
+        assert!(audit.gitignore_present);
+        assert_eq!(
+            audit.session_dirs, 1,
+            "`subagent-logs` must not count as a session dir"
+        );
 
         let _ = fs::remove_dir_all(&ws);
     }

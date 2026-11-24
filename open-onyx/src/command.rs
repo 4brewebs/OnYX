@@ -10,21 +10,43 @@ use onyx_soul_agents::{
     spawn_event,
 };
 use onyx_workspace::{
-    SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools, WorkspaceVocab,
-    evaluate_workspace_trust, format_services_panel_from_toon, graph_workspace_mode,
+    RecordedLlmProfile, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle, WorkspaceTools,
+    WorkspaceVocab, evaluate_workspace_trust, format_services_panel_from_toon,
+    graph_subagent_records, graph_workspace_llm_profile, graph_workspace_mode,
     graph_workspace_plan, graph_workspace_services, mark_latest_effect_undone,
-    revoke_workspace_trust, set_workspace_mode, set_workspace_services, trust_workspace,
+    revoke_workspace_trust, set_workspace_llm_profile, set_workspace_mode, set_workspace_services,
+    trust_workspace, update_subagent_status, upsert_subagent_record,
 };
 
-use crate::context::{COMPACT_MARKER, build_compaction_summary};
+use crate::context::{
+    COMPACT_MARKER, ReasoningEffort, SessionTelemetryHandle, build_compaction_summary,
+};
+use crate::llm_profile::{LlmProfileHandle, LlmProvider, ResolvedLlmTarget, effort_label};
 use crate::pack::SharedPackStore;
+use crate::subagent::{SubagentHandle, decode_proposal_command};
 
 /// Acción de sesión solicitada por un comando slash que requiere operar sobre `AgentHost`,
 /// `PackSnapshotStore` o el árbol Git fuera de un tick individual (`REQ-03.2`, `REQ-03.3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAction {
-    Rewind { requested_tick: u64 },
-    Fork { label: Option<String> },
+    Rewind {
+        requested_tick: u64,
+    },
+    Fork {
+        label: Option<String>,
+    },
+    MergeSubagent {
+        job_id: String,
+    },
+    DiscardSubagent {
+        job_id: String,
+    },
+    /// `/spawn [--driver <id>] <tarea>` (`SDD-10` Fase 4): lanza un job de worktree
+    /// en segundo plano sin gastar un turno de `root`.
+    SpawnSubagent {
+        goal: String,
+        driver: Option<String>,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -46,10 +68,16 @@ impl PendingSessionAction {
     }
 }
 
+#[derive(Default)]
+struct PendingSystemQueue {
+    notes: Vec<String>,
+    subagent_statuses: Vec<(String, &'static str)>,
+}
+
 /// Cola thread-safe de notas de sistema que `CommandSpawnerSystem` proyecta en la memoria del
 /// agente raíz en el siguiente tick (manteniendo todas las mutaciones del grafo dentro de `OnyxSystem`).
 #[derive(Clone, Default)]
-pub struct PendingSystemNotes(Arc<Mutex<Vec<String>>>);
+pub struct PendingSystemNotes(Arc<Mutex<PendingSystemQueue>>);
 
 impl PendingSystemNotes {
     pub fn new() -> Self {
@@ -58,14 +86,27 @@ impl PendingSystemNotes {
 
     pub fn push(&self, note: impl Into<String>) {
         if let Ok(mut guard) = self.0.lock() {
-            guard.push(note.into());
+            guard.notes.push(note.into());
         }
     }
 
     pub fn drain(&self) -> Vec<String> {
         self.0
             .lock()
-            .map(|mut g| std::mem::take(&mut *g))
+            .map(|mut g| std::mem::take(&mut g.notes))
+            .unwrap_or_default()
+    }
+
+    pub fn push_subagent_status(&self, job_id: impl Into<String>, status: &'static str) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.subagent_statuses.push((job_id.into(), status));
+        }
+    }
+
+    pub fn drain_subagent_statuses(&self) -> Vec<(String, &'static str)> {
+        self.0
+            .lock()
+            .map(|mut g| std::mem::take(&mut g.subagent_statuses))
             .unwrap_or_default()
     }
 }
@@ -79,15 +120,36 @@ pub enum SlashCommand {
     Services,
     Service(String),
     Agent(Option<String>),
+    Subagents,
+    /// `/spawn [--driver <id>] <tarea>` (`SDD-10` Fase 4): subagente en segundo plano sin
+    /// turno de `root`. `driver` es `None`/`"native"` → motor en proceso; otro `id` →
+    /// harness CLI de `[[external_drivers]]`.
+    SpawnSubagent {
+        driver: Option<String>,
+        goal: Option<String>,
+    },
+    MergeSubagent(String),
+    DiscardSubagent(String),
     Rewind(Option<u64>),
     RewindInvalid(String),
     Fork(Option<String>),
     Trust(Option<String>),
-    Cancel { all: bool },
+    /// `/profile [id]` (`SDD-03` Fase 2): cambia a un perfil LLM registrado o lista los disponibles.
+    Profile(Option<String>),
+    /// `/provider <gemini|openai>` (`SDD-03` Fase 2): conmuta el provider LLM en caliente.
+    Provider(Option<String>),
+    /// `/model <name>` (`SDD-03` Fase 2): cambia el modelo del objetivo LLM activo.
+    Model(Option<String>),
+    /// `/effort [auto|low|medium|high]` (`SDD-03` Fase 2): cambia el esfuerzo de razonamiento.
+    Effort(Option<String>),
+    Cancel {
+        all: bool,
+    },
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
     let cmd = raw.trim();
+    let lower = cmd.to_ascii_lowercase();
     if cmd == "/new" {
         return Some(SlashCommand::New(None));
     }
@@ -105,6 +167,54 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
     if let Some(arg) = cmd.strip_prefix("/mode ") {
         let trimmed = arg.trim();
         return Some(SlashCommand::Mode(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    // `SDD-03` Fase 3: la **palabra** del comando matchea case-insensitive
+    // (coherente con `is_immediate_slash_cmd` de TUI/Web y el patrón ASCII-safe
+    // de `/spawn`); el **argumento** se toma de `cmd` para conservar la case del
+    // usuario.
+    if lower == "/profile" {
+        return Some(SlashCommand::Profile(None));
+    }
+    if lower.starts_with("/profile ") {
+        let trimmed = cmd["/profile ".len()..].trim();
+        return Some(SlashCommand::Profile(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if lower == "/provider" {
+        return Some(SlashCommand::Provider(None));
+    }
+    if lower.starts_with("/provider ") {
+        let trimmed = cmd["/provider ".len()..].trim();
+        return Some(SlashCommand::Provider(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if lower == "/model" {
+        return Some(SlashCommand::Model(None));
+    }
+    if lower.starts_with("/model ") {
+        let trimmed = cmd["/model ".len()..].trim();
+        return Some(SlashCommand::Model(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }));
+    }
+    if lower == "/effort" {
+        return Some(SlashCommand::Effort(None));
+    }
+    if lower.starts_with("/effort ") {
+        let trimmed = cmd["/effort ".len()..].trim();
+        return Some(SlashCommand::Effort(if trimmed.is_empty() {
             None
         } else {
             Some(trimmed.to_string())
@@ -186,7 +296,63 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             Some(trimmed.to_string())
         }));
     }
-    let lower = cmd.to_ascii_lowercase();
+    if lower == "/subagents" || lower == "/subagent" {
+        return Some(SlashCommand::Subagents);
+    }
+    if let Some(rest) = cmd.strip_prefix("/merge ") {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(SlashCommand::MergeSubagent(trimmed.to_string()));
+        }
+    }
+    if let Some(rest) = cmd.strip_prefix("/discard ") {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(SlashCommand::DiscardSubagent(trimmed.to_string()));
+        }
+    }
+    if lower == "/spawn" {
+        return Some(SlashCommand::SpawnSubagent {
+            driver: None,
+            goal: None,
+        });
+    }
+    if lower.starts_with("/spawn ") {
+        // `SDD-10` Fase 4: comando case-insensitive; los **args** se toman de `cmd` en la
+        // misma posición (se conserva la mayúscula/minúscula del usuario, a diferencia del
+        // resto de comandos que solo comparan en minúsculas), con tolerancia a espacios
+        // múltiples (`trim_start` tras `/spawn ` y tras `--driver`, `splitn` en
+        // cualquier carácter de whitespace).
+        let rest = cmd["/spawn ".len()..].trim_start();
+        let first_token = rest.split(char::is_whitespace).next().unwrap_or("");
+        let (driver, goal_src) = if first_token.eq_ignore_ascii_case("--driver") {
+            let after = rest["--driver".len()..].trim_start();
+            if after.is_empty() {
+                // Flag incompleta (sin id): sin driver ni tarea → nota de uso.
+                (None, "")
+            } else {
+                let mut parts = after.splitn(2, char::is_whitespace);
+                let id = parts.next().unwrap_or("").trim();
+                let driver = if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                };
+                let goal_src = parts.next().map(str::trim).unwrap_or("");
+                (driver, goal_src)
+            }
+        } else {
+            (None, rest.trim_end())
+        };
+        return Some(SlashCommand::SpawnSubagent {
+            driver,
+            goal: if goal_src.is_empty() {
+                None
+            } else {
+                Some(goal_src.to_string())
+            },
+        });
+    }
     if lower == "/cancel" || lower == "/stop" {
         return Some(SlashCommand::Cancel { all: false });
     }
@@ -245,10 +411,16 @@ pub struct CommandSpawnerSystem {
     ws_vocab: Option<WorkspaceVocab>,
     mode_handle: WorkspaceModeHandle,
     sprout: Option<SproutSupervisor>,
+    subagents: Option<SubagentHandle>,
     workspace_root: Option<PathBuf>,
     snapshot_store: Option<SharedPackStore>,
     pending_action: PendingSessionAction,
     pending_notes: PendingSystemNotes,
+    /// Registro LLM para hot-swap en caliente (`SDD-03` Fase 2); `None` en sesiones
+    /// sin LLM (tests, `run` headless sin handle inyectado).
+    llm_handle: Option<LlmProfileHandle>,
+    /// Telemetría efímera para sincronizar el modelo activo en `/effort` etc.
+    telemetry: Option<SessionTelemetryHandle>,
     auto_approve: bool,
     max_steps_per_turn: i64,
     force_new_agent: bool,
@@ -262,15 +434,23 @@ impl CommandSpawnerSystem {
             ws_vocab: None,
             mode_handle: WorkspaceModeHandle::default(),
             sprout: None,
+            subagents: None,
             workspace_root: None,
             snapshot_store: None,
             pending_action: PendingSessionAction::new(),
             pending_notes: PendingSystemNotes::new(),
+            llm_handle: None,
+            telemetry: None,
             auto_approve,
             max_steps_per_turn: 128,
             force_new_agent: false,
             counter: 0,
         }
+    }
+
+    pub fn with_subagents(mut self, subagents: SubagentHandle) -> Self {
+        self.subagents = Some(subagents);
+        self
     }
 
     pub fn with_max_steps(mut self, max_steps_per_turn: i64) -> Self {
@@ -308,6 +488,19 @@ impl CommandSpawnerSystem {
         self
     }
 
+    /// Registro LLM para hot-swap en caliente (`SDD-03` Fase 2): habilita
+    /// `/profile`/`/provider`/`/model`/`/effort` y el sellado `ws.llm.*` en tick 0.
+    pub fn with_llm_profile(mut self, handle: LlmProfileHandle) -> Self {
+        self.llm_handle = Some(handle);
+        self
+    }
+
+    /// Telemetría efímera (el spawner sincroniza el modelo activo en caliente).
+    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
     fn spawn_spec<G: GraphView + ?Sized>(
         &mut self,
         graph: &G,
@@ -336,6 +529,62 @@ pub fn find_latest_root_agent<G: GraphView + ?Sized>(graph: &G, v: &Vocab) -> Op
         .rfind(|id| graph.related(*id, v.rel_parent).is_empty())
 }
 
+impl CommandSpawnerSystem {
+    /// `SDD-03` Fase 2: nota de error accionable cuando un comando LLM se ejecuta
+    /// sin handle (sesión sin LLM inyectado).
+    fn llm_cmd_unavailable(&self, ctx: &mut Ctx, v: &Vocab, now: u64, cmd: &str) {
+        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) {
+            append_agent_memory(
+                ctx.graph,
+                v,
+                root_id,
+                "system",
+                &format!(
+                    "[{cmd}] LLM hot-swap is not available in this session (no LLM profile handle)."
+                ),
+                now,
+            );
+        }
+    }
+
+    /// `SDD-03` Fase 2: nota al agente raíz (memoria `system`) para comandos LLM.
+    fn llm_note(&self, ctx: &mut Ctx, v: &Vocab, now: u64, note: &str) {
+        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) {
+            append_agent_memory(ctx.graph, v, root_id, "system", note, now);
+        }
+    }
+
+    /// `SDD-03` Fase 2: aplica un cambio modal LLM — persiste `ws.llm.*` en el grafo
+    /// EAV (sin credenciales), sincroniza la telemetría efímera y notifica al root.
+    fn apply_llm_target(
+        &self,
+        ctx: &mut Ctx,
+        v: &Vocab,
+        now: u64,
+        target: &ResolvedLlmTarget,
+        note: &str,
+    ) {
+        if let Some(wv) = self.ws_vocab {
+            set_workspace_llm_profile(
+                ctx.graph,
+                &wv,
+                &RecordedLlmProfile {
+                    profile_id: target.profile_id.clone(),
+                    provider: target.provider.as_str().to_string(),
+                    model: target.model.clone(),
+                    effort: target.effort.map(|e| e.as_str().to_string()),
+                },
+            );
+        }
+        if let Some(tel) = &self.telemetry {
+            tel.set_active_model(&target.model, target.is_local_endpoint);
+        }
+        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) {
+            append_agent_memory(ctx.graph, v, root_id, "system", note, now);
+        }
+    }
+}
+
 impl OnyxSystem for CommandSpawnerSystem {
     fn name(&self) -> &str {
         "openonyx_command_spawner"
@@ -352,6 +601,17 @@ impl OnyxSystem for CommandSpawnerSystem {
             if let Some(mode) = graph_workspace_mode(graph, &wv) {
                 self.mode_handle.set(mode);
             }
+            // `SDD-03` Fase 2: sincroniza el estado modal LLM restaurado (read-only,
+            // idempotente; `chat --resume --tick`, `/rewind` y replay lo invocan vía tick).
+            if let (Some(handle), Some(rec)) =
+                (&self.llm_handle, graph_workspace_llm_profile(graph, &wv))
+            {
+                handle.restore_from_graph(&rec);
+                if let Some(tel) = &self.telemetry {
+                    let target = handle.active_target();
+                    tel.set_active_model(&target.model, target.is_local_endpoint);
+                }
+            }
         }
     }
 
@@ -366,6 +626,15 @@ impl OnyxSystem for CommandSpawnerSystem {
             })
             .unwrap_or(0);
 
+        let status_updates = self.pending_notes.drain_subagent_statuses();
+        if !status_updates.is_empty() {
+            if let Some(wv) = self.ws_vocab {
+                for (job_id, status) in status_updates {
+                    update_subagent_status(ctx.graph, &wv, &job_id, status);
+                }
+            }
+        }
+
         let notes = self.pending_notes.drain();
         if !notes.is_empty() {
             if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
@@ -375,12 +644,74 @@ impl OnyxSystem for CommandSpawnerSystem {
             }
         }
 
+        // `SDD-03` Fase 2: sella `ws.llm.*` desde el tick 0 (idempotente: en resume el
+        // grafo ya trae el estado modal; en replay el handle best-effort escribe el
+        // mismo shape, conservando la asignación EAV idéntica al `chat` en vivo).
+        if let (Some(wv), Some(handle)) = (self.ws_vocab, &self.llm_handle) {
+            if graph_workspace_llm_profile(&*ctx.graph, &wv).is_none() {
+                let target = handle.active_target();
+                set_workspace_llm_profile(
+                    ctx.graph,
+                    &wv,
+                    &RecordedLlmProfile {
+                        profile_id: target.profile_id.clone(),
+                        provider: target.provider.as_str().to_string(),
+                        model: target.model.clone(),
+                        effort: target.effort.map(|e| e.as_str().to_string()),
+                    },
+                );
+            }
+        }
+
         for event in ctx.inbox {
             let OnyxEvent::Ingress(IngressEvent::Command(raw_cmd)) = event else {
                 continue;
             };
             let cmd = raw_cmd.trim();
             if cmd.is_empty() {
+                continue;
+            }
+
+            // Ingesta determinista y proactiva de propuestas `SubagentProposal` en frontera de tick
+            // (`SDD-09` Fase 3): reconcilia semánticamente en grafo (`job_id` / `ws.file.path`, nunca
+            // `ConceptId`) y despierta proactivamente a `root` si estaba ocioso sin hacer polling.
+            if let Some((proposal, cancelled)) = decode_proposal_command(cmd) {
+                let status = if cancelled {
+                    "cancelled"
+                } else if proposal.ok {
+                    "done"
+                } else {
+                    "failed"
+                };
+                if let Some(wv) = self.ws_vocab {
+                    upsert_subagent_record(ctx.graph, &wv, &proposal, status);
+                }
+                let touched = if proposal.touched_files.is_empty() {
+                    "(no file edits)".to_string()
+                } else {
+                    proposal.touched_files.join(", ")
+                };
+                let summary_preview: String = proposal.summary.trim().chars().take(240).collect();
+                let notice = format!(
+                    "[subagent `{}` finished · status={status} · branch={}]\ntouched: {touched}\nsummary: {summary_preview}\nUse `subagent_merge` (or `/merge {id}`) to reconcile 3-way into root, or `subagent_discard` (`/discard {id}`) to drop the worktree.",
+                    proposal.job_id,
+                    proposal.branch_name,
+                    id = proposal.job_id
+                );
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    if cancelled
+                        || !continue_agent(
+                            ctx.graph,
+                            &v,
+                            root_id,
+                            &notice,
+                            self.max_steps_per_turn,
+                            now,
+                        )
+                    {
+                        append_agent_memory(ctx.graph, &v, root_id, "system", &notice, now);
+                    }
+                }
                 continue;
             }
 
@@ -449,6 +780,175 @@ impl OnyxSystem for CommandSpawnerSystem {
                                 now,
                             );
                         }
+                    }
+                    SlashCommand::Profile(arg_opt) => {
+                        let Some(handle) = self.llm_handle.clone() else {
+                            self.llm_cmd_unavailable(ctx, &v, now, "/profile");
+                            continue;
+                        };
+                        match arg_opt {
+                            Some(id) => match handle.switch_profile(&id) {
+                                Ok(target) => {
+                                    self.apply_llm_target(
+                                        ctx,
+                                        &v,
+                                        now,
+                                        &target,
+                                        &format!(
+                                            "[/profile] LLM profile `{id}` active: {}/{}, effort {}.",
+                                            target.provider.as_str(),
+                                            target.model,
+                                            effort_label(target.effort)
+                                        ),
+                                    );
+                                }
+                                Err(err) => {
+                                    self.llm_note(ctx, &v, now, &format!("[/profile] {err}"));
+                                }
+                            },
+                            None => {
+                                let snap = handle.public_snapshot();
+                                let mut lines = vec![format!(
+                                    "[/profile] Active: `{}` ({}, {}, effort {})",
+                                    snap.active_profile_id, snap.provider, snap.model, snap.effort
+                                )];
+                                for p in &snap.profiles {
+                                    let mark = if p.id == snap.active_profile_id {
+                                        "*"
+                                    } else {
+                                        " "
+                                    };
+                                    if p.available {
+                                        lines.push(format!(
+                                            "  {mark} `{}` {} {} (effort {}, available)",
+                                            p.id, p.provider, p.model, p.effort
+                                        ));
+                                    } else {
+                                        lines.push(format!(
+                                            "  {mark} `{}` {} {} (effort {}, unavailable: {})",
+                                            p.id,
+                                            p.provider,
+                                            p.model,
+                                            p.effort,
+                                            p.unavailable_reason.as_deref().unwrap_or("no details")
+                                        ));
+                                    }
+                                }
+                                lines.push(
+                                    "Use `/profile <id>` to switch (or `/provider`, `/model`, `/effort`).".to_string(),
+                                );
+                                self.llm_note(ctx, &v, now, &lines.join("\n"));
+                            }
+                        }
+                    }
+                    SlashCommand::Provider(arg_opt) => {
+                        let Some(handle) = self.llm_handle.clone() else {
+                            self.llm_cmd_unavailable(ctx, &v, now, "/provider");
+                            continue;
+                        };
+                        let Some(arg) = arg_opt else {
+                            let avail = handle.public_snapshot().available_providers.join(", ");
+                            self.llm_note(
+                                ctx,
+                                &v,
+                                now,
+                                &format!(
+                                    "[/provider] Usage: `/provider <name>`. Available providers: {avail}."
+                                ),
+                            );
+                            continue;
+                        };
+                        match LlmProvider::parse(&arg) {
+                            Err(err) => self.llm_note(ctx, &v, now, &format!("[/provider] {err}")),
+                            Ok(provider) => match handle.set_provider(provider) {
+                                Ok(target) => {
+                                    self.apply_llm_target(
+                                        ctx,
+                                        &v,
+                                        now,
+                                        &target,
+                                        &format!(
+                                            "[/provider] LLM provider set to `{}` (model `{}`, effort {}).",
+                                            provider.as_str(),
+                                            target.model,
+                                            effort_label(target.effort)
+                                        ),
+                                    );
+                                }
+                                Err(err) => {
+                                    self.llm_note(ctx, &v, now, &format!("[/provider] {err}"));
+                                }
+                            },
+                        }
+                    }
+                    SlashCommand::Model(arg_opt) => {
+                        let Some(handle) = self.llm_handle.clone() else {
+                            self.llm_cmd_unavailable(ctx, &v, now, "/model");
+                            continue;
+                        };
+                        let Some(arg) = arg_opt else {
+                            self.llm_note(
+                                ctx,
+                                &v,
+                                now,
+                                "[/model] Usage: `/model <name>` (changes the model of the active LLM target in place).",
+                            );
+                            continue;
+                        };
+                        match handle.set_model(&arg) {
+                            Ok(target) => {
+                                self.apply_llm_target(
+                                    ctx,
+                                    &v,
+                                    now,
+                                    &target,
+                                    &format!(
+                                        "[/model] LLM model set to `{}` (provider `{}`, effort {}).",
+                                        target.model,
+                                        target.provider.as_str(),
+                                        effort_label(target.effort)
+                                    ),
+                                );
+                            }
+                            Err(err) => self.llm_note(ctx, &v, now, &format!("[/model] {err}")),
+                        }
+                    }
+                    SlashCommand::Effort(arg_opt) => {
+                        let Some(handle) = self.llm_handle.clone() else {
+                            self.llm_cmd_unavailable(ctx, &v, now, "/effort");
+                            continue;
+                        };
+                        let effort = match arg_opt.as_deref() {
+                            None => None,
+                            Some(arg) => match arg.to_ascii_lowercase().as_str() {
+                                "auto" | "none" | "off" => None,
+                                other => match ReasoningEffort::parse(other) {
+                                    Ok(e) => Some(e),
+                                    Err(_) => {
+                                        self.llm_note(
+                                            ctx,
+                                            &v,
+                                            now,
+                                            &format!(
+                                                "[/effort] Unknown effort `{arg}` (use `auto`, `low`, `medium`, or `high`)."
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                },
+                            },
+                        };
+                        let target = handle.set_effort(effort);
+                        self.apply_llm_target(
+                            ctx,
+                            &v,
+                            now,
+                            &target,
+                            &format!(
+                                "[/effort] LLM reasoning effort set to {}.",
+                                effort_label(effort)
+                            ),
+                        );
                     }
                     SlashCommand::Undo => {
                         let Some(wv) = self.ws_vocab else { continue };
@@ -659,6 +1159,137 @@ impl OnyxSystem for CommandSpawnerSystem {
                         if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
                             append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
                         }
+                    }
+                    SlashCommand::Subagents => {
+                        let live_list = self
+                            .subagents
+                            .as_ref()
+                            .map(|h| h.list_summaries())
+                            .unwrap_or_default();
+                        let note = if !live_list.is_empty() {
+                            let mut lines = vec![format!(
+                                "[/subagents] {} background worktree job(s):",
+                                live_list.len()
+                            )];
+                            for s in live_list {
+                                let files = if s.touched_files.is_empty() {
+                                    "0 files".to_string()
+                                } else {
+                                    s.touched_files.join(", ")
+                                };
+                                // `SDD-10` Fase 4: badge del driver (`→ opencode`); el
+                                // driver nativo es el default y no se muestra.
+                                let driver_badge = if s.driver == "native" {
+                                    String::new()
+                                } else {
+                                    format!("→ {} ", s.driver)
+                                };
+                                lines.push(format!(
+                                    "  - [bg #{}] ({}) {driver_badge}branch={} touched=[{}] goal=\"{}\"",
+                                    s.job_id, s.status, s.branch_name, files, s.goal
+                                ));
+                            }
+                            lines.join("\n")
+                        } else if let Some(wv) = self.ws_vocab {
+                            let recs = graph_subagent_records(&*ctx.graph, &wv);
+                            if recs.is_empty() {
+                                "[/subagents] No async background worktree jobs.".to_string()
+                            } else {
+                                let mut lines = vec![format!(
+                                    "[/subagents] {} recorded worktree job(s):",
+                                    recs.len()
+                                )];
+                                for r in recs {
+                                    // `SDD-10` Fase 4: badge del driver (`→ opencode`);
+                                    // el driver nativo es el default y no se muestra.
+                                    let driver_badge = if r.driver == "native" {
+                                        String::new()
+                                    } else {
+                                        format!("→ {} ", r.driver)
+                                    };
+                                    lines.push(format!(
+                                        "  - [bg #{}] ({}) {driver_badge}branch={} touched=[{}]",
+                                        r.job_id,
+                                        r.status,
+                                        r.branch,
+                                        r.touched_files.join(", ")
+                                    ));
+                                }
+                                lines.join("\n")
+                            }
+                        } else {
+                            "[/subagents] No async background worktree jobs.".to_string()
+                        };
+                        if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                            append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        }
+                    }
+                    SlashCommand::MergeSubagent(job_id) => {
+                        if !self.mode_handle.get().allows_mutation() {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    &format!(
+                                        "[/merge] Blocked in `{}` mode: switch to BUILD to merge `{job_id}`.",
+                                        self.mode_handle.get().as_label()
+                                    ),
+                                    now,
+                                );
+                            }
+                        } else if self.subagents.is_none() {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    "[/merge] Async subagent worktree manager is unavailable in this mode (offline replay).",
+                                    now,
+                                );
+                            }
+                        } else {
+                            self.pending_action
+                                .set(SessionAction::MergeSubagent { job_id });
+                        }
+                    }
+                    SlashCommand::DiscardSubagent(job_id) => {
+                        if self.subagents.is_none() {
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    "[/discard] Async subagent worktree manager is unavailable in this mode (offline replay).",
+                                    now,
+                                );
+                            }
+                        } else {
+                            self.pending_action
+                                .set(SessionAction::DiscardSubagent { job_id });
+                        }
+                    }
+                    SlashCommand::SpawnSubagent { driver, goal } => {
+                        let Some(goal) = goal else {
+                            // Nota de uso (si no hay `root` todavía, la nota es un no-op y
+                            // no se muestra nada, igual que el resto de comandos).
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    "[/spawn] Usage: `/spawn [--driver <id>] <task>` — runs the task in an isolated worktree without spending a root turn (list jobs with `/subagents`).",
+                                    now,
+                                );
+                            }
+                            continue;
+                        };
+                        self.pending_action
+                            .set(SessionAction::SpawnSubagent { goal, driver });
                     }
                     SlashCommand::Rewind(None) => {
                         let note = if let Some(store) = &self.snapshot_store {
@@ -986,5 +1617,182 @@ impl OnyxSystem for CommandSpawnerSystem {
             let spec = self.spawn_spec(&*ctx.graph, &v, cmd.to_string());
             ctx.outbox.push(spawn_event(&v, &spec, None));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SDD-10` Fase 4: parseo de `/spawn [--driver <id>] <tarea>`. El comando y el flag
+    /// son case-insensitive (incluido `/SPAWN` **con** args), tolera espacios múltiples
+    /// (tras `/spawn ` y tras `--driver`); el `id` y la **tarea** conservan la
+    /// mayúscula/minúscula del usuario (a diferencia del resto de comandos, que solo
+    /// comparan en minúsculas).
+    #[test]
+    fn parse_slash_spawn_variants() {
+        // `/spawn` solo → sin driver ni goal (nota de uso en el dispatch).
+        assert_eq!(
+            parse_slash_command("/spawn"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: None
+            })
+        );
+        // El comando es case-insensitive.
+        assert_eq!(
+            parse_slash_command("/SPAWN"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: None
+            })
+        );
+        // Con tarea libre: se conserva la mayúscula del usuario.
+        assert_eq!(
+            parse_slash_command("/spawn Fix The Parser BUG"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: Some("Fix The Parser BUG".to_string())
+            })
+        );
+        // `--driver <id>` + tarea.
+        assert_eq!(
+            parse_slash_command("/spawn --driver opencode refactor the parser"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: Some("refactor the parser".to_string())
+            })
+        );
+        // Flag case-insensitive; el `id` conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/spawn --Driver OPCODE Fix It"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("OPCODE".to_string()),
+                goal: Some("Fix It".to_string())
+            })
+        );
+        // `--driver` sin id → driver `None`, sin goal.
+        assert_eq!(
+            parse_slash_command("/spawn --driver"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: None
+            })
+        );
+        // `--driver <id>` sin tarea → driver `Some`, goal `None`.
+        assert_eq!(
+            parse_slash_command("/spawn --driver opencode"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: None
+            })
+        );
+        // Comando case-insensitive **con** args: la tarea conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/SPAWN Fix It"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: Some("Fix It".to_string())
+            })
+        );
+        // Espacios múltiples tras `/spawn` → se toleran.
+        assert_eq!(
+            parse_slash_command("/spawn  --driver opencode task"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: Some("task".to_string())
+            })
+        );
+        // Espacios múltiples tras `--driver` → el id y la tarea se separan igualmente.
+        assert_eq!(
+            parse_slash_command("/spawn --driver  opencode task"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: Some("task".to_string())
+            })
+        );
+    }
+
+    /// `SDD-03` Fase 2 (Fase 3: palabra case-insensitive): parseo de los
+    /// comandos de cambio de LLM en caliente. La **palabra** del comando matchea
+    /// case-insensitive (como `is_immediate_slash_cmd` de TUI/Web y `/spawn`);
+    /// el **argumento** (si existe) conserva la mayúscula del usuario.
+    #[test]
+    fn parse_slash_llm_variants() {
+        // Sin argumento → `None` (consulta de estado / nota de uso).
+        assert_eq!(
+            parse_slash_command("/profile"),
+            Some(SlashCommand::Profile(None))
+        );
+        assert_eq!(
+            parse_slash_command("/provider"),
+            Some(SlashCommand::Provider(None))
+        );
+        assert_eq!(
+            parse_slash_command("/model"),
+            Some(SlashCommand::Model(None))
+        );
+        assert_eq!(
+            parse_slash_command("/effort"),
+            Some(SlashCommand::Effort(None))
+        );
+        // Con argumento → se conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/profile FastModel"),
+            Some(SlashCommand::Profile(Some("FastModel".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/provider openai"),
+            Some(SlashCommand::Provider(Some("openai".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/model gpt-4o-mini"),
+            Some(SlashCommand::Model(Some("gpt-4o-mini".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/effort high"),
+            Some(SlashCommand::Effort(Some("high".to_string())))
+        );
+        // `auto`/`off`/`none` son argumentos válidos de `/effort` (el handler los
+        // normaliza a `None`); aquí solo se comprueba el parseo.
+        assert_eq!(
+            parse_slash_command("/effort off"),
+            Some(SlashCommand::Effort(Some("off".to_string())))
+        );
+        // Argumento con espacios múltiples → se trimean.
+        assert_eq!(
+            parse_slash_command("/profile   spaced   "),
+            Some(SlashCommand::Profile(Some("spaced".to_string())))
+        );
+        // Argumento vacío → equivale al comando sin argumento.
+        assert_eq!(
+            parse_slash_command("/effort   "),
+            Some(SlashCommand::Effort(None))
+        );
+        // Comandos ajenos no se ven afectados.
+        assert_eq!(
+            parse_slash_command("/mode build"),
+            Some(SlashCommand::Mode(Some("build".to_string())))
+        );
+        assert_eq!(parse_slash_command("/profil"), None);
+        assert_eq!(parse_slash_command("/models"), None);
+        // Palabra case-insensitive (coherente con `is_immediate_slash_cmd` de
+        // TUI/Web); el argumento conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/PROFILE"),
+            Some(SlashCommand::Profile(None))
+        );
+        assert_eq!(
+            parse_slash_command("/Provider OPENAI"),
+            Some(SlashCommand::Provider(Some("OPENAI".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/MODEL Gemini-4-Helium"),
+            Some(SlashCommand::Model(Some("Gemini-4-Helium".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/EFFORT High"),
+            Some(SlashCommand::Effort(Some("High".to_string())))
+        );
     }
 }

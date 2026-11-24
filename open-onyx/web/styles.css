@@ -417,6 +417,26 @@ p, li {
   font-family: var(--font-mono);
 }
 
+/* LLM target selector button (SDD-03 Fase 4): mismo look que el subtitle,
+   accesible como botón (focus visible, hover, aria-haspopup). */
+.llm-config-btn {
+  display: block;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.llm-config-btn:hover,
+.llm-config-btn:focus-visible {
+  text-decoration: underline;
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -1389,6 +1409,23 @@ button.pill:active {
   gap: 0.55rem;
 }
 
+.driver-select {
+  flex-shrink: 0;
+  max-inline-size: 9.5rem;
+  padding: 0.62rem 0.6rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--ink-primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.driver-select:focus {
+  outline: 2px solid color-mix(in oklab, var(--accent) 65%, transparent);
+  outline-offset: 1px;
+}
+
 .prompt-input {
   flex: 1;
   min-inline-size: 0;
@@ -1606,4 +1643,90 @@ dialog::backdrop {
 .agent-row-goal {
   font-size: 0.76rem;
   color: var(--ink-secondary);
+}
+
+/* LLM target dialog (SDD-03 Fase 4): reutiliza las filas de agentes para la
+   lista de perfiles; grid 2 columnas para provider/effort, 1 en móvil. */
+.llm-profile-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.llm-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.llm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.llm-field-wide {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 480px) {
+  .llm-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Async Background Worktree Subagent Cards (per modern-web-guidance `card` & `natural-interactions`) */
+.bg-subagents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.bg-subagent-card {
+  container-type: inline-size;
+  display: grid;
+  gap: 0.38rem;
+  padding: 0.58rem 0.7rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.bg-subagent-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.bg-subagent-id {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+.bg-subagent-meta {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-secondary);
+}
+
+.bg-subagent-card > footer {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+:where(button):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@container (inline-size < 16rem) {
+  .bg-subagent-card > footer .chip-btn {
+    flex: 1 1 auto;
+  }
 }

@@ -27,14 +27,18 @@ use onyx_soul_agents::{
 use onyx_workspace::{
     ImpactAssessment, PermissionDecision, SandboxDriverKind, SproutSupervisor, WorkspaceModeHandle,
     WorkspacePolicy, WorkspaceTools, WorkspaceVocab, detect_sandbox_capabilities,
-    graph_workspace_plan, graph_workspace_services, preview_tool_diff,
+    graph_subagent_records, graph_workspace_plan, graph_workspace_services, preview_tool_diff,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::context::{ReasoningEffort, SessionTelemetryHandle};
 use crate::gemini::StreamPreviewHandle;
+use crate::llm_profile::LlmProfileHandle;
 use crate::pack::SharedPackStore;
 use crate::session::UiIdlePump;
+use crate::subagent::{
+    MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, effective_merge_decision,
+};
 use crate::tui_input::WorkspaceFileIndex;
 use crate::vault::session_display_label;
 
@@ -248,6 +252,35 @@ pub struct WebTelemetrySnapshot {
     pub estimated_cost_usd: f64,
 }
 
+/// Metadatos públicos de un perfil LLM registrado (**SDD-03** Fase 4).
+///
+/// **Invariante de seguridad:** solo metadatos — `api_key`/`api_key_env`
+/// nunca salen del handle; este struct no puede contenerlos por construcción.
+#[derive(Clone, Debug, Serialize)]
+pub struct WebLlmProfileSnapshot {
+    pub id: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WebSubagentSnapshot {
+    pub job_id: String,
+    pub name: String,
+    /// Backend que ejecuta el job: `"native"` o el `id` del harness CLI externo (`SDD-10`).
+    pub driver: String,
+    pub status: String,
+    pub ok: Option<bool>,
+    pub spawn_tick: u64,
+    pub branch: String,
+    pub goal: String,
+    pub touched_files: Vec<String>,
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WebStateSnapshot {
     pub schema: &'static str,
@@ -257,10 +290,20 @@ pub struct WebStateSnapshot {
     pub sandbox_badge: String,
     pub untrusted: bool,
     pub model: String,
+    /// Drivers disponibles para `/spawn` (`"native"` + ids de `[[external_drivers]]`, `SDD-10`).
+    pub drivers: Vec<String>,
     pub effort: String,
+    /// `SDD-03` Fase 4: objetivo LLM vivo (selector en Web) — salen del
+    /// `LlmProfileHandle` (hot-swap en frontera de tick); sin handle, el
+    /// arranque estático y listas vacías.
+    pub profile_id: String,
+    pub provider: String,
+    pub profiles: Vec<WebLlmProfileSnapshot>,
+    pub available_providers: Vec<String>,
     pub vault_label: Option<String>,
     pub focused_agent_id: Option<u64>,
     pub agents: Vec<WebAgentSnapshot>,
+    pub subagents: Vec<WebSubagentSnapshot>,
     pub stream_preview: Option<WebStreamPreview>,
     pub pending_approval: Option<WebApprovalSnapshot>,
     pub plan: Option<String>,
@@ -358,6 +401,9 @@ impl WebHub {
         let cmd = raw_cmd.trim();
         if cmd.is_empty() {
             return Err("command cannot be empty".to_string());
+        }
+        if cmd.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX.trim_end()) || cmd.starts_with("/__onyx_") {
+            return Err("reserved internal command prefix".to_string());
         }
         let mut guard = self
             .state
@@ -464,10 +510,24 @@ fn is_immediate_web_slash(cmd: &str) -> bool {
     let lower = cmd.trim().to_ascii_lowercase();
     lower == "/mode"
         || lower.starts_with("/mode ")
+        || lower == "/profile"
+        || lower.starts_with("/profile ")
+        || lower == "/provider"
+        || lower.starts_with("/provider ")
+        || lower == "/model"
+        || lower.starts_with("/model ")
+        || lower == "/effort"
+        || lower.starts_with("/effort ")
         || lower == "/services"
         || lower.starts_with("/services ")
         || lower == "/service"
         || lower.starts_with("/service ")
+        || lower == "/subagents"
+        || lower == "/subagent"
+        || lower == "/spawn"
+        || lower.starts_with("/spawn ")
+        || lower.starts_with("/merge ")
+        || lower.starts_with("/discard ")
         || lower == "/trust"
         || lower.starts_with("/trust ")
         || lower == "/undo"
@@ -488,9 +548,14 @@ struct WebRuntimeInner {
     policy: Option<WorkspacePolicy>,
     tools: Option<WorkspaceTools>,
     sprout: Option<SproutSupervisor>,
+    subagents: Option<SubagentHandle>,
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
+    /// `SDD-03` Fase 3: fuente live del objetivo LLM (hot-swap en frontera de
+    /// tick). Si existe, `model`/`effort` del snapshot salen de aquí; si no,
+    /// del arranque estático (`model_name`/`reasoning_effort`).
+    llm_profile: Option<LlmProfileHandle>,
     model_name: String,
     reasoning_effort: Option<ReasoningEffort>,
     session_label: Option<String>,
@@ -540,12 +605,18 @@ impl UiIdlePump for WebHandle {
         if let Ok(mut inner) = self.inner.lock() {
             let stream_dirty = inner.stream_preview.take_dirty();
             let telemetry_dirty = inner.telemetry.take_dirty();
+            // `SDD-03` Fase 3: un cambio LLM en caliente marca dirty → la
+            // cabecera (model/effort) se actualiza sin tocar el bucle determinista.
+            let llm_dirty = inner
+                .llm_profile
+                .as_ref()
+                .is_some_and(LlmProfileHandle::take_dirty);
             let dispatched = inner.dispatch_queued_if_idle(graph);
             let hub_dirty = self.hub.take_state_dirty();
 
             // Solo serializamos y difundimos `event: state` completo cuando realmente cambió
-            // el estado de sesión/telemetría/cola (0 trabajo de grafo en reposo o durante streaming).
-            if telemetry_dirty || dispatched || hub_dirty {
+            // el estado de sesión/telemetría/cola/objetivo LLM (0 trabajo de grafo en reposo o durante streaming).
+            if telemetry_dirty || dispatched || hub_dirty || llm_dirty {
                 inner.publish_snapshot(graph, true);
             }
 
@@ -596,9 +667,11 @@ impl WebDriver {
             policy,
             tools: None,
             sprout: None,
+            subagents: None,
             mode_handle: WorkspaceModeHandle::default(),
             stream_preview: StreamPreviewHandle::default(),
             telemetry: SessionTelemetryHandle::default(),
+            llm_profile: None,
             model_name: String::new(),
             reasoning_effort: None,
             session_label: None,
@@ -649,6 +722,13 @@ impl WebDriver {
         self
     }
 
+    pub fn with_subagents(self, subagents: SubagentHandle) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.subagents = Some(subagents);
+        }
+        self
+    }
+
     pub fn with_workspace_vocab(self, ws_vocab: WorkspaceVocab) -> Self {
         if let Ok(mut inner) = self.inner.lock() {
             inner.ws_vocab = Some(ws_vocab);
@@ -678,6 +758,17 @@ impl WebDriver {
         if let Ok(mut inner) = self.inner.lock() {
             inner.model_name = model.into();
             inner.reasoning_effort = effort;
+        }
+        self
+    }
+
+    /// `SDD-03` Fase 3: conecta el handle LLM vivo a la cabecera — `model`/
+    /// `effort` del snapshot siguen el hot-swap (`/profile`/`/provider`/
+    /// `/model`/`/effort` en frontera de tick); sin handle, fallback al
+    /// arranque estático de [`WebDriver::with_model_info`].
+    pub fn with_llm_profile(self, profile: LlmProfileHandle) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.llm_profile = Some(profile);
         }
         self
     }
@@ -793,6 +884,20 @@ impl WebRuntimeInner {
         }
     }
 
+    /// Drivers disponibles para `/spawn`: `"native"` + los ids de `[[external_drivers]]`
+    /// resueltos en la policy cargada (`SDD-10` Fase 4). En un workspace **no confiado**
+    /// no se expone ningún driver externo (defense in depth, alineado con `main.rs` y
+    /// `subagent.rs`): `spawn_job` lo bloquearía igualmente en runtime.
+    fn available_driver_ids(&self) -> Vec<String> {
+        let mut ids = vec!["native".to_string()];
+        if let Some(pol) = &self.policy {
+            if pol.trust.config_trusted {
+                ids.extend(pol.external_drivers().iter().map(|d| d.id.clone()));
+            }
+        }
+        ids
+    }
+
     fn publish_snapshot(&mut self, graph: &dyn GraphView, force_notify: bool) {
         let agents = collect_agents(graph, &self.vocab);
         let root_busy = is_root_agent_busy(graph, &self.vocab);
@@ -807,7 +912,51 @@ impl WebRuntimeInner {
             let Some(p) = &a.pending_approval else {
                 continue;
             };
-            let impact_assessment = if let Some(tools) = &self.tools {
+            let mut merge_preview_diff: Option<String> = None;
+            let impact_assessment = if p.tool == "subagent_merge" {
+                let static_dec = self.policy.as_ref().map_or(PermissionDecision::Ask, |pol| {
+                    pol.evaluate_permission_in_mode(current_mode, &p.tool, &p.args)
+                });
+                if static_dec == PermissionDecision::Deny {
+                    continue;
+                }
+                let job_id = serde_json::from_str::<serde_json::Value>(&p.args)
+                    .ok()
+                    .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
+                let preview = job_id.and_then(|jid| {
+                    self.subagents
+                        .as_ref()
+                        .and_then(|h| h.preview_merge_for_request(&jid, a.agent.0, a.request).ok())
+                });
+                match preview {
+                    // `SDD-10` Fase 4: misma decisión efectiva que `SubagentManagerDriver`
+                    // (gobernanza → `Ask` obligatorio); si no es `Ask`, el driver auto-aprueba
+                    // y el banner no debe mostrarse.
+                    Some(MergePreviewState::Clean(ticket)) => {
+                        if effective_merge_decision(static_dec, &ticket) != PermissionDecision::Ask
+                        {
+                            continue;
+                        }
+                        merge_preview_diff =
+                            Some(truncate_web_diff_lines(&ticket.unified_diff, 120));
+                        ticket.impact
+                    }
+                    Some(MergePreviewState::NoOp) => {
+                        if static_dec != PermissionDecision::Ask {
+                            continue;
+                        }
+                        None
+                    }
+                    Some(MergePreviewState::Conflict { .. }) => continue,
+                    // `SDD-10` Fase 3: Control Plane → sin banner; `SubagentManagerDriver`
+                    // niega la solicitud de plano (disco de `root` intacto).
+                    Some(MergePreviewState::ControlPlaneDenied { .. }) => continue,
+                    // `SDD-10` Fase 4: alineado con `CliApprovalDriver`: sin preview no hay
+                    // banner; el driver auto-aprueba para que `subagent_merge` devuelva el
+                    // error exacto a `root` (evita un banner que el driver no espera).
+                    None => continue,
+                }
+            } else if let Some(tools) = &self.tools {
                 let (decision, impact) =
                     tools.evaluate_permission_with_impact(current_mode, &p.tool, &p.args);
                 if decision != PermissionDecision::Ask {
@@ -827,10 +976,11 @@ impl WebRuntimeInner {
 
             let key = (a.agent, a.request);
             if self.cached_approval_key != Some(key) {
-                self.cached_approval_diff = self
-                    .workspace_root
-                    .as_deref()
-                    .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 120));
+                self.cached_approval_diff = merge_preview_diff.or_else(|| {
+                    self.workspace_root
+                        .as_deref()
+                        .and_then(|root| preview_tool_diff(root, &p.tool, &p.args, 120))
+                });
                 self.cached_approval_impact = impact_assessment;
                 self.cached_approval_key = Some(key);
             }
@@ -924,7 +1074,84 @@ impl WebRuntimeInner {
             guard.focused_agent_id = latest_root.or_else(|| agents.first().map(|a| a.id));
         }
 
+        let subagents: Vec<WebSubagentSnapshot> = if let Some(ref handle) = self.subagents {
+            handle
+                .list_summaries()
+                .into_iter()
+                .map(|s| WebSubagentSnapshot {
+                    job_id: s.job_id,
+                    name: s.name,
+                    driver: s.driver,
+                    status: s.status.to_string(),
+                    ok: s.ok,
+                    spawn_tick: s.spawn_tick,
+                    branch: s.branch_name,
+                    goal: s.goal,
+                    touched_files: s.touched_files,
+                    summary: s.summary,
+                })
+                .collect()
+        } else if let Some(wv) = &self.ws_vocab {
+            graph_subagent_records(graph, wv)
+                .into_iter()
+                .map(|r| WebSubagentSnapshot {
+                    job_id: r.job_id.clone(),
+                    name: r.job_id,
+                    driver: r.driver,
+                    status: r.status,
+                    ok: Some(r.ok),
+                    spawn_tick: r.spawn_tick,
+                    branch: r.branch,
+                    goal: String::new(),
+                    touched_files: r.touched_files,
+                    summary: r.summary,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let next_version = guard.version.saturating_add(1);
+        // `SDD-03` Fase 3/4: cabecera viva + selector en Web — el objetivo
+        // LLM actual (id/perfil/provider/modelo/esfuerzo/perfiles
+        // registrados) sale del handle (hot-swap en frontera de tick); sin
+        // handle, el arranque estático y listas vacías (degrada al perfil CLI).
+        let llm = self
+            .llm_profile
+            .as_ref()
+            .map(|handle| handle.public_snapshot());
+        let (profile_id, provider, model, effort, profiles, available_providers) =
+            match llm.as_ref() {
+                Some(s) => (
+                    s.active_profile_id.clone(),
+                    s.provider.clone(),
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.profiles
+                        .iter()
+                        .map(|e| WebLlmProfileSnapshot {
+                            id: e.id.clone(),
+                            provider: e.provider.clone(),
+                            model: e.model.clone(),
+                            effort: e.effort.clone(),
+                            available: e.available,
+                            unavailable_reason: e.unavailable_reason.clone(),
+                        })
+                        .collect(),
+                    s.available_providers.clone(),
+                ),
+                None => (
+                    String::from("default"),
+                    String::new(),
+                    self.model_name.clone(),
+                    self.reasoning_effort
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("auto")
+                        .to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
         let snap = WebStateSnapshot {
             schema: "onyx.web.state.v1",
             version: next_version,
@@ -932,15 +1159,17 @@ impl WebRuntimeInner {
             mode: current_mode.as_label().to_string(),
             sandbox_badge,
             untrusted,
-            model: self.model_name.clone(),
-            effort: self
-                .reasoning_effort
-                .map(ReasoningEffort::as_str)
-                .unwrap_or("auto")
-                .to_string(),
+            model,
+            drivers: self.available_driver_ids(),
+            effort,
+            profile_id,
+            provider,
+            profiles,
+            available_providers,
             vault_label: self.active_session_label(),
             focused_agent_id: guard.focused_agent_id,
             agents,
+            subagents,
             stream_preview,
             pending_approval: active_approval_snapshot,
             plan,
@@ -974,6 +1203,17 @@ fn strip_version(json: &str) -> &str {
     match json.find(",\"tick\":") {
         Some(idx) => &json[idx..],
         None => json,
+    }
+}
+
+fn truncate_web_diff_lines(diff: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= max_lines {
+        diff.to_string()
+    } else {
+        let mut head = lines[..max_lines].join("\n");
+        head.push_str(&format!("\n... (+{} more lines)", lines.len() - max_lines));
+        head
     }
 }
 
@@ -1827,6 +2067,7 @@ mod tests {
     use super::*;
     use onyx_soul_agents::{AgentConfig, AgentHost, AgentView, RecordingBridge, Reply};
     use onyx_workspace::{WorkspaceLedgerSystem, WorkspaceMode, WorkspaceToolBridge};
+    use std::env;
 
     fn in_memory_exchange(hub: &Arc<WebHub>, raw_req: &str) -> (String, bool) {
         let req = read_http_request(io::Cursor::new(raw_req.as_bytes()))
@@ -1941,6 +2182,13 @@ mod tests {
         );
         assert!(csrf.starts_with("HTTP/1.1 403 Forbidden"), "{csrf}");
 
+        // 3b. Spoofed internal subagent proposal command prefix is blocked (400).
+        let (spoof, _) = in_memory_exchange(
+            &hub,
+            "POST /api/v1/command HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer test-api-key-1234567890\r\nContent-Length: 41\r\n\r\n{\"command\":\"/__onyx_subagent_proposal {}\"}",
+        );
+        assert!(spoof.starts_with("HTTP/1.1 400 Bad Request"), "{spoof}");
+
         // 4. Login issues HttpOnly cookie and grants /api/v1/state access.
         let login_body = r#"{"api_key":"test-api-key-1234567890"}"#;
         let login_req = format!(
@@ -2009,6 +2257,171 @@ mod tests {
         assert!(
             logout.contains("Clear-Site-Data: \"cookies\", \"storage\", \"cache\""),
             "{logout}"
+        );
+    }
+
+    /// `SDD-03` Fase 3: la cabecera `model`/`effort` del snapshot web sigue el
+    /// objetivo LLM vivo (hot-swap en frontera de tick), no el campo estático
+    /// de arranque (regresión: la cabecera "mentía" hasta reiniciar).
+    #[test]
+    fn web_state_snapshot_model_and_effort_follow_live_llm_handle() {
+        use crate::llm_profile::{LlmConfig, LlmProvider};
+
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("web-live-llm-key-123456789".to_string()),
+            None,
+        )
+        .unwrap();
+        let host = AgentHost::builder(1).build().unwrap();
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let handle = LlmProfileHandle::new(&startup, &[], false);
+        let web_driver = WebDriver::start(host.vocab(), &cfg, None, None)
+            .unwrap()
+            // Campo estático deliberadamente antiguo: con handle presente debe
+            // quedar opacado por el objetivo vivo.
+            .with_model_info("stale-static-model", None)
+            .with_llm_profile(handle.clone());
+        let web_handle = web_driver.handle();
+        let hub = Arc::clone(&web_driver.hub);
+        let snapshot_json = |hub: &Arc<WebHub>| {
+            hub.state
+                .lock()
+                .map(|g| g.snapshot_json.clone())
+                .unwrap_or_else(|_| "{}".to_string())
+        };
+
+        // Tick 0: la cabecera muestra el objetivo de arranque del handle.
+        web_handle.render(host.graph());
+        let json = snapshot_json(&hub);
+        assert!(json.contains("\"model\":\"gemini-4-hydrogen\""), "{json}");
+        assert!(json.contains("\"effort\":\"auto\""), "{json}");
+
+        // Hot-swap (lo que hace `apply_llm_target` en la frontera de tick):
+        // el próximo render publica la cabecera actualizada.
+        handle
+            .set_model("gemini-4-deuterium")
+            .expect("set_model sobre el perfil por defecto");
+        handle.set_effort(Some(ReasoningEffort::High));
+        web_handle.render(host.graph());
+        let json = snapshot_json(&hub);
+        assert!(json.contains("\"model\":\"gemini-4-deuterium\""), "{json}");
+        assert!(json.contains("\"effort\":\"high\""), "{json}");
+    }
+
+    /// `SDD-03` Fase 4: el selector en Web lee el snapshot vivo —
+    /// `profile_id`/`provider`/`profiles`/`available_providers` salen del
+    /// handle (con perfil no disponible y su motivo), y **ninguna
+    /// `api_key`/`api_key_env` aparece en el JSON serializado** (invariante
+    /// de seguridad: el snapshot web solo lleva metadatos).
+    #[test]
+    fn web_state_snapshot_exposes_llm_profiles_without_credentials() {
+        use crate::llm_profile::{LlmConfig, LlmProvider};
+        use onyx_workspace::LlmProfileConfig;
+
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("web-llm-profiles-key-123456".to_string()),
+            None,
+        )
+        .unwrap();
+        let host = AgentHost::builder(1).build().unwrap();
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key-secret-do-not-leak".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        // Perfil OpenAI sin `api_key_env` resuelta → no disponible, con motivo.
+        let profiles = vec![LlmProfileConfig {
+            id: "openai-local".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-4.1-mini".to_string(),
+            effort: None,
+            api_base: None,
+            api_key_env: Some("ONYX_TEST_LLM_OPENAI_SECRET".to_string()),
+        }];
+        // Determinismo: aislar los envs de credenciales/base del CI para que
+        // `available_providers` salga solo del registro.
+        let saved = [
+            "ONYX_TEST_LLM_OPENAI_SECRET",
+            "OPENAI_API_KEY",
+            "OPENAI_API_BASE",
+            "OPENAI_BASE_URL",
+            "ONYX_API_KEY",
+        ]
+        .into_iter()
+        .map(|name| (name, env::var(name).ok()))
+        .collect::<Vec<_>>();
+        unsafe {
+            for (name, _) in &saved {
+                env::remove_var(name);
+            }
+        }
+        let handle = LlmProfileHandle::new(&startup, &profiles, false);
+        let web_driver = WebDriver::start(host.vocab(), &cfg, None, None)
+            .unwrap()
+            .with_model_info("stale-static-model", None)
+            .with_llm_profile(handle);
+        let web_handle = web_driver.handle();
+        let hub = Arc::clone(&web_driver.hub);
+        let snapshot_json = |hub: &Arc<WebHub>| {
+            hub.state
+                .lock()
+                .map(|g| g.snapshot_json.clone())
+                .unwrap_or_else(|_| "{}".to_string())
+        };
+
+        web_handle.render(host.graph());
+        let json = snapshot_json(&hub);
+
+        // Objetivo vivo: `profile_id` + `provider` + modelo/esfuerzo.
+        assert!(json.contains("\"profile_id\":\"default\""), "{json}");
+        assert!(json.contains("\"provider\":\"gemini\""), "{json}");
+        assert!(json.contains("\"model\":\"gemini-4-hydrogen\""), "{json}");
+        assert!(json.contains("\"effort\":\"auto\""), "{json}");
+        // Con OpenAI sin credenciales, solo Gemini queda disponible.
+        assert!(
+            json.contains("\"available_providers\":[\"gemini\"]"),
+            "{json}"
+        );
+
+        // Perfiles registrados: el no disponible sale deshabilitado con motivo.
+        assert!(json.contains("\"profiles\":["), "{json}");
+        assert!(json.contains("\"id\":\"openai-local\""), "{json}");
+        assert!(json.contains("\"available\":false"), "{json}");
+        assert!(
+            json.contains("ONYX_TEST_LLM_OPENAI_SECRET"),
+            "motivo accionable del perfil no disponible: {json}"
+        );
+
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(v) => env::set_var(name, v),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+
+        // Invariante de seguridad: 0 credenciales en el JSON serializado.
+        assert!(!json.contains("api_key"), "api_key en snapshot web: {json}");
+        assert!(
+            !json.contains("api_key_env"),
+            "api_key_env en snapshot web: {json}"
+        );
+        assert!(
+            !json.contains("startup-key-secret-do-not-leak"),
+            "valor de credencial en snapshot web: {json}"
         );
     }
 
@@ -2142,6 +2555,7 @@ mod tests {
             );
             if state_resp.contains("\"pending_approval\":{") {
                 assert!(state_resp.contains("hello onyx web"), "{state_resp}");
+                assert!(state_resp.contains("\"subagents\":"), "{state_resp}");
                 let body_start = state_resp.find("\r\n\r\n").unwrap() + 4;
                 let parsed: serde_json::Value =
                     serde_json::from_str(&state_resp[body_start..]).unwrap();

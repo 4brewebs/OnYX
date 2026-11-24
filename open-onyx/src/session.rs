@@ -15,14 +15,17 @@ use onyx_soul_agents::{
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
     WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
+    graph_workspace_services,
 };
 
 use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
+use crate::external_driver::ExternalDriverApprovalPolicy;
 use crate::ops::reconcile_rewind_effects_report;
 use crate::pack::{
     MilestoneSnapshotSystem, PackSnapshotStore, SharedPackStore, default_fork_dir,
     fork_pack_until_tick,
 };
+use crate::subagent::{MergePreviewState, SubagentHandle, effective_merge_decision};
 
 /// Interfaz mínima de bombeo UI compartida entre `TuiHandle` (`openonyx chat`) y
 /// `WebHandle` (`openonyx serve`) para que ambos corran sobre el mismo bucle determinista
@@ -37,9 +40,19 @@ pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
 pub const SURFACE_TRACE: SurfaceId = SurfaceId(2);
 pub const SURFACE_APPROVAL: SurfaceId = SurfaceId(3);
 pub const SURFACE_PLAN: SurfaceId = SurfaceId(4);
+/// `SDD-03` Fase 3: superficie de servicios Sprout, activa solo si el grafo tiene
+/// `ws.services.text` no vacío (vista `F3 Sprout`).
+pub const SURFACE_SERVICES: SurfaceId = SurfaceId(5);
 
-/// Declara las cuatro superficies lógicas activas para un tick según el estado del grafo.
-pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding; 4] {
+/// Declara las superficies lógicas activas para un tick según el estado del grafo.
+/// `SURFACE_SERVICES` se añade cuando existen servicios registrados
+/// (`ws.services.text` no vacío); el resto de constantes y bindings son
+/// invariantes (orden estable para replay).
+pub fn active_surfaces(
+    graph: &dyn GraphView,
+    vocab: &Vocab,
+    ws_vocab: &WorkspaceVocab,
+) -> Vec<SurfaceBinding> {
     let has_pending_approval = !pending_approvals(graph, vocab).is_empty();
     let any_active = graph.query(&[vocab.state]).into_iter().any(|id| {
         matches!(
@@ -49,7 +62,7 @@ pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding;
         )
     });
 
-    [
+    let mut surfaces = vec![
         SurfaceBinding {
             surface: SURFACE_STATUS,
             view: vocab.state,
@@ -70,7 +83,15 @@ pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding;
             view: vocab.goal,
             focused: false,
         },
-    ]
+    ];
+    if graph_workspace_services(graph, ws_vocab).is_some() {
+        surfaces.push(SurfaceBinding {
+            surface: SURFACE_SERVICES,
+            view: ws_vocab.services_text,
+            focused: false,
+        });
+    }
+    surfaces
 }
 
 /// Extensión interna sobre `PlatformDriver` para consultar progreso de replay o
@@ -106,7 +127,7 @@ pub struct SessionOptions {
     pub max_snapshots: Option<usize>,
 }
 
-/// Contexto necesario para ejecutar `/rewind <tick>` y `/fork [label]` en caliente dentro de `chat`.
+/// Contexto necesario para ejecutar `/rewind <tick>`, `/fork`, `/merge` y `/discard` en caliente dentro de `chat` / `serve`.
 #[derive(Clone)]
 pub struct SessionActionContext {
     pub workspace_root: PathBuf,
@@ -115,6 +136,7 @@ pub struct SessionActionContext {
     pub mode_handle: WorkspaceModeHandle,
     pub tools: WorkspaceTools,
     pub snapshot_store: Option<SharedPackStore>,
+    pub subagents: Option<SubagentHandle>,
     pub pending_action: PendingSessionAction,
     pub pending_notes: PendingSystemNotes,
 }
@@ -143,10 +165,14 @@ pub fn run_session<D: SessionDriver>(
     opts: &SessionOptions,
     stop: StopPolicy,
 ) -> io::Result<()> {
+    // `SDD-03` Fase 3: `SURFACE_SERVICES` depende de `ws.services.text`; el
+    // vocabulario workspace es determinista por nombre (misma resolución que
+    // `build_host_with_shared_store`).
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
     match stop {
         StopPolicy::Settled { max_ticks } => {
             for _ in 0..max_ticks {
-                let surfaces = active_surfaces(host.graph(), &host.vocab());
+                let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                 host.step_with(driver, &surfaces);
                 if host.is_settled() {
                     break;
@@ -157,7 +183,7 @@ pub fn run_session<D: SessionDriver>(
         }
         StopPolicy::ReplayExhausted { max_ticks } => {
             for _ in 0..max_ticks {
-                let surfaces = active_surfaces(host.graph(), &host.vocab());
+                let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                 host.step_with(driver, &surfaces);
                 if driver.replay_remaining() == Some(0)
                     && (host.is_settled() || all_live_waiting_approval(host.graph(), &host.vocab()))
@@ -191,7 +217,7 @@ pub fn run_session<D: SessionDriver>(
                 let can_advance = !host.is_settled() && !all_blocked;
                 if can_advance || ui_queued || ready || needs_follow_up_tick {
                     let was_settled = host.is_settled();
-                    let surfaces = active_surfaces(host.graph(), &host.vocab());
+                    let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                     host.step_with(driver, &surfaces);
                     stepped_in_session = true;
                     // Un `IngressEvent::Command` tarda 1 tick en convertirse en
@@ -245,6 +271,102 @@ pub fn apply_session_action(
     action: SessionAction,
     ctx: &SessionActionContext,
 ) -> String {
+    match &action {
+        SessionAction::MergeSubagent { job_id } => {
+            let Some(ref sub) = ctx.subagents else {
+                let msg = "[/merge] Async subagents are unavailable in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            let msg = match sub.merge_job(job_id) {
+                Ok(report) => {
+                    ctx.pending_notes
+                        .push_subagent_status(report.job_id.clone(), "merged");
+                    let impact_suffix = report
+                        .impact
+                        .as_ref()
+                        .map(|imp| format!(" {}", imp.summary_line))
+                        .unwrap_or_default();
+                    if report.was_noop {
+                        format!(
+                            "[/merge] Subagent `{}` had no net file changes; worktree cleaned.{impact_suffix}",
+                            report.job_id
+                        )
+                    } else {
+                        format!(
+                            "[/merge] Merged subagent `{}` into root ({} file(s): {}).{impact_suffix}",
+                            report.job_id,
+                            report.changed_files.len(),
+                            report.changed_files.join(", ")
+                        )
+                    }
+                }
+                Err(err) => format!("[/merge] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return msg;
+        }
+        SessionAction::DiscardSubagent { job_id } => {
+            let Some(ref sub) = ctx.subagents else {
+                let msg = "[/discard] Async subagents are unavailable in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            let msg = match sub.discard_job(job_id) {
+                Ok(summary) => {
+                    ctx.pending_notes
+                        .push_subagent_status(job_id.as_str(), "discarded");
+                    format!("[/discard] {summary}")
+                }
+                Err(err) => format!("[/discard] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return msg;
+        }
+        SessionAction::SpawnSubagent { goal, driver } => {
+            // `SDD-10` Fase 4: `/spawn` crea un worktree → bloqueado fuera de BUILD
+            // (mismo gate que `/merge`).
+            if !ctx.mode_handle.get().allows_mutation() {
+                let msg = format!(
+                    "[/spawn] Blocked in `{}` mode: switch to BUILD to spawn a background subagent.",
+                    ctx.mode_handle.get().as_label()
+                );
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            }
+            let Some(ref sub) = ctx.subagents else {
+                let msg = "[/spawn] Async subagents are unavailable in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            // El job queda registrado en el grafo al completar (notificación proactiva);
+            // aquí solo lanzamos: 0 trabajo del grafo, 0 turno de `root`.
+            let msg = match sub.spawn_job(
+                goal,
+                None,
+                None,
+                host.ticks(),
+                Vec::new(),
+                driver.as_deref(),
+            ) {
+                Ok(summary) => {
+                    let driver_note = match driver.as_deref() {
+                        Some(d) if !d.eq_ignore_ascii_case("native") => format!(" on driver `{d}`"),
+                        _ => String::new(),
+                    };
+                    format!(
+                        "[/spawn] Launched background worktree job `[{job_id}]`{driver_note}; it runs without spending a root turn (check `/subagents`).",
+                        job_id = summary.job_id
+                    )
+                }
+                Err(err) => format!("[/spawn] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return msg;
+        }
+        SessionAction::Rewind { .. } | SessionAction::Fork { .. } => {}
+    }
+
     let Some(store) = &ctx.snapshot_store else {
         let msg =
             "[session] Snapshot persistence is disabled; pass `--snapshot-dir <dir>`.".to_string();
@@ -363,6 +485,11 @@ pub fn apply_session_action(
             emit_session_note(host, &ctx.pending_notes, &summary);
             summary
         }
+        SessionAction::MergeSubagent { .. }
+        | SessionAction::DiscardSubagent { .. }
+        | SessionAction::SpawnSubagent { .. } => {
+            unreachable!("subagent session actions return early above")
+        }
     }
 }
 
@@ -417,6 +544,7 @@ pub struct CliApprovalDriver {
     vocab: Vocab,
     policy: Option<WorkspacePolicy>,
     tools: Option<WorkspaceTools>,
+    subagents: Option<SubagentHandle>,
     inner: Box<dyn PlatformDriver>,
     seen: BTreeSet<(u64, u64)>,
     queued: Vec<Reply>,
@@ -428,6 +556,7 @@ impl CliApprovalDriver {
             vocab,
             policy: None,
             tools: None,
+            subagents: None,
             inner: Box::new(inner),
             seen: BTreeSet::new(),
             queued: Vec::new(),
@@ -441,6 +570,11 @@ impl CliApprovalDriver {
 
     pub fn with_tools(mut self, tools: WorkspaceTools) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    pub fn with_subagents(mut self, subagents: SubagentHandle) -> Self {
+        self.subagents = Some(subagents);
         self
     }
 }
@@ -459,7 +593,57 @@ impl PlatformDriver for CliApprovalDriver {
             let Some(pending) = &view.pending_approval else {
                 continue;
             };
-            let impact = if let Some(tools) = &self.tools {
+            let mut preview_diff: Option<String> = None;
+            let impact = if pending.tool == "subagent_merge" {
+                let static_dec = self.policy.as_ref().map_or(PermissionDecision::Ask, |pol| {
+                    pol.evaluate_permission_in_mode(
+                        WorkspaceMode::Build,
+                        &pending.tool,
+                        &pending.args,
+                    )
+                });
+                let job_id = serde_json::from_str::<serde_json::Value>(&pending.args)
+                    .ok()
+                    .and_then(|v| v.get("job_id").and_then(|j| j.as_str()).map(str::to_string));
+                let preview = job_id.and_then(|jid| {
+                    self.subagents.as_ref().and_then(|h| {
+                        h.preview_merge_for_request(&jid, view.agent.0, view.request)
+                            .ok()
+                    })
+                });
+                match preview {
+                    Some(MergePreviewState::Clean(ticket)) => {
+                        // `SDD-10` Fase 4: la decisión efectiva es la misma que en las
+                        // superficies TUI/Web (delta de gobernanza → `Ask` obligatorio);
+                        // se calcula **antes** de mover los campos del ticket.
+                        if effective_merge_decision(static_dec, &ticket) != PermissionDecision::Ask
+                        {
+                            continue;
+                        }
+                        let imp = ticket.impact;
+                        preview_diff = Some(ticket.unified_diff);
+                        imp
+                    }
+                    Some(MergePreviewState::NoOp) => {
+                        if static_dec != PermissionDecision::Ask {
+                            continue;
+                        }
+                        None
+                    }
+                    // `Conflict`, `Err` o `job_id` ausente: no pedir `y/n`.
+                    // `SubagentManagerDriver` auto-aprueba la solicitud para que
+                    // `subagent_merge` se ejecute y devuelva el error exacto (rutas en
+                    // conflicto, estado del job) a `root`, conservando el worktree
+                    // (igual que TUI y Web; `SDD-10` Paso 0).
+                    // `ControlPlaneDenied`: no hay nada que aprobar; `SubagentManagerDriver`
+                    // niega la solicitud de plano (`SDD-10` Fase 3).
+                    Some(
+                        MergePreviewState::Conflict { .. }
+                        | MergePreviewState::ControlPlaneDenied { .. },
+                    )
+                    | None => continue,
+                }
+            } else if let Some(tools) = &self.tools {
                 let (decision, imp) = tools.evaluate_permission_with_impact(
                     WorkspaceMode::Build,
                     &pending.tool,
@@ -485,7 +669,12 @@ impl PlatformDriver for CliApprovalDriver {
             if !self.seen.insert((view.agent.0, view.request)) {
                 continue;
             }
-            let reply = if prompt_approval(&pending.tool, &pending.args, impact.as_ref()) {
+            let reply = if prompt_approval(
+                &pending.tool,
+                &pending.args,
+                impact.as_ref(),
+                preview_diff.as_deref(),
+            ) {
                 Reply::approve(view.agent, view.request)
             } else {
                 Reply::deny(view.agent, view.request, "denied by user")
@@ -495,12 +684,22 @@ impl PlatformDriver for CliApprovalDriver {
     }
 }
 
-fn prompt_approval(tool: &str, args: &str, impact: Option<&ImpactAssessment>) -> bool {
+fn prompt_approval(
+    tool: &str,
+    args: &str,
+    impact: Option<&ImpactAssessment>,
+    diff_preview: Option<&str>,
+) -> bool {
     println!("\n[openOnyx] Approval required for `{tool}`:");
     if let Some(imp) = impact {
         println!("  {}", imp.summary_line);
     }
     println!("  args: {args}");
+    if let Some(diff) = diff_preview {
+        for line in diff.lines().take(24) {
+            println!("  {line}");
+        }
+    }
     print!("Approve? [y/N]: ");
     let _ = io::stdout().flush();
     let mut line = String::new();
@@ -607,7 +806,10 @@ pub fn build_host_with_shared_store(
     let mut builder = AgentHost::builder(seed)
         .config(config.clone())
         .system(Box::new(SubagentSystem::new(config)))
-        .system(Box::new(ledger));
+        .system(Box::new(ledger))
+        // `SDD-10` Fase 1: fuerza `WaitingApproval` solo para `spawn_subagent` con un
+        // driver externo no-nativo (el gate de trust/reglas decide Allow/Deny/Ask después).
+        .approval(Box::new(ExternalDriverApprovalPolicy));
     if let Some(sys) = extra_system {
         builder = builder.system(sys);
     }

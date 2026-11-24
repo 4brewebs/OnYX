@@ -5,9 +5,9 @@ description: Guía operativa completa para usar, configurar, depurar y automatiz
 
 # openOnyx (`openonyx`) — Guía Operativa
 
-`openonyx` es el harness CLI y TUI de OnYX (`onyx-soul-agents` + `onyx-workspace`). Conecta un proveedor LLM por HTTP/SSE (`gemini` o cualquier endpoint compatible con OpenAI `/v1/chat/completions`, con tolerancia a cortes SSE y reintentos transitorios) con un runtime determinista de grafo EAV (`AgentHost`), registro de transcripciones (`ONYXTR2`), snapshots comprimidos por hitos (`snapshots.onyxpack`), checkpoints Git reversibles (`/undo`), time-travel seguro con bifurcación (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`), sandbox OS y orquestación local de servicios (`sprout.toml`).
+`openonyx` es el harness CLI y TUI de OnYX (`onyx-soul-agents` + `onyx-workspace`). Conecta un proveedor LLM por HTTP/SSE (`gemini` o cualquier endpoint compatible con OpenAI `/v1/chat/completions`, con tolerancia a cortes SSE y reintentos transitorios) con un runtime determinista de grafo EAV (`AgentHost`), registro de transcripciones (`ONYXTR2`), snapshots comprimidos por hitos (`snapshots.onyxpack`), checkpoints Git reversibles (`/undo`), time-travel seguro con bifurcación (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`), sandbox OS, subagentes asíncronos en worktrees Git aislados con fusión 3-way (*Scent-Heated Merge*) y harnesses CLI externos como drivers (`/spawn`, `[[external_drivers]]`), vistas TUI modulares `F1..F5` con paleta `Ctrl+K`, objetivo LLM conmutado en caliente (`[[llm_profiles]]`, `/profile`/`/provider`/`/model`/`/effort`, cabecera `provider/model` viva y selector Web sin credenciales), y orquestación local de servicios (`sprout.toml`).
 
-> **Manual de usuario completo:** consulta [`docs/manual/index.md`](../../../docs/manual/index.md) para tutoriales paso a paso, arquitectura de la TUI, configuración de permisos/sandbox, time-travel, catálogo completo de las 19 herramientas y resolución de problemas.
+> **Manual de usuario completo:** consulta [`docs/manual/index.md`](../../../docs/manual/index.md) para tutoriales paso a paso, arquitectura de la TUI, configuración de permisos/sandbox, time-travel, catálogo completo de las 23 herramientas y resolución de problemas.
 
 ---
 
@@ -56,13 +56,31 @@ openonyx chat --provider openai --api-base http://localhost:11434/v1 --model qwe
 openonyx run "resume la arquitectura de crates" --auto-save
 ```
 
+### Perfiles LLM y cambio en caliente (`[[llm_profiles]]`)
+
+`.onyx/config.toml` admite (global `~/.onyx/config.toml` + workspace, fusión *replace-by-id* con precedencia `global < workspace (trusted)`) objetivos LLM nombrados:
+
+```toml
+[[llm_profiles]]
+id = "local-coder"            # [a-z0-9_-]; "custom" está reservado
+provider = "openai"           # "gemini" | "openai"
+model = "qwen2.5-coder:14b"   # no vacío
+effort = "medium"             # "low" | "medium" | "high" | ausente (auto)
+api_base = "http://localhost:11434/v1"
+api_key_env = "OLLAMA_API_KEY"   # nombre de la variable de entorno — nunca el valor literal
+```
+
+- Los perfiles del workspace solo se aplican en workspaces **confiados** (mismo gate de Workspace Trust que `[[external_drivers]]`; en `[UNTRUSTED]` se ignoran por completo). Las API keys solo se referencian por nombre de variable de entorno (`api_key_env`: la estructura no tiene campo de clave literal, de modo que ningún snapshot público puede exponerlas), y `api_base` se valida en el registro (`validate_api_base`: `http://` solo en loopback, remotos exigen `https://` + autorización explícita — bloquea exfiltración de credenciales).
+- **Hot-swap**: `/profile [<id>]`, `/provider <gemini|openai>`, `/model <name>` y `/effort <auto|low|medium|high>` (TUI y Web, case-insensitive) cambian el objetivo activo **en la frontera de tick** (`DynamicLlmDriver`): no interrumpen el turno en vuelo, los subagentes pinnan el objetivo del tick de spawn, cada conmutación queda sellada en `ONYXTR2` (el `replay` reproduce el hot-swap con 0 I/O vía `LlmProfileHandle::new_for_replay`) y la cabecera TUI/Web muestra el `provider/model · effort` **vivo** (fuente: `LlmProfileHandle::public_snapshot()`, con estado modal `ws.llm.*` restaurado en `/rewind` / `chat --resume --tick`).
+- **Web UI**: la PWA expone un selector LLM sin credenciales (`#llm-config-btn` → `<dialog id="llm-modal">` nativo, 0 `innerHTML`) con los perfiles registrados (los no disponibles aparecen deshabilitados con motivo accionable), provider, modelo y esfuerzo; aplica **solo los campos modificados** como slash estándar por el endpoint autenticado existente `/api/v1/command` (0 endpoints nuevos) y los push SSE con el modal abierto nunca reescriben los campos en edición.
+
 ---
 
 ## 2. Subcomandos y Opciones CLI
 
 ### Subcomandos
 
-1. **`chat`**: Lanza la TUI (`ratatui` + `crossterm`) con streaming SSE en vivo, emblema Braille de estado, cabecera compacta con modelo/`--effort`/modo/sandbox, vista previa de diffs antes de aprobar, selector interactivo de agentes (`F2` / `/agent`), alternancia `[PLAN]` / `[BUILD]`, time-travel en sesión (`/rewind`, `/fork`, `/undo`) y paneles laterales `Live Plan` + `Services (Sprout)`.
+1. **`chat`**: Lanza la TUI (`ratatui` + `crossterm`) con streaming SSE en vivo, emblema Braille de estado, cabecera compacta con objetivo LLM `provider/model` vivo/`--effort`/modo/sandbox, vista previa de diffs antes de aprobar, vistas modulares `F1..F5` (Chat, Agents, Sprout, Plan & Diff, Timeline) con paleta `Ctrl+K` y `/view`, selector de agentes (`/agent`, `Ctrl+Tab`), cambio en caliente de objetivo LLM (`/profile`, `/provider`, `/model`, `/effort`), alternancia `[PLAN]` / `[BUILD]`, time-travel en sesión (`/rewind`, `/fork`, `/undo`) y paneles laterales `Live Plan` + `Services (Sprout)`.
 2. **`run <goal>`**: Ejecuta un único objetivo en modo headless y muestra el resultado final + resumen `[openOnyx telemetry]`.
 3. **`replay <transcript>`**: Reproduce offline una transcripción `ONYXTR2` (0 llamadas HTTP, 0 mutaciones en disco). Acepta `--snapshot-dir`, `--snapshot-every`, `--max-snapshots`.
 4. **`inspect <snapshot_dir>`**: Inspecciona hitos en `snapshots.onyxpack` (o archivos legacy `tick-*.bin`).
@@ -73,9 +91,9 @@ openonyx run "resume la arquitectura de crates" --auto-save
    - `--dry-run`: previsualiza efectos huérfanos y plan de rollback sin tocar archivos.
    - `--transcript <file>`: reanuda determinísticamente desde una transcripción grabada.
    - `--interactive` / `--tui`: abre directamente la TUI en el tick restaurado creando un fork hermano seguro (`--fork-dir <dir>` opcional, o `--truncate-future` si se desea truncar in-place).
-6. **`doctor`**: Verifica salud del worktree Git, artefactos residuales, integridad de `snapshots.onyxpack` (checksums FNV-1a, payloads `ONYXAG`, colas truncadas tras crash), snapshots legacy, cabeceras de transcripción, objetos `tree_sha` del ledger, driver de sandbox OS disponible, estado de **Workspace Trust** y configuración/puertos de `sprout.toml`.
+6. **`doctor`**: Verifica salud del worktree Git, artefactos residuales, integridad de `snapshots.onyxpack` (checksums FNV-1a, payloads `ONYXAG`, colas truncadas tras crash), snapshots legacy, cabeceras de transcripción, objetos `tree_sha` del ledger, driver de sandbox OS disponible, estado de **Workspace Trust**, configuración/puertos de `sprout.toml` y **drivers externos** `[[external_drivers]]` (binario en `PATH`/`PATHEXT` con probe `--version` aislada de 3 s, y severidad por origen: `[WARN]` preset integrado ausente, `[ERR]` driver declarado ausente, `[CHECK]` binario que responde y allowlist enforzada solo con `strict-container` activo).
 7. **`trust [add|list|check|revoke]`**: Aprueba, lista, verifica o revoca los hashes `blake3` de `.onyx/config.toml` y `sprout.toml` en `~/.onyx/trusted_workspaces.toml`. En repositorios no confiados o modificados (`[UNTRUSTED]`), las reglas `allow` y relajaciones de `[sandbox]`/`[impact]` del proyecto se ignoran y `sprout.toml` bloquea la ejecución hasta confirmación explícita (también desde `/trust` en TUI).
-8. **`serve [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>]`**: Sirve la PWA mobile-first embebida (Vanilla HTML/CSS/JS, 0 Node, 0 `tokio`) y la API `/api/v1/...` (JSON + SSE) lista para clientes externos (p. ej. Svelte) y despliegue en VPS detrás de HTTPS/Tailscale. Escucha en `127.0.0.1:8787` por defecto (generando clave aleatoria de 256 bits) y bloquea `--bind 0.0.0.0:...` sin `--api-key` / `ONYX_WEB_API_KEY` explícita (`>= 16` chars).
+8. **`serve [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>]`**: Sirve la PWA mobile-first embebida (Vanilla HTML/CSS/JS, 0 Node, 0 `tokio`) — con selector LLM sin credenciales para `[[llm_profiles]]` — y la API `/api/v1/...` (JSON + SSE) lista para clientes externos (p. ej. Svelte) y despliegue en VPS detrás de HTTPS/Tailscale. Escucha en `127.0.0.1:8787` por defecto (generando clave aleatoria de 256 bits) y bloquea `--bind 0.0.0.0:...` sin `--api-key` / `ONYX_WEB_API_KEY` explícita (`>= 16` chars).
 
 ### Flags transversales principales
 
@@ -86,6 +104,7 @@ openonyx run "resume la arquitectura de crates" --auto-save
 - `--ignore-deny`: desactiva explícitamente las reglas `[permissions].deny` de `.onyx/config.toml`.
 - `--sandbox <off|workspace-write|strict-container>` y `--sandbox-net <offline|localhost|unrestricted>`: perfil de sandbox OS (`env_clear()`, protección RO del Control Plane `.onyx/config.toml`/`.git/hooks/**`/`.git/config`/`.env*`, `ProcessJob` RAII, y fallback automático de `bwrap` en Linux con AppArmor restrictivo) y política de red para `shell_exec`. El estado se muestra en `[SANDBOX:...]` y se audita en `openonyx doctor`.
 - `--max-steps <n>`: límite de pasos del agente raíz por turno (default: `128` en `chat`, `64` en `run`; los subagentes lanzados con `spawn_agent` heredan un techo por defecto de `32` pasos salvo override explícito `max_steps` en los argumentos).
+- `--max-subagents <n>`: tope de subagentes **asíncronos** concurrentes en worktree (`spawn_subagent` / `/spawn`; default `3`, `ONYX_MAX_SUBAGENTS`); aplica a los backends nativo y externo por igual.
 - `--shell-timeout <secs>`: timeout en segundos por comando `shell_exec` (default de `WorkspacePolicy`: `30s`).
 - `--auto-save`: genera automáticamente una carpeta descriptiva en `<workspace>/.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama|goal>]/` guardando juntos `snapshots.onyxpack` y `<id>.tr` (activable por defecto con `ONYX_AUTO_SAVE=1`). Crea `.onyx/vault/.gitignore` (`*`) automáticamente para no ensuciar Git ni los checkpoints de `/undo`.
 - `--record <file>` / `--save-transcript <file>`: guarda transcripción determinista `ONYXTR2`. Los nombres cortos sin separador de ruta se guardan dentro de `--snapshot-dir` si existe, o en `.onyx/vault/unassigned/<file>` si no hay directorio de snapshots (rutas explícitas con `/` o `\` se respetan tal cual).
@@ -104,16 +123,20 @@ openonyx run "resume la arquitectura de crates" --auto-save
 - **`/` y `@`**: abre el popup de autocompletado interactivo de comandos slash (`/`) o archivos del workspace (`@`, ignorando `.git`/`target`/`.onyx/vault`, navegable con `↑`/`↓`, `Tab`/`Enter` para aceptar y `Esc` para cerrar).
 - **`Left` / `Right` / `Home` / `End` / `Delete`**: edición UTF-8 con cursor visible; **`Alt+Up` / `Alt+Down`** (`Ctrl+P` / `Ctrl+N`) navega el historial de prompts preservando el borrador.
 - **`Tab`**: alterna en caliente entre `[BUILD]` (edición permitida) y `[PLAN]` (solo lectura).
-- **`F2`**: abre/cierra el popup interactivo **Agent Selector** para inspeccionar y enfocar al agente raíz o cualquiera de sus subagentes (`↑`/`↓`, `Enter`, `Esc`).
-- **`Ctrl+Tab`**: atajo rápido para rotar el agente enfocado (alias dependiente del terminal para `F2` / `/agent`).
+- **`F1..F5`**: cambia entre las cinco vistas efímeras — `F1 Chat` (traza completa, paneles, input y aprobaciones), `F2 Agents` (agentes del grafo + jobs asíncronos `[bg]`; `↑`/`↓` selecciona y `Enter` enfoca de vuelta en `F1 Chat`), `F3 Sprout` (lista/DAG de servicios de `sprout.toml` + logs en vivo del servicio seleccionado; las teclas mutantes `s`/`x`/`r`/`a` están gateadas por modo/confianza con aviso), `F4 Plan & Diff` (plan activo + ledger de efectos Git) y `F5 Timeline` (hitos de `snapshots.onyxpack` para `/rewind` / `/fork`). La tira de pestañas muestra el badge `[F1 Chat !APPROVAL]` cuando hay una aprobación pendiente fuera de Chat.
+- **`Ctrl+K`**: abre la paleta de comandos (vistas + objetivos LLM + agentes): cualquier carácter imprimible filtra (subsecuencia fuzzy), `↑`/`↓`/`Ctrl+P`/`Ctrl+N` navegan, `Enter` aplica y `Esc`/`Ctrl+K` cierra. Mientras está abierta traga todas las teclas (salvo `Ctrl+C`).
+- **`Ctrl+Tab`**: rota el agente enfocado (ciclo rápido); con varios agentes, `/agent` (alias `/agents`) abre el popup interactivo **Agent Selector** para inspeccionar y enfocar al agente raíz o cualquiera de sus subagentes (`↑`/`↓`, `Enter`, `Esc`).
 - **`y` / `n`**: aprueba o rechaza una herramienta mutante pendiente (`WaitingApproval`), indicando el origen `[agent #id name]` y mostrando diff unificado en color para `fs_write` y `fs_edit` multi-hunk.
 - **`Up` / `Down` / `PgUp` / `PgDn` / `Home` / `End` / `Ctrl+U` / `Ctrl+D`**: desplaza el historial `Memory & Trace` incluso durante un prompt de aprobación.
-- **`Esc` / `Ctrl+C`**: cierra el popup abierto o sale limpiamente guardando snapshot final (`exit`) y transcripción si están configurados.
-- **Cabecera compacta, emblema Braille y paneles laterales**: la cabecera de 3 filas muestra el emblema animado (`⠋..⠏`, throttled a 90 ms), `[PLAN]`/`[BUILD]`, `[SANDBOX:...]`, modelo y `--effort`, además de telemetría en vivo (`ctx: <1%`/`XX% · in / cache / out / think · ~$cost` o `local`). Cuando `plan_update` y/o `sprout.toml` están activos y el terminal tiene `>= 100` columnas, se muestran a la derecha `Live Plan` y `Services (Sprout)`.
+- **`Esc`**: cierra el popup/paleta abierta; en `F1 Chat` sale limpiamente guardando snapshot final (`exit`) y transcripción si están configurados; en `F2..F5` **vuelve a `F1 Chat`** en vez de salir (nunca sale a ciegas desde otra vista). **`Ctrl+C`** siempre sale limpiamente.
+- **Cabecera compacta, emblema Braille y paneles laterales**: la cabecera de 3 filas muestra el emblema animado (`⠋..⠏`, throttled a 90 ms), `[PLAN]`/`[BUILD]`, `[SANDBOX:...]`, `[UNTRUSTED]`, el objetivo LLM activo `provider/model` **vivo** (sigue los hot-swaps de `/profile`/`/provider`/`/model`/`/effort`) y `--effort`, además de telemetría en vivo (`ctx: <1%`/`XX% · in / cache / out / think · ~$cost` o `local`). Cuando `plan_update` y/o `sprout.toml` están activos y el terminal tiene `>= 100` columnas, se muestran a la derecha `Live Plan` y `Services (Sprout)`.
 
 ### Comandos Slash
 
 - **`/agent [id|name]`** (alias `/agents`): abre el selector de agentes o enfoca directamente a un agente por ID numérico o nombre (etiqueta de hito `cmd:/agent`).
+- **`/view <chat|agents|sprout|plan|timeline>`**: cambia la vista efímera (case-insensitive). Se intercepta a nivel TUI: no llega al bus de eventos, al historial de prompts ni a `ONYXTR2` (0 ticks, 0 mutaciones de grafo).
+- **`/profile [<id>]`**: sin argumentos lista los perfiles LLM registrados (`[[llm_profiles]]`); con `<id>` conmuta en caliente al perfil (frontera de tick, sellado en `ONYXTR2`, reproducido por `replay` con 0 I/O).
+- **`/provider <gemini|openai>`**, **`/model <name>`** y **`/effort <auto|low|medium|high>`**: cambian el proveedor, el modelo y el esfuerzo de razonamiento del objetivo LLM activo (misma semántica de hot-swap: no interrumpen el turno en vuelo, subagentes pinnan el tick de spawn, cabecera `provider/model` viva en TUI y Web). Todos los slash LLM son case-insensitive y también disponibles en la Web UI.
 - **`/mode [plan|build|explore]`**: cambia al modo indicado o alterna `PLAN` ↔ `BUILD` si se omite el argumento.
   - `BUILD`: lectura y modificación controlada (`fs_edit` exige lectura previa del archivo).
   - `PLAN`: solo lectura y análisis; bloquea mutaciones.
@@ -124,6 +147,11 @@ openonyx run "resume la arquitectura de crates" --auto-save
 - **`/compact [focus]`**: compacta determinísticamente el historial de conversación del agente en un `[session_summary]` (rescatando `files_found` y `focus_matches` relevantes a `[focus]` de turnos previos), crea el hito `cmd:/compact` en `snapshots.onyxpack` y conserva intacta la traza en el grafo para `rewind` y `replay`.
 - **`/services`** y **`/service <start|stop|logs> <id|all> [tail]`**: consulta y controla procesos locales y contenedores Docker/Rancher definidos en `sprout.toml` (reflejados en el panel derecho `Services (Sprout)` y auditados en `openonyx doctor`).
 - **`/new`** o **`/new <goal>`**: fuerza que el siguiente prompt cree un agente raíz limpio (o lo lanza de inmediato con `<goal>`, enfocando automáticamente la vista en el nuevo agente raíz).
+- **`/subagents`**: lista los jobs de subagentes asíncronos en worktree aislado (`[bg #job_id]`, estado, rama y badge `→ <driver>` cuando el motor no es `native`).
+- **`/merge <job_id>`**: fusiona la propuesta sellada del job con aprobación humana única (preview 3-way con banner `# impact:` de calor Scent; `Deny` para rutas del Control Plane y `Ask` obligatorio por gobernanza) y limpia el worktree.
+- **`/discard <job_id>`**: descarta el job sin fusionar (limpia el worktree y el estado `ws.subagent.*`).
+- **`/spawn [--driver <id>] <tarea>`**: lanza un subagente en segundo plano en un worktree aislado **sin gastar un turno de `root`** (válido incluso antes de tener un agente raíz activo). Comando y flag `--driver` case-insensitive y tolerantes a espacios múltiples; sin driver → motor nativo.
+- **Harnesses CLI externos (`[[external_drivers]]` en `.onyx/config.toml`)**: declara drivers adicionales (`id`, `bin`, `args`, `prompt_transport = "stdin" | "arg" | "temp_file"`, `prompt_flag`, `timeout_secs`, `allowed_env`, `inherit_home`, `network_allowlist`); el preset `opencode` existe de serie y se sobreescribe por `id` (precedencia `preset < global < workspace`). Solo se aplican en workspaces **confiados** (en un workspace `[UNTRUSTED]` se ignoran por completo, también en el selector de la Web UI), `root` necesita aprobación explícita o regla `allow spawn_subagent(<driver>)` para delegar a un driver no-nativo, y el binario se audita en `openonyx doctor` (severidad por origen + probe `--version` aislada).
 - **Permisos granulares e impacto AST (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`), `[sandbox]` e `[impact]` (*Scent-Heated Approval* monótono: escala `Allow → Ask` cuando `fs_edit`/`fs_write` toca símbolos con callers y muestra `# impact: ...` sobre el diff, guardando además `ws.effect.symbols` en el ledger).
 
 ---
@@ -146,7 +174,8 @@ Cuando operes dentro de `openonyx`, sigue esta disciplina para minimizar tokens,
    - Usa `git_status` y `git_diff` (sin aprobación) en lugar de `shell_exec` para inspeccionar estado Git.
    - Reserva `shell_exec` para compilar, testear o ejecutar comandos mutantes (salida limitada a `32 KiB`, filtrada con `scrub_secrets`; evita crear scripts temporales ad-hoc cuando exista herramienta nativa).
 4. **Subagentes acotados**:
-   - Usa `spawn_agent` para delegar subtareas independientes con un `goal` claro y acotado (techo por defecto: `32` pasos por subagente; inspeccionables en vivo con `F2` / `/agent`).
+   - Usa `spawn_agent` para delegar subtareas independientes **síncronas** con un `goal` claro y acotado (techo por defecto: `32` pasos por subagente; inspeccionables en vivo con `F2` / `/agent`).
+   - Usa `spawn_subagent` para trabajo **asíncrono en segundo plano** en un worktree Git aislado (tope de concurrencia `--max-subagents`, default `3`; parámetro opcional `driver` para un harness CLI de `[[external_drivers]]`, que exige aprobación). La propuesta sellada vuelve a `root` para una fusión 3-way con aprobación humana única (`subagent_merge`); consulta el estado en vivo con `subagent_status`.
 
 ---
 
