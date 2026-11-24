@@ -27,7 +27,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -705,6 +705,8 @@ fn parse_mcp_env_table(raw: &str, line_no: usize) -> Result<BTreeMap<String, Str
 
 /// Tabla inline `headers = { "Authorization" = "Bearer ${TOKEN}", ... }`.
 /// Igual que `env`, pero con nombres *token* HTTP (no solo `[A-Za-z0-9_]`).
+/// 4C-audit: además de la clave entrecomillada, acepta claves TOML *bare*
+/// (`Authorization = "..."`) — el valor sigue requiriendo comillas.
 fn parse_mcp_headers_table(raw: &str, line_no: usize) -> Result<BTreeMap<String, String>, String> {
     let inner = raw
         .trim()
@@ -720,7 +722,19 @@ fn parse_mcp_headers_table(raw: &str, line_no: usize) -> Result<BTreeMap<String,
         let (k, v) = part
             .split_once('=')
             .ok_or_else(|| format!("expected `\"Name\" = \"value\"`, got `{part}`"))?;
-        let k = parse_mcp_string(k, line_no, "headers")?;
+        let k = k.trim();
+        let k = match parse_mcp_string(k, line_no, "headers") {
+            Ok(s) => s,
+            // Clave bare de TOML: `[A-Za-z0-9_-]+` sin comillas.
+            Err(_)
+                if !k.is_empty()
+                    && k.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+            {
+                k.to_string()
+            }
+            Err(e) => return Err(e),
+        };
         let v = parse_mcp_string(v, line_no, "headers")?;
         if out.insert(k, v).is_some() {
             return Err("duplicate header".to_string());
@@ -920,6 +934,10 @@ pub struct StdioMcpClient {
     /// `None` hasta que el handshake ha completado; `Some(tools)` son los
     /// schemas cacheados de ese handshake.
     cached_tools: Mutex<Option<Vec<ToolSchema>>>,
+    /// Raíz del workspace inyectada desde `discover_from_config` (4C-audit):
+    /// evita depender de `std::env::current_dir()` (puede fallar si el cwd fue
+    /// eliminado o es inaccesible) al preparar el spawn.
+    workspace_root: Option<PathBuf>,
 }
 
 impl fmt::Debug for StdioMcpClient {
@@ -932,12 +950,13 @@ impl fmt::Debug for StdioMcpClient {
 }
 
 impl StdioMcpClient {
-    pub fn new(name: String, cfg: McpServerConfig) -> Arc<Self> {
+    pub fn new(name: String, cfg: McpServerConfig, workspace_root: Option<&Path>) -> Arc<Self> {
         Arc::new(Self {
             name,
             cfg,
             session: Mutex::new(None),
             cached_tools: Mutex::new(None),
+            workspace_root: workspace_root.map(PathBuf::from),
         })
     }
 
@@ -958,7 +977,14 @@ impl StdioMcpClient {
                 if cfg!(windows) { "/PATHEXT" } else { "" }
             ))
         })?;
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // 4C-audit: nunca fallar por `current_dir()` inaccesible/eliminado —
+        // preferir el `workspace_root` inyectado y, en último caso, el temp dir
+        // (una ruta relativa `.` rompería el spawn del proceso hijo).
+        let workspace_root = self
+            .workspace_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(std::env::temp_dir);
         let sandbox_tmp = ensure_sandbox_tmp_dir(&workspace_root)
             .map_err(|e| McpError::Transport(format!("MCP server `{}`: {e}", self.name)))?;
         let mut cmd = Command::new(&resolved.path);
@@ -1302,14 +1328,17 @@ impl HttpMcpClient {
     }
 
     fn map_ureq_error(&self, method: &str, e: ureq::Error) -> McpError {
+        // `SDD-04 4C-audit`: la query de la URL puede contener token/cuenta:
+        // redactarla en los mensajes de error (misma regla que `with_client`).
+        let url = redact_url_for_debug(&self.url);
         match e {
             ureq::Error::Status(code, _resp) => McpError::Transport(format!(
-                "MCP server `{}`: `{method}` got HTTP {code} from `{}` (response body redacted)",
-                self.name, self.url
+                "MCP server `{}`: `{method}` got HTTP {code} from `{url}` (response body redacted)",
+                self.name
             )),
             ureq::Error::Transport(t) => McpError::Transport(format!(
-                "MCP server `{}`: `{method}` transport failure ({t}) against `{}`",
-                self.name, self.url
+                "MCP server `{}`: `{method}` transport failure ({t}) against `{url}`",
+                self.name
             )),
         }
     }
@@ -1381,7 +1410,9 @@ impl HttpMcpClient {
     }
 
     /// Lee el stream SSE hasta el JSON-RPC con el `id` esperado (ignora los
-    /// demás eventos), acotando el tamaño de `data:`.
+    /// demás eventos), acotando el tamaño de `data:`. Si el servidor cierra el
+    /// stream justo después del último evento (sin línea en blanco final), el
+    /// bloque `data` pendiente se procesa igualmente (4C-audit).
     fn read_sse_response(
         &self,
         resp: ureq::Response,
@@ -1389,23 +1420,37 @@ impl HttpMcpClient {
         id: u64,
     ) -> Result<JsonValue, McpError> {
         let mut reader = std::io::BufReader::new(resp.into_reader());
-        let mut line = String::new();
         let mut data: Vec<u8> = Vec::new();
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line).map_err(|e| {
+            let line = read_bounded_line(&mut reader, MCP_MAX_STDOUT_LINE_BYTES).map_err(|e| {
                 McpError::Transport(format!(
                     "MCP server `{}`: failed to read SSE stream of `{method}`: {e}",
                     self.name
                 ))
             })?;
-            if n == 0 {
+            let Some(line) = line else {
+                // EOF: procesar el último bloque `data` aunque no cerrara con
+                // línea en blanco; si no hay datos, la respuesta no llegó.
+                let event = if data.is_empty() {
+                    return Err(McpError::Transport(format!(
+                        "MCP server `{}`: SSE stream ended without a response to `{method}`",
+                        self.name
+                    )));
+                } else {
+                    String::from_utf8_lossy(&data).into_owned()
+                };
+                if let Ok(v) = serde_json::from_str::<JsonValue>(&event) {
+                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                        return extract_jsonrpc_result(&v, method);
+                    }
+                }
                 return Err(McpError::Transport(format!(
                     "MCP server `{}`: SSE stream ended without a response to `{method}`",
                     self.name
                 )));
-            }
-            let trimmed = line.trim_end_matches(['\n', '\r']);
+            };
+            let trimmed = String::from_utf8_lossy(&line);
+            let trimmed = trimmed.trim_end_matches(['\n', '\r']);
             if trimmed.is_empty() {
                 if data.is_empty() {
                     continue;
@@ -1541,8 +1586,9 @@ fn mcp_reader_loop(stdout: ChildStdout, tx: mpsc::Sender<InboxMsg>) {
 
 /// Lee una línea (sin el `\n`) con tope duro de `cap` bytes usando
 /// `fill_buffer`/`consume` (sin copias ni pérdida de bytes entre líneas).
-fn read_bounded_line(
-    reader: &mut std::io::BufReader<ChildStdout>,
+/// Genérico sobre `BufRead` para reutilizarla en el stream SSE (4C-audit).
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
     cap: usize,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
@@ -1731,9 +1777,12 @@ impl McpRegistry {
     /// Descubre los servidores de `configs` (orden determinista por nombre).
     /// Ambos transportes (`stdio` y `http`) hacen handshake completo;
     /// `enabled = false` → `Disabled`. Ningún fallo aborta la función.
+    /// `workspace_root` (4C-audit) es el cwd del servidor stdio hijo cuando
+    /// `current_dir()` no está disponible.
     pub fn discover_from_config(
         configs: &BTreeMap<String, McpServerConfig>,
         max_output_bytes: usize,
+        workspace_root: Option<&Path>,
     ) -> Self {
         let mut servers = Vec::with_capacity(configs.len());
         for (name, cfg) in configs {
@@ -1747,7 +1796,9 @@ impl McpRegistry {
                 continue;
             }
             let client: Arc<dyn McpClient> = match &cfg.transport {
-                McpTransport::Stdio { .. } => StdioMcpClient::new(name.clone(), cfg.clone()),
+                McpTransport::Stdio { .. } => {
+                    StdioMcpClient::new(name.clone(), cfg.clone(), workspace_root)
+                }
                 McpTransport::Http { url, headers } => {
                     HttpMcpClient::new(name.clone(), url.clone(), headers.clone(), cfg.timeout_secs)
                 }
@@ -2304,7 +2355,7 @@ command = "x"
 
     #[test]
     fn registry_call_rejects_malformed_prefixed_name() {
-        let reg = McpRegistry::discover_from_config(&BTreeMap::new(), 1024);
+        let reg = McpRegistry::discover_from_config(&BTreeMap::new(), 1024, None);
         let err = reg.call("mcp__server", &json!({})).unwrap_err();
         assert!(err.to_string().contains("malformed"), "{err}");
         let err = reg.call("mcp__nope__tool", &json!({})).unwrap_err();
@@ -2331,7 +2382,7 @@ command = "x"
                 enabled: true,
             },
         );
-        let reg = McpRegistry::discover_from_config(&configs, 1024);
+        let reg = McpRegistry::discover_from_config(&configs, 1024, None);
         let statuses = reg.server_statuses();
         assert_eq!(statuses[0], ("off".to_string(), McpServerStatus::Disabled));
         match &statuses[1].1 {
@@ -2358,7 +2409,7 @@ command = "x"
             "broken".to_string(),
             stdio_cfg("definitely-not-a-real-binary-onyx-mcp-xyz"),
         );
-        let reg = McpRegistry::discover_from_config(&configs, 1024);
+        let reg = McpRegistry::discover_from_config(&configs, 1024, None);
         let statuses = reg.server_statuses();
         assert_eq!(statuses.len(), 1);
         match &statuses[0].1 {

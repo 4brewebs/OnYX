@@ -26,7 +26,6 @@ use crate::context::{
     extract_gemini_usage, project_memory,
 };
 use crate::llm_profile::{api_base_host, is_loopback_host};
-use crate::openai::lowercase_json_schema_types;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -351,13 +350,14 @@ pub(crate) fn build_request_body_with_context(
             })
             .collect();
     // `SDD-04 REQ-04.3`: declaraciones MCP `mcp__*` (schemas del registro,
-    // filtradas por los tools del spec; los `type` se normalizan a minúsculas).
+    // filtradas por los tools del spec y normalizados al formato
+    // `functionDeclarations` de Gemini: ver `sanitize_gemini_mcp_schema`).
     for s in mcp_schemas
         .iter()
         .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
     {
         let mut params = s.parameters.clone();
-        lowercase_json_schema_types(&mut params);
+        sanitize_gemini_mcp_schema(&mut params);
         declarations.push(json!({
             "name": s.name,
             "description": s.description,
@@ -387,6 +387,74 @@ pub(crate) fn build_request_body_with_context(
         });
     }
     body
+}
+
+/// `SDD-04 REQ-04.3`: normaliza un `inputSchema` de tool MCP al formato de
+/// `functionDeclarations` de Gemini:
+/// - `type` → MAYÚSCULAS (`OBJECT`, `STRING`, `INTEGER`, `NUMBER`, `BOOLEAN`, `ARRAY`);
+/// - `["string", "null"]` → `"STRING"` + `"nullable": true`;
+/// - elimina recursivamente los metadatos que Gemini rechaza: `$schema`,
+///   `additionalProperties`, `$id`, `$defs`, `definitions`, `default`, `examples`,
+///   `title`.
+fn sanitize_gemini_mcp_schema(val: &mut JsonValue) {
+    const STRIP_KEYS: [&str; 8] = [
+        "$schema",
+        "additionalProperties",
+        "$id",
+        "$defs",
+        "definitions",
+        "default",
+        "examples",
+        "title",
+    ];
+    match val {
+        JsonValue::Object(map) => {
+            if let Some(ty) = map.get("type").and_then(|v| v.as_str()) {
+                map.insert(
+                    "type".to_string(),
+                    JsonValue::String(ty.to_ascii_uppercase()),
+                );
+            } else if let Some(JsonValue::Array(tys)) = map.get("type") {
+                // Clonamos el array: mutar `map` con `tys` vivo no compila
+                // (préstamo inmutable pendiente del `map.get`).
+                let tys: Vec<JsonValue> = tys.to_vec();
+                if tys
+                    .iter()
+                    .any(|t| t.as_str().is_some_and(|s| s.eq_ignore_ascii_case("null")))
+                {
+                    map.insert("nullable".to_string(), JsonValue::Bool(true));
+                }
+                let kept: Vec<JsonValue> = tys
+                    .into_iter()
+                    .filter(|t| t.as_str().is_none_or(|s| !s.eq_ignore_ascii_case("null")))
+                    .map(|t| match t.as_str() {
+                        Some(s) => JsonValue::String(s.to_ascii_uppercase()),
+                        None => t,
+                    })
+                    .collect();
+                match kept.len() {
+                    1 => {
+                        map.insert("type".to_string(), kept.into_iter().next().unwrap());
+                    }
+                    _ => {
+                        map.insert("type".to_string(), JsonValue::Array(kept));
+                    }
+                };
+            }
+            for key in STRIP_KEYS {
+                map.remove(key);
+            }
+            for v in map.values_mut() {
+                sanitize_gemini_mcp_schema(v);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr {
+                sanitize_gemini_mcp_schema(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parsea una respuesta `generateContent` (REST o SSE acumulada) y registra
@@ -1082,6 +1150,77 @@ mod tests {
         let sig_guard = shared.thought_signatures.lock().unwrap();
         assert_eq!(sig_guard.get(&(1, 0)), Some(&json!("sig-0")));
         assert_eq!(sig_guard.get(&(1, 1)), Some(&json!("sig-1")));
+    }
+
+    #[test]
+    fn sanitize_gemini_mcp_schema_normalizes_types_and_strips_metadata() {
+        // `inputSchema` MCP realista (draft 2020-12, tipos con `null`, metadatos).
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Echo params",
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": ["string", "null"],
+                    "description": "Text to echo back",
+                    "default": "hello",
+                    "examples": ["a", "b"]
+                },
+                "count": { "type": "integer", "minimum": 1 },
+                "ratio": { "type": "number" },
+                "dry_run": { "type": "boolean" },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "additionalProperties": true
+                },
+                "meta": {
+                    "type": "object",
+                    "properties": {
+                        "score": { "type": ["number", "null"] }
+                    }
+                }
+            },
+            "$id": "urn:echo:1",
+            "definitions": { "x": { "type": "string" } },
+            "$defs": { "y": { "type": "boolean" } }
+        });
+        sanitize_gemini_mcp_schema(&mut schema);
+
+        // Tipos en MAYÚSCULAS.
+        assert_eq!(schema["type"], "OBJECT");
+        let props = schema["properties"].as_object().unwrap();
+        assert_eq!(props["count"]["type"], "INTEGER");
+        assert_eq!(props["ratio"]["type"], "NUMBER");
+        assert_eq!(props["dry_run"]["type"], "BOOLEAN");
+        assert_eq!(props["tags"]["type"], "ARRAY");
+        assert_eq!(props["tags"]["items"]["type"], "STRING");
+
+        // `["string","null"]` → `"STRING"` + `nullable: true` (también anidado).
+        assert_eq!(props["message"]["type"], "STRING");
+        assert_eq!(props["message"]["nullable"], true);
+        assert_eq!(props["meta"]["properties"]["score"]["type"], "NUMBER");
+        assert_eq!(props["meta"]["properties"]["score"]["nullable"], true);
+
+        // Metadatos prohibidos eliminados (recursivo y en raíz).
+        for key in [
+            "$schema",
+            "title",
+            "$id",
+            "definitions",
+            "$defs",
+            "default",
+            "examples",
+        ] {
+            assert!(schema.get(key).is_none(), "root kept {key}");
+        }
+        assert!(props["message"].get("default").is_none());
+        assert!(props["message"].get("examples").is_none());
+        assert!(props["tags"].get("additionalProperties").is_none());
+
+        // Lo legítimo se conserva.
+        assert_eq!(props["message"]["description"], "Text to echo back");
+        assert_eq!(props["count"]["minimum"], 1);
     }
 
     #[test]

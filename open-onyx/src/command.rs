@@ -525,8 +525,11 @@ impl CommandSpawnerSystem {
         let mut spec =
             AgentSpec::new(format!("openonyx-{}", self.counter), goal).with_tools(tool_names);
         if !self.auto_approve {
-            spec =
-                spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
+            // `SDD-04 REQ-04.4`: los tools MCP `mcp__*` requieren aprobación cuando no
+            // hay auto-approve (misma regla que los built-in mutantes).
+            let mut approval: Vec<&str> = WorkspaceTools::approval_required_names().to_vec();
+            approval.extend(self.mcp_tool_names.iter().map(|t| t.as_str()));
+            spec = spec.with_approval_tools(approval);
         }
         spec
     }

@@ -99,7 +99,7 @@ fn main() {
     configs.insert("slowmock".to_string(), mock_cfg(1));
 
     let max_output_bytes: usize = 2048;
-    let registry = McpRegistry::discover_from_config(&configs, max_output_bytes);
+    let registry = McpRegistry::discover_from_config(&configs, max_output_bytes, None);
     let statuses = registry.server_statuses();
 
     let mut failures: Vec<String> = Vec::new();

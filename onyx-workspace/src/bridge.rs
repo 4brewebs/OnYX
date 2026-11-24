@@ -134,7 +134,8 @@ impl WorkspaceToolBridge {
         args_json: &str,
     ) -> Result<(), String> {
         let current_mode = self.current_mode(graph);
-        if is_mutating_tool(tool) && !current_mode.allows_mutation() {
+        if (is_mutating_tool(tool) || tool.starts_with("mcp__")) && !current_mode.allows_mutation()
+        {
             return Err(format!(
                 "blocked by workspace mode `{:?}`: `{tool}` is not permitted in read-only mode",
                 current_mode
@@ -230,7 +231,8 @@ impl PlatformDriver for WorkspaceToolBridge {
                 }
                 PermissionDecision::Deny => {
                     if self.handled_approvals.insert((view.agent.0, view.request)) {
-                        let reason = if is_mutating_tool(&pending.tool)
+                        let reason = if (is_mutating_tool(&pending.tool)
+                            || pending.tool.starts_with("mcp__"))
                             && !current_mode.allows_mutation()
                         {
                             format!(

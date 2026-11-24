@@ -276,7 +276,7 @@ fn http_e2e_json_direct_with_session_and_scrub() {
             15,
         ),
     );
-    let registry = McpRegistry::discover_from_config(&configs, 2048);
+    let registry = McpRegistry::discover_from_config(&configs, 2048, None);
     let statuses = registry.server_statuses();
     assert_eq!(statuses.len(), 1);
     assert!(
@@ -340,7 +340,7 @@ fn http_e2e_sse_response() {
             15,
         ),
     );
-    let registry = McpRegistry::discover_from_config(&configs, 2048);
+    let registry = McpRegistry::discover_from_config(&configs, 2048, None);
     let statuses = registry.server_statuses();
     assert!(
         matches!(statuses[0].1, McpServerStatus::Connected { tool_count: 2 }),
@@ -368,7 +368,7 @@ fn http_e2e_failure_isolated_from_healthy_server() {
         "dead".to_string(),
         http_cfg(&format!("http://127.0.0.1:{dead_port}/mcp"), vec![], 3),
     );
-    let registry = McpRegistry::discover_from_config(&configs, 2048);
+    let registry = McpRegistry::discover_from_config(&configs, 2048, None);
     let statuses = registry.server_statuses();
     let status_of = |n: &str| {
         statuses
@@ -411,7 +411,7 @@ fn http_e2e_missing_header_var_fails_actionably() {
             15,
         ),
     );
-    let registry = McpRegistry::discover_from_config(&configs, 2048);
+    let registry = McpRegistry::discover_from_config(&configs, 2048, None);
     let statuses = registry.server_statuses();
     match &statuses[0].1 {
         McpServerStatus::Failed(msg) => {
@@ -427,7 +427,7 @@ fn http_e2e_http_500_mapped_to_transport_error() {
     state.fail_tools_call.store(true, Ordering::SeqCst);
     let mut configs = BTreeMap::new();
     configs.insert("boom".to_string(), http_cfg(&url, vec![], 15));
-    let registry = McpRegistry::discover_from_config(&configs, 2048);
+    let registry = McpRegistry::discover_from_config(&configs, 2048, None);
     // El handshake (initialize/tools/list) sigue siendo 200.
     assert!(
         matches!(

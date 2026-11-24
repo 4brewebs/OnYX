@@ -17,6 +17,7 @@ mod tui_views;
 mod vault;
 mod web;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,8 @@ use gemini::{
 use llm_driver::DynamicLlmDriver;
 use llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider, ResolvedLlmTarget, validate_api_base};
 use onyx_soul_agents::{
-    AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
+    AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply, Responder,
+    Transcript, Verb,
 };
 use onyx_workspace::{
     McpRegistry, McpServerStatus, NetworkPolicy, PendingCheckpoints, SandboxMode, ToolSchema,
@@ -1710,6 +1712,24 @@ fn run_trust_command(
 /// los resultados se truncan a 32 KiB antes de llegar al LLM.
 const MCP_LIVE_MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
+/// `SDD-04 REQ-04.4`: extrae de una `Transcript` los tools `mcp__*` que la
+/// sesión original invocó (entradas `Verb::Call`), en orden determinista
+/// (`BTreeSet`), para que un replay offline los declare en el spec de sus
+/// agentes sin tocar disco ni red (0 I/O).
+fn extract_mcp_tools_from_transcript(tr: &Transcript) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for entry in &tr.entries {
+        if entry.reply.verb != Verb::Call {
+            continue;
+        }
+        let (tool, _args) = Reply::parse_call_payload(&entry.reply.payload);
+        if tool.starts_with("mcp__") {
+            names.insert(tool.to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// `SDD-04 REQ-04.3`: registro MCP de arranque con **descubrimiento vivo**. Solo
 /// los modos interactivos/en vivo (chat, run, serve, rewind en vivo) lo cargan;
 /// `doctor` audita los servidores con su propio timeout corto (TEST-04.4) y
@@ -1721,19 +1741,27 @@ fn load_mcp_registry(policy: &WorkspacePolicy, workspace: &Path) -> Option<Arc<M
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from);
-    let (configs, warnings) = load_mcp_config(
+    // `SDD-04 4C-audit`: un fallo de configuración no debe silenciar el diagnóstico;
+    // se loguea en stderr y MCP queda desactivado (MCP disabled) sin abortar.
+    let (configs, warnings) = match load_mcp_config(
         home.as_deref(),
         Some(workspace),
         policy.trust.config_trusted,
-    )
-    .ok()?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[openOnyx mcp] config error (MCP disabled): {e}");
+            return None;
+        }
+    };
     for w in &warnings {
         eprintln!("[openOnyx mcp] {w}");
     }
     if configs.is_empty() {
         return None;
     }
-    let registry = McpRegistry::discover_from_config(&configs, MCP_LIVE_MAX_OUTPUT_BYTES);
+    let registry =
+        McpRegistry::discover_from_config(&configs, MCP_LIVE_MAX_OUTPUT_BYTES, Some(workspace));
     for (name, status) in registry.server_statuses() {
         match status {
             McpServerStatus::Failed(msg) => {
@@ -1805,8 +1833,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // `SDD-04 REQ-04.3`: descubrimiento MCP vivo solo en modos interactivos/en
     // vivo; `doctor` (auditoría propia) y los modos offline no lo cargan.
+    // `SDD-04 REQ-04.4`: `rewind --transcript` no interactivo es replay 0-I/O y
+    // `--dry-run` no hace I/O: en ambos casos los tools `mcp__*` salen del
+    // transcript (ver `extract_mcp_tools_from_transcript`), no del registro.
     let mcp_registry: Option<Arc<McpRegistry>> = match &cli.mode {
         Mode::Doctor { .. } | Mode::Replay(_) | Mode::Inspect { .. } => None,
+        Mode::Rewind {
+            transcript: Some(_),
+            ..
+        } if !cli.interactive => None,
+        _ if cli.dry_run => None,
         _ => load_mcp_registry(&policy, &cli.workspace),
     };
     let tools = match mcp_registry.as_ref() {
@@ -1972,6 +2008,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let bytes = fs::read(&resolved_tr)?;
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
+            // `SDD-04 REQ-04.4`: replay offline real — los tools `mcp__*` del
+            // spec salen del transcript (0 I/O: sin `load_mcp_registry` ni
+            // handshake), no de un registro en vivo.
+            let replay_mcp_tools = extract_mcp_tools_from_transcript(&transcript);
             let has_commands = transcript
                 .commands
                 .iter()
@@ -1988,6 +2028,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let replay_llm = resolve_replay_llm_config(&cli)?;
             let replay_spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(replay_config.default_max_steps)
+                .with_mcp_tool_names(replay_mcp_tools.clone())
                 .with_llm_profile(LlmProfileHandle::new_for_replay(
                     &replay_llm,
                     policy.llm_profiles(),
@@ -2001,7 +2042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(PendingCheckpoints::default()),
             )?;
             if !has_commands {
-                host.spawn(&make_spec("replay", cli.auto_approve, &[]));
+                host.spawn(&make_spec("replay", cli.auto_approve, &replay_mcp_tools));
             }
 
             // Replay determinista puro: NO toca disco ni llama a Gemini.
@@ -2088,13 +2129,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 LlmProfileHandle::new(&rewind_llm, policy.llm_profiles(), allow_custom_auth_host)
             };
+            // `SDD-04 REQ-04.4`: en el replay offline (`--transcript` no
+            // interactivo, sin registro MCP vivo) el transcript se parsea
+            // **antes** de construir el spawner para extraer los tools
+            // `mcp__*` grabados (y se reusa después, sin doble lectura).
+            let rewind_transcript: Option<Transcript> = if !cli.interactive {
+                transcript
+                    .as_ref()
+                    .map(|tr_path| {
+                        let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
+                        let bytes = fs::read(&resolved_tr).map_err(|e| e.to_string())?;
+                        Transcript::from_bytes(&bytes).map_err(|e| e.to_string())
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             // En la rama en vivo el spec necesita las tools `mcp__*` para poder
             // invocarlas; en la rama `--transcript` el spec debe incluirlas igual
-            // para que el replay valide las llamadas grabadas en la sesión original.
+            // (extraídas del transcript en el replay offline) para que el replay
+            // valide las llamadas grabadas en la sesión original.
+            let rewind_mcp_tools = match rewind_transcript.as_ref() {
+                Some(tr) => extract_mcp_tools_from_transcript(tr),
+                None => mcp_tool_names.to_vec(),
+            };
             let spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(128)
                 .with_llm_profile(llm_handle)
-                .with_mcp_tool_names(mcp_tool_names.to_vec());
+                .with_mcp_tool_names(rewind_mcp_tools);
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
@@ -2109,10 +2171,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host.set_tick(next_tick);
 
             let rewind_opts = SessionOptions::default();
-            if let Some(tr_path) = transcript {
-                let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
-                let bytes = fs::read(&resolved_tr)?;
-                let tr = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
+            let replay_tr: Option<Transcript> = match (transcript.as_ref(), rewind_transcript) {
+                (Some(_tr_path), Some(tr)) => Some(tr), // ya parseado para la extracción
+                (Some(tr_path), None) => {
+                    let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
+                    let bytes = fs::read(&resolved_tr)?;
+                    Some(Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?)
+                }
+                (None, _) => None,
+            };
+            if let Some(tr) = replay_tr {
                 let mut driver = ReplayBridge::new(tr)
                     .starting_at(next_tick)
                     .wrapping(HeadlessDriver::new());
@@ -2204,7 +2272,7 @@ mod tests {
 
     use onyx_soul_agents::{AgentHost, AgentState, IngressEvent, OnyxEvent, Reply};
     use onyx_workspace::{
-        graph_workspace_llm_profile, graph_workspace_mode, latest_undoable_effect,
+        McpClient, graph_workspace_llm_profile, graph_workspace_mode, latest_undoable_effect,
     };
     use ops::render_inspect;
     use session::{
@@ -4572,14 +4640,243 @@ ready_log = "READY_BUS"
         assert_eq!(host.result(root).as_deref(), Some("recovered after cancel"));
     }
 
-    /// `SDD-04` REQ-04.5: una llamada en vivo a una tool `mcp__<server>__<tool>`
-    /// (con `McpClient` in-memoria inyectado vía `McpRegistry::with_client`, sin
-    /// red) y su observación quedan grabadas en el transcript ONYXTR2, y
-    /// `ReplayBridge` reproduce la sesión con **0 I/O**: el contador de calls
-    /// del mock no cambia durante el replay y el resultado final es idéntico.
+    /// Mock MCP in-memoria (sin red) con contador de calls para tests E2E
+    /// (`SDD-04` REQ-04.4/04.5, 4C-audit).
+    struct ApprovalMockMcpClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl onyx_workspace::McpClient for ApprovalMockMcpClient {
+        fn handshake(&self) -> Result<Vec<ToolSchema>, onyx_workspace::McpError> {
+            Ok(vec![ToolSchema {
+                name: std::borrow::Cow::Owned("mcp__mock__echo".to_string()),
+                description: std::borrow::Cow::Owned("echo de texto".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } }
+                }),
+                requires_approval: true,
+            }])
+        }
+
+        fn call_tool(
+            &self,
+            tool: &str,
+            args: &serde_json::Value,
+        ) -> Result<String, onyx_workspace::McpError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            Ok(format!("mcp-echo:{tool}:{text}"))
+        }
+    }
+
+    /// `SDD-04` REQ-04.4 (4C-audit): en modo `Build` **sin auto-approve**, una
+    /// llamada a `mcp__mock__echo` entra en `WaitingApproval` (el mock NO se
+    /// llama hasta la aprobación: `calls == 0`) y al aprobarse se despacha
+    /// exactamente una vez (`calls == 1`).
+    #[test]
+    fn mcp_tool_waits_for_approval_in_build_mode_without_auto_approve() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-mcp-approval-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(ApprovalMockMcpClient {
+            calls: Arc::clone(&calls),
+        });
+        let schemas = client.handshake().expect("mock handshake");
+        let registry = Arc::new(McpRegistry::with_client(
+            2048,
+            "mock",
+            client.clone(),
+            schemas,
+        ));
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+
+        let spawner = CommandSpawnerSystem::new(false) // sin auto-approve
+            .with_mode_handle(mode_handle.clone())
+            .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
+        let (mut host, ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "use the mock echo".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .wrapping(headless);
+        let mut turn = 0usize;
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            turn += 1;
+            if turn == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "mcp__mock__echo",
+                    r#"{"text":"hola mcp"}"#,
+                ))
+            } else {
+                Some(Reply::done(req.agent, req.request, "mcp echo approved"))
+            }
+        })
+        .wrapping(ws_bridge);
+
+        // tick 0: comando → `spawn_event`; tick 1: agente `Thinking` y el
+        // responder encola el `Call` (su `present`); tick 2: el runtime aplica
+        // el `Call` → `WaitingApproval` (sin auto-approve, `mcp__*` exige
+        // aprobación en el spec).
+        host.step(&mut driver);
+        host.step(&mut driver);
+        host.step(&mut driver);
+        let root = host.agents()[0];
+        // Sin auto-approve, la tool `mcp__*` queda en `WaitingApproval`…
+        assert_eq!(
+            host.agent_state(root),
+            Some(AgentState::WaitingApproval),
+            "la llamada MCP debe esperar aprobación"
+        );
+        // …y el cliente NO se llama antes de aprobar (0 I/O).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        // Un humano aprueba: el bridge despacha la llamada exactamente una vez.
+        let pending = &host.pending_approvals()[0];
+        assert_eq!(
+            pending.pending_approval.as_ref().unwrap().tool,
+            "mcp__mock__echo"
+        );
+        host.push(Reply::approve(pending.agent, pending.request).to_event());
+        assert!(host.run_until_settled(&mut driver, 32));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "la aprobación debe despazar exactamente una llamada al mock"
+        );
+        assert_eq!(host.result(root).as_deref(), Some("mcp echo approved"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-04` REQ-04.4 (4C-audit): en modo `Plan`, una llamada a `mcp__*`
+    /// queda bloqueada **incluso** con `auto_approve = true` y regla `allow`
+    /// explícita `mcp__*`: el gate de modo del bridge la niega y el cliente
+    /// nunca se llama (`calls == 0`).
+    #[test]
+    fn mcp_tool_blocked_in_plan_mode_even_with_auto_approve_and_allow_rule() {
+        use onyx_workspace::PermissionRules;
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-mcp-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(ApprovalMockMcpClient {
+            calls: Arc::clone(&calls),
+        });
+        let schemas = client.handshake().expect("mock handshake");
+        let registry = Arc::new(McpRegistry::with_client(
+            2048,
+            "mock",
+            client.clone(),
+            schemas,
+        ));
+        let policy = WorkspacePolicy::new(&dir)
+            .unwrap()
+            .with_permissions(PermissionRules {
+                allow: vec!["mcp__*".to_string()],
+                ..PermissionRules::default()
+            });
+        let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Plan);
+
+        let spawner = CommandSpawnerSystem::new(true) // auto-approve
+            .with_mode_handle(mode_handle.clone())
+            .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
+        let (mut host, ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "use the mock echo".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .wrapping(headless);
+        let mut turn = 0usize;
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            turn += 1;
+            if turn == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "mcp__mock__echo",
+                    r#"{"text":"hola mcp"}"#,
+                ))
+            } else {
+                Some(Reply::done(req.agent, req.request, "blocked in plan"))
+            }
+        })
+        .wrapping(ws_bridge);
+
+        host.step(&mut driver);
+        host.step(&mut driver);
+        let root = host.agents()[0];
+        assert!(host.run_until_settled(&mut driver, 32));
+        // El gate de modo bloquea el despacho: el mock nunca se llama.
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "el modo Plan debe bloquear la llamada MCP aunque haya allow + auto-approve"
+        );
+        // El agente recibió un tool_error con el motivo de modo.
+        let view = host.view(root);
+        assert!(
+            view.memory
+                .iter()
+                .any(|(kind, text)| kind == "tool_error" && text.contains("Plan")),
+            "el tool_error debe mencionar el modo Plan: {:?}",
+            view.memory
+        );
+        assert_eq!(host.result(root).as_deref(), Some("blocked in plan"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-04` REQ-04.5 (4C-audit): una llamada en vivo a una tool
+    /// `mcp__<server>__<tool>` **sin auto-approve** (con `McpClient`
+    /// in-memoria inyectado vía `McpRegistry::with_client`, sin red) queda
+    /// grabada en el transcript ONYXTR2 junto con su `Reply::approve` y su
+    /// observación; el replay (con los tools `mcp__*` **extraídos del
+    /// transcript** vía `extract_mcp_tools_from_transcript`, sin hardcodear ni
+    /// registro vivo) reproduce la sesión con **0 I/O**: el contador de calls
+    /// del mock no cambia y el resultado final es idéntico.
     #[test]
     fn mcp_tool_call_and_its_observation_replay_without_io() {
-        use onyx_workspace::{McpClient, McpError, McpRegistry, ToolSchema};
+        use onyx_workspace::{McpClient, McpError, McpRegistry, PermissionRules, ToolSchema};
         use std::borrow::Cow;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4622,11 +4919,20 @@ ready_log = "READY_BUS"
             client.clone(),
             schemas,
         ));
-        let policy = WorkspacePolicy::new(&dir).unwrap();
+        // `SDD-04 REQ-04.4` (4C-audit): sin auto-approve la llamada MCP pasa por
+        // `WaitingApproval`; la regla `allow mcp__*` hace que el bridge
+        // auto-apruebe y la `Reply::approve` quede **grabada** en el transcript
+        // (el replay la reproduce).
+        let policy = WorkspacePolicy::new(&dir)
+            .unwrap()
+            .with_permissions(PermissionRules {
+                allow: vec!["mcp__*".to_string()],
+                ..PermissionRules::default()
+            });
         let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
         let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
 
-        let spawner = CommandSpawnerSystem::new(true)
+        let spawner = CommandSpawnerSystem::new(false) // sin auto-approve
             .with_mode_handle(mode_handle.clone())
             .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
         let (mut live_host, live_ws_vocab) = build_host(
@@ -4672,15 +4978,28 @@ ready_log = "READY_BUS"
         assert_eq!(live_host.result(root).as_deref(), Some("mcp echo done"));
         // El despacho en vivo llamó al mock exactamente una vez (I/O real).
         assert_eq!(client.calls.load(Ordering::Acquire), 1);
-        // La observación quedó grabada en el transcript.
+        // La observación y la aprobación quedaron grabadas en el transcript.
         let tr_bytes = driver.transcript().to_bytes();
+        let tr_text = String::from_utf8_lossy(&tr_bytes);
         assert!(
-            String::from_utf8_lossy(&tr_bytes).contains("mcp-echo:echo:hola mcp"),
+            tr_text.contains("mcp-echo:echo:hola mcp"),
             "el transcript debe contener la observación MCP"
         );
+        assert!(
+            tr_text.contains("approve"),
+            "el transcript debe contener la `Reply::approve` (4C-audit: !auto_approve)"
+        );
 
-        // Replay: mismo spec (con las tools `mcp__*`) y 0 I/O.
+        // Replay: los tools `mcp__*` del spec salen del transcript (sin
+        // hardcodear ni registro vivo) y el spec replica el live (sin
+        // auto-approve) para que el replay sea idéntico, con 0 I/O.
         let decoded = Transcript::from_bytes(&tr_bytes).expect("decodificar ONYXTR2");
+        let replay_mcp_tools = extract_mcp_tools_from_transcript(&decoded);
+        assert_eq!(
+            replay_mcp_tools,
+            vec!["mcp__mock__echo".to_string()],
+            "el transcript debe extraer la tool MCP invocada"
+        );
         let (mut replay_host, _) = build_host(
             1,
             AgentConfig {
@@ -4690,8 +5009,7 @@ ready_log = "READY_BUS"
             },
             None,
             Some(Box::new(
-                CommandSpawnerSystem::new(true)
-                    .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]),
+                CommandSpawnerSystem::new(false).with_mcp_tool_names(replay_mcp_tools),
             )),
         )
         .unwrap();

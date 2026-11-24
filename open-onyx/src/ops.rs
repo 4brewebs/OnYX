@@ -1035,7 +1035,8 @@ fn audit_mcp_servers(
             (name, cfg)
         })
         .collect();
-    let registry = McpRegistry::discover_from_config(&audit_configs, max_output_bytes);
+    let registry =
+        McpRegistry::discover_from_config(&audit_configs, max_output_bytes, Some(workspace));
     for (name, status) in registry.server_statuses() {
         match status {
             McpServerStatus::Connected { tool_count } => {

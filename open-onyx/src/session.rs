@@ -838,7 +838,11 @@ pub fn make_spec(goal: &str, auto_approve: bool, mcp_tools: &[String]) -> AgentS
     tool_names.extend(mcp_tools.iter().map(|t| t.as_str()));
     let mut spec = AgentSpec::new("openonyx", goal).with_tools(tool_names);
     if !auto_approve {
-        spec = spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
+        // `SDD-04 REQ-04.4`: los tools MCP `mcp__*` requieren aprobación cuando no
+        // hay auto-approve (misma regla que los built-in mutantes).
+        let mut approval: Vec<&str> = WorkspaceTools::approval_required_names().to_vec();
+        approval.extend(mcp_tools.iter().map(|t| t.as_str()));
+        spec = spec.with_approval_tools(approval);
     }
     spec
 }
