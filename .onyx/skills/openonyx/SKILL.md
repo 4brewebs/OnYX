@@ -7,7 +7,7 @@ description: Guía operativa completa para usar, configurar, depurar y automatiz
 
 `openonyx` es el harness CLI y TUI de OnYX (`onyx-soul-agents` + `onyx-workspace`). Conecta un proveedor LLM por HTTP/SSE (`gemini` o cualquier endpoint compatible con OpenAI `/v1/chat/completions`, con tolerancia a cortes SSE y reintentos transitorios) con un runtime determinista de grafo EAV (`AgentHost`), registro de transcripciones (`ONYXTR2`), snapshots comprimidos por hitos (`snapshots.onyxpack`), checkpoints Git reversibles (`/undo`), time-travel seguro con bifurcación (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`), sandbox OS, subagentes asíncronos en worktrees Git aislados con fusión 3-way (*Scent-Heated Merge*) y harnesses CLI externos como drivers (`/spawn`, `[[external_drivers]]`), vistas TUI modulares `F1..F5` con paleta `Ctrl+K`, objetivo LLM conmutado en caliente (`[[llm_profiles]]`, `/profile`/`/provider`/`/model`/`/effort`, cabecera `provider/model` viva y selector Web sin credenciales), y orquestación local de servicios (`sprout.toml`).
 
-> **Manual de usuario completo:** consulta [`docs/manual/index.md`](../../../docs/manual/index.md) para tutoriales paso a paso, arquitectura de la TUI, configuración de permisos/sandbox, time-travel, catálogo completo de las 19 herramientas y resolución de problemas.
+> **Manual de usuario completo:** consulta [`docs/manual/index.md`](../../../docs/manual/index.md) para tutoriales paso a paso, arquitectura de la TUI, configuración de permisos/sandbox, time-travel, catálogo completo de las 23 herramientas y resolución de problemas.
 
 ---
 

@@ -2,11 +2,11 @@
 
 > 🇬🇧 **[Read this chapter in English](05-tools-scent-sprout-and-skills.md)**
 
-Este capítulo recoge el catálogo completo de las **19 herramientas** disponibles para el agente dentro de `openonyx`, cómo aprovechar la navegación AST (`onyx-scent`), cómo orquestar procesos y contenedores locales con `sprout.toml`, cómo personalizar el comportamiento mediante `ONYX.md` / skills y cómo ejecutar tareas en modo headless (`openonyx run`).
+Este capítulo recoge el catálogo completo de las **23 herramientas** disponibles para el agente dentro de `openonyx` (19 base + `spawn_agent` + 4 asíncronas de subagentes en worktrees Git aislados), cómo aprovechar la navegación AST (`onyx-scent`), cómo orquestar procesos y contenedores locales con `sprout.toml`, cómo personalizar el comportamiento mediante `ONYX.md` / skills y cómo ejecutar tareas en modo headless (`openonyx run`).
 
 ---
 
-## 1. Catálogo Completo de las 19 Herramientas
+## 1. Catálogo Completo de las 23 Herramientas
 
 ### Herramientas de solo lectura y coordinación (sin aprobación)
 
@@ -36,6 +36,21 @@ Este capítulo recoge el catálogo completo de las **19 herramientas** disponibl
 | `service_start` | Arranca un servicio (`id`) o todo el DAG (`all: true`) de `sprout.toml`. | Respeta `depends_on` en orden topológico y espera sondas reales (`ready_port`, `ready_log`, `ready_cmd`). |
 | `service_stop` | Detiene un servicio (`id`) o todos (`all: true`). | Cierre limpio con `stop_cmd` / `ProcessJob`. |
 | `service_exec` | Ejecuta un comando dentro de un contenedor activo (`docker exec` / `nerdctl exec` / `podman exec`). | Aplica `env_clear()`, timeout y `scrub_secrets`. |
+
+### Herramientas asíncronas de subagentes (worktrees Git aislados)
+
+Además de `spawn_agent` (síncrono, misma workspace), el agente puede lanzar jobs **asíncronos** que corren en worktrees Git aislados (rama `onyx/sub/<job_id>`) sin bloquear al agente raíz:
+
+| Herramienta | Propósito | Notas clave |
+| --- | --- | --- |
+| `spawn_subagent` | Lanza un job asíncrono en un worktree Git aislado. | `goal` requerido; `max_steps` default `32` (máx `128`); `driver` opcional (`native` por defecto o id de `[[external_drivers]]` — un driver externo exige aprobación o `allow spawn_subagent(<driver>)`, capítulo 03). Paralelismo limitado por `--max-subagents <n>` (default `3`, o `ONYX_MAX_SUBAGENTS`). |
+| `subagent_status` | Consulta el estado de los jobs asíncronos. | `job_id` opcional; muestra estado, rama, archivos tocados y resumen. |
+| `subagent_merge` | Fusiona el worktree del job con la workspace raíz (3-way, *Scent-Heated Merge*). | `git merge-tree` **sin mover `HEAD`** ni el índice. Es la única de las 4 con `requires_approval: true`. Gobernanza del delta: `Deny` si toca Control Plane (bloquea el merge entero) y `Ask` si toca `sprout.toml` / `.github/workflows/**` (capítulo 03); driver externo fuerza `Ask`. |
+| `subagent_discard` | Cancela el job y elimina su worktree y rama temporal. | Si el job está en marcha, cancela el árbol de procesos del `ProcessJob`. |
+
+**Equivalencias slash en la TUI:** `/spawn [--driver <id>] <objetivo>` (lanza), `/subagents` (lista), `/merge <job_id>` (fusiona) y `/discard <job_id>` (descarta). Los logs completos de cada job (stdout/stderr del trabajo, sellados con `scrub_secrets`) se guardan en `.onyx/vault/subagent-logs/<job_id>.log`, y la vista `F2 Agents` (capítulo 02) muestra los jobs `[bg]` con su estado y badge `→ <driver>`.
+
+> **Drivers externos:** con `driver = "opencode"` (o cualquier `[[external_drivers]]` declarado), el job se delega a un harness CLI externo que trabaja en el mismo worktree aislado; el aislamiento de proceso, el gate de Trust y la política de red se documentan en el capítulo 03 (sección 2.7).
 
 ---
 

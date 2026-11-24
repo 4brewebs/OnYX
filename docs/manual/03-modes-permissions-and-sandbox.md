@@ -102,6 +102,54 @@ To defend against malicious cloned repositories or untrusted PRs (*Indirect Prom
 
 ---
 
+## 2.6. LLM Profiles (`[[llm_profiles]]`)
+
+The LLM target (provider, model, `api_base`, effort) can be declared in `.onyx/config.toml` as `[[llm_profiles]]` blocks and hot-swapped with `/profile` / `/provider` / `/model` / `/effort` (chapter 02, section 2.1):
+
+```toml
+[[llm_profiles]]
+id = "local-ollama"
+provider = "openai"
+model = "llama3.1:70b"
+effort = "medium"
+api_base = "http://localhost:11434/v1"
+# api_key_env = "OLLAMA_API_KEY"
+```
+
+- **Fields:** `id` (unique), `provider` (`gemini` | `openai`), `model`, `effort` (`auto` | `low` | `medium` | `high`), optional `api_base`, and optional `api_key_env`. Unknown or duplicate keys are an actionable parse error.
+- **Never literal keys:** a literal `api_key` in the block is **rejected** by the parser with an error pointing to `api_key_env` (and the message never echoes the key value). Credentials are always resolved from environment variables (`api_key_env` → the provider's standard variable → `ONYX_API_KEY`).
+- **`api_base` validated at registration:** same policy as `--api-base` (`http://` only on loopback; remote hosts require `https://`; non-official hosts require `--allow-custom-auth-host`).
+- **Trust gate:** an **untrusted** workspace ignores its `[[llm_profiles]]` blocks and shows the warning `ignored N [[llm_profiles]] block(s); run openonyx trust or /trust to approve`. With a trusted workspace, precedence is global (`~/.onyx/config.toml`) < project (merge *replace-by-id*).
+- **Availability:** a profile with no resolved key or a rejected `api_base` is listed as `unavailable` with the actionable reason (`/profile`, `Ctrl+K` palette, and the Web selector). The TUI and Web only expose metadata (`public_snapshot`): provider, model, effort, reason — **never** keys.
+
+---
+
+## 2.7. External CLI Harnesses (`[[external_drivers]]`)
+
+Async `spawn_subagent` / `/spawn` jobs (chapter 05) can run outside the OnYX engine by delegating the work to an external CLI harness declared in `.onyx/config.toml`:
+
+```toml
+[[external_drivers]]
+id = "opencode"
+bin = "opencode"
+args = ["run", "--model", "qwen38-27b"]
+# prompt_transport = "stdin"        # "stdin" (default) | "arg" | "temp_file"
+# prompt_flag = "--prompt-file"     # for "temp_file" (or {prompt_file} placeholder in args)
+timeout_secs = 600
+allowed_env = []
+# inherit_home = true               # if the CLI needs config/OAuth from the real HOME
+# network_allowlist = ["api.example.com"]
+```
+
+- **Fields:** `id` (charset `[a-z0-9_-]`), `bin` (resolved on `PATH`/`PATHEXT`), `args` (fixed arguments), `prompt_transport` (`stdin` recommended and default; `arg` is rejected on Windows when the binary resolves to a `.cmd`/`.bat` wrapper; `temp_file` for large prompts, kept out of the Git index), `prompt_flag`, `timeout_secs`, `allowed_env` (env whitelist for the child), and `inherit_home` (default `false`).
+- **Trust gate:** an **untrusted** workspace cannot launch external drivers (absolute `Deny`: `requires a trusted workspace`).
+- **Default `Ask` approval:** `spawn_subagent` with an external driver **never** auto-approves: without explicit `ask`/`allow` rules the decision is `Ask`; you can pin it with `allow = ["spawn_subagent(opencode)"]` or `ask`/`deny` with the same pattern (a `deny spawn_subagent(opencode)` blocks that driver even with an `allow`).
+- **Process isolation:** the prompt is delivered without shell injection (stdin / single argv / temp file); the child environment goes through `env_clear()` + `allowed_env`; the process is bound to a `ProcessJob` at `spawn` (if `timeout_secs` elapses or the job is cancelled, the whole tree dies; on Windows there is a `taskkill /F /T /PID` fallback); and the full log is sealed in `.onyx/vault/subagent-logs/<job_id>.log` after passing through `scrub_secrets`.
+- **Declarative network (`network_allowlist`):** this is **declarative** governance: it is enforced in-container only under `--sandbox strict-container`; under the other profiles it is advisory (`doctor` tells you so). An empty allowlist means `LocalhostOnly`; with an allowlist, the sandbox does **not** inject `*_OFFLINE` variables (the harness must reach its API).
+- **Merge forced to `Ask`:** even if your permissions would auto-approve, `subagent_merge` for a job with an external driver requires explicit approval (`ExternalDriverApprovalPolicy`).
+
+---
+
 ## 3. Read-Only Control Plane Protection
 
 Even in `BUILD` mode with `--auto-approve`, `onyx-workspace` protects sensitive control-plane paths as **read-only**:
@@ -112,6 +160,16 @@ Even in `BUILD` mode with `--auto-approve`, `onyx-workspace` protects sensitive 
 - `.env` and `.env.*` (prevents secret exfiltration or corruption).
 
 This check applies across `fs_write`, `fs_edit`, and write inspection on `shell_exec`.
+
+### Governance of the `subagent_merge` Delta (3-way merge)
+
+When an async job (`spawn_subagent` / `/spawn`) is merged with `subagent_merge` / `/merge`, the `<root>..<merged_tree>` delta is classified **before anything touches disk**:
+
+- **`Deny` — Control Plane**: if the delta touches `.onyx/config.toml`, `.onyx/vault/**`, `.git/hooks/**`, `.git/config`, or `.env*`, the **entire** merge is **blocked** (a single file blocks the whole delta; it is never applied partially).
+- **`Ask` — governance surfaces**: if the delta touches `sprout.toml` or `.github/workflows/**`, the merge approval must be **explicit** (never auto-approved), even if your `allow` rules cover other tools.
+- **`Safe`**: the rest of the delta follows the standard impact-based approval (*Scent-Heated Approval*).
+
+The merge is 3-way via `git merge-tree` **without moving the workspace's `HEAD` or index**; the verdict is applied to the whole delta.
 
 ---
 

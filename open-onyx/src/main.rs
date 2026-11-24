@@ -521,7 +521,7 @@ fn help_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let usage_str = usage();
     let body = r#"SUBCOMMANDS:
-  chat                     Launch interactive TUI with SSE streaming, diff approvals, Plan/Build toggle, and Live Plan
+  chat                     Launch interactive TUI with SSE streaming, diff approvals, F1..F5 views + Ctrl+K palette, Plan/Build toggle, and Live Plan
   run <goal>               Run a single headless turn toward <goal> and print the final result
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
@@ -578,9 +578,12 @@ TUI CONTROLS & SLASH COMMANDS (chat):
                            Browse prompt input history (preserving unsent draft)
   Ctrl+X                   Clear queued follow-up prompts
   Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
-  F2                       Open/close interactive Agent Selector popup (focus root or subagents)
-  Ctrl+Tab                 Quick-cycle focused agent (optional terminal-dependent alias for F2 / /agent)
-  y / n                    Approve or deny a pending mutating tool diff
+  F1..F5                   Switch ephemeral views: F1 Chat · F2 Agents · F3 Sprout · F4 Plan & Diff · F5 Timeline
+  Ctrl+K                   Command palette: filter views, LLM slash commands, and agents (Up/Down + Enter)
+  /view <chat|agents|sprout|plan|timeline>
+                           Switch views from the prompt (ephemeral: no bus event, no tick, no graph write)
+  Ctrl+Tab                 Quick-cycle focused agent (terminal-dependent alias; `F2`/`/agent` work everywhere)
+  y / n                    Approve or deny a pending mutating tool diff (only in `F1 Chat`; other views hint to press `F1`)
   Up / Down / PgUp / PgDn / Home / End / Ctrl+U / Ctrl+D
                            Scroll the `Memory & Trace` history panel
   /agent [id|name]         Open agent selector or focus a specific agent by ID or name
@@ -606,7 +609,8 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /effort [auto|low|medium|high]
                           Change the reasoning/thinking effort of the active target
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
-  Esc / Ctrl+C             Close popup or quit cleanly (flushing exit snapshot & transcript if configured)
+  Esc                      Close popup/palette; from F2..F5 back to F1 Chat; in F1 Chat quit cleanly
+  Ctrl+C                   Quit cleanly (flushing exit snapshot & transcript if configured)
 
 PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
   ONYX.md / AGENTS.md      Loaded from ~/.onyx/ and the workspace root into system instructions

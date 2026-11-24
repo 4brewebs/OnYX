@@ -41,6 +41,7 @@ openonyx [--help | -h | --version | -V]
 | `--auto-approve` | `chat`, `run`, `rewind` | Omite confirmaciones interactivas para herramientas mutantes (`deny` sigue aplicando y eleva sandbox `off` → `workspace-write` + `offline` salvo `--sandbox off`). |
 | `--ignore-deny` | `chat`, `run`, `rewind` | Desactiva explícitamente las reglas `[permissions].deny` de `.onyx/config.toml`. |
 | `--max-steps <n>` | `chat`, `run` | Límite de pasos por turno del agente raíz (default: `128` en `chat`, `64` en `run`; subagentes `32` por defecto). |
+| `--max-subagents <n>` | `chat`, `run`, `serve`, `rewind --interactive` | Máximo de worktrees Git en paralelo para subagentes asíncronos (default: `3`, o `ONYX_MAX_SUBAGENTS`). |
 | `--shell-timeout <secs>` | `chat`, `run` | Timeout en segundos por comando `shell_exec` (default: `30s`). |
 | `--auto-save` | `chat`, `run` | Crea automáticamente `.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama\|goal>]/` con `snapshots.onyxpack` + `.tr` juntos (o `ONYX_AUTO_SAVE=1`). |
 | `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Guarda transcripción determinista `ONYXTR2` (nombres cortos van dentro de `--snapshot-dir`, o en `.onyx/vault/unassigned/` si no hay snapshot dir). |
@@ -71,8 +72,11 @@ openonyx [--help | -h | --version | -V]
 | `ONYX_MODEL` | Ambos | Modelo por defecto (fallbacks: `ONYX_GEMINI_MODEL` para Gemini, `OPENAI_MODEL` para OpenAI). |
 | `ONYX_EFFORT` | Ambos | Esfuerzo por defecto (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`). |
 | `ONYX_AUTO_SAVE` | Ambos | Activa `--auto-save` por defecto (`1` \| `true` \| `yes` \| `on`) guardando en `.onyx/vault/`. |
+| `ONYX_MAX_SUBAGENTS` | Ambos | Máximo de worktrees en paralelo para subagentes asíncronos (usado cuando no se pasa `--max-subagents <n>`; default: `3`). |
 | `GEMINI_API_BASE` | Gemini | Endpoint personalizado para Gemini. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Endpoint compatible con OpenAI (default: `https://api.openai.com/v1`). |
+
+> **Configuración LLM y drivers en `config.toml`:** además de flags y variables, `.onyx/config.toml` acepta bloques `[[llm_profiles]]` (capítulo 03, sección 2.6) y `[[external_drivers]]` (capítulo 03, sección 2.7). Las credenciales de un perfil se resuelven en el orden `api_key_env` → variable estándar del proveedor → `ONYX_API_KEY`.
 
 ---
 
@@ -105,7 +109,7 @@ Por defecto el sandbox usa `--sandbox-net offline` (inyectando además `CARGO_NE
 Ubuntu 24.04 restringe *unprivileged user namespaces* vía AppArmor. `openonyx` ejecuta una sonda real (`bwrap_is_usable()`) y aplica automáticamente un *fallback* seguro para que `shell_exec` no falle. Comprueba el estado exacto en `openonyx doctor`.
 
 ### 5. `Ctrl+Tab` no cambia de agente en mi terminal
-Algunos emuladores de terminal (especialmente en Windows o a través de tmux/SSH) interceptan o no envían `Ctrl+Tab`. Usa siempre **`F2`** (popup interactivo **Agent Selector**) o el comando **`/agent [id|name]`**, que funcionan en el 100% de terminales.
+Algunos emuladores de terminal (especialmente en Windows o a través de tmux/SSH) interceptan o no envían `Ctrl+Tab`. Usa siempre la tecla **`F2`** (ahora abre la vista **Agents**, capítulo 02) o el comando **`/agent [id|name]`**, que funcionan en el 100% de terminales.
 
 ### 6. `/rewind` dice que no puede ejecutarse mientras hay actividad
 Por seguridad, `/rewind <tick>` en vivo requiere que ningún agente esté `thinking`, `acting`, `waiting_children` ni con una llamada LLM en vuelo. Espera a que el turno termine (emblema detenido / `Settled`), o sal con `Esc` y ejecuta `openonyx chat --resume <dir> --tick <n>`.
@@ -117,6 +121,14 @@ Por seguridad, `/rewind <tick>` en vivo requiere que ningún agente esté `think
 1. Ejecuta `openonyx doctor --snapshot-dir <dir>` para comprobar si quedó una cola truncada en `snapshots.onyxpack`.
 2. Revisa los hitos intactos con `openonyx inspect <dir> --list`.
 3. Reanuda con `openonyx chat --resume <dir>` (la cola truncada se ignora de forma segura al leer y se repara automáticamente al guardar el próximo hito).
+
+### 9. `openonyx doctor` avisa o falla en un driver externo (`[[external_drivers]]`)
+`doctor` audita las declaraciones de `[[external_drivers]]` (capítulo 03, sección 2.7):
+- Preset integrado `opencode`: `[WARN]` si el binario `opencode` no está en `PATH` (el preset se omite).
+- Driver declarado cuyo `bin` no existe: `[ERR]` — `/spawn --driver <id> will fail at runtime`.
+- `bin` encontrado pero la sonda `--version` (deadline 3 s, entorno saneado) se queda a tiempo: `[ERR]`; si responde con error (p. ej., flags mal puestas): `[WARN]`.
+- `prompt_transport = "arg"` en Windows: `[WARN]` si el binario resuelve a un wrapper `.cmd`/`.bat` (rechazado en el spawn).
+- `network_allowlist` sin `--sandbox strict-container`: `[WARN]` — la allowlist es *advisory* fuera de `strict-container`; un driver declarado sin `network_allowlist` queda `LocalhostOnly` salvo que el sandbox lo relaje.
 
 ---
 

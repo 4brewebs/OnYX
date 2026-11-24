@@ -8,6 +8,9 @@ A diferencia de otros asistentes de terminal que mezclan estado en memoria volá
 
 - **Snapshots comprimidos por hitos** (`snapshots.onyxpack`) con verificación FNV-1a y tolerancia a cortes.
 - **Time-travel y bifurcación segura** (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`).
+- **Subagentes asíncronos en worktrees Git aislados** (`spawn_subagent` / `/spawn`, fusión 3-way con *Scent-Heated Merge*, `--max-subagents`, y harnesses CLI externos como drivers opcionales `[[external_drivers]]`).
+- **Objetivo LLM conmutable en caliente** (`[[llm_profiles]]`, `/profile` / `/provider` / `/model` / `/effort`, cabecera `provider/model` viva y selector Web sin credenciales).
+- **TUI modular `F1..F5`** (Chat, Agents, Sprout, Plan & Diff, Timeline) con paleta de comandos `Ctrl+K` y `/view`.
 - **Checkpoints Git reversibles (`/undo`)** sin tocar `HEAD` ni tu área de *staging*.
 - **Grabación y reproducción 100% offline** (`ONYXTR2`, 0 llamadas de red, 0 escrituras en disco).
 - **Seguridad por capas**: **Workspace Trust con `blake3`** (`openonyx trust` / `/trust`), modos `PLAN` / `BUILD` / `EXPLORE`, reglas `.onyx/config.toml` (`deny > ask > allow`), *Scent-Heated Approvals*, sandbox OS con `env_clear()`, protección RO del Control Plane y `ProcessJob` RAII.
