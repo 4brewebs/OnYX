@@ -4,17 +4,13 @@
 //! reutilizando `ContextBudget`, invalidación `superseded`, cola secuencial de tool calls y
 //! `StreamPreviewHandle` para proyección en vivo sin mutar el determinismo del grafo.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::BufReader;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use onyx_soul_agents::{
-    AgentView, ConceptId, EventBus, GraphView, PlatformDriver, Reply, Responder, SurfaceBinding,
-    Vocab, pending_requests,
-};
+use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
 use onyx_workspace::WorkspaceTools;
 use serde_json::{Value as JsonValue, json};
 
@@ -23,23 +19,28 @@ use crate::context::{
     extract_openai_usage, project_memory,
 };
 use crate::gemini::{
-    InFlightGuard, PendingCallQueue, QueuedToolCall, StreamPreviewHandle, next_queued_call,
-    push_queued_calls, system_instruction_text,
+    PendingCallQueue, QueuedToolCall, StreamPreviewHandle, next_queued_call, push_queued_calls,
+    system_instruction_text,
 };
+
+use crate::llm_profile::{api_base_host, is_loopback_host};
 
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
 pub const DEFAULT_OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 
+/// Estado compartido por los hilos de despacho OpenAI (cola secuencial de tool
+/// calls, telemetría). `pub(crate)` para que `DynamicLlmDriver` (`SDD-03` Fase 2)
+/// lo construya con la cola de tool calls compartida con Gemini.
 #[derive(Clone, Default)]
-struct OpenAiSharedState {
-    pending_calls: PendingCallQueue,
-    project_instructions: Arc<String>,
-    telemetry: Option<SessionTelemetryHandle>,
-    context_config: TieredContextConfig,
-    effort: Option<ReasoningEffort>,
+pub(crate) struct OpenAiSharedState {
+    pub(crate) pending_calls: PendingCallQueue,
+    pub(crate) project_instructions: Arc<String>,
+    pub(crate) telemetry: Option<SessionTelemetryHandle>,
+    pub(crate) context_config: TieredContextConfig,
+    pub(crate) effort: Option<ReasoningEffort>,
     /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
     /// esquema dinámico de `spawn_subagent` (`driver` opcional).
-    driver_ids: Vec<String>,
+    pub(crate) driver_ids: Vec<String>,
 }
 
 fn tool_call_args_as_string(raw: &JsonValue) -> String {
@@ -216,16 +217,22 @@ fn lowercase_json_schema_types(val: &mut JsonValue) {
     }
 }
 
+/// Parsea una respuesta `chat/completions` (REST o SSE acumulada) y registra
+/// telemetría por la **llamada real** (`SDD-03` Fase 2: `record_turn_for` con el
+/// modelo/endpoint despachados, no los del handle, que pueden haber cambiado
+/// en caliente entre el despacho y la respuesta).
 pub(crate) fn parse_openai_response(
     json: &JsonValue,
     agent: ConceptId,
     request: u64,
     pending_calls: &PendingCallQueue,
     telemetry: Option<&SessionTelemetryHandle>,
+    model: &str,
+    is_local_endpoint: bool,
 ) -> Reply {
     if let Some(usage) = extract_openai_usage(json) {
         if let Some(tel) = telemetry {
-            tel.record_turn(usage);
+            tel.record_turn_for(model, is_local_endpoint, usage);
         }
     }
     let message = &json["choices"][0]["message"];
@@ -485,13 +492,16 @@ fn post_openai_json(
     }
 }
 
-fn execute_openai_http(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_openai_http(
     url: &str,
     api_key: &str,
     body: JsonValue,
     agent: ConceptId,
     request: u64,
     shared: &OpenAiSharedState,
+    model: &str,
+    is_local_endpoint: bool,
 ) -> Reply {
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         let resp = match post_openai_json(url, api_key, &body, agent, request) {
@@ -525,21 +535,28 @@ fn execute_openai_http(
             request,
             &shared.pending_calls,
             shared.telemetry.as_ref(),
+            model,
+            is_local_endpoint,
         );
     }
     Reply::fail(agent, request, "openai request exhausted retries")
 }
 
-struct OpenAiStreamTarget<'a> {
-    url: &'a str,
-    api_key: &'a str,
-    agent: ConceptId,
-    request: u64,
-    shared: &'a OpenAiSharedState,
-    preview: Option<&'a StreamPreviewHandle>,
+/// Parámetros inmutables de una llamada SSE `chat/completions`
+/// (`SDD-03` Fase 2: incluye el modelo/endpoint reales de la llamada para
+/// telemetría por llamada). `pub(crate)` para `DynamicLlmDriver`.
+pub(crate) struct OpenAiStreamTarget<'a> {
+    pub(crate) url: &'a str,
+    pub(crate) api_key: &'a str,
+    pub(crate) agent: ConceptId,
+    pub(crate) request: u64,
+    pub(crate) shared: &'a OpenAiSharedState,
+    pub(crate) preview: Option<&'a StreamPreviewHandle>,
+    pub(crate) model: &'a str,
+    pub(crate) is_local_endpoint: bool,
 }
 
-fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -> Reply {
+pub(crate) fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -> Reply {
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         let resp = match post_openai_json(
             target.url,
@@ -596,6 +613,8 @@ fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -
             target.request,
             &target.shared.pending_calls,
             target.shared.telemetry.as_ref(),
+            target.model,
+            target.is_local_endpoint,
         );
     }
     Reply::fail(
@@ -664,6 +683,7 @@ impl Responder for OpenAiResponder {
         if let Some(queued_reply) = next_queued_call(&self.shared.pending_calls, req) {
             return Some(queued_reply);
         }
+        let is_local = is_loopback_host(api_base_host(&self.api_base));
         let url = format!("{}/chat/completions", self.api_base);
         let body = build_openai_request_body(
             req,
@@ -681,165 +701,9 @@ impl Responder for OpenAiResponder {
             req.agent,
             req.request,
             &self.shared,
+            &self.model,
+            is_local,
         ))
-    }
-}
-
-/// Driver asíncrono con streaming SSE para endpoints compatibles con OpenAI en `Mode::Chat`.
-pub struct AsyncOpenAiDriver {
-    vocab: Vocab,
-    api_key: String,
-    model: String,
-    api_base: String,
-    shared: OpenAiSharedState,
-    dispatched: HashSet<(u64, u64)>,
-    in_flight_count: Arc<AtomicUsize>,
-    has_ready: Arc<AtomicBool>,
-    stream_preview: Option<StreamPreviewHandle>,
-    rx: mpsc::Receiver<Reply>,
-    tx: mpsc::Sender<Reply>,
-    inner: Option<Box<dyn PlatformDriver>>,
-}
-
-impl AsyncOpenAiDriver {
-    pub fn new(
-        vocab: Vocab,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-        in_flight_count: Arc<AtomicUsize>,
-        has_ready: Arc<AtomicBool>,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self {
-            vocab,
-            api_key: api_key.into(),
-            model: model.into(),
-            api_base: DEFAULT_OPENAI_API_BASE.to_string(),
-            shared: OpenAiSharedState::default(),
-            dispatched: HashSet::new(),
-            in_flight_count,
-            has_ready,
-            stream_preview: None,
-            rx,
-            tx,
-            inner: None,
-        }
-    }
-
-    pub fn wrapping(mut self, inner: impl PlatformDriver + 'static) -> Self {
-        self.inner = Some(Box::new(inner));
-        self
-    }
-
-    pub fn with_api_base(mut self, api_base: Option<String>) -> Self {
-        if let Some(base) = api_base {
-            let trimmed = base.trim().trim_end_matches('/');
-            if !trimmed.is_empty() {
-                self.api_base = trimmed.to_string();
-            }
-        }
-        self
-    }
-
-    pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.shared.project_instructions = Arc::new(instructions.into());
-        self
-    }
-
-    pub fn with_stream_preview(mut self, preview: StreamPreviewHandle) -> Self {
-        self.stream_preview = Some(preview);
-        self
-    }
-
-    pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
-        self.shared.telemetry = Some(telemetry);
-        self
-    }
-
-    pub fn with_context_config(mut self, cfg: TieredContextConfig) -> Self {
-        self.shared.context_config = cfg;
-        self
-    }
-
-    pub fn with_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
-        self.shared.effort = effort;
-        self
-    }
-
-    pub fn with_external_driver_ids(mut self, driver_ids: Vec<String>) -> Self {
-        self.shared.driver_ids = driver_ids;
-        self
-    }
-}
-
-impl PlatformDriver for AsyncOpenAiDriver {
-    fn poll(&mut self, bus: &mut dyn EventBus) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.poll(bus);
-        }
-        self.has_ready.store(false, Ordering::Release);
-        while let Ok(reply) = self.rx.try_recv() {
-            if let Some(prev) = &self.stream_preview {
-                prev.clear();
-            }
-            bus.push(reply.to_event());
-        }
-    }
-
-    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.present(graph, surfaces);
-        }
-        for req in pending_requests(graph, &self.vocab) {
-            let key = (req.agent.0, req.request);
-            if !self.dispatched.insert(key) {
-                continue;
-            }
-            if let Some(queued_reply) = next_queued_call(&self.shared.pending_calls, &req) {
-                if self.tx.send(queued_reply).is_ok() {
-                    self.has_ready.store(true, Ordering::Release);
-                }
-                continue;
-            }
-
-            self.in_flight_count.fetch_add(1, Ordering::Release);
-            let guard = InFlightGuard(Arc::clone(&self.in_flight_count));
-            let url = format!("{}/chat/completions", self.api_base);
-            let body = build_openai_request_body(
-                &req,
-                &self.model,
-                self.shared.context_config,
-                &self.shared.project_instructions,
-                self.shared.effort,
-                true,
-                &self.shared.driver_ids,
-            );
-            let api_key = self.api_key.clone();
-            let shared = self.shared.clone();
-            let ready_flag = Arc::clone(&self.has_ready);
-            let tx = self.tx.clone();
-            let preview = self.stream_preview.clone();
-            let agent = req.agent;
-            let request = req.request;
-
-            thread::spawn(move || {
-                let _guard = guard;
-                let reply = execute_openai_stream_http(
-                    OpenAiStreamTarget {
-                        url: &url,
-                        api_key: &api_key,
-                        agent,
-                        request,
-                        shared: &shared,
-                        preview: preview.as_ref(),
-                    },
-                    body,
-                );
-                if tx.send(reply).is_ok() {
-                    ready_flag.store(true, Ordering::Release);
-                }
-            });
-        }
     }
 }
 
@@ -928,7 +792,15 @@ mod tests {
         let prev_snap = preview.get().unwrap();
         assert_eq!(prev_snap.text, "Hola OpenAI!");
         assert_eq!(prev_snap.thought, "plan first ");
-        let reply = parse_openai_response(&json, ConceptId(2), 5, &pending, Some(&telemetry));
+        let reply = parse_openai_response(
+            &json,
+            ConceptId(2),
+            5,
+            &pending,
+            Some(&telemetry),
+            "gpt-4o",
+            false,
+        );
         assert_eq!(reply, Reply::done(ConceptId(2), 5, "Hola OpenAI!"));
         let snap = telemetry.snapshot();
         assert_eq!(snap.last_turn.input_tokens, 6_400);
@@ -950,7 +822,8 @@ mod tests {
             Some(&preview),
         )
         .unwrap();
-        let r1 = parse_openai_response(&tool_json, ConceptId(2), 6, &pending, None);
+        let r1 =
+            parse_openai_response(&tool_json, ConceptId(2), 6, &pending, None, "gpt-4o", false);
         assert!(format!("{r1:?}").contains("fs_read"), "{r1:?}");
         assert!(format!("{r1:?}").contains("lib.rs"), "{r1:?}");
 
@@ -987,8 +860,15 @@ mod tests {
             pos: 0,
         });
         let json = accumulate_openai_sse_reader(reader_ok, ConceptId(2), 1, None).unwrap();
-        let reply =
-            parse_openai_response(&json, ConceptId(2), 1, &PendingCallQueue::default(), None);
+        let reply = parse_openai_response(
+            &json,
+            ConceptId(2),
+            1,
+            &PendingCallQueue::default(),
+            None,
+            "gpt-4o",
+            false,
+        );
         assert_eq!(reply, Reply::done(ConceptId(2), 1, "42 tildes"));
 
         // Mid-stream truncation before `finish_reason` must return a retryable error.

@@ -488,6 +488,14 @@ fn is_immediate_web_slash(cmd: &str) -> bool {
     let lower = cmd.trim().to_ascii_lowercase();
     lower == "/mode"
         || lower.starts_with("/mode ")
+        || lower == "/profile"
+        || lower.starts_with("/profile ")
+        || lower == "/provider"
+        || lower.starts_with("/provider ")
+        || lower == "/model"
+        || lower.starts_with("/model ")
+        || lower == "/effort"
+        || lower.starts_with("/effort ")
         || lower == "/services"
         || lower.starts_with("/services ")
         || lower == "/service"

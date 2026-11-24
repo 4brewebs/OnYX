@@ -37,6 +37,12 @@ use crate::external_driver::{ExternalDriverRunner, ExternalHarnessDriver};
 /// Fábrica thread-safe para construir un `Responder` independiente por cada hilo de subagente.
 pub type ResponderFactory = Arc<dyn Fn() -> Box<dyn Responder> + Send + Sync>;
 
+/// Fábrica pinneada del objetivo LLM por job lanzado (`SDD-03` Fase 2): la `Fn`
+/// externa congela el objetivo activo de forma síncrona (en el hilo que llama a
+/// [`SubagentManager::spawn_job`]) y la interna construye el [`Responder`] del job.
+pub type PinnedResponderFactory =
+    Arc<dyn Fn() -> Box<dyn Fn() -> Box<dyn Responder> + Send + Sync> + Send + Sync>;
+
 /// Decisión efectiva para la aprobación de `subagent_merge` con un ticket sellado
 /// (`SDD-10` Fase 4): única fuente de verdad compartida por [`SubagentManagerDriver`]
 /// (auto-aprobación) y por las superficies TUI/Web/CLI (¿mostrar el prompt `y/n`?).
@@ -377,6 +383,10 @@ pub struct SubagentManager {
     root_seed: u64,
     network_policy: SubagentNetworkPolicy,
     responder_factory: ResponderFactory,
+    /// Fábrica pinneada (`SDD-03` Fase 2): si está set, [`Self::spawn_job`] congela
+    /// el objetivo LLM activo en el hilo que lo llama (thread principal) y el job
+    /// usa ese objetivo durante toda su vida, ignorando la fábrica base de arranque.
+    pinned_responder_factory: Option<PinnedResponderFactory>,
     /// Drivers de harness CLI externos registrados (`SDD-10`): construidos desde
     /// `root_policy.external_drivers()` en [`Self::with_worktree_base_dir`].
     external_drivers: Vec<Arc<dyn ExternalHarnessDriver>>,
@@ -428,6 +438,7 @@ impl SubagentManager {
             root_seed,
             network_policy: SubagentNetworkPolicy::NativeOffline,
             responder_factory,
+            pinned_responder_factory: None,
             external_drivers,
             jobs: BTreeMap::new(),
             pending_merge_tickets: BTreeMap::new(),
@@ -457,6 +468,15 @@ impl SubagentManager {
 
     pub fn with_root_tools(mut self, tools: WorkspaceTools) -> Self {
         self.root_tools = Some(tools);
+        self
+    }
+
+    /// Pinnea el objetivo LLM por job lanzado (`SDD-03` Fase 2): la fábrica se
+    /// invoca **síncrono en [`Self::spawn_job`]** (congela el objetivo activo en el
+    /// hilo principal) y devuelve la fábrica interna que el worker thread usa para
+    /// construir su `Responder`. Sin pin, se usa `responder_factory` (arranque).
+    pub fn with_pinned_responder_factory(mut self, factory: PinnedResponderFactory) -> Self {
+        self.pinned_responder_factory = Some(factory);
         self
     }
 
@@ -612,7 +632,15 @@ impl SubagentManager {
         let worker_cancel = Arc::clone(&cancel_flag);
         let worker_ready = self.ready_flag.clone();
         let worker_tx = self.tx.clone();
-        let worker_factory = Arc::clone(&self.responder_factory);
+        // `SDD-03` Fase 2: con fábrica pinneada, congelamos el objetivo LLM activo
+        // **antes** de lanzar el worker (hilo principal); sin pin, fábrica base.
+        let worker_factory: ResponderFactory =
+            if let Some(pinned) = self.pinned_responder_factory.as_ref() {
+                let inner = (pinned)();
+                Arc::new(move || (inner)())
+            } else {
+                Arc::clone(&self.responder_factory)
+            };
         let worker_handle = handle.clone();
         let worker_goal = goal_trimmed.to_string();
         let worker_name = display_name.clone();
@@ -2346,6 +2374,102 @@ mod tests {
         let _ = mgr.discard_job(&j1.job_id);
         let _ = mgr.discard_job(&j2.job_id);
         drop(mgr);
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// `SDD-03` Fase 2: `spawn_job` con fábrica pinneada congela el objetivo LLM
+    /// activo en el hilo que llama (principal) **antes** de lanzar el worker. Si el
+    /// objetivo activo cambia en caliente (`set_model`) mientras el job vuela, el
+    /// subagente sigue usando el perfil congelado, no el modelo activo.
+    #[test]
+    fn spawn_job_pins_active_llm_target_across_hot_swap() {
+        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider};
+
+        let repo = init_temp_git_repo("llm_pin");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("openonyx_wt_base_llmpin_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        // Registro LLM: el objetivo activo al lanzar es Gemini/hidrógeno.
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let handle = LlmProfileHandle::new(&startup, &[], false);
+
+        // La fábrica pinneada replica el wiring real (`main.rs`): la fábrica externa
+        // se invoca dentro de `spawn_job` (congela `active_target()` en el hilo
+        // principal) y la interna, que usa el worker para construir su `Responder`,
+        // reporta el modelo congelado. El responder bloquea hasta `release` para que
+        // el hot-swap ocurra **mientras** el job está en vuelo.
+        let release = Arc::new(AtomicBool::new(false));
+        let seen_models = Arc::new(Mutex::new(Vec::<String>::new()));
+        let release_f = Arc::clone(&release);
+        let seen_f = Arc::clone(&seen_models);
+        let handle_f = handle.clone();
+        let pinned: PinnedResponderFactory = Arc::new(move || {
+            let frozen_model = handle_f.active_target().model;
+            let seen_f = Arc::clone(&seen_f);
+            let release_f = Arc::clone(&release_f);
+            Box::new(move || {
+                let model = frozen_model.clone();
+                let seen_f = Arc::clone(&seen_f);
+                let release_f = Arc::clone(&release_f);
+                Box::new(move |req: &AgentView| {
+                    for _ in 0..300 {
+                        if release_f.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    seen_f.lock().unwrap().push(model.clone());
+                    Some(Reply::done(
+                        req.agent,
+                        req.request,
+                        "done with frozen profile",
+                    ))
+                })
+            })
+        });
+
+        let policy = WorkspacePolicy::new(&repo).unwrap();
+        let mut mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        )
+        .with_pinned_responder_factory(pinned);
+
+        let job = mgr
+            .spawn_job("pinned job", Some("pin"), Some(8), 1, Vec::new(), None)
+            .unwrap();
+
+        // Hot-swap en caliente mientras el worker vuela: el objetivo activo cambia…
+        assert_eq!(handle.active_target().model, "gemini-4-hydrogen");
+        handle.set_model("gemini-4-deuterium").unwrap();
+        assert_eq!(handle.active_target().model, "gemini-4-deuterium");
+
+        // …y al soltarse, el subagente registra el modelo CONGELADO (no el activo).
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while mgr.active_count() > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = mgr.discard_job(&job.job_id);
+        drop(mgr);
+
+        assert_eq!(
+            *seen_models.lock().unwrap(),
+            vec!["gemini-4-hydrogen".to_string()]
+        );
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&repo);
     }

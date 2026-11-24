@@ -52,6 +52,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Cancel and drop an async subagent worktree (`<job_id>`)",
     },
     SlashCommandHint {
+        command: "/effort",
+        insert: "/effort ",
+        description: "Set LLM reasoning effort (`auto|low|medium|high`)",
+    },
+    SlashCommandHint {
         command: "/fork",
         insert: "/fork ",
         description: "Branch snapshots into sibling folder (`[name]`)",
@@ -67,9 +72,24 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Switch or toggle mode (`plan|build|explore`)",
     },
     SlashCommandHint {
+        command: "/model",
+        insert: "/model ",
+        description: "Change the LLM model of the active target (`<name>`)",
+    },
+    SlashCommandHint {
         command: "/new",
         insert: "/new ",
         description: "Start a fresh root agent (`[goal]`)",
+    },
+    SlashCommandHint {
+        command: "/profile",
+        insert: "/profile ",
+        description: "List LLM profiles or switch to one (`<id>`)",
+    },
+    SlashCommandHint {
+        command: "/provider",
+        insert: "/provider ",
+        description: "Hot-swap LLM provider (`gemini|openai`)",
     },
     SlashCommandHint {
         command: "/rewind",

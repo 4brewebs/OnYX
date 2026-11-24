@@ -89,7 +89,9 @@ pub(crate) struct LlmConfig {
     pub(crate) project_instructions: String,
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// `true` si un host de base URL es loopback (`localhost`, `127.0.0.1`, `::1`, `*.localhost`):
+/// los endpoints locales (Ollama/vLLM/LM Studio) no acumulan coste estimado.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower.ends_with(".localhost")
 }
@@ -190,19 +192,13 @@ pub(crate) fn validate_api_base(
 /// HTTP en vuelo.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedLlmTarget {
-    #[allow(dead_code)] // Fase 2: notas de sistema + `ws.llm.profile` en el grafo.
     pub(crate) profile_id: String,
-    #[allow(dead_code)] // Fase 2: selección del responder (Gemini/OpenAI) y `ws.llm.provider`.
     pub(crate) provider: LlmProvider,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
-    #[allow(dead_code)] // Fase 2: construcción del responder (`.with_api_key`/auth).
     pub(crate) api_key: String,
-    #[allow(dead_code)] // Fase 2: construcción del responder (`.with_api_base`).
     pub(crate) api_base: Option<String>,
-    #[allow(dead_code)] // Fase 2: telemetría `record_turn_for` (coste endpoint local).
     pub(crate) is_local_endpoint: bool,
-    #[allow(dead_code)] // Fase 2: construcción del responder (`.with_project_instructions`).
     pub(crate) project_instructions: Arc<String>,
 }
 
@@ -237,8 +233,20 @@ pub(crate) struct LlmProfilesPublicState {
     pub(crate) available_providers: Vec<String>,
 }
 
+/// Origen de las credenciales de un perfil (el valor nunca se guarda).
+enum LlmKeySource {
+    /// API key del arranque CLI (solo el perfil implícito `"default"`).
+    Startup,
+    /// `api_key_env = "NOMBRE"` explícito en TOML (obligatoria).
+    Explicit(String),
+    /// Sin `api_key_env` explícito: se resuelve por env como en el arranque CLI
+    /// (variable estándar del provider → `ONYX_API_KEY`); `optional` → un perfil
+    /// OpenAI con `api_base` local (Ollama/vLLM) puede operar con clave vacía.
+    Fallback { optional: bool },
+}
+
 /// Perfil registrado en el handle (el valor de la credencial nunca se guarda;
-/// solo el nombre de la variable de entorno).
+/// solo su origen: arranque CLI, variable de entorno nombrada o env por provider).
 struct LlmProfileEntry {
     id: String,
     provider: LlmProvider,
@@ -246,9 +254,7 @@ struct LlmProfileEntry {
     effort: Option<ReasoningEffort>,
     /// Base URL ya validada con [`validate_api_base`] en el registro.
     api_base: Option<String>,
-    /// `None` → credenciales del arranque CLI (solo el perfil implícito
-    /// `"default"` no sobrescrito).
-    api_key_env: Option<String>,
+    key_source: LlmKeySource,
     available: bool,
     unavailable_reason: Option<String>,
 }
@@ -296,7 +302,6 @@ impl LlmProfileHandle {
     /// accionable) si falta la variable de entorno de la API key o si
     /// `validate_api_base` rechaza su `api_base` (p. ej. exfiltración a host
     /// remoto no oficial sin opt-in).
-    #[allow(dead_code)] // Fase 2: construcción en el arranque de sesión (chat/serve).
     pub(crate) fn new(
         cfg: &LlmConfig,
         profiles: &[LlmProfileConfig],
@@ -308,7 +313,7 @@ impl LlmProfileHandle {
             model: cfg.model.clone(),
             effort: cfg.effort,
             api_base: cfg.api_base.clone(),
-            api_key_env: None,
+            key_source: LlmKeySource::Startup,
             available: true,
             unavailable_reason: None,
         }];
@@ -321,13 +326,24 @@ impl LlmProfileHandle {
                 .effort
                 .as_deref()
                 .and_then(|e| ReasoningEffort::parse(e).ok());
-            let key_env = p
-                .api_key_env
-                .clone()
-                .unwrap_or_else(|| provider.api_key_env().to_string());
-            let key_present = env::var(&key_env)
-                .ok()
-                .is_some_and(|k| !k.trim().is_empty());
+            // Credenciales: `api_key_env` explícito (obligatorio) o fallback por env
+            // como en el arranque CLI (variable del provider → `ONYX_API_KEY`); un
+            // perfil OpenAI con `api_base` local puede operar sin clave (Ollama/vLLM).
+            let key_source = match &p.api_key_env {
+                Some(name) => LlmKeySource::Explicit(name.clone()),
+                None => LlmKeySource::Fallback {
+                    optional: provider == LlmProvider::OpenAi && p.api_base.is_some(),
+                },
+            };
+            let key_present = match &key_source {
+                LlmKeySource::Startup => true,
+                LlmKeySource::Explicit(name) => {
+                    env::var(name).ok().is_some_and(|k| !k.trim().is_empty())
+                }
+                LlmKeySource::Fallback { optional } => {
+                    Self::env_key_for(provider).is_some() || *optional
+                }
+            };
 
             let (mut available, mut unavailable_reason, api_base) = match &p.api_base {
                 Some(raw) => {
@@ -340,10 +356,17 @@ impl LlmProfileHandle {
             };
             if available && !key_present {
                 available = false;
-                unavailable_reason = Some(format!(
-                    "API key env var `{key_env}` is not set (required by LLM profile `{}`)",
-                    p.id
-                ));
+                unavailable_reason = match &key_source {
+                    LlmKeySource::Explicit(name) => Some(format!(
+                        "API key env var `{name}` is not set (required by LLM profile `{}`)",
+                        p.id
+                    )),
+                    _ => Some(format!(
+                        "no API key for provider `{}`: set `{}` or `ONYX_API_KEY` (or an explicit `api_key_env` on the profile)",
+                        provider.as_str(),
+                        provider.api_key_env()
+                    )),
+                };
             }
 
             let entry = LlmProfileEntry {
@@ -352,25 +375,30 @@ impl LlmProfileHandle {
                 model: p.model.clone(),
                 effort,
                 api_base,
-                api_key_env: Some(key_env),
+                key_source,
                 available,
                 unavailable_reason,
             };
-            // `replace-by-id`: un perfil declarado con un id existente
-            // (p. ej. `"default"`) sustituye al ya registrado.
+            // `replace-by-id`: un perfil declarado con un id existente sustituye
+            // al registrado — salvo un bloque TOML `id = "default"` que falle la
+            // disponibilidad, que no invalida el perfil de arranque operativo.
             if let Some(slot) = entries.iter_mut().find(|e| e.id == entry.id) {
-                *slot = entry;
+                if entry.available || slot.id != "default" {
+                    *slot = entry;
+                }
             } else {
                 entries.push(entry);
             }
         }
 
-        // Perfil activo: el de arranque; si un perfil declarado coincide en
-        // provider+modelo+base, su `id` lo representa (la clave sigue siendo la CLI).
+        // Perfil activo: el de arranque; si un perfil **disponible** declarado
+        // coincide en provider+modelo+base, su `id` lo representa (la clave sigue
+        // siendo la CLI).
         let active_profile_id = entries
             .iter()
             .find(|e| {
                 e.id != "default"
+                    && e.available
                     && e.provider == cfg.provider
                     && e.model == cfg.model
                     && e.api_base == cfg.api_base
@@ -409,12 +437,13 @@ impl LlmProfileHandle {
         self.dirty.swap(false, Ordering::SeqCst)
     }
 
-    /// Resuelve la API key de un perfil: la variable de entorno nombrada
-    /// (nunca un valor persistido) o la clave del arranque para `"default"`.
+    /// Resuelve la API key de un perfil (nunca un valor persistido): clave del
+    /// arranque para `"default"`, variable de entorno nombrada (`Explicit`,
+    /// obligatoria) o env por provider (`Fallback`; `optional` → clave vacía).
     fn resolve_entry_key(entry: &LlmProfileEntry, startup_key: &str) -> Result<String, String> {
-        match &entry.api_key_env {
-            None => Ok(startup_key.to_string()),
-            Some(name) => env::var(name)
+        match &entry.key_source {
+            LlmKeySource::Startup => Ok(startup_key.to_string()),
+            LlmKeySource::Explicit(name) => env::var(name)
                 .ok()
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| {
@@ -423,16 +452,31 @@ impl LlmProfileHandle {
                         entry.id
                     )
                 }),
+            LlmKeySource::Fallback { optional } => match Self::env_key_for(entry.provider) {
+                Some(k) => Ok(k),
+                None if *optional => Ok(String::new()),
+                None => Err(format!(
+                    "no API key for provider `{}`: set `{}` or `ONYX_API_KEY` (or an explicit `api_key_env` on the profile)",
+                    entry.provider.as_str(),
+                    entry.provider.api_key_env()
+                )),
+            },
         }
+    }
+
+    /// API key del proveedor desde el entorno con la misma precedencia que el
+    /// arranque CLI (variable estándar del provider → `ONYX_API_KEY`).
+    fn env_key_for(provider: LlmProvider) -> Option<String> {
+        [provider.api_key_env(), "ONYX_API_KEY"]
+            .iter()
+            .find_map(|v| env::var(*v).ok())
+            .filter(|k| !k.trim().is_empty())
     }
 
     /// Credenciales del proveedor desde el entorno, con el mismo contrato que
     /// el arranque CLI (autodescubrimiento del provider alternativo).
     fn env_credentials_for(provider: LlmProvider) -> Option<(String, Option<String>)> {
-        let key = [provider.api_key_env(), "ONYX_API_KEY"]
-            .iter()
-            .find_map(|v| env::var(*v).ok())
-            .filter(|k| !k.trim().is_empty());
+        let key = Self::env_key_for(provider);
         let base = provider
             .api_base_envs()
             .iter()
@@ -474,15 +518,20 @@ impl LlmProfileHandle {
     }
 
     /// Snapshot inmutable del objetivo activo (para despachar cada llamada).
-    #[allow(dead_code)] // Fase 2: `DynamicLlmDriver` lo toma al despachar cada turno.
     pub(crate) fn active_target(&self) -> ResolvedLlmTarget {
         let st = self.state.lock().unwrap();
         self.target_from(&st)
     }
 
+    /// Instrucciones de proyecto (`AGENTS.md`/`ONYX.md`) compartidas por todos
+    /// los perfiles del registro (cargadas una sola vez en el arranque).
+    #[allow(dead_code)] // Fase 3 (TUI: cabecera de perfiles) / Fase 4 (SSE Web).
+    pub(crate) fn project_instructions(&self) -> Arc<String> {
+        self.state.lock().unwrap().project_instructions.clone()
+    }
+
     /// Cambia a un perfil registrado. Error accionable si no existe o no está
     /// disponible (clave ausente, `api_base` rechazada, …).
-    #[allow(dead_code)] // Fase 2: comando `/profile <id>` (frontera de tick).
     pub(crate) fn switch_profile(&self, id: &str) -> Result<ResolvedLlmTarget, String> {
         let id = id.trim();
         let mut st = self.state.lock().unwrap();
@@ -519,16 +568,23 @@ impl LlmProfileHandle {
     /// disponible de ese proveedor (o el autodescubrimiento por env). El
     /// modelo se conserva si coincide con el del perfil; si no, se ajusta al
     /// del perfil (o al default del proveedor). Error accionable sin credenciales.
-    #[allow(dead_code)] // Fase 2: comando `/provider <gemini|openai>`.
     pub(crate) fn set_provider(&self, provider: LlmProvider) -> Result<ResolvedLlmTarget, String> {
         let mut st = self.state.lock().unwrap();
         if st.active.provider == provider {
             return Ok(self.target_from(&st));
         }
+        // Primero un perfil declarado del proveedor; si no, el perfil de
+        // arranque `"default"` cuando sea de ese proveedor (p. ej.
+        // `--provider openai --api-base http://127.0.0.1:8000/v1` sin env vars).
         if let Some(entry) = st
             .entries
             .iter()
             .find(|e| e.id != "default" && e.provider == provider && e.available)
+            .or_else(|| {
+                st.entries
+                    .iter()
+                    .find(|e| e.id == "default" && e.provider == provider && e.available)
+            })
         {
             let api_key = Self::resolve_entry_key(entry, &st.startup_key)?;
             st.active = LlmActiveState {
@@ -576,7 +632,6 @@ impl LlmProfileHandle {
 
     /// Cambia el modelo del objetivo activo; si difiere del preset del perfil
     /// activo, el objetivo queda marcado como `"custom"`.
-    #[allow(dead_code)] // Fase 2: comando `/model <name>`.
     pub(crate) fn set_model(&self, model: &str) -> Result<ResolvedLlmTarget, String> {
         let model = model.trim();
         if model.is_empty() {
@@ -597,7 +652,6 @@ impl LlmProfileHandle {
     }
 
     /// Cambia el esfuerzo de razonamiento del objetivo activo (`None` = auto).
-    #[allow(dead_code)] // Fase 2: comando `/effort <auto|low|medium|high>`.
     pub(crate) fn set_effort(&self, effort: Option<ReasoningEffort>) -> ResolvedLlmTarget {
         let mut st = self.state.lock().unwrap();
         let matches_preset = st
@@ -616,34 +670,35 @@ impl LlmProfileHandle {
     /// Sincroniza el handle con un estado modal restaurado (`/rewind`,
     /// `chat --resume --tick`, `on_restore`): **best-effort**, nunca falla
     /// aunque un perfil ya no exista (cauce a provider/modelo/esfuerzo).
-    #[allow(dead_code)] // Fase 2: `on_restore` / `/rewind` / `chat --resume --tick`.
     pub(crate) fn restore_from_graph(&self, rec: &RecordedLlmProfile) {
         let want_model = rec.model.trim();
         let want_effort = rec
             .effort
             .as_deref()
             .and_then(|e| ReasoningEffort::parse(e).ok());
+        let recorded_provider = LlmProvider::parse(rec.provider.trim()).ok();
         let target = match self.switch_profile(rec.profile_id.trim()) {
             Ok(t) => t,
             Err(_) => {
-                if let Ok(provider) = LlmProvider::parse(rec.provider.trim()) {
+                if let Some(provider) = recorded_provider {
                     let _ = self.set_provider(provider);
                 }
-                let _ = self.set_model(want_model);
-                let _ = self.set_effort(want_effort);
                 self.active_target()
             }
         };
-        if target.model != want_model {
-            let _ = self.set_model(want_model);
-        }
-        if target.effort != want_effort {
-            let _ = self.set_effort(want_effort);
+        // Modelo/esfuerzo grabados solo si el proveedor activo coincide con el
+        // grabado (no proyectar p. ej. un modelo OpenAI sobre Gemini → 404).
+        if Some(target.provider) == recorded_provider {
+            if target.model != want_model {
+                let _ = self.set_model(want_model);
+            }
+            if target.effort != want_effort {
+                let _ = self.set_effort(want_effort);
+            }
         }
     }
 
     /// Snapshot público para TUI/Web (solo metadatos; **nunca** credenciales).
-    #[allow(dead_code)] // Fase 3 (cabecera TUI) / Fase 4 (`WebStateSnapshot`).
     pub(crate) fn public_snapshot(&self) -> LlmProfilesPublicState {
         let st = self.state.lock().unwrap();
         let profiles = st
@@ -674,8 +729,8 @@ impl LlmProfileHandle {
     }
 }
 
-/// Extrae el host de un base URL ya validado (para `is_local_endpoint`).
-fn api_base_host(raw: &str) -> &str {
+/// Extrae el host de un base URL (para `is_local_endpoint`).
+pub(crate) fn api_base_host(raw: &str) -> &str {
     let rest = raw.trim().split_once("//").map(|(_, r)| r).unwrap_or("");
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if let Some(bracketed) = authority.strip_prefix('[') {
@@ -729,6 +784,27 @@ mod tests {
         unsafe {
             env::remove_var(name);
         }
+    }
+
+    fn restore_test_env(name: &str, saved: Option<String>) {
+        unsafe {
+            match saved {
+                Some(v) => env::set_var(name, v),
+                None => env::remove_var(name),
+            }
+        }
+    }
+
+    /// Guarda y borra las variables indicadas; devuelve qué restaurar al final.
+    fn without_env(names: &[&str]) -> Vec<(String, Option<String>)> {
+        names
+            .iter()
+            .map(|name| {
+                let saved = env::var(name).ok();
+                remove_test_env(name);
+                (name.to_string(), saved)
+            })
+            .collect()
     }
 
     #[test]
@@ -804,11 +880,14 @@ mod tests {
 
     #[test]
     fn set_provider_without_credentials_fails_actionably() {
-        // Hermeticidad: garantizar que NO hay credenciales OpenAI en el entorno.
-        let saved_openai = env::var("OPENAI_API_KEY").ok();
-        let saved_onyx = env::var("ONYX_API_KEY").ok();
-        remove_test_env("OPENAI_API_KEY");
-        remove_test_env("ONYX_API_KEY");
+        // Hermeticidad: sin credenciales OpenAI ni base URLs de descubrimiento
+        // (`OPENAI_API_BASE`/`OPENAI_BASE_URL` solos ya habilitan el fallback).
+        let saved = without_env(&[
+            "OPENAI_API_KEY",
+            "ONYX_API_KEY",
+            "OPENAI_API_BASE",
+            "OPENAI_BASE_URL",
+        ]);
 
         let handle = LlmProfileHandle::new(
             &startup_cfg(LlmProvider::Gemini, DEFAULT_GEMINI_MODEL, None),
@@ -825,16 +904,43 @@ mod tests {
         assert_eq!(target.provider, LlmProvider::Gemini);
         assert_eq!(target.profile_id, "default");
 
-        // Restaurar el entorno tal como estaba.
-        unsafe {
-            match saved_openai {
-                Some(v) => env::set_var("OPENAI_API_KEY", v),
-                None => env::remove_var("OPENAI_API_KEY"),
-            }
-            match saved_onyx {
-                Some(v) => env::set_var("ONYX_API_KEY", v),
-                None => env::remove_var("ONYX_API_KEY"),
-            }
+        for (name, saved) in saved {
+            restore_test_env(&name, saved);
+        }
+    }
+
+    #[test]
+    fn local_openai_profile_without_api_key_is_available() {
+        // Hermeticidad: sin credenciales OpenAI en el entorno del desarrollador.
+        let saved = without_env(&["OPENAI_API_KEY", "ONYX_API_KEY"]);
+
+        // Perfil local tipo Ollama/vLLM: OpenAI con `api_base` loopback y sin
+        // `api_key_env` → la clave es opcional y el perfil queda disponible.
+        let handle = LlmProfileHandle::new(
+            &startup_cfg(LlmProvider::Gemini, DEFAULT_GEMINI_MODEL, None),
+            &[profile_cfg(
+                "qwen-local",
+                "openai",
+                "qwen38-27b",
+                Some("http://127.0.0.1:11434/v1"),
+                None,
+            )],
+            false,
+        );
+
+        let snap = handle.public_snapshot();
+        let local = snap.profiles.iter().find(|p| p.id == "qwen-local").unwrap();
+        assert!(local.available, "{local:?}");
+
+        let t = handle.switch_profile("qwen-local").unwrap();
+        assert_eq!(t.provider, LlmProvider::OpenAi);
+        assert_eq!(t.model, "qwen38-27b");
+        assert_eq!(t.api_key, "", "un endpoint local opera con clave vacía");
+        assert_eq!(t.api_base.as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert!(t.is_local_endpoint);
+
+        for (name, saved) in saved {
+            restore_test_env(&name, saved);
         }
     }
 
