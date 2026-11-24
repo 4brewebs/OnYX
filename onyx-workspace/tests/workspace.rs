@@ -540,6 +540,224 @@ fn fs_read_deduplicates_unchanged_reads_and_invalidates_after_edit() {
 }
 
 #[test]
+fn fs_read_dedup_expires_after_window_of_tool_executions() {
+    let dir = TempDir::new("dedup_window");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let first = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(1))
+        .unwrap();
+    assert!(first.contains("1: alpha"), "{first}");
+
+    // `FS_READ_DEDUP_WINDOW` (8) ejecuciones de tool en medio: la dedup
+    // expira y se devuelve el contenido completo (4C-audit).
+    for _ in 0..8 {
+        tools.execute("fs_list", "{}").unwrap();
+    }
+    let after_window = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(20))
+        .unwrap();
+    assert!(
+        after_window.contains("1: alpha"),
+        "tras 8 ejecuciones la re-lectura debe devolver el contenido completo: {after_window}"
+    );
+    assert!(!after_window.starts_with("@TOON v1"), "{after_window}");
+
+    // Re-ancorada con contenido: la siguiente lectura (dentro de la ventana)
+    // vuelve a stubear.
+    let re_stub = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(21))
+        .unwrap();
+    assert!(re_stub.starts_with("@TOON v1"), "{re_stub}");
+}
+
+#[test]
+fn fs_read_consecutive_stub_is_broken_by_full_content() {
+    let dir = TempDir::new("dedup_stubbed");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let first = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(1))
+        .unwrap();
+    assert!(first.contains("1: alpha"), "{first}");
+
+    let second = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(2))
+        .unwrap();
+    assert!(second.starts_with("@TOON v1"), "{second}");
+
+    // La lectura previa era un stub (el modelo no ha visto el contenido):
+    // la siguiente debe devolver el contenido completo (4C-audit).
+    let third = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(3))
+        .unwrap();
+    assert!(
+        third.contains("1: alpha"),
+        "un stub no debe encadenarse: {third}"
+    );
+    assert!(!third.starts_with("@TOON v1"), "{third}");
+
+    // Re-ancorada con contenido: la siguiente sí puede stubear otra vez.
+    let fourth = tools
+        .execute_with_tick("fs_read", r#"{"path":"notes.txt"}"#, Some(4))
+        .unwrap();
+    assert!(fourth.starts_with("@TOON v1"), "{fourth}");
+}
+
+#[test]
+fn fs_read_subset_stub_marks_covering_read_as_stubbed() {
+    let dir = TempDir::new("dedup_subset");
+    let mut content = String::new();
+    for i in 1..=20 {
+        content.push_str(&format!("fn f_{i}() {{ {i} }}\n"));
+    }
+    fs::write(dir.0.join("lib.rs"), content).unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let full = tools
+        .execute(
+            "fs_read",
+            r#"{"path":"lib.rs","start_line":1,"end_line":20}"#,
+        )
+        .unwrap();
+    assert!(full.contains("fn f_10()"), "{full}");
+
+    let subset = tools
+        .execute(
+            "fs_read",
+            r#"{"path":"lib.rs","start_line":5,"end_line":12}"#,
+        )
+        .unwrap();
+    assert!(
+        subset.starts_with("@TOON v1") && subset.contains("covered_by:1-20"),
+        "{subset}"
+    );
+
+    // La lectura cubridora (1-20) queda marcada como stub: una re-lectura
+    // completa debe devolver el contenido (4C-audit).
+    let full_again = tools
+        .execute(
+            "fs_read",
+            r#"{"path":"lib.rs","start_line":1,"end_line":20}"#,
+        )
+        .unwrap();
+    assert!(
+        full_again.contains("fn f_10()"),
+        "la lectura cubridora debe re-ancorarse con contenido: {full_again}"
+    );
+    assert!(!full_again.starts_with("@TOON v1"), "{full_again}");
+}
+
+#[test]
+fn code_search_default_excludes_lockfiles_and_internal_dirs_at_root() {
+    let dir = TempDir::new("search_excludes");
+    fs::create_dir_all(dir.0.join(".onyx/skills")).unwrap();
+    fs::create_dir_all(dir.0.join(".agents")).unwrap();
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let marker = "NEEDLE_MARKER";
+    fs::write(dir.0.join("Cargo.lock"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join("package-lock.json"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join("pnpm-lock.yaml"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join("yarn.lock"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join(".onyx/skills/SKILL.md"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join(".agents/AGENTS.md"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join("src/lib.rs"), format!("// {marker}\n")).unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // Sin `path` (raíz = workspace): exclusiones por defecto activas
+    // (4C-audit).
+    let out = tools
+        .execute("code_search", r#"{"pattern":"NEEDLE_MARKER"}"#)
+        .unwrap();
+    assert!(out.contains("src/lib.rs"), "{out}");
+    assert!(!out.contains("Cargo.lock"), "{out}");
+    assert!(!out.contains("package-lock.json"), "{out}");
+    assert!(!out.contains("pnpm-lock.yaml"), "{out}");
+    assert!(!out.contains("yarn.lock"), "{out}");
+    assert!(!out.contains("SKILL.md"), "{out}");
+    assert!(!out.contains("AGENTS.md"), "{out}");
+}
+
+#[test]
+fn code_search_explicit_path_bypasses_default_excludes() {
+    let dir = TempDir::new("search_excl_path");
+    fs::create_dir_all(dir.0.join(".onyx/skills")).unwrap();
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let marker = "NEEDLE_MARKER";
+    fs::write(dir.0.join(".onyx/skills/SKILL.md"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join("Cargo.lock"), format!("{marker}\n")).unwrap();
+    fs::write(dir.0.join("src/lib.rs"), format!("// {marker}\n")).unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // Con `path` explícito se busca exactamente lo pedido (4C-audit).
+    let in_onyx = tools
+        .execute(
+            "code_search",
+            r#"{"pattern":"NEEDLE_MARKER","path":".onyx"}"#,
+        )
+        .unwrap();
+    assert!(in_onyx.contains("SKILL.md"), "{in_onyx}");
+    assert!(!in_onyx.contains("src/lib.rs"), "{in_onyx}");
+
+    let in_lock = tools
+        .execute(
+            "code_search",
+            r#"{"pattern":"NEEDLE_MARKER","path":"Cargo.lock"}"#,
+        )
+        .unwrap();
+    assert!(in_lock.contains("Cargo.lock"), "{in_lock}");
+}
+
+#[test]
+fn code_search_truncates_long_lines_and_reports_max_results() {
+    let dir = TempDir::new("search_clip");
+    let long_tail = "x".repeat(300);
+    let line = format!("NEEDLE_CLIP {long_tail}");
+    fs::write(dir.0.join("big.txt"), format!("{line}\n{line}\n")).unwrap();
+
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    // `max_results=1`: la línea coincide pero se recorta a 240 chars
+    // (frontera UTF-8) + `...`, y el aviso accionable cierra la salida
+    // (4C-audit). "NEEDLE_CLIP " = 12 chars -> 228 `x` visibles.
+    let out = tools
+        .execute(
+            "code_search",
+            r#"{"pattern":"NEEDLE_CLIP","max_results":1}"#,
+        )
+        .unwrap();
+    let clipped_line = format!("big.txt:1: NEEDLE_CLIP {}...", "x".repeat(228));
+    assert!(out.contains(&clipped_line), "{out}");
+    assert!(
+        !out.contains(&"x".repeat(229)),
+        "la línea debe recortarse: {out}"
+    );
+    assert!(
+        !out.contains("big.txt:2:"),
+        "max_results=1: solo 1 match: {out}"
+    );
+    assert!(
+        out.ends_with("# truncated: reached max_results (1); narrow with path or include_glob."),
+        "{out}"
+    );
+}
+
+#[test]
 fn shell_exec_scrubs_credentials_and_honors_custom_timeout() {
     let dir = TempDir::new("scrub");
     let policy = WorkspacePolicy::new(&dir.0)

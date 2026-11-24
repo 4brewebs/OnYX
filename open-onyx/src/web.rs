@@ -730,7 +730,9 @@ impl UiIdlePump for WebHandle {
         // Espera breve sobre Condvar (35ms): despierta al instante si llega un comando web,
         // sin consumir CPU y sin avanzar `host.ticks()`.
         if let Ok(guard) = self.hub.state.lock() {
-            if guard.incoming_events.is_empty() && !self.hub.quit.load(Ordering::Relaxed) {
+            // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del
+            // watcher de apago (`spawn_shutdown_watcher`).
+            if guard.incoming_events.is_empty() && !self.hub.quit.load(Ordering::Acquire) {
                 let _ = self
                     .hub
                     .input_cv
@@ -1489,7 +1491,9 @@ struct HttpRequest {
 }
 
 fn accept_loop(listener: TcpListener, hub: Arc<WebHub>) {
-    while !hub.quit.load(Ordering::Relaxed) {
+    // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del watcher
+    // de apago (`spawn_shutdown_watcher`).
+    while !hub.quit.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let conn_hub = Arc::clone(&hub);
@@ -1961,7 +1965,9 @@ fn handle_sse_stream(
     let mut last_stream_ver = 0u64;
     let mut last_ping = Instant::now();
 
-    while !hub.quit.load(Ordering::Relaxed) {
+    // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del watcher
+    // de apago (`spawn_shutdown_watcher`).
+    while !hub.quit.load(Ordering::Acquire) {
         let (state_payload, stream_payload) = {
             let Ok(mut guard) = hub.state.lock() else {
                 break;

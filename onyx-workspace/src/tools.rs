@@ -39,7 +39,49 @@ pub struct ToolSchema {
     pub requires_approval: bool,
 }
 
-type SeenReadsMap = Arc<Mutex<BTreeMap<(String, usize, usize), (String, u64)>>>;
+/// `SDD-04` 4C-audit: metadatos de una lectura registrada en `seen_reads`.
+/// `exec_seq` es la secuencia de ejecución de tools en el momento de la
+/// lectura (ancora la ventana de deduplicación); `stubbed` indica que la
+/// última "lectura" devolvió un stub `@TOON` (el modelo no ha visto el
+/// contenido desde entonces).
+#[derive(Clone, Debug)]
+struct SeenRead {
+    digest: String,
+    tick: u64,
+    exec_seq: u64,
+    stubbed: bool,
+}
+
+/// `SDD-04` 4C-audit: ventana de deduplicación de `fs_read`: re-lecturas del
+/// mismo archivo/rango con digest igual dentro de `FS_READ_DEDUP_WINDOW`
+/// ejecuciones de tool devuelven el stub `@TOON` (rompe bucles de re-lectura
+/// sin perder visibilidad del contenido, que se garantiza alternando
+/// stub/literal).
+const FS_READ_DEDUP_WINDOW: u64 = 8;
+
+/// `SDD-04` 4C-audit: máximo de caracteres por línea en la salida de
+/// `code_search`; las líneas más largas se recortan en el carácter 240
+/// (frontera UTF-8) y se añade `...` (evita inflar el contexto con líneas
+/// minificadas).
+const CODE_SEARCH_MAX_LINE_CHARS: usize = 240;
+
+/// `SDD-04` 4C-audit: recorta una línea de `code_search` a
+/// `CODE_SEARCH_MAX_LINE_CHARS` caracteres (frontera UTF-8, `char_indices`)
+/// y añade `...` si se trunca.
+fn clip_search_line(line: &str) -> String {
+    if line.chars().count() <= CODE_SEARCH_MAX_LINE_CHARS {
+        line.to_string()
+    } else {
+        let cut = line
+            .char_indices()
+            .nth(CODE_SEARCH_MAX_LINE_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        format!("{}...", &line[..cut])
+    }
+}
+
+type SeenReadsMap = Arc<Mutex<BTreeMap<(String, usize, usize), SeenRead>>>;
 #[cfg(feature = "scent")]
 type SeenOutlinesMap = Arc<Mutex<BTreeMap<String, String>>>;
 
@@ -49,6 +91,9 @@ pub struct WorkspaceTools {
     policy: WorkspacePolicy,
     seen_reads: SeenReadsMap,
     read_seq: Arc<AtomicU64>,
+    /// `SDD-04` 4C-audit: secuencia global de ejecuciones de tool (se bumpa
+    /// en `execute_with_tick`); ancora la ventana `FS_READ_DEDUP_WINDOW`.
+    tool_exec_seq: Arc<AtomicU64>,
     sprout: SproutSupervisor,
     cancel_flag: Option<Arc<AtomicBool>>,
     #[cfg(feature = "scent")]
@@ -91,6 +136,7 @@ impl WorkspaceTools {
             policy,
             seen_reads: Arc::new(Mutex::new(BTreeMap::new())),
             read_seq: Arc::new(AtomicU64::new(1)),
+            tool_exec_seq: Arc::new(AtomicU64::new(1)),
             sprout,
             cancel_flag: None,
             #[cfg(feature = "scent")]
@@ -723,6 +769,9 @@ impl WorkspaceTools {
         args_json: &str,
         tick_hint: Option<u64>,
     ) -> Result<String, String> {
+        // `SDD-04` 4C-audit: secuencia global de ejecuciones de tool; ancora
+        // la ventana de deduplicación de `fs_read` (`FS_READ_DEDUP_WINDOW`).
+        self.tool_exec_seq.fetch_add(1, Ordering::Relaxed);
         let raw = if args_json.trim().is_empty() {
             "{}"
         } else {
@@ -880,28 +929,68 @@ impl WorkspaceTools {
         }
 
         let key = (rel.clone(), start, end);
-        if let Ok(mut guard) = self.seen_reads.lock() {
-            if let Some((prev_digest, prev_tick)) = guard.get(&key) {
-                if prev_digest == &digest {
-                    let tick_label = tick_hint.unwrap_or(*prev_tick);
-                    return Ok(format!(
+        // `SDD-04` 4C-audit: el stub `@TOON` solo es válido cuando el digest
+        // coincide, la lectura está dentro de la ventana de deduplicación
+        // (menos de `FS_READ_DEDUP_WINDOW` ejecuciones de tool desde la
+        // última lectura con contenido) y la lectura previa no era ella
+        // misma un stub. Expirada o ya-stub → contenido completo y
+        // re-ancraje (`stubbed = false`).
+        let now_seq = self.tool_exec_seq.load(Ordering::Relaxed);
+        let stub_reply = if let Ok(mut guard) = self.seen_reads.lock() {
+            let mut reply: Option<String> = None;
+            if let Some(prev) = guard.get_mut(&key) {
+                if prev.digest == digest
+                    && now_seq.saturating_sub(prev.exec_seq) < FS_READ_DEDUP_WINDOW
+                    && !prev.stubbed
+                {
+                    prev.stubbed = true;
+                    let tick_label = tick_hint.unwrap_or(prev.tick);
+                    reply = Some(format!(
                         "@TOON v1\n# cols: subject | predicate | object | meta\n{rel} | unchanged_since_tick:{tick_label} | lines:{start}-{end} | digest:{digest}\n# note: already read and unchanged; do not re-read unless edited\n# total: 1\n"
                     ));
+                } else {
+                    let tick_val =
+                        tick_hint.unwrap_or_else(|| self.read_seq.fetch_add(1, Ordering::Relaxed));
+                    prev.digest = digest.clone();
+                    prev.tick = tick_val;
+                    prev.exec_seq = now_seq;
+                    prev.stubbed = false;
                 }
-            }
-            if let Some(((_, prev_s, prev_e), (_, prev_tick))) =
-                guard.iter().find(|((p, ps, pe), (pd, _))| {
-                    p == &rel && pd == &digest && *ps <= start && end <= *pe
+            } else if let Some(((_, prev_s, prev_e), prev)) =
+                guard.iter_mut().find(|((p, ps, pe), prev)| {
+                    p == &rel
+                        && !(*ps == start && *pe == end) // la clave exacta la gestiona la rama 1
+                        && prev.digest == digest
+                        && now_seq.saturating_sub(prev.exec_seq) < FS_READ_DEDUP_WINDOW
+                        && !prev.stubbed
+                        && *ps <= start
+                        && end <= *pe
                 })
             {
-                let tick_label = tick_hint.unwrap_or(*prev_tick);
-                return Ok(format!(
+                prev.stubbed = true;
+                let tick_label = tick_hint.unwrap_or(prev.tick);
+                reply = Some(format!(
                     "@TOON v1\n# cols: subject | predicate | object | meta\n{rel} | unchanged_since_tick:{tick_label} | lines:{start}-{end} | covered_by:{prev_s}-{prev_e} digest:{digest}\n# note: range already covered by prior read ({prev_s}-{prev_e}); do not re-read unless edited\n# total: 1\n"
                 ));
+            } else {
+                let tick_val =
+                    tick_hint.unwrap_or_else(|| self.read_seq.fetch_add(1, Ordering::Relaxed));
+                guard.insert(
+                    key,
+                    SeenRead {
+                        digest: digest.clone(),
+                        tick: tick_val,
+                        exec_seq: now_seq,
+                        stubbed: false,
+                    },
+                );
             }
-            let tick_val =
-                tick_hint.unwrap_or_else(|| self.read_seq.fetch_add(1, Ordering::Relaxed));
-            guard.insert(key, (digest, tick_val));
+            reply
+        } else {
+            None
+        };
+        if let Some(reply) = stub_reply {
+            return Ok(reply);
         }
 
         let mut out = String::new();
@@ -1120,12 +1209,22 @@ impl WorkspaceTools {
             _ => None,
         };
 
+        // `SDD-04` 4C-audit: las exclusiones por defecto solo se aplican
+        // cuando se busca en todo el workspace (`path` ausente o `"."`);
+        // con un `path` explícito se busca exactamente lo pedido (p. ej.
+        // `path: ".onyx"`).
+        let default_excludes = args
+            .path
+            .as_deref()
+            .map(|p| p.trim() == ".")
+            .unwrap_or(true);
         let opts = SearchOptions {
             matcher: &matcher,
             include_re: include_re.as_ref(),
             exclude_re: exclude_re.as_ref(),
             context_lines,
             max_results,
+            default_excludes,
         };
         let mut match_count = 0usize;
         let mut blocks: Vec<String> = Vec::new();
@@ -1139,7 +1238,15 @@ impl WorkspaceTools {
                 blocks.join("\n")
             };
             let cleaned = scrub_secrets(&joined);
-            Ok(truncate_utf8(&cleaned, self.policy.max_output_bytes))
+            let mut out = truncate_utf8(&cleaned, self.policy.max_output_bytes);
+            if match_count >= max_results {
+                // `SDD-04` 4C-audit: aviso accionable cuando el resultado se
+                // recortó en `max_results`.
+                out.push_str(&format!(
+                    "\n# truncated: reached max_results ({max_results}); narrow with path or include_glob."
+                ));
+            }
+            Ok(out)
         }
     }
 
@@ -1158,6 +1265,22 @@ impl WorkspaceTools {
         };
         if meta.file_type().is_symlink() {
             return;
+        }
+        // `SDD-04` 4C-audit: exclusiones por defecto del workspace (lockfiles
+        // y directorios internos) solo si la raíz de búsqueda era el
+        // workspace; un `path` explícito las ignora.
+        if opts.default_excludes {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if meta.is_file() {
+                if matches!(
+                    name,
+                    "Cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+                ) {
+                    return;
+                }
+            } else if matches!(name, ".onyx" | ".agents") {
+                return;
+            }
         }
         if meta.is_file() {
             if meta.len() > 1024 * 1024 {
@@ -1197,7 +1320,12 @@ impl WorkspaceTools {
             }
             if opts.context_lines == 0 {
                 for idx in matched_indices {
-                    blocks.push(format!("{rel}:{}: {}", idx + 1, lines[idx]));
+                    // `SDD-04` 4C-audit: recorte de líneas > 240 chars.
+                    blocks.push(format!(
+                        "{rel}:{}: {}",
+                        idx + 1,
+                        clip_search_line(lines[idx])
+                    ));
                 }
             } else {
                 // Agrupa rangos solapados [idx - ctx ..= idx + ctx] en bloques separados por `--`.
@@ -1216,11 +1344,13 @@ impl WorkspaceTools {
                 for (start, end) in ranges {
                     let mut hunk = Vec::with_capacity(end - start + 1);
                     for (line_idx, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+                        // `SDD-04` 4C-audit: recorte de líneas > 240 chars.
+                        let shown = clip_search_line(line);
                         let is_match = matched_indices.binary_search(&line_idx).is_ok();
                         if is_match {
-                            hunk.push(format!("{rel}:{}: {line}", line_idx + 1));
+                            hunk.push(format!("{rel}:{}: {shown}", line_idx + 1));
                         } else {
-                            hunk.push(format!("{rel}-{}- {line}", line_idx + 1));
+                            hunk.push(format!("{rel}-{}- {shown}", line_idx + 1));
                         }
                     }
                     blocks.push(hunk.join("\n"));
@@ -1643,6 +1773,10 @@ struct SearchOptions<'a> {
     exclude_re: Option<&'a Regex>,
     context_lines: usize,
     max_results: usize,
+    /// `SDD-04` 4C-audit: exclusiones por defecto (lockfiles, `.onyx`,
+    /// `.agents`) solo cuando la raíz de búsqueda es el workspace; un `path`
+    /// explícito busca exactamente lo pedido.
+    default_excludes: bool,
 }
 
 #[derive(Deserialize)]

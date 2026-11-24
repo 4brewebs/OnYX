@@ -205,7 +205,9 @@ pub fn run_session<D: SessionDriver>(
             let mut needs_follow_up_tick = false;
             let mut stepped_in_session = false;
             let shared_store = action_ctx.as_ref().and_then(|c| c.snapshot_store.clone());
-            while !quit.load(Ordering::Relaxed) {
+            // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del
+            // watcher de apago de `serve` (`spawn_shutdown_watcher`).
+            while !quit.load(Ordering::Acquire) {
                 let ui_queued = ui.has_queued_events();
                 let ready =
                     llm_ready.load(Ordering::Acquire) || bridge_ready.load(Ordering::Acquire);

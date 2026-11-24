@@ -428,6 +428,10 @@ pub struct CommandSpawnerSystem {
     /// Nombres de tools MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`):
     /// se añaden a los tools del spec de cada agente (orden determinista).
     mcp_tool_names: Vec<String>,
+    /// `SDD-04` 4C-audit: handle a `WorkspaceTools` para que `/compact` limpie
+    /// `seen_reads` (los anclajes de deduplicación apuntan a lecturas que el
+    /// compactado acaba de sacar del contexto).
+    tools: Option<WorkspaceTools>,
 }
 
 impl CommandSpawnerSystem {
@@ -449,6 +453,7 @@ impl CommandSpawnerSystem {
             force_new_agent: false,
             counter: 0,
             mcp_tool_names: Vec::new(),
+            tools: None,
         }
     }
 
@@ -509,6 +514,13 @@ impl CommandSpawnerSystem {
     /// declaran en el spec de cada agente nuevo.
     pub fn with_mcp_tool_names(mut self, mcp_tool_names: Vec<String>) -> Self {
         self.mcp_tool_names = mcp_tool_names;
+        self
+    }
+
+    /// `SDD-04` 4C-audit: habilita que `/compact` limpie la caché de
+    /// deduplicación de `fs_read` (`WorkspaceTools::clear_seen_reads`).
+    pub fn with_tools(mut self, tools: WorkspaceTools) -> Self {
+        self.tools = Some(tools);
         self
     }
 
@@ -980,6 +992,13 @@ impl OnyxSystem for CommandSpawnerSystem {
                         }
                     }
                     SlashCommand::Compact(focus) => {
+                        // `SDD-04` 4C-audit: tras el compactado, los anclajes de
+                        // deduplicación de `fs_read` están obsoletos (el contexto
+                        // ya perdió la lectura original); se limpian para que la
+                        // siguiente `fs_read` devuelva el contenido completo.
+                        if let Some(tools) = &self.tools {
+                            tools.clear_seen_reads();
+                        }
                         if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
                             let (goal, memory) =
                                 read_agent_memory_ordered(&*ctx.graph, &v, root_id);

@@ -1252,6 +1252,8 @@ fn launch_interactive_chat(
         .with_mcp_tool_names(mcp_tool_names.to_vec())
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
+        // `SDD-04` 4C-audit: `/compact` limpia `seen_reads`.
+        .with_tools(tools.clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
         .with_pending_notes(pending_notes.clone())
@@ -1492,6 +1494,8 @@ fn launch_web_serve(
         .with_mcp_tool_names(mcp_tool_names.to_vec())
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
+        // `SDD-04` 4C-audit: `/compact` limpia `seen_reads`.
+        .with_tools(tools.clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
         .with_pending_notes(pending_notes.clone())
