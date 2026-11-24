@@ -14,8 +14,7 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
-    WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, apply_impact_escalation,
-    graph_workspace_mode,
+    WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
 };
 
 use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
@@ -25,7 +24,7 @@ use crate::pack::{
     MilestoneSnapshotSystem, PackSnapshotStore, SharedPackStore, default_fork_dir,
     fork_pack_until_tick,
 };
-use crate::subagent::{MergePreviewState, SubagentHandle};
+use crate::subagent::{MergePreviewState, SubagentHandle, effective_merge_decision};
 
 /// Interfaz mínima de bombeo UI compartida entre `TuiHandle` (`openonyx chat`) y
 /// `WebHandle` (`openonyx serve`) para que ambos corran sobre el mismo bucle determinista
@@ -591,13 +590,15 @@ impl PlatformDriver for CliApprovalDriver {
                 });
                 match preview {
                     Some(MergePreviewState::Clean(ticket)) => {
-                        let imp = ticket.impact;
-                        preview_diff = Some(ticket.unified_diff);
-                        if apply_impact_escalation(static_dec, imp.as_ref())
-                            != PermissionDecision::Ask
+                        // `SDD-10` Fase 4: la decisión efectiva es la misma que en las
+                        // superficies TUI/Web (delta de gobernanza → `Ask` obligatorio);
+                        // se calcula **antes** de mover los campos del ticket.
+                        if effective_merge_decision(static_dec, &ticket) != PermissionDecision::Ask
                         {
                             continue;
                         }
+                        let imp = ticket.impact;
+                        preview_diff = Some(ticket.unified_diff);
                         imp
                     }
                     Some(MergePreviewState::NoOp) => {

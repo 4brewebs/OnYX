@@ -4,21 +4,25 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 
 use onyx_soul_agents::{
     AgentConfig, AgentGraph, Graph, GraphView, HeadlessDriver, Transcript, Value,
 };
 use onyx_workspace::{
-    ExternalDriverConfig, PromptTransport, RecordedEffect, SandboxDriverKind, SandboxMode,
-    SubagentNetworkPolicy, WorkspacePolicy, WorktreeManager, all_recorded_effects,
-    audit_sprout_workspace, check_git_version, detect_sandbox_capabilities, effects_after_tick,
+    ExternalDriverConfig, NetworkPolicy, ProcessJob, ProcessLimits, PromptTransport,
+    RecordedEffect, SandboxConfig, SandboxDriverKind, SandboxMode, SubagentNetworkPolicy,
+    WorkspacePolicy, WorktreeManager, all_recorded_effects, apply_sanitized_env,
+    audit_sprout_workspace, builtin_external_driver_presets, check_git_version, clean_process_path,
+    configure_process_isolation, detect_sandbox_capabilities, effects_after_tick,
     graph_workspace_mode, graph_workspace_plan, is_effect_undone, resolve_process_binary,
     restore_git_tree_checkpoint_for_targets,
 };
 use serde::Serialize;
 use serde_json::json;
 
+use crate::external_driver::kill_process_tree;
 use crate::pack::{PackSnapshotStore, SnapshotSource};
 use crate::session::build_host;
 use crate::vault::audit_vault;
@@ -642,10 +646,13 @@ pub fn run_doctor(
             report.warnings.push(warn.clone());
         }
         // `SDD-10` Fase 4: auditoría de los harnesses CLI externos declarados
-        // (`[[external_drivers]]` + presets): bin resuelto en PATH/PATHEXT, probe
-        // `--version` con deadline, transporte de prompt y política de red.
+        // (`[[external_drivers]]` + presets): bin resuelto en PATH/PATHEXT (preset
+        // faltante → `[WARN]`, driver declarado faltante → `[ERR]`), probe `--version`
+        // aislada con deadline, transporte de prompt y política de red (`[CHECK]`
+        // enforzada solo con `strict-container` activo).
+        let presets = builtin_external_driver_presets();
         for d in pol.external_drivers() {
-            audit_external_driver(&mut report, d);
+            audit_external_driver(&mut report, d, &active_sandbox, &presets);
         }
     }
 
@@ -838,39 +845,65 @@ enum DriverVersionProbe {
 }
 
 /// Probe `--version` acotada en el tiempo del binario resuelto (`SDD-10` Fase 4):
-/// diagnóstico **local del host** (hereda el entorno real, sin sandbox), lee
-/// stdout/stderr en hilos lectores y espera con deadline de 3 s vía `try_wait`;
-/// al expirar, mata el proceso. **0 `tokio`**, solo `std::process`/`std::thread`.
+/// diagnóstico local **aislado** — entorno saneado con `NetworkPolicy::Offline`
+/// (`--version` no necesita salir a red) vía [`apply_sanitized_env`], ruta limpia vía
+/// [`clean_process_path`], `configure_process_isolation` (grupo de proceso / ventana
+/// oculta) y `ProcessJob::assign` **inmediato** tras `spawn` — y espera con deadline de
+/// 3 s vía `try_wait`; al expirar mata el **árbol** completo con [`kill_process_tree`]
+/// (Job Object / `kill -9 -pgid`, fallback `taskkill /F /T /PID`) y join de los hilos
+/// lectores, acotados a 64 KiB cada uno. **0 `tokio`**, solo `std` + `onyx-workspace`.
 fn probe_driver_version(path: &Path) -> DriverVersionProbe {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
     const DEADLINE: Duration = Duration::from_secs(3);
+    const READ_CAP: u64 = 64 * 1024;
+
     let started = Instant::now();
-    let mut child = match Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+    let clean = clean_process_path(path);
+    let workspace_root = clean
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut cmd = Command::new(&clean);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_isolation(&mut cmd, true);
+    apply_sanitized_env(
+        &mut cmd,
+        &SandboxConfig {
+            network: NetworkPolicy::Offline,
+            ..SandboxConfig::default()
+        },
+        &workspace_root,
+        &std::env::temp_dir(),
+    );
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return DriverVersionProbe::Failed(format!("spawn failed: {e}")),
     };
 
-    let out_pipe = child.stdout.take();
-    let err_pipe = child.stderr.take();
-    let out_thread = out_pipe.map(|mut out| {
-        std::thread::spawn(move || {
+    // Asignación inmediata al `ProcessJob`: sin intervalo sin cobertura entre `spawn`
+    // y el bucle de espera (los nietos heredan el job / grupo de procesos).
+    let mut job = ProcessJob::assign(&child, ProcessLimits::default());
+
+    // Hilos lectores acotados: ni una salida enorme ni una pipe llena pueden bloquear
+    // el bucle de espera ni agotar memoria.
+    let out_thread = child.stdout.take().map(|out| {
+        thread::spawn(move || {
             let mut buf = String::new();
-            let _ = out.read_to_string(&mut buf);
+            let _ = out.take(READ_CAP).read_to_string(&mut buf);
             buf
         })
     });
-    let err_thread = err_pipe.map(|mut err| {
-        std::thread::spawn(move || {
+    let err_thread = child.stderr.take().map(|err| {
+        thread::spawn(move || {
             let mut buf = String::new();
-            let _ = err.read_to_string(&mut buf);
+            let _ = err.take(READ_CAP).read_to_string(&mut buf);
             buf
         })
     });
@@ -880,14 +913,22 @@ fn probe_driver_version(path: &Path) -> DriverVersionProbe {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() >= DEADLINE {
-                    // El proceso se colgó (o ignoró `--version`): mata el árbol y reporta.
-                    let _ = child.kill();
+                    // El proceso se colgó (o ignoró `--version`): mata el árbol completo,
+                    // cosecha y join de los lectores (las pipes mueron con el proceso).
+                    kill_process_tree(&mut job, &mut child);
                     let _ = child.wait();
+                    let _ = out_thread.and_then(|h| h.join().ok());
+                    let _ = err_thread.and_then(|h| h.join().ok());
                     return DriverVersionProbe::TimedOut;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return DriverVersionProbe::Failed(format!("wait failed: {e}")),
+            Err(e) => {
+                kill_process_tree(&mut job, &mut child);
+                let _ = out_thread.and_then(|h| h.join().ok());
+                let _ = err_thread.and_then(|h| h.join().ok());
+                return DriverVersionProbe::Failed(format!("wait failed: {e}"));
+            }
         }
     };
 
@@ -929,15 +970,33 @@ fn probe_driver_version(path: &Path) -> DriverVersionProbe {
 }
 
 /// Auditoría de un driver de harness CLI externo declarado en `[[external_drivers]]`
-/// (`SDD-10` Fase 4): bin resuelto en `PATH`/`PATHEXT`, probe `--version` acotada,
-/// `prompt_transport = "arg"` en Windows y política de red advisory.
-fn audit_external_driver(report: &mut DoctorReport, d: &ExternalDriverConfig) {
+/// (`SDD-10` Fase 4): bin resuelto en `PATH`/`PATHEXT`, probe `--version` aislada y
+/// acotada, `prompt_transport = "arg"` en Windows y política de red.
+///
+/// Severidad según el origen del driver: un **preset integrado** (`presets.contains(d)`)
+/// cuyo bin falte da `[WARN]` — las máquinas/CI sin ese CLI instalado no deben romper
+/// `doctor` —; un **driver declarado** en `config.toml` cuyo bin falte da `[ERR]`
+/// accionable. La `ExternalHarnessAllowlist` solo es `[CHECK]` (enforzada) con el modo de
+/// sandbox activo `StrictContainer`; en el resto de modos es `[WARN]` advisory.
+fn audit_external_driver(
+    report: &mut DoctorReport,
+    d: &ExternalDriverConfig,
+    active_sandbox: &SandboxConfig,
+    presets: &[ExternalDriverConfig],
+) {
     let label = format!("external driver `{}`", d.id);
     let Some(resolved) = resolve_process_binary(&d.bin) else {
-        report.errors.push(format!(
-            "{label}: binary `{}` not found in PATH/PATHEXT; `/spawn --driver {}` will fail at runtime",
-            d.bin, d.id
-        ));
+        if presets.contains(d) {
+            report.warnings.push(format!(
+                "{label}: built-in preset binary `{}` not found in PATH/PATHEXT; install it to use `/spawn --driver {}` (doctor continues)",
+                d.bin, d.id
+            ));
+        } else {
+            report.errors.push(format!(
+                "{label}: binary `{}` not found in PATH/PATHEXT; `/spawn --driver {}` will fail at runtime",
+                d.bin, d.id
+            ));
+        }
         return;
     };
     match probe_driver_version(&resolved.path) {
@@ -976,9 +1035,15 @@ fn audit_external_driver(report: &mut DoctorReport, d: &ExternalDriverConfig) {
             } else {
                 hosts.join(", ")
             };
-            report.warnings.push(format!(
-                "{label}: network allowlist [{hosts}] is advisory; only enforced with `--sandbox strict-container`"
-            ));
+            if active_sandbox.mode == SandboxMode::StrictContainer {
+                report.checks.push(format!(
+                    "{label}: network allowlist [{hosts}] is enforced (active sandbox mode is `strict-container`)"
+                ));
+            } else {
+                report.warnings.push(format!(
+                    "{label}: network allowlist [{hosts}] is advisory; only enforced with `--sandbox strict-container`"
+                ));
+            }
         }
     }
 }
@@ -1130,9 +1195,11 @@ mod tests {
     }
 
     /// `SDD-10` Fase 4: `openonyx doctor` audita cada driver de `[[external_drivers]]`:
-    /// bin inexistente → `[ERR]` accionable, `--version` OK → `[CHECK]`, `prompt_transport
-    /// = "arg"` en Windows → `[WARN]` (advisory), y la política de red → `[WARN]` que
-    /// distingue lo advisory de lo que solo aplica con `--sandbox strict-container`.
+    /// bin de **driver declarado** inexistente → `[ERR]` accionable; bin de **preset
+    /// integrado** inexistente → `[WARN]` (no rompe doctor/CI); `--version` OK → `[CHECK]`;
+    /// `prompt_transport = "arg"` en Windows → `[WARN]` (advisory); y la política de red →
+    /// `[WARN]` advisory en modos distintos de `strict-container` y `[CHECK]` enforzada
+    /// con el modo activo `StrictContainer`.
     #[test]
     fn doctor_audits_external_driver_bins() {
         let tmp = std::env::temp_dir().join(format!(
@@ -1162,7 +1229,8 @@ mod tests {
             }
         }
 
-        // 1) Bin inexistente → `[ERR]` accionable que menciona `/spawn --driver <id>`.
+        // 1) Bin inexistente en **driver declarado** (no es preset) → `[ERR]` accionable
+        //    que menciona `/spawn --driver <id>`.
         let mut report = DoctorReport::default();
         audit_external_driver(
             &mut report,
@@ -1171,6 +1239,8 @@ mod tests {
                 "definitely-missing-onyx-bin",
                 PromptTransport::Stdin,
             ),
+            &SandboxConfig::default(),
+            &[],
         );
         assert!(
             report.errors.iter().any(|e| {
@@ -1202,7 +1272,12 @@ mod tests {
         // 2) Bin resuelto y con `--version` → `[CHECK]` con la versión; la red → `[WARN]`
         //    advisory que distingue `--sandbox strict-container`.
         let mut report = DoctorReport::default();
-        audit_external_driver(&mut report, &drv("ok", &ok_bin, PromptTransport::Stdin));
+        audit_external_driver(
+            &mut report,
+            &drv("ok", &ok_bin, PromptTransport::Stdin),
+            &SandboxConfig::default(),
+            &[],
+        );
         assert!(
             report.checks.iter().any(
                 |c| c.contains("responds to `--version`") && c.contains("opencode v9.9.9-fake")
@@ -1223,7 +1298,12 @@ mod tests {
         // 3) `prompt_transport = "arg"` en Windows → `[WARN]` (fragilidad argv); en el
         //    resto de plataformas no se emite (el transporte es seguro ahí).
         let mut report = DoctorReport::default();
-        audit_external_driver(&mut report, &drv("arg", &ok_bin, PromptTransport::Arg));
+        audit_external_driver(
+            &mut report,
+            &drv("arg", &ok_bin, PromptTransport::Arg),
+            &SandboxConfig::default(),
+            &[],
+        );
         if cfg!(windows) {
             assert!(
                 report
@@ -1251,13 +1331,74 @@ mod tests {
             ..drv("off", &ok_bin, PromptTransport::Stdin)
         };
         let mut report = DoctorReport::default();
-        audit_external_driver(&mut report, &offline);
+        audit_external_driver(&mut report, &offline, &SandboxConfig::default(), &[]);
         assert!(
             report
                 .warnings
                 .iter()
                 .any(|w| w.contains("NativeOffline") && w.contains("cannot reach its LLM API")),
             "NativeOffline must be [WARN]: {:?}",
+            report.warnings
+        );
+
+        // 5) Bin inexistente en **preset integrado** (`presets.contains(d)`) → `[WARN]`,
+        //    nunca `[ERR]`: una máquina/CI sin el CLI del preset no rompe `doctor`.
+        let ghost_preset = drv(
+            "ghost-preset",
+            "definitely-missing-onyx-bin",
+            PromptTransport::Stdin,
+        );
+        let mut report = DoctorReport::default();
+        audit_external_driver(
+            &mut report,
+            &ghost_preset,
+            &SandboxConfig::default(),
+            std::slice::from_ref(&ghost_preset),
+        );
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.contains("/spawn --driver ghost-preset")),
+            "missing built-in preset must not be [ERR]: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("built-in preset") && w.contains("not found in PATH/PATHEXT")),
+            "missing built-in preset must be [WARN]: {:?}",
+            report.warnings
+        );
+
+        // 6) Allowlist + modo activo `StrictContainer` → `[CHECK]` enforzada (no `[WARN]`
+        //    advisory); el resto de modos ya queda cubierto en el caso 2.
+        let strict = SandboxConfig {
+            mode: SandboxMode::StrictContainer,
+            ..SandboxConfig::default()
+        };
+        let mut report = DoctorReport::default();
+        audit_external_driver(
+            &mut report,
+            &drv("strict", &ok_bin, PromptTransport::Stdin),
+            &strict,
+            &[],
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains("network allowlist") && c.contains("enforced")),
+            "allowlist under strict-container must be [CHECK] enforced: {:?}",
+            report.checks
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("network allowlist")),
+            "enforced allowlist must not also be [WARN] advisory: {:?}",
             report.warnings
         );
 

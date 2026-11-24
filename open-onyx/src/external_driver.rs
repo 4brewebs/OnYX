@@ -301,7 +301,9 @@ impl ExternalHarnessDriver for ExternalDriverRunner {
 /// (Job Object en Windows, grupo de procesos POSIX en unix) o, si la asignación al job no fue
 /// posible, `taskkill /F /T /PID` como fallback en Windows (patrón de `WorkspaceTools`).
 /// La llamada `child.kill()` final es redundante pero barata y cubre la ventana de race.
-fn kill_process_tree(job: &mut Option<ProcessJob>, child: &mut Child) {
+///
+/// `pub(crate)`: también lo usa la probe `--version` de `openonyx doctor` (`SDD-10` Fase 4).
+pub(crate) fn kill_process_tree(job: &mut Option<ProcessJob>, child: &mut Child) {
     if let Some(mut j) = job.take() {
         j.terminate();
     } else {

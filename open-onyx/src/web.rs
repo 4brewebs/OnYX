@@ -833,11 +833,15 @@ impl WebRuntimeInner {
     }
 
     /// Drivers disponibles para `/spawn`: `"native"` + los ids de `[[external_drivers]]`
-    /// resueltos en la policy cargada (`SDD-10` Fase 4).
+    /// resueltos en la policy cargada (`SDD-10` Fase 4). En un workspace **no confiado**
+    /// no se expone ningún driver externo (defense in depth, alineado con `main.rs` y
+    /// `subagent.rs`): `spawn_job` lo bloquearía igualmente en runtime.
     fn available_driver_ids(&self) -> Vec<String> {
         let mut ids = vec!["native".to_string()];
         if let Some(pol) = &self.policy {
-            ids.extend(pol.external_drivers().iter().map(|d| d.id.clone()));
+            if pol.trust.config_trusted {
+                ids.extend(pol.external_drivers().iter().map(|d| d.id.clone()));
+            }
         }
         ids
     }

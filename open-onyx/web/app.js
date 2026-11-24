@@ -358,6 +358,22 @@
     });
   }
 
+  // `SDD-10` Fase 4: el composer refleja el driver seleccionado: `native` → "Send" (turno
+  // de root); driver externo → "Spawn" + placeholder indicando que la tarea corre como
+  // subagente en background sin gastar turno de root.
+  const NATIVE_PLACEHOLDER = 'Ask openOnyx, type / for commands, or @ for workspace files…';
+  function updateComposerDriverUI() {
+    const driver = dom.driverSelect.value || 'native';
+    const spawning = driver !== 'native';
+    dom.sendBtn.textContent = spawning ? 'Spawn' : 'Send';
+    dom.sendBtn.setAttribute('aria-label', spawning ? 'Spawn background task' : 'Send message');
+    dom.promptInput.placeholder = spawning
+      ? `Background task for ${driver} (no root turn)…`
+      : NATIVE_PLACEHOLDER;
+  }
+  dom.driverSelect.addEventListener('change', updateComposerDriverUI);
+  updateComposerDriverUI();
+
   dom.composerForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = dom.promptInput.value.trim();
@@ -370,9 +386,16 @@
     closeAutocomplete();
     dom.promptInput.value = '';
     autoResizeTextarea();
+    let sent = false;
     try {
       await sendCommand(command);
+      sent = true;
     } catch (_) {}
+    if (sent) {
+      // La selección de driver es de un solo uso: tras el envío exitoso vuelve a `native`.
+      dom.driverSelect.value = 'native';
+      updateComposerDriverUI();
+    }
   });
 
   let renderedDriversKey = null;
@@ -390,6 +413,7 @@
       dom.driverSelect.append(opt);
     }
     if (drivers.includes(prev)) dom.driverSelect.value = prev;
+    updateComposerDriverUI();
   }
 
   dom.modeBtn.addEventListener('click', () => {

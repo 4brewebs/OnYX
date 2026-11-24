@@ -257,26 +257,32 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             goal: None,
         });
     }
-    if let Some(rest) = cmd.strip_prefix("/spawn ") {
-        // `SDD-10` Fase 4: flag opcional `--driver <id>` al inicio; el resto es la tarea
-        // libre (se conserva la mayúscula/minúscula del usuario, a diferencia del resto
-        // de comandos que solo comparan en minúsculas).
-        let (driver, goal_src) = if rest.to_ascii_lowercase().starts_with("--driver ") {
-            let after = &rest["--driver ".len()..];
-            let mut parts = after.splitn(2, ' ');
-            let id = parts.next().map(str::trim).unwrap_or("");
-            let driver = if id.is_empty() {
-                None
+    if lower.starts_with("/spawn ") {
+        // `SDD-10` Fase 4: comando case-insensitive; los **args** se toman de `cmd` en la
+        // misma posición (se conserva la mayúscula/minúscula del usuario, a diferencia del
+        // resto de comandos que solo comparan en minúsculas), con tolerancia a espacios
+        // múltiples (`trim_start` tras `/spawn ` y tras `--driver`, `splitn` en
+        // cualquier carácter de whitespace).
+        let rest = cmd["/spawn ".len()..].trim_start();
+        let first_token = rest.split(char::is_whitespace).next().unwrap_or("");
+        let (driver, goal_src) = if first_token.eq_ignore_ascii_case("--driver") {
+            let after = rest["--driver".len()..].trim_start();
+            if after.is_empty() {
+                // Flag incompleta (sin id): sin driver ni tarea → nota de uso.
+                (None, "")
             } else {
-                Some(id.to_string())
-            };
-            let goal_src = parts.next().map(str::trim).unwrap_or("");
-            (driver, goal_src)
-        } else if rest.trim().eq_ignore_ascii_case("--driver") {
-            // Flag incompleta (sin id): sin driver ni tarea → nota de uso.
-            (None, "")
+                let mut parts = after.splitn(2, char::is_whitespace);
+                let id = parts.next().unwrap_or("").trim();
+                let driver = if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                };
+                let goal_src = parts.next().map(str::trim).unwrap_or("");
+                (driver, goal_src)
+            }
         } else {
-            (None, rest.trim())
+            (None, rest.trim_end())
         };
         return Some(SlashCommand::SpawnSubagent {
             driver,
@@ -836,8 +842,15 @@ impl OnyxSystem for CommandSpawnerSystem {
                                 } else {
                                     s.touched_files.join(", ")
                                 };
+                                // `SDD-10` Fase 4: badge del driver (`→ opencode`); el
+                                // driver nativo es el default y no se muestra.
+                                let driver_badge = if s.driver == "native" {
+                                    String::new()
+                                } else {
+                                    format!("→ {} ", s.driver)
+                                };
                                 lines.push(format!(
-                                    "  - [bg #{}] ({}) branch={} touched=[{}] goal=\"{}\"",
+                                    "  - [bg #{}] ({}) {driver_badge}branch={} touched=[{}] goal=\"{}\"",
                                     s.job_id, s.status, s.branch_name, files, s.goal
                                 ));
                             }
@@ -852,8 +865,15 @@ impl OnyxSystem for CommandSpawnerSystem {
                                     recs.len()
                                 )];
                                 for r in recs {
+                                    // `SDD-10` Fase 4: badge del driver (`→ opencode`);
+                                    // el driver nativo es el default y no se muestra.
+                                    let driver_badge = if r.driver == "native" {
+                                        String::new()
+                                    } else {
+                                        format!("→ {} ", r.driver)
+                                    };
                                     lines.push(format!(
-                                        "  - [bg #{}] ({}) branch={} touched=[{}]",
+                                        "  - [bg #{}] ({}) {driver_badge}branch={} touched=[{}]",
                                         r.job_id,
                                         r.status,
                                         r.branch,
@@ -1269,9 +1289,11 @@ impl OnyxSystem for CommandSpawnerSystem {
 mod tests {
     use super::*;
 
-    /// `SDD-10` Fase 4: parseo de `/spawn [--driver <id>] <tarea>`. El flag es
-    /// case-insensitive; el `id` y la **tarea** conservan la mayúscula/minúscula del
-    /// usuario (a diferencia del resto de comandos, que solo comparan en minúsculas).
+    /// `SDD-10` Fase 4: parseo de `/spawn [--driver <id>] <tarea>`. El comando y el flag
+    /// son case-insensitive (incluido `/SPAWN` **con** args), tolera espacios múltiples
+    /// (tras `/spawn ` y tras `--driver`); el `id` y la **tarea** conservan la
+    /// mayúscula/minúscula del usuario (a diferencia del resto de comandos, que solo
+    /// comparan en minúsculas).
     #[test]
     fn parse_slash_spawn_variants() {
         // `/spawn` solo → sin driver ni goal (nota de uso en el dispatch).
@@ -1328,6 +1350,30 @@ mod tests {
             Some(SlashCommand::SpawnSubagent {
                 driver: Some("opencode".to_string()),
                 goal: None
+            })
+        );
+        // Comando case-insensitive **con** args: la tarea conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/SPAWN Fix It"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: Some("Fix It".to_string())
+            })
+        );
+        // Espacios múltiples tras `/spawn` → se toleran.
+        assert_eq!(
+            parse_slash_command("/spawn  --driver opencode task"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: Some("task".to_string())
+            })
+        );
+        // Espacios múltiples tras `--driver` → el id y la tarea se separan igualmente.
+        assert_eq!(
+            parse_slash_command("/spawn --driver  opencode task"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: Some("task".to_string())
             })
         );
     }

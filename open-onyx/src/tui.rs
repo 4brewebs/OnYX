@@ -1662,7 +1662,7 @@ pub(crate) fn render_agent_picker_with_subagents(
             } else {
                 clean_goal
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     "  [bg] ",
                     Style::default()
@@ -1677,26 +1677,24 @@ pub(crate) fn render_agent_picker_with_subagents(
                     format!("({}) ", job.status),
                     Style::default().fg(state_color),
                 ),
-                // `SDD-10` Fase 4: badge del driver (`→ opencode`); el driver nativo es el
-                // default y no se muestra para no ensuciar la línea.
-                Span::styled(
-                    if job.driver == "native" {
-                        String::new()
-                    } else {
-                        format!("→ {} ", job.driver)
-                    },
-                    Style::default().fg(if job.driver == "native" {
-                        Color::DarkGray
-                    } else {
-                        Color::Magenta
-                    }),
-                ),
-                Span::styled(
-                    format!("{} — ", job.branch_name),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(goal_preview, Style::default().fg(Color::DarkGray)),
-            ]));
+            ];
+            // `SDD-10` Fase 4: badge del driver (`→ opencode`); el driver nativo es el
+            // default y no se muestra (ni se empuja Span vacío) para no ensuciar la línea.
+            if job.driver != "native" {
+                spans.push(Span::styled(
+                    format!("→ {} ", job.driver),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{} — ", job.branch_name),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                goal_preview,
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(spans));
         }
     }
 
