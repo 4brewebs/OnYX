@@ -60,6 +60,11 @@ const MAX_THINKING_MAX_TOKENS: u64 = 64_000;
 /// `thinking.budget_tokens` mínimo explícito (0 = desactivado).
 pub(crate) const MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
 
+/// Tope del `thinking.budget_tokens` explícito: por encima, `max_tokens`
+/// (acotado a `MAX_THINKING_MAX_TOKENS`) dejaría de ser `> budget_tokens`
+/// y la API devolvería 400.
+const MAX_THINKING_BUDGET_TOKENS: u64 = 60_000;
+
 /// Tope del `Retry-After` sugerido por el servidor (ms): evita que un proxy
 /// malicioso/lento bloquee el bucle de reintentos indefinidamente.
 const MAX_RETRY_AFTER_MS: u64 = 60_000;
@@ -173,6 +178,11 @@ pub(crate) fn parse_thinking_budget(raw: &str) -> Result<u64, String> {
             "--thinking-budget must be 0 (disabled) or at least {MIN_THINKING_BUDGET_TOKENS} tokens, got {value}"
         ));
     }
+    if value > MAX_THINKING_BUDGET_TOKENS {
+        return Err(format!(
+            "--thinking-budget cannot exceed {MAX_THINKING_BUDGET_TOKENS} tokens (the API requires `max_tokens` above the budget), got {value}"
+        ));
+    }
     Ok(value)
 }
 
@@ -241,18 +251,27 @@ fn push_user_message(messages: &mut Vec<JsonValue>, content: JsonValue) {
     messages.push(json!({"role": "user", "content": content}));
 }
 
-/// `true` si la historia proyectada contiene un `tool_use` cuya respuesta no
-/// tiene bloques de thinking en caché (con `signature`) — p. ej. tras
-/// `--resume` o un hot-swap de proveedor. En ese caso se omite el parámetro
-/// `thinking` de esta petición (fallback seguro) para que la API no devuelva
-/// 400 por bloques de thinking ausentes en la historia.
+/// `true` si el segmento de historia **tras el último mensaje de usuario**
+/// contiene un `tool_use` sin bloques de thinking en caché (con
+/// `signature`) — p. ej. tras `--resume` o un hot-swap de proveedor. En ese
+/// caso se omite el parámetro `thinking` de esta petición (fallback seguro)
+/// para que la API no devuelva 400 por bloques de thinking ausentes.
+///
+/// Un nuevo mensaje de usuario tras el último tool loop reactiva el thinking
+/// (el segmento antiguo queda «respondido» y no se inspecciona): por eso solo
+/// se escanea desde el último `ProjectedTurn::User` en adelante.
 fn history_missing_thinking(
     turns: &[ProjectedTurn],
     agent: u64,
     cache: &HashMap<(u64, usize), Vec<JsonValue>>,
 ) -> bool {
+    let last_user = turns
+        .iter()
+        .rposition(|t| matches!(t, ProjectedTurn::User(_)))
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let mut prev_was_tool_call = false;
-    for turn in turns {
+    for turn in &turns[last_user..] {
         let is_tool_call = matches!(turn, ProjectedTurn::ToolCall { .. });
         if is_tool_call && !prev_was_tool_call {
             let call_index = match turn {
@@ -289,14 +308,20 @@ pub(crate) fn build_anthropic_request_body(
     let thinking_budget = thinking_budget_tokens.filter(|b| *b > 0);
     let enable_thinking = thinking_budget
         .is_some_and(|_| !history_missing_thinking(&projected.turns, req.agent.0, thinking_blocks));
-    // La API exige `max_tokens > budget_tokens`: se auto-ajusta hacia arriba.
-    let max_tokens = thinking_budget
-        .map(|b| {
-            DEFAULT_ANTHROPIC_MAX_TOKENS
-                .max(b.saturating_add(4096))
-                .min(MAX_THINKING_MAX_TOKENS)
-        })
-        .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS);
+    // La API exige `max_tokens > budget_tokens` SOLO cuando `thinking` se envía:
+    // se auto-ajusta hacia arriba únicamente en ese caso (sin thinking, el
+    // `max_tokens` por defecto vale y evita sobre-cobro de ventana).
+    let max_tokens = if enable_thinking {
+        thinking_budget
+            .map(|b| {
+                DEFAULT_ANTHROPIC_MAX_TOKENS
+                    .max(b.saturating_add(4096))
+                    .min(MAX_THINKING_MAX_TOKENS)
+            })
+            .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS)
+    } else {
+        DEFAULT_ANTHROPIC_MAX_TOKENS
+    };
 
     for turn in projected.turns {
         match turn {
@@ -646,18 +671,19 @@ pub(crate) fn accumulate_anthropic_sse_reader<R: std::io::BufRead>(
                             }
                         }
                         Some("signature_delta") => {
-                            // Firma cifrada del bloque de thinking: sin ella el
-                            // bloque no puede reenviarse en el tool loop.
+                            // Firma cifrada del bloque de thinking (formato
+                            // oficial: `{"type":"signature_delta","signature":…}`):
+                            // sin ella el bloque no puede reenviarse en el tool
+                            // loop. Puede llegar en varios chunks: se acumula.
                             let sig = delta
-                                .get("data")
+                                .get("signature")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            if let Some(BlockState::Thinking { signature, .. }) =
-                                blocks.get_mut(&index)
-                            {
-                                if !sig.is_empty() {
-                                    *signature = Some(sig);
+                                .unwrap_or_default();
+                            if !sig.is_empty() {
+                                if let Some(BlockState::Thinking { signature, .. }) =
+                                    blocks.get_mut(&index)
+                                {
+                                    signature.get_or_insert_with(String::new).push_str(sig);
                                 }
                             }
                         }
@@ -1494,6 +1520,9 @@ mod tests {
         assert!(parse_thinking_budget("512").is_err());
         assert!(parse_thinking_budget("abc").is_err());
         assert!(parse_thinking_budget("-1").is_err());
+        // Tope: por encima, `max_tokens` no podría superar `budget_tokens`.
+        assert_eq!(parse_thinking_budget("60000").unwrap(), 60_000);
+        assert!(parse_thinking_budget("60001").is_err());
 
         // El explícito manda (incluso `0` = off contra `--effort`).
         assert_eq!(
@@ -1573,6 +1602,56 @@ mod tests {
     }
 
     #[test]
+    fn history_missing_thinking_only_scans_segment_after_last_user_turn() {
+        let tool_call = |call_index: usize| ProjectedTurn::ToolCall {
+            call_index,
+            call_id: format!("call_{call_index}"),
+            name: "fs_read".to_string(),
+            args_json: "{}".to_string(),
+        };
+        let empty = HashMap::new();
+
+        // Tool loop sin firmas en caché → `true` (fallback: sin `thinking`).
+        let turns = vec![
+            ProjectedTurn::User("goal".to_string()),
+            tool_call(0),
+            ProjectedTurn::ToolObserve {
+                call_id: Some("call_0".to_string()),
+                name: "fs_read".to_string(),
+                content: "ok".to_string(),
+                tier: crate::context::ToolOutputTier::Tier0Full,
+                is_toon: false,
+                is_superseded: false,
+            },
+        ];
+        assert!(history_missing_thinking(&turns, 1, &empty));
+
+        // Mismo tool loop pero con un **nuevo mensaje de usuario** al final
+        // (p. ej. tras `--resume`): el segmento antiguo no se inspecciona →
+        // el thinking vuelve a activarse.
+        let turns = vec![
+            ProjectedTurn::User("goal".to_string()),
+            tool_call(0),
+            ProjectedTurn::ToolObserve {
+                call_id: Some("call_0".to_string()),
+                name: "fs_read".to_string(),
+                content: "ok".to_string(),
+                tier: crate::context::ToolOutputTier::Tier0Full,
+                is_toon: false,
+                is_superseded: false,
+            },
+            ProjectedTurn::User("otra pregunta".to_string()),
+        ];
+        assert!(!history_missing_thinking(&turns, 1, &empty));
+
+        // Firma en caché para el primer `call` de la corrida → `false`.
+        let mut cache = HashMap::new();
+        cache.insert((1u64, 0usize), vec![json!({"type": "thinking", "signature": "s"})]);
+        let turns = vec![ProjectedTurn::User("goal".to_string()), tool_call(0)];
+        assert!(!history_missing_thinking(&turns, 1, &cache));
+    }
+
+    #[test]
     fn anthropic_sse_reader_captures_thinking_signature_and_reinjected_in_tool_loop() {
         // `REQ-04.2`: thinking (con `signature_delta`) + `redacted_thinking` +
         // `tool_use` → bloques cacheados para el turno de continuación.
@@ -1587,7 +1666,10 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think \"}}\n",
             "\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"data\":\"sig_abc\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_a\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"bc\"}}\n",
             "\n",
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n",

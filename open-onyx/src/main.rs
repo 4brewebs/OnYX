@@ -70,7 +70,7 @@ struct CliArgs {
     model: Option<String>,
     effort: Option<ReasoningEffort>,
     /// `--thinking-budget <tokens>` (Anthropic extended thinking, `REQ-04.2`):
-    /// `Some(0)` = off explícito, `Some(n)` = >= 1024, `None` = se deriva de `--effort`.
+    /// `Some(0)` = off explícito, `Some(n)` = 1024..=60000, `None` = se deriva de `--effort`.
     thinking_budget: Option<u64>,
     api_base: Option<String>,
     allow_custom_auth_host: bool,
@@ -550,7 +550,7 @@ OPTIONS:
       --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`, Anthropic `__ANTHROPIC_MODEL__`)
       --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`); for `anthropic` it maps to a thinking budget (low 2048 / medium 8192 / high 16384) when no explicit budget is set
       --thinking-budget <n>
-                            Anthropic extended thinking budget in tokens (`0` = off, or >= 1024; or `ANTHROPIC_THINKING_BUDGET`). Raises `max_tokens` above the budget; without it, `--effort` maps to a budget for `anthropic`
+                            Anthropic extended thinking budget in tokens (`0` = off, or 1024..=60000; or `ANTHROPIC_THINKING_BUDGET`). Raises `max_tokens` above the budget; without it, `--effort` maps to a budget for `anthropic`
       --api-base <url>     Custom API base URL (`http://` allowed on loopback only; remote hosts require `https://`)
       --allow-custom-auth-host
                            Explicit opt-in to send API keys to non-official remote HTTPS `--api-base` hosts (or `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`)
@@ -654,7 +654,7 @@ ENVIRONMENT VARIABLES:
                            Custom OpenAI-compatible API endpoint
   ANTHROPIC_API_BASE       Custom Anthropic API endpoint (default `https://api.anthropic.com`)
   ANTHROPIC_THINKING_BUDGET
-                           Anthropic extended thinking budget in tokens (`0` = off, or >= 1024); overrides the `--effort`-derived budget"#
+                           Anthropic extended thinking budget in tokens (`0` = off, or 1024..=60000); overrides the `--effort`-derived budget"#
         .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
         .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL)
         .replace("__ANTHROPIC_MODEL__", DEFAULT_ANTHROPIC_MODEL);
@@ -711,6 +711,20 @@ fn resolve_llm_config(
 
     let allow_custom_auth_host = cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
 
+    // `REQ-04.2`: presupuesto explícito de extended thinking, resuelto una vez
+    // antes del match: la CLI manda; el env se valida con el mismo contrato
+    // (`0` = off, >= 1024, <= 60000) y un valor inválido es **error duro**
+    // (mismo trato que el flag CLI). Se puebla en los tres proveedores para
+    // conservarlo en caliente (`/provider anthropic`).
+    let thinking_budget = match cli.thinking_budget {
+        Some(value) => Some(value),
+        None => env::var("ANTHROPIC_THINKING_BUDGET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|raw| parse_thinking_budget(&raw))
+            .transpose()?,
+    };
+
     match provider {
         LlmProvider::Gemini => {
             let api_key = env::var("GEMINI_API_KEY")
@@ -745,7 +759,7 @@ fn resolve_llm_config(
                 api_key,
                 model,
                 effort,
-                thinking_budget: None,
+                thinking_budget,
                 api_base,
                 project_instructions,
             })
@@ -786,7 +800,7 @@ fn resolve_llm_config(
                 api_key,
                 model,
                 effort,
-                thinking_budget: None,
+                thinking_budget,
                 api_base,
                 project_instructions,
             })
@@ -819,14 +833,6 @@ fn resolve_llm_config(
                         .filter(|s| !s.trim().is_empty())
                 })
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string());
-            // `REQ-04.2`: presupuesto explícito (`--thinking-budget` / env);
-            // `None` → se deriva de `--effort` (low 2048 / medium 8192 / high 16384).
-            let thinking_budget = cli.thinking_budget.or_else(|| {
-                env::var("ANTHROPIC_THINKING_BUDGET")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .and_then(|raw| parse_thinking_budget(&raw).ok())
-            });
             Ok(LlmConfig {
                 provider,
                 api_key,

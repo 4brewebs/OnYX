@@ -1208,6 +1208,8 @@ pub fn estimate_usage_cost_usd(model: &str, usage: TokenUsage) -> f64 {
         (3.00, 1.50, 12.00)
     } else if lower.starts_with("claude-opus") {
         (15.00, 1.50, 75.00)
+    } else if lower.starts_with("claude-haiku") {
+        (1.00, 0.10, 5.00)
     } else if lower.starts_with("claude-") {
         (3.00, 0.30, 15.00)
     } else {
@@ -1603,9 +1605,13 @@ mod tests {
             output_tokens: 1_000_000,
             reasoning_tokens: 0,
         };
-        // sonnet/haiku: (1.5M uncached * 3.00) + (0.5M cached * 0.30) + (1M * 15.00) = 19.65
+        // sonnet: (1.5M uncached * 3.00) + (0.5M cached * 0.30) + (1M * 15.00) = 19.65
         let sonnet = estimate_usage_cost_usd("claude-sonnet-4-5", usage);
         assert!((sonnet - 19.65).abs() < 1e-9, "{sonnet}");
+
+        // haiku: (1.5M uncached * 1.00) + (0.5M cached * 0.10) + (1M * 5.00) = 6.55
+        let haiku = estimate_usage_cost_usd("claude-haiku-4-5", usage);
+        assert!((haiku - 6.55).abs() < 1e-9, "{haiku}");
 
         let opus_usage = TokenUsage {
             input_tokens: 1_000_000,
