@@ -25,10 +25,24 @@ use crate::subagent::{SubagentHandle, decode_proposal_command};
 /// `PackSnapshotStore` o el árbol Git fuera de un tick individual (`REQ-03.2`, `REQ-03.3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAction {
-    Rewind { requested_tick: u64 },
-    Fork { label: Option<String> },
-    MergeSubagent { job_id: String },
-    DiscardSubagent { job_id: String },
+    Rewind {
+        requested_tick: u64,
+    },
+    Fork {
+        label: Option<String>,
+    },
+    MergeSubagent {
+        job_id: String,
+    },
+    DiscardSubagent {
+        job_id: String,
+    },
+    /// `/spawn [--driver <id>] <tarea>` (`SDD-10` Fase 4): lanza un job de worktree
+    /// en segundo plano sin gastar un turno de `root`.
+    SpawnSubagent {
+        goal: String,
+        driver: Option<String>,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -103,13 +117,22 @@ pub enum SlashCommand {
     Service(String),
     Agent(Option<String>),
     Subagents,
+    /// `/spawn [--driver <id>] <tarea>` (`SDD-10` Fase 4): subagente en segundo plano sin
+    /// turno de `root`. `driver` es `None`/`"native"` → motor en proceso; otro `id` →
+    /// harness CLI de `[[external_drivers]]`.
+    SpawnSubagent {
+        driver: Option<String>,
+        goal: Option<String>,
+    },
     MergeSubagent(String),
     DiscardSubagent(String),
     Rewind(Option<u64>),
     RewindInvalid(String),
     Fork(Option<String>),
     Trust(Option<String>),
-    Cancel { all: bool },
+    Cancel {
+        all: bool,
+    },
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
@@ -227,6 +250,42 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
         if !trimmed.is_empty() {
             return Some(SlashCommand::DiscardSubagent(trimmed.to_string()));
         }
+    }
+    if lower == "/spawn" {
+        return Some(SlashCommand::SpawnSubagent {
+            driver: None,
+            goal: None,
+        });
+    }
+    if let Some(rest) = cmd.strip_prefix("/spawn ") {
+        // `SDD-10` Fase 4: flag opcional `--driver <id>` al inicio; el resto es la tarea
+        // libre (se conserva la mayúscula/minúscula del usuario, a diferencia del resto
+        // de comandos que solo comparan en minúsculas).
+        let (driver, goal_src) = if rest.to_ascii_lowercase().starts_with("--driver ") {
+            let after = &rest["--driver ".len()..];
+            let mut parts = after.splitn(2, ' ');
+            let id = parts.next().map(str::trim).unwrap_or("");
+            let driver = if id.is_empty() {
+                None
+            } else {
+                Some(id.to_string())
+            };
+            let goal_src = parts.next().map(str::trim).unwrap_or("");
+            (driver, goal_src)
+        } else if rest.trim().eq_ignore_ascii_case("--driver") {
+            // Flag incompleta (sin id): sin driver ni tarea → nota de uso.
+            (None, "")
+        } else {
+            (None, rest.trim())
+        };
+        return Some(SlashCommand::SpawnSubagent {
+            driver,
+            goal: if goal_src.is_empty() {
+                None
+            } else {
+                Some(goal_src.to_string())
+            },
+        });
     }
     if lower == "/cancel" || lower == "/stop" {
         return Some(SlashCommand::Cancel { all: false });
@@ -858,6 +917,25 @@ impl OnyxSystem for CommandSpawnerSystem {
                                 .set(SessionAction::DiscardSubagent { job_id });
                         }
                     }
+                    SlashCommand::SpawnSubagent { driver, goal } => {
+                        let Some(goal) = goal else {
+                            // Nota de uso (si no hay `root` todavía, la nota es un no-op y
+                            // no se muestra nada, igual que el resto de comandos).
+                            if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                                append_agent_memory(
+                                    ctx.graph,
+                                    &v,
+                                    root_id,
+                                    "system",
+                                    "[/spawn] Usage: `/spawn [--driver <id>] <task>` — runs the task in an isolated worktree without spending a root turn (list jobs with `/subagents`).",
+                                    now,
+                                );
+                            }
+                            continue;
+                        };
+                        self.pending_action
+                            .set(SessionAction::SpawnSubagent { goal, driver });
+                    }
                     SlashCommand::Rewind(None) => {
                         let note = if let Some(store) = &self.snapshot_store {
                             let entries = store.entries();
@@ -1184,5 +1262,73 @@ impl OnyxSystem for CommandSpawnerSystem {
             let spec = self.spawn_spec(&*ctx.graph, &v, cmd.to_string());
             ctx.outbox.push(spawn_event(&v, &spec, None));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SDD-10` Fase 4: parseo de `/spawn [--driver <id>] <tarea>`. El flag es
+    /// case-insensitive; el `id` y la **tarea** conservan la mayúscula/minúscula del
+    /// usuario (a diferencia del resto de comandos, que solo comparan en minúsculas).
+    #[test]
+    fn parse_slash_spawn_variants() {
+        // `/spawn` solo → sin driver ni goal (nota de uso en el dispatch).
+        assert_eq!(
+            parse_slash_command("/spawn"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: None
+            })
+        );
+        // El comando es case-insensitive.
+        assert_eq!(
+            parse_slash_command("/SPAWN"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: None
+            })
+        );
+        // Con tarea libre: se conserva la mayúscula del usuario.
+        assert_eq!(
+            parse_slash_command("/spawn Fix The Parser BUG"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: Some("Fix The Parser BUG".to_string())
+            })
+        );
+        // `--driver <id>` + tarea.
+        assert_eq!(
+            parse_slash_command("/spawn --driver opencode refactor the parser"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: Some("refactor the parser".to_string())
+            })
+        );
+        // Flag case-insensitive; el `id` conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/spawn --Driver OPCODE Fix It"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("OPCODE".to_string()),
+                goal: Some("Fix It".to_string())
+            })
+        );
+        // `--driver` sin id → driver `None`, sin goal.
+        assert_eq!(
+            parse_slash_command("/spawn --driver"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: None,
+                goal: None
+            })
+        );
+        // `--driver <id>` sin tarea → driver `Some`, goal `None`.
+        assert_eq!(
+            parse_slash_command("/spawn --driver opencode"),
+            Some(SlashCommand::SpawnSubagent {
+                driver: Some("opencode".to_string()),
+                goal: None
+            })
+        );
     }
 }

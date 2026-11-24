@@ -1389,6 +1389,23 @@ button.pill:active {
   gap: 0.55rem;
 }
 
+.driver-select {
+  flex-shrink: 0;
+  max-inline-size: 9.5rem;
+  padding: 0.62rem 0.6rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--ink-primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.driver-select:focus {
+  outline: 2px solid color-mix(in oklab, var(--accent) 65%, transparent);
+  outline-offset: 1px;
+}
+
 .prompt-input {
   flex: 1;
   min-inline-size: 0;

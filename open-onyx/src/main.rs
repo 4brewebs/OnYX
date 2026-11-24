@@ -609,6 +609,8 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /subagents               List background async subagent worktree jobs and touched files
   /merge <job_id>          Reconcile 3-way and merge a finished async subagent into root
   /discard <job_id>        Cancel and remove an async subagent worktree and temporary branch
+  /spawn [--driver <id>] <task>
+                          Launch a background subagent worktree job without spending a root turn
   /undo                    Revert the latest reversible git checkpoint (also removes newly created untracked `fs_write` files)
   /rewind [tick]           List milestones or rewind in-place to `<tick>` (forks snapshots safely + restores git tree)
   /fork [name]             Branch snapshots up to the current tick into a sibling directory without mutating the original

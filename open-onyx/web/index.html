@@ -129,6 +129,15 @@
           <div id="autocomplete" class="autocomplete hidden" role="listbox" aria-label="Autocomplete suggestions"></div>
 
           <form id="composer-form" class="composer-form" autocomplete="off">
+            <label class="sr-only" for="driver-select">Subagent driver</label>
+            <select
+              id="driver-select"
+              class="driver-select"
+              aria-label="Subagent driver"
+              title="Driver for background tasks (native or configured external harness CLI)"
+            >
+              <option value="native">native</option>
+            </select>
             <label class="sr-only" for="prompt-input">Message or slash command</label>
             <textarea
               id="prompt-input"

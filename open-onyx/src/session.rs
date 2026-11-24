@@ -301,6 +301,47 @@ pub fn apply_session_action(
             emit_session_note(host, &ctx.pending_notes, &msg);
             return msg;
         }
+        SessionAction::SpawnSubagent { goal, driver } => {
+            // `SDD-10` Fase 4: `/spawn` crea un worktree → bloqueado fuera de BUILD
+            // (mismo gate que `/merge`).
+            if !ctx.mode_handle.get().allows_mutation() {
+                let msg = format!(
+                    "[/spawn] Blocked in `{}` mode: switch to BUILD to spawn a background subagent.",
+                    ctx.mode_handle.get().as_label()
+                );
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            }
+            let Some(ref sub) = ctx.subagents else {
+                let msg = "[/spawn] Async subagents are unavailable in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return msg;
+            };
+            // El job queda registrado en el grafo al completar (notificación proactiva);
+            // aquí solo lanzamos: 0 trabajo del grafo, 0 turno de `root`.
+            let msg = match sub.spawn_job(
+                goal,
+                None,
+                None,
+                host.ticks(),
+                Vec::new(),
+                driver.as_deref(),
+            ) {
+                Ok(summary) => {
+                    let driver_note = match driver.as_deref() {
+                        Some(d) if !d.eq_ignore_ascii_case("native") => format!(" on driver `{d}`"),
+                        _ => String::new(),
+                    };
+                    format!(
+                        "[/spawn] Launched background worktree job `[{job_id}]`{driver_note}; it runs without spending a root turn (check `/subagents`).",
+                        job_id = summary.job_id
+                    )
+                }
+                Err(err) => format!("[/spawn] ERROR: {err}"),
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return msg;
+        }
         SessionAction::Rewind { .. } | SessionAction::Fork { .. } => {}
     }
 
@@ -422,7 +463,9 @@ pub fn apply_session_action(
             emit_session_note(host, &ctx.pending_notes, &summary);
             summary
         }
-        SessionAction::MergeSubagent { .. } | SessionAction::DiscardSubagent { .. } => {
+        SessionAction::MergeSubagent { .. }
+        | SessionAction::DiscardSubagent { .. }
+        | SessionAction::SpawnSubagent { .. } => {
             unreachable!("subagent session actions return early above")
         }
     }

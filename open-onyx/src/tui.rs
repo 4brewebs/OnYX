@@ -22,7 +22,7 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     ImpactAssessment, PermissionDecision, SproutSupervisor, WorkspaceMode, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, apply_impact_escalation, graph_workspace_plan,
+    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_plan,
     graph_workspace_services, preview_tool_diff,
 };
 use ratatui::{
@@ -46,6 +46,7 @@ use crate::gemini::StreamPreviewHandle;
 use crate::pack::SharedPackStore;
 use crate::subagent::{
     MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentJobSummary,
+    effective_merge_decision,
 };
 use crate::tui_input::{
     InputBuffer, InputHistory, PopupState, QueuedPrompts, WorkspaceFileIndex, render_input_popup,
@@ -720,8 +721,11 @@ impl TuiInner {
                         })
                     });
                     match preview {
+                        // `SDD-10` Fase 4: misma decisión efectiva que
+                        // `SubagentManagerDriver` (gobernanza → `Ask` obligatorio); si no es
+                        // `Ask`, el driver auto-aprueba y el prompt no debe mostrarse.
                         Some(MergePreviewState::Clean(ticket)) => {
-                            if apply_impact_escalation(static_dec, ticket.impact.as_ref())
+                            if effective_merge_decision(static_dec, &ticket)
                                 != PermissionDecision::Ask
                             {
                                 continue;
@@ -740,12 +744,10 @@ impl TuiInner {
                         // `SDD-10` Fase 3: Control Plane → sin banner; `SubagentManagerDriver`
                         // niega la solicitud de plano (disco de `root` intacto).
                         Some(MergePreviewState::ControlPlaneDenied { .. }) => continue,
-                        None => {
-                            if static_dec != PermissionDecision::Ask {
-                                continue;
-                            }
-                            None
-                        }
+                        // `SDD-10` Fase 4: alineado con `CliApprovalDriver`: sin preview no hay
+                        // `y/n`; el driver auto-aprueba para que `subagent_merge` devuelva el
+                        // error exacto a `root` (evita un prompt que el driver no espera).
+                        None => continue,
                     }
                 } else if let Some(tools) = &self.tools {
                     let (decision, impact) =
@@ -1480,6 +1482,8 @@ fn is_immediate_slash_cmd(cmd: &str) -> bool {
         || lower.starts_with("/service ")
         || lower == "/subagents"
         || lower == "/subagent"
+        || lower == "/spawn"
+        || lower.starts_with("/spawn ")
         || lower.starts_with("/merge ")
         || lower.starts_with("/discard ")
         || lower == "/trust"
@@ -1672,6 +1676,20 @@ pub(crate) fn render_agent_picker_with_subagents(
                 Span::styled(
                     format!("({}) ", job.status),
                     Style::default().fg(state_color),
+                ),
+                // `SDD-10` Fase 4: badge del driver (`→ opencode`); el driver nativo es el
+                // default y no se muestra para no ensuciar la línea.
+                Span::styled(
+                    if job.driver == "native" {
+                        String::new()
+                    } else {
+                        format!("→ {} ", job.driver)
+                    },
+                    Style::default().fg(if job.driver == "native" {
+                        Color::DarkGray
+                    } else {
+                        Color::Magenta
+                    }),
                 ),
                 Span::styled(
                     format!("{} — ", job.branch_name),

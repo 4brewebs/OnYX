@@ -26,9 +26,8 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     ImpactAssessment, PermissionDecision, SandboxDriverKind, SproutSupervisor, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, apply_impact_escalation,
-    detect_sandbox_capabilities, graph_subagent_records, graph_workspace_plan,
-    graph_workspace_services, preview_tool_diff,
+    WorkspacePolicy, WorkspaceTools, WorkspaceVocab, detect_sandbox_capabilities,
+    graph_subagent_records, graph_workspace_plan, graph_workspace_services, preview_tool_diff,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +35,9 @@ use crate::context::{ReasoningEffort, SessionTelemetryHandle};
 use crate::gemini::StreamPreviewHandle;
 use crate::pack::SharedPackStore;
 use crate::session::UiIdlePump;
-use crate::subagent::{MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle};
+use crate::subagent::{
+    MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, effective_merge_decision,
+};
 use crate::tui_input::WorkspaceFileIndex;
 use crate::vault::session_display_label;
 
@@ -254,6 +255,8 @@ pub struct WebTelemetrySnapshot {
 pub struct WebSubagentSnapshot {
     pub job_id: String,
     pub name: String,
+    /// Backend que ejecuta el job: `"native"` o el `id` del harness CLI externo (`SDD-10`).
+    pub driver: String,
     pub status: String,
     pub ok: Option<bool>,
     pub spawn_tick: u64,
@@ -272,6 +275,8 @@ pub struct WebStateSnapshot {
     pub sandbox_badge: String,
     pub untrusted: bool,
     pub model: String,
+    /// Drivers disponibles para `/spawn` (`"native"` + ids de `[[external_drivers]]`, `SDD-10`).
+    pub drivers: Vec<String>,
     pub effort: String,
     pub vault_label: Option<String>,
     pub focused_agent_id: Option<u64>,
@@ -489,6 +494,8 @@ fn is_immediate_web_slash(cmd: &str) -> bool {
         || lower.starts_with("/service ")
         || lower == "/subagents"
         || lower == "/subagent"
+        || lower == "/spawn"
+        || lower.starts_with("/spawn ")
         || lower.starts_with("/merge ")
         || lower.starts_with("/discard ")
         || lower == "/trust"
@@ -825,6 +832,16 @@ impl WebRuntimeInner {
         }
     }
 
+    /// Drivers disponibles para `/spawn`: `"native"` + los ids de `[[external_drivers]]`
+    /// resueltos en la policy cargada (`SDD-10` Fase 4).
+    fn available_driver_ids(&self) -> Vec<String> {
+        let mut ids = vec!["native".to_string()];
+        if let Some(pol) = &self.policy {
+            ids.extend(pol.external_drivers().iter().map(|d| d.id.clone()));
+        }
+        ids
+    }
+
     fn publish_snapshot(&mut self, graph: &dyn GraphView, force_notify: bool) {
         let agents = collect_agents(graph, &self.vocab);
         let root_busy = is_root_agent_busy(graph, &self.vocab);
@@ -856,9 +873,11 @@ impl WebRuntimeInner {
                         .and_then(|h| h.preview_merge_for_request(&jid, a.agent.0, a.request).ok())
                 });
                 match preview {
+                    // `SDD-10` Fase 4: misma decisión efectiva que `SubagentManagerDriver`
+                    // (gobernanza → `Ask` obligatorio); si no es `Ask`, el driver auto-aprueba
+                    // y el banner no debe mostrarse.
                     Some(MergePreviewState::Clean(ticket)) => {
-                        if apply_impact_escalation(static_dec, ticket.impact.as_ref())
-                            != PermissionDecision::Ask
+                        if effective_merge_decision(static_dec, &ticket) != PermissionDecision::Ask
                         {
                             continue;
                         }
@@ -876,12 +895,10 @@ impl WebRuntimeInner {
                     // `SDD-10` Fase 3: Control Plane → sin banner; `SubagentManagerDriver`
                     // niega la solicitud de plano (disco de `root` intacto).
                     Some(MergePreviewState::ControlPlaneDenied { .. }) => continue,
-                    None => {
-                        if static_dec != PermissionDecision::Ask {
-                            continue;
-                        }
-                        None
-                    }
+                    // `SDD-10` Fase 4: alineado con `CliApprovalDriver`: sin preview no hay
+                    // banner; el driver auto-aprueba para que `subagent_merge` devuelva el
+                    // error exacto a `root` (evita un banner que el driver no espera).
+                    None => continue,
                 }
             } else if let Some(tools) = &self.tools {
                 let (decision, impact) =
@@ -1008,6 +1025,7 @@ impl WebRuntimeInner {
                 .map(|s| WebSubagentSnapshot {
                     job_id: s.job_id,
                     name: s.name,
+                    driver: s.driver,
                     status: s.status.to_string(),
                     ok: s.ok,
                     spawn_tick: s.spawn_tick,
@@ -1023,6 +1041,7 @@ impl WebRuntimeInner {
                 .map(|r| WebSubagentSnapshot {
                     job_id: r.job_id.clone(),
                     name: r.job_id,
+                    driver: r.driver,
                     status: r.status,
                     ok: Some(r.ok),
                     spawn_tick: r.spawn_tick,
@@ -1045,6 +1064,7 @@ impl WebRuntimeInner {
             sandbox_badge,
             untrusted,
             model: self.model_name.clone(),
+            drivers: self.available_driver_ids(),
             effort: self
                 .reasoning_effort
                 .map(ReasoningEffort::as_str)

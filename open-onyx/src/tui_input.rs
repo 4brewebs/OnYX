@@ -87,6 +87,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Show status of `sprout.toml` services",
     },
     SlashCommandHint {
+        command: "/spawn",
+        insert: "/spawn ",
+        description: "Launch background subagent without a root turn (`[--driver <id>] <task>`)",
+    },
+    SlashCommandHint {
         command: "/subagents",
         insert: "/subagents",
         description: "List background async worktree subagent jobs",

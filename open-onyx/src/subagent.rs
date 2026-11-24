@@ -37,6 +37,27 @@ use crate::external_driver::{ExternalDriverRunner, ExternalHarnessDriver};
 /// Fábrica thread-safe para construir un `Responder` independiente por cada hilo de subagente.
 pub type ResponderFactory = Arc<dyn Fn() -> Box<dyn Responder> + Send + Sync>;
 
+/// Decisión efectiva para la aprobación de `subagent_merge` con un ticket sellado
+/// (`SDD-10` Fase 4): única fuente de verdad compartida por [`SubagentManagerDriver`]
+/// (auto-aprobación) y por las superficies TUI/Web/CLI (¿mostrar el prompt `y/n`?).
+///
+/// - El delta toca la superficie de **gobernanza** (`sprout.toml`, `.github/workflows/**`)
+///   → `Ask` obligatorio, aunque la política estética permita el merge (`SDD-10` Fase 3).
+/// - En el resto, la decisión del policy + escalado por impacto (Scent).
+///
+/// Los sitios que la consumen ya han descartado el `Deny` estático y el
+/// [`MergePreviewState::ControlPlaneDenied`], por lo que aquí solo entran `Allow`/`Ask`.
+pub(crate) fn effective_merge_decision(
+    static_dec: PermissionDecision,
+    ticket: &MergePreviewTicket,
+) -> PermissionDecision {
+    if classify_merge_delta(&ticket.changed_files) == MergeDeltaVerdict::Ask {
+        PermissionDecision::Ask
+    } else {
+        apply_impact_escalation(static_dec, ticket.impact.as_ref())
+    }
+}
+
 /// Backend de ejecución de un job de subagente (`SDD-10` Fase 1):
 /// - [`WorkerBackend::Native`]: motor OnYX en proceso (snapshot del grafo + semilla derivada).
 /// - [`WorkerBackend::External`]: harness CLI externo (`opencode`, `claude`, ...) ejecutado
@@ -1742,15 +1763,9 @@ impl PlatformDriver for SubagentManagerDriver {
                         continue;
                     }
                     match preview {
+                        // Gobernanza → `Ask` obligatorio; resto → policy + escalado por impacto.
                         Ok(MergePreviewState::Clean(ticket)) => {
-                            // Superficie de gobernanza (`sprout.toml`, `.github/workflows/**`)
-                            // → `Ask` obligatorio: nunca auto-aprobado (`SDD-10` Fase 3).
-                            if classify_merge_delta(&ticket.changed_files) == MergeDeltaVerdict::Ask
-                            {
-                                PermissionDecision::Ask
-                            } else {
-                                apply_impact_escalation(static_decision, ticket.impact.as_ref())
-                            }
+                            effective_merge_decision(static_decision, &ticket)
                         }
                         Ok(MergePreviewState::NoOp) => static_decision,
                         // No alcanzable: `ControlPlaneDenied` se niega arriba (el `if let` no
@@ -3961,6 +3976,224 @@ mod tests {
         );
         assert_eq!(count_worktrees(), 0, "el replay no debe crear worktrees");
 
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&host_tmp);
+    }
+
+    /// Ticket mínimo para los tests unitarios de [`effective_merge_decision`]: solo
+    /// `changed_files` e `impact` influyen en la decisión; el resto son campos inertes.
+    fn test_merge_ticket(
+        changed_files: Vec<&str>,
+        impact: Option<ImpactAssessment>,
+    ) -> MergePreviewTicket {
+        MergePreviewTicket {
+            job_id: "t-1".to_string(),
+            approval_key: None,
+            root_now_commit: "root-commit".to_string(),
+            root_now_tree: "root-tree".to_string(),
+            sub_commit: "sub-commit".to_string(),
+            merged_tree: "merged-tree".to_string(),
+            changed_files: changed_files.into_iter().map(String::from).collect(),
+            unified_diff: String::new(),
+            impact,
+        }
+    }
+
+    /// `SDD-10` Fase 4 (fix deadlock de gobernanza): [`effective_merge_decision`] es la única
+    /// fuente de verdad compartida por `SubagentManagerDriver` y las superficies TUI/Web/CLI:
+    /// un delta que toca gobernanza (`sprout.toml`, `.github/workflows/**`) fuerza `Ask`
+    /// **aunque** la política lo permita estáticamente; en el resto delega en
+    /// `apply_impact_escalation` (monotonía `Allow ≤ Ask`).
+    #[test]
+    fn effective_merge_decision_forces_ask_on_governance_and_delegates_to_impact() {
+        // Impacto que escala `Allow → Ask` (heat por encima del umbral duro).
+        let escalation = ImpactAssessment {
+            max_heat_bp: 400,
+            callers: 12,
+            hops: 4,
+            touches_public_src: true,
+            hard_threshold_hit: true,
+            escalates_allow_to_ask: true,
+            epicenters: vec!["src/main.rs".to_string()],
+            summary_line: "high impact".to_string(),
+        };
+
+        // Gobernanza → `Ask` siempre, aunque la política permita el merge.
+        assert_eq!(
+            effective_merge_decision(
+                PermissionDecision::Allow,
+                &test_merge_ticket(vec!["src/a.rs", "sprout.toml"], None)
+            ),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            effective_merge_decision(
+                PermissionDecision::Allow,
+                &test_merge_ticket(vec![".github/workflows/ci.yml"], None)
+            ),
+            PermissionDecision::Ask
+        );
+        // `Ask` ya pedido por la política sigue siendo `Ask`.
+        assert_eq!(
+            effective_merge_decision(
+                PermissionDecision::Ask,
+                &test_merge_ticket(vec!["sprout.toml"], None)
+            ),
+            PermissionDecision::Ask
+        );
+
+        // Sin gobernanza → delega en el impacto: `Allow` + escalado → `Ask`.
+        assert_eq!(
+            effective_merge_decision(
+                PermissionDecision::Allow,
+                &test_merge_ticket(vec!["src/a.rs"], Some(escalation.clone()))
+            ),
+            PermissionDecision::Ask
+        );
+        // Sin gobernanza ni impacto escalado → la decisión estática se conserva.
+        assert_eq!(
+            effective_merge_decision(
+                PermissionDecision::Allow,
+                &test_merge_ticket(vec!["src/a.rs"], None)
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            effective_merge_decision(
+                PermissionDecision::Ask,
+                &test_merge_ticket(vec!["src/a.rs"], Some(escalation))
+            ),
+            PermissionDecision::Ask
+        );
+    }
+
+    /// `SDD-10` Fase 4 (e2e sin turno de root): `/spawn --driver <id> <tarea>` vía
+    /// [`apply_session_action`] lanza un job de worktree con driver externo en un host
+    /// **fresco** (0 agentes, 0 turnos de `root`): el job es visible en `list_summaries()`
+    /// con el `driver` correcto y el tick del host no avanza; fuera de BUILD el gate
+    /// bloquea el spawn sin crear job alguno.
+    #[test]
+    fn slash_spawn_external_driver_runs_without_root_turn() {
+        use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
+        use crate::session::{SessionActionContext, apply_session_action};
+
+        let repo = init_temp_git_repo("spawn_slash");
+        let wt_base = repo.parent().unwrap().join(format!(
+            "openonyx_wt_base_spawn_slash_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&wt_base);
+        let host_tmp = host_tmp_dir("spawn_slash");
+
+        // CLI fake que crea `from_slash.txt` dentro del worktree (CWD del runner).
+        let bin = write_cli_script(
+            &host_tmp,
+            "spawnfake",
+            "@echo off\r\necho spawned > from_slash.txt\r\n",
+            "#!/bin/sh\necho spawned > from_slash.txt\n",
+        );
+        let policy = WorkspacePolicy::new(&repo)
+            .unwrap()
+            .with_external_drivers(vec![test_external_driver("fake", bin)]);
+
+        // Host fresco: **sin** `host.spawn(make_spec(...))` — `/spawn` no exige turno de root.
+        let (mut host, ws_vocab) = build_host(1, AgentConfig::default(), None, None).unwrap();
+        let before_ticks = host.ticks();
+
+        let tools = WorkspaceTools::new(policy.clone());
+        let mgr = SubagentManager::with_worktree_base_dir(
+            policy,
+            1,
+            Arc::new(|| Box::new(|_: &AgentView| None)),
+            Some(&wt_base),
+        )
+        .with_root_tools(tools.clone());
+        let handle = SubagentHandle::new(mgr);
+
+        let ctx = SessionActionContext {
+            workspace_root: repo.clone(),
+            config: AgentConfig::default(),
+            ws_vocab,
+            mode_handle: WorkspaceModeHandle::new(WorkspaceMode::Build),
+            tools,
+            snapshot_store: None,
+            subagents: Some(handle.clone()),
+            pending_action: PendingSessionAction::new(),
+            pending_notes: PendingSystemNotes::new(),
+        };
+
+        // Gate: fuera de BUILD el `/spawn` se bloquea y no crea job.
+        ctx.mode_handle.set(WorkspaceMode::Plan);
+        let blocked = apply_session_action(
+            &mut host,
+            SessionAction::SpawnSubagent {
+                goal: "should be blocked".to_string(),
+                driver: None,
+            },
+            &ctx,
+        );
+        assert!(
+            blocked.contains("Blocked in `PLAN` mode"),
+            "spawn must be blocked in PLAN mode, got: {blocked}"
+        );
+        assert!(
+            handle.list_summaries().is_empty(),
+            "no job may be created outside BUILD"
+        );
+
+        // BUILD: `/spawn --driver fake <tarea>` lanza sin gastar turno de root.
+        ctx.mode_handle.set(WorkspaceMode::Build);
+        let msg = apply_session_action(
+            &mut host,
+            SessionAction::SpawnSubagent {
+                goal: "Add from_slash.txt".to_string(),
+                driver: Some("fake".to_string()),
+            },
+            &ctx,
+        );
+        assert!(
+            msg.contains("Launched background worktree job"),
+            "spawn should launch, got: {msg}"
+        );
+        assert!(
+            msg.contains("on driver `fake`"),
+            "message must mention the external driver: {msg}"
+        );
+        assert_eq!(
+            host.ticks(),
+            before_ticks,
+            "/spawn must not consume a root turn"
+        );
+
+        // El job es visible con el driver correcto hasta completar (verdad de Git).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut finished = None;
+        while finished.is_none() {
+            for j in handle.list_summaries() {
+                if j.status == "done" || j.status == "failed" {
+                    finished = Some(j);
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "external job launched via /spawn did not finish in 30 s: {:?}",
+                handle.list_summaries()
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let s = finished.unwrap();
+        assert_eq!(s.driver, "fake");
+        assert_eq!(s.status, "done");
+        assert_eq!(s.ok, Some(true));
+        assert!(
+            s.touched_files.iter().any(|f| f == "from_slash.txt"),
+            "the fake CLI's file must be captured from Git, got: {:?}",
+            s.touched_files
+        );
+
+        let _ = handle.discard_job(&s.job_id);
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&host_tmp);

@@ -10,9 +10,10 @@ use onyx_soul_agents::{
     AgentConfig, AgentGraph, Graph, GraphView, HeadlessDriver, Transcript, Value,
 };
 use onyx_workspace::{
-    RecordedEffect, SandboxDriverKind, SandboxMode, WorkspacePolicy, WorktreeManager,
-    all_recorded_effects, audit_sprout_workspace, check_git_version, detect_sandbox_capabilities,
-    effects_after_tick, graph_workspace_mode, graph_workspace_plan, is_effect_undone,
+    ExternalDriverConfig, PromptTransport, RecordedEffect, SandboxDriverKind, SandboxMode,
+    SubagentNetworkPolicy, WorkspacePolicy, WorktreeManager, all_recorded_effects,
+    audit_sprout_workspace, check_git_version, detect_sandbox_capabilities, effects_after_tick,
+    graph_workspace_mode, graph_workspace_plan, is_effect_undone, resolve_process_binary,
     restore_git_tree_checkpoint_for_targets,
 };
 use serde::Serialize;
@@ -473,7 +474,7 @@ pub fn reconcile_rewind_effects(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DoctorReport {
     pub checks: Vec<String>,
     pub warnings: Vec<String>,
@@ -639,6 +640,12 @@ pub fn run_doctor(
     if let Some(ref pol) = loaded_policy {
         for warn in &pol.trust_warnings {
             report.warnings.push(warn.clone());
+        }
+        // `SDD-10` Fase 4: auditoría de los harnesses CLI externos declarados
+        // (`[[external_drivers]]` + presets): bin resuelto en PATH/PATHEXT, probe
+        // `--version` con deadline, transporte de prompt y política de red.
+        for d in pol.external_drivers() {
+            audit_external_driver(&mut report, d);
         }
     }
 
@@ -820,6 +827,162 @@ pub fn run_doctor(
     report
 }
 
+/// Resultado de la probe `--version` de un binario de harness externo (`SDD-10` Fase 4).
+enum DriverVersionProbe {
+    /// El binario respondió a `--version` (primerá línea, truncada).
+    Responded(String),
+    /// No respondió dentro del deadline (proceso colgado o sin soporte `--version`).
+    TimedOut,
+    /// El spawn o la salida fallaron (motivo descriptivo).
+    Failed(String),
+}
+
+/// Probe `--version` acotada en el tiempo del binario resuelto (`SDD-10` Fase 4):
+/// diagnóstico **local del host** (hereda el entorno real, sin sandbox), lee
+/// stdout/stderr en hilos lectores y espera con deadline de 3 s vía `try_wait`;
+/// al expirar, mata el proceso. **0 `tokio`**, solo `std::process`/`std::thread`.
+fn probe_driver_version(path: &Path) -> DriverVersionProbe {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    const DEADLINE: Duration = Duration::from_secs(3);
+    let started = Instant::now();
+    let mut child = match Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return DriverVersionProbe::Failed(format!("spawn failed: {e}")),
+    };
+
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_thread = out_pipe.map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = out.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let err_thread = err_pipe.map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= DEADLINE {
+                    // El proceso se colgó (o ignoró `--version`): mata el árbol y reporta.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return DriverVersionProbe::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return DriverVersionProbe::Failed(format!("wait failed: {e}")),
+        }
+    };
+
+    let out = out_thread.and_then(|h| h.join().ok()).unwrap_or_default();
+    let err = err_thread.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    if !status.success() {
+        let code = status
+            .code()
+            .map(|c| format!("code {c}"))
+            .unwrap_or_else(|| "signal".to_string());
+        let detail: String = err
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
+        return DriverVersionProbe::Failed(if detail.is_empty() {
+            format!("exited with {code}")
+        } else {
+            format!("exited with {code} ({detail})")
+        });
+    }
+    let first: String = out
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect();
+    DriverVersionProbe::Responded(if first.is_empty() {
+        "ok".to_string()
+    } else {
+        first
+    })
+}
+
+/// Auditoría de un driver de harness CLI externo declarado en `[[external_drivers]]`
+/// (`SDD-10` Fase 4): bin resuelto en `PATH`/`PATHEXT`, probe `--version` acotada,
+/// `prompt_transport = "arg"` en Windows y política de red advisory.
+fn audit_external_driver(report: &mut DoctorReport, d: &ExternalDriverConfig) {
+    let label = format!("external driver `{}`", d.id);
+    let Some(resolved) = resolve_process_binary(&d.bin) else {
+        report.errors.push(format!(
+            "{label}: binary `{}` not found in PATH/PATHEXT; `/spawn --driver {}` will fail at runtime",
+            d.bin, d.id
+        ));
+        return;
+    };
+    match probe_driver_version(&resolved.path) {
+        DriverVersionProbe::Responded(v) => report.checks.push(format!(
+            "{label}: binary `{}` resolves to `{}` and responds to `--version` ({v})",
+            d.bin,
+            resolved.path.display()
+        )),
+        DriverVersionProbe::TimedOut => report.errors.push(format!(
+            "{label}: binary `{}` (resolved `{}`) did not respond to `--version` within 3 s (hangs or lacks `--version` support)",
+            d.bin,
+            resolved.path.display()
+        )),
+        DriverVersionProbe::Failed(msg) => report.warnings.push(format!(
+            "{label}: `--version` probe on `{}` failed: {msg}",
+            resolved.path.display()
+        )),
+    }
+    if d.prompt_transport == PromptTransport::Arg && cfg!(windows) {
+        let why = if resolved.is_shell_wrapper {
+            "it resolves to a `.cmd`/`.bat` shell wrapper"
+        } else {
+            "single-argv prompts are fragile on Windows"
+        };
+        report.warnings.push(format!(
+            "{label}: `prompt_transport = \"arg\"` on Windows ({why}); prefer `stdin`"
+        ));
+    }
+    match &d.network_policy {
+        SubagentNetworkPolicy::NativeOffline => report.warnings.push(format!(
+            "{label}: network policy is `NativeOffline`; the external CLI cannot reach its LLM API (declare `network_allowlist`)"
+        )),
+        SubagentNetworkPolicy::ExternalHarnessAllowlist(hosts) => {
+            let hosts = if hosts.is_empty() {
+                "(empty → LocalhostOnly)".to_string()
+            } else {
+                hosts.join(", ")
+            };
+            report.warnings.push(format!(
+                "{label}: network allowlist [{hosts}] is advisory; only enforced with `--sandbox strict-container`"
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,5 +1053,214 @@ mod tests {
 
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-10` Fase 4: la probe `--version` de un binario de harness externo —
+    /// respuesta → `Responded` (primera línea, truncada), fallo → `Failed` (code + stderr),
+    /// colgado → `TimedOut` tras el deadline de 3 s.
+    #[test]
+    fn probe_driver_version_reports_responded_failed_and_timeout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "openonyx_probe_drv_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fn write_bin(tmp: &Path, name: &str, body_windows: &str, body_posix: &str) -> PathBuf {
+            #[cfg(windows)]
+            {
+                let _ = body_posix;
+                let p = tmp.join(format!("{name}.cmd"));
+                fs::write(&p, body_windows).unwrap();
+                p
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = body_windows;
+                let p = tmp.join(format!("{name}.sh"));
+                fs::write(&p, body_posix).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+                p
+            }
+        }
+
+        // Responde a `--version` (ignora el arg) → `Responded` con la primera línea.
+        let ok_bin = write_bin(
+            &tmp,
+            "ok",
+            "@echo off\r\necho opencode v9.9.9-fake\r\n",
+            "#!/bin/sh\necho \"opencode v9.9.9-fake\"\n",
+        );
+        assert!(matches!(
+            probe_driver_version(&ok_bin),
+            DriverVersionProbe::Responded(ref v) if v == "opencode v9.9.9-fake"
+        ));
+
+        // Sale con código ≠ 0 → `Failed` con code y primera línea de stderr (80 chars).
+        let fail_bin = write_bin(
+            &tmp,
+            "fail",
+            "@echo off\r\necho boom 1>&2\r\nexit /b 1\r\n",
+            "#!/bin/sh\necho boom >&2\nexit 1\n",
+        );
+        assert!(matches!(
+            probe_driver_version(&fail_bin),
+            DriverVersionProbe::Failed(ref m) if m.contains("code 1") && m.contains("boom")
+        ));
+
+        // Se cuelga (ignora `--version` > 3 s) → `TimedOut` y el proceso es matado.
+        let hang_bin = write_bin(
+            &tmp,
+            "hang",
+            "@echo off\r\nping -n 6 127.0.0.1 >nul\r\n",
+            "#!/bin/sh\nsleep 5 &\nwait\n",
+        );
+        assert!(matches!(
+            probe_driver_version(&hang_bin),
+            DriverVersionProbe::TimedOut
+        ));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `SDD-10` Fase 4: `openonyx doctor` audita cada driver de `[[external_drivers]]`:
+    /// bin inexistente → `[ERR]` accionable, `--version` OK → `[CHECK]`, `prompt_transport
+    /// = "arg"` en Windows → `[WARN]` (advisory), y la política de red → `[WARN]` que
+    /// distingue lo advisory de lo que solo aplica con `--sandbox strict-container`.
+    #[test]
+    fn doctor_audits_external_driver_bins() {
+        let tmp = std::env::temp_dir().join(format!(
+            "openonyx_doctor_drv_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fn drv(id: &str, bin: &str, transport: PromptTransport) -> ExternalDriverConfig {
+            ExternalDriverConfig {
+                id: id.to_string(),
+                bin: bin.to_string(),
+                args: Vec::new(),
+                prompt_transport: transport,
+                prompt_flag: None,
+                timeout: std::time::Duration::from_secs(600),
+                allowed_env: Vec::new(),
+                inherit_home: false,
+                network_policy: SubagentNetworkPolicy::ExternalHarnessAllowlist(vec![
+                    "api.example.com".to_string(),
+                ]),
+            }
+        }
+
+        // 1) Bin inexistente → `[ERR]` accionable que menciona `/spawn --driver <id>`.
+        let mut report = DoctorReport::default();
+        audit_external_driver(
+            &mut report,
+            &drv(
+                "ghost",
+                "definitely-missing-onyx-bin",
+                PromptTransport::Stdin,
+            ),
+        );
+        assert!(
+            report.errors.iter().any(|e| {
+                e.contains("not found in PATH/PATHEXT") && e.contains("/spawn --driver ghost")
+            }),
+            "missing bin must be [ERR]: {:?}",
+            report.errors
+        );
+        assert!(
+            report.checks.is_empty() && report.warnings.is_empty(),
+            "missing bin must not add checks/warnings: {report:?}"
+        );
+
+        // Bin fake que responde a `--version` (la probe lo usa; los args se ignoran).
+        #[cfg(windows)]
+        let ok_bin = tmp.join("ok.cmd");
+        #[cfg(not(windows))]
+        let ok_bin = tmp.join("ok.sh");
+        #[cfg(windows)]
+        fs::write(&ok_bin, "@echo off\r\necho opencode v9.9.9-fake\r\n").unwrap();
+        #[cfg(not(windows))]
+        {
+            fs::write(&ok_bin, "#!/bin/sh\necho \"opencode v9.9.9-fake\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ok_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ok_bin = ok_bin.to_string_lossy().into_owned();
+
+        // 2) Bin resuelto y con `--version` → `[CHECK]` con la versión; la red → `[WARN]`
+        //    advisory que distingue `--sandbox strict-container`.
+        let mut report = DoctorReport::default();
+        audit_external_driver(&mut report, &drv("ok", &ok_bin, PromptTransport::Stdin));
+        assert!(
+            report.checks.iter().any(
+                |c| c.contains("responds to `--version`") && c.contains("opencode v9.9.9-fake")
+            ),
+            "responsive bin must be [CHECK] with version: {:?}",
+            report.checks
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("advisory") && w.contains("--sandbox strict-container")),
+            "network allowlist must be [WARN] advisory: {:?}",
+            report.warnings
+        );
+
+        // 3) `prompt_transport = "arg"` en Windows → `[WARN]` (fragilidad argv); en el
+        //    resto de plataformas no se emite (el transporte es seguro ahí).
+        let mut report = DoctorReport::default();
+        audit_external_driver(&mut report, &drv("arg", &ok_bin, PromptTransport::Arg));
+        if cfg!(windows) {
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("prompt_transport = \"arg\"")
+                        && w.contains("prefer `stdin`")),
+                "arg transport on Windows must be [WARN]: {:?}",
+                report.warnings
+            );
+        } else {
+            assert!(
+                !report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("prompt_transport")),
+                "arg transport is safe off Windows: {:?}",
+                report.warnings
+            );
+        }
+
+        // 4) `NativeOffline` → `[WARN]` (el CLI no podría llegar a su API de LLM).
+        let offline = ExternalDriverConfig {
+            network_policy: SubagentNetworkPolicy::NativeOffline,
+            ..drv("off", &ok_bin, PromptTransport::Stdin)
+        };
+        let mut report = DoctorReport::default();
+        audit_external_driver(&mut report, &offline);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("NativeOffline") && w.contains("cannot reach its LLM API")),
+            "NativeOffline must be [WARN]: {:?}",
+            report.warnings
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

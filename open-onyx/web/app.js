@@ -8,6 +8,7 @@
     { key: '/cancel', desc: 'Stop active subagent or interrupt current turn' },
     { key: '/cancel all', desc: 'Interrupt both subagents and root turn' },
     { key: '/subagents', desc: 'List background worktree subagent jobs' },
+    { key: '/spawn', desc: 'Launch background subagent without a root turn (`[--driver <id>] <task>`)' },
     { key: '/merge', desc: '3-way merge finished async subagent (`<job_id>`)' },
     { key: '/discard', desc: 'Cancel & discard async subagent worktree (`<job_id>`)' },
     { key: '/mode plan', desc: 'Switch to read-only PLAN mode' },
@@ -67,6 +68,7 @@
     queueClearBtn: document.getElementById('queue-clear-btn'),
     autocomplete: document.getElementById('autocomplete'),
     composerForm: document.getElementById('composer-form'),
+    driverSelect: document.getElementById('driver-select'),
     promptInput: document.getElementById('prompt-input'),
     sendBtn: document.getElementById('send-btn'),
     planBadge: document.getElementById('plan-badge'),
@@ -360,13 +362,35 @@
     e.preventDefault();
     const text = dom.promptInput.value.trim();
     if (!text) return;
+    // `SDD-10` Fase 4: driver no nativo + texto libre (no slash) → `/spawn --driver <id> <task>`,
+    // sin gastar un turno de root. Un slash command explítico siempre se envía tal cual.
+    const driver = dom.driverSelect.value || 'native';
+    const command =
+      driver !== 'native' && !text.startsWith('/') ? `/spawn --driver ${driver} ${text}` : text;
     closeAutocomplete();
     dom.promptInput.value = '';
     autoResizeTextarea();
     try {
-      await sendCommand(text);
+      await sendCommand(command);
     } catch (_) {}
   });
+
+  let renderedDriversKey = null;
+  function renderDriverSelect(s) {
+    const drivers = Array.isArray(s.drivers) && s.drivers.length > 0 ? s.drivers : ['native'];
+    const key = drivers.join('\u0000');
+    if (key === renderedDriversKey) return;
+    renderedDriversKey = key;
+    const prev = dom.driverSelect.value;
+    dom.driverSelect.replaceChildren();
+    for (const d of drivers) {
+      const opt = document.createElement('option');
+      opt.value = d;
+      opt.textContent = d;
+      dom.driverSelect.append(opt);
+    }
+    if (drivers.includes(prev)) dom.driverSelect.value = prev;
+  }
 
   dom.modeBtn.addEventListener('click', () => {
     if (!state) return;
@@ -600,7 +624,10 @@
     const header = document.createElement('header');
     const title = document.createElement('span');
     title.className = 'bg-subagent-id';
-    title.textContent = `${showTitlePrefix ? '[bg #' : '#'}${job.job_id}${showTitlePrefix ? ']' : ''}`;
+    // `SDD-10` Fase 4: badge del driver en tarjetas externas (`[bg #job_id] → opencode`);
+    // el driver nativo es el default y no se muestra.
+    const driverSuffix = job.driver && job.driver !== 'native' ? ` → ${job.driver}` : '';
+    title.textContent = `${showTitlePrefix ? '[bg #' : '#'}${job.job_id}${showTitlePrefix ? ']' : ''}${driverSuffix}`;
     const badge = document.createElement('span');
     badge.className = 'pill pill-mono';
     if (job.status === 'done' || job.status === 'merged') badge.classList.add('pill-live');
@@ -702,6 +729,7 @@
     dom.sandboxPill.textContent = `SANDBOX:${s.sandbox_badge || 'workspace'}`;
     dom.trustPill.classList.toggle('hidden', !s.untrusted);
     dom.tickPill.textContent = `tick ${s.tick || 0}`;
+    renderDriverSelect(s);
 
     if (s.vault_label) {
       dom.vaultPill.textContent = `vault:${s.vault_label}`;
