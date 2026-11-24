@@ -478,9 +478,14 @@
   let llmProfilesKey = '';
   function llmProfilesKeyOf(s) {
     const p = Array.isArray(s.profiles) ? s.profiles : [];
-    return p
-      .map((x) => `${x.id}|${x.provider}|${x.model}|${x.effort}|${x.available ? 1 : 0}|${x.unavailable_reason || ''}`)
-      .join(';');
+    // `s.profile_id` en la clave: si cambia el perfil activo (hot-swap con
+    // el modal abierto) se refresca el resaltado `.is-focused`.
+    return (
+      `${s.profile_id || ''}|` +
+      p
+        .map((x) => `${x.id}|${x.provider}|${x.model}|${x.effort}|${x.available ? 1 : 0}|${x.unavailable_reason || ''}`)
+        .join(';')
+    );
   }
 
   function renderLlmProfiles(s) {
@@ -521,27 +526,35 @@
     }
   }
 
-  function renderLlmModal(s) {
-    // La etiqueta del botón es de solo lectura: siempre al día (hot-swap).
-    dom.llmConfigBtn.textContent =
-      `${s.provider || 'provider'}/${s.model || 'model'} · effort:${s.effort || 'auto'}`;
-    if (!dom.llmModal.open) return;
-    // Re-render idempotente: nunca pisar el control que el usuario está
-    // editando en ese instante (push SSE con el dialog abierto).
-    renderLlmProfiles(s);
+  function syncLlmProviderAvailability(s) {
+    const providers = Array.isArray(s.available_providers) ? s.available_providers : null;
     for (const opt of dom.llmProviderSelect.options) {
-      const providers = Array.isArray(s.available_providers) ? s.available_providers : null;
       opt.disabled = !!(providers && providers.length) && !providers.includes(opt.value);
     }
-    if (document.activeElement !== dom.llmProviderSelect) {
-      dom.llmProviderSelect.value = s.provider || 'gemini';
-    }
-    if (document.activeElement !== dom.llmEffortSelect) {
-      dom.llmEffortSelect.value = s.effort || 'auto';
-    }
-    if (document.activeElement !== dom.llmModelInput) {
-      dom.llmModelInput.value = s.model || '';
-    }
+  }
+
+  // Solo al abrir el modal: puebla provider/effort/modelo desde el snapshot
+  // actual (con la sesión en reposo no hay push SSE que lo haga).
+  function populateLlmModalInputs(s) {
+    dom.llmProviderSelect.value = s.provider || 'gemini';
+    dom.llmEffortSelect.value = s.effort || 'auto';
+    dom.llmModelInput.value = s.model || '';
+  }
+
+  function renderLlmModal(s) {
+    // La etiqueta del botón es de solo lectura: siempre al día (hot-swap).
+    // Sin `provider` (snapshot sin handle, perfil CLI degradado) no se
+    // antepone el prefijo literal `provider/`.
+    dom.llmConfigBtn.textContent =
+      `${s.provider ? `${s.provider}/${s.model || 'model'}` : (s.model || 'model')} · effort:${s.effort || 'auto'}`;
+    if (!dom.llmModal.open) return;
+    // Re-render idempotente (push SSE con el dialog abierto): lista de
+    // perfiles + disponibilidad de providers. **Nunca** se tocan los valores
+    // del formulario — si el usuario cambia Provider a `openai` y mueve el
+    // foco, el siguiente push no revierte su edición a espaldas (los valores
+    // solo se pueblan al abrir, en `populateLlmModalInputs`).
+    renderLlmProfiles(s);
+    syncLlmProviderAvailability(s);
   }
 
   async function applyLlmCommands(commands) {
@@ -565,6 +578,10 @@
     dom.llmModalStatus.textContent = '';
     dom.llmModalApply.disabled = false;
     dom.llmModal.showModal();
+    // Poblar al abrir: con la sesión en reposo no llega push SSE.
+    populateLlmModalInputs(state);
+    syncLlmProviderAvailability(state);
+    renderLlmProfiles(state);
   });
   dom.llmModalClose.addEventListener('click', () => dom.llmModal.close());
   dom.llmModalCancel.addEventListener('click', () => dom.llmModal.close());
