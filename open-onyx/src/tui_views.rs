@@ -161,8 +161,15 @@ pub fn view_tabs_line(active: TuiView, approval_pending: bool) -> Line<'static> 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     } else {
+        // `SDD-03` Fase 4: la etiqueta de Esc refleja lo que hace — salir de
+        // la app solo en `Chat`; en las vistas efímeras vuelve a `Chat`.
+        let esc_label = if active == TuiView::Chat {
+            "Esc:Quit"
+        } else {
+            "Esc:Back"
+        };
         spans.push(Span::styled(
-            "  ·  Esc:Quit",
+            format!("  ·  {esc_label}"),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -791,8 +798,12 @@ mod tests {
         let rendered: String = line.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(!rendered.contains("!APPROVAL"), "{rendered}");
 
-        // Sin aprobación: hint normal de salida.
+        // Sin aprobación: la etiqueta de Esc depende de la vista —
+        // `Esc:Quit` solo en Chat; `Esc:Back` en las efímeras.
         let line = view_tabs_line(TuiView::Timeline, false);
+        let rendered: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(rendered.contains("Esc:Back"), "{rendered}");
+        let line = view_tabs_line(TuiView::Chat, false);
         let rendered: String = line.spans.iter().map(|s| s.content.to_string()).collect();
         assert!(rendered.contains("Esc:Quit"), "{rendered}");
     }

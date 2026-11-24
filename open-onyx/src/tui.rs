@@ -533,8 +533,9 @@ impl TuiInner {
     }
 
     /// Paleta abierta: traga todas las teclas (Esc/Ctrl+K cierra, `F1..F5`
-    /// cierra y cambia de vista, Up/k Down/j navegan, Enter ejecuta,
-    /// caracteres filtran).
+    /// cierra y cambia de vista, Up/Down o Ctrl+P/Ctrl+N navegan, Enter
+    /// ejecuta). **Todos** los caracteres imprimibles filtran (`insert_char`)
+    /// — `j`/`k` incluidos, nunca navegan.
     fn handle_palette_key(&mut self, code: CtKeyCode, modifiers: KeyModifiers) {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         match code {
@@ -550,10 +551,16 @@ impl TuiInner {
                     self.switch_view(view);
                 }
             }
-            CtKeyCode::Up | CtKeyCode::Char('k') if !ctrl => {
+            CtKeyCode::Up => {
                 self.palette.move_up();
             }
-            CtKeyCode::Down | CtKeyCode::Char('j') if !ctrl => {
+            CtKeyCode::Down => {
+                self.palette.move_down();
+            }
+            CtKeyCode::Char('p' | 'P') if ctrl => {
+                self.palette.move_up();
+            }
+            CtKeyCode::Char('n' | 'N') if ctrl => {
                 self.palette.move_down();
             }
             CtKeyCode::Enter => {
@@ -610,16 +617,19 @@ impl TuiInner {
     /// comando `/service ...` correspondiente por el bus (el turno de root lo
     /// re-valida contra el modo). Bloqueado por el gate ⇒ aviso, sin mutar.
     fn sprout_mutate(&mut self, key: char) {
-        let rows = self.sprout_service_rows();
-        let Some(row) = rows.get(self.sprout_selected) else {
-            self.set_status_hint("F3 Sprout: no service selected.".to_string());
-            return;
-        };
+        // `SDD-03` Fase 4: el gate antes que la selección — en `[UNTRUSTED]`
+        // el panel no lista filas y el aviso real es el de trust, no
+        // "no service selected".
         let gate = sprout_mutation_gate(self.mode_handle.get(), self.sprout_untrusted());
         if !matches!(gate, SproutGate::Allowed) {
             self.set_status_hint(gate.notice());
             return;
         }
+        let rows = self.sprout_service_rows();
+        let Some(row) = rows.get(self.sprout_selected) else {
+            self.set_status_hint("F3 Sprout: no service selected.".to_string());
+            return;
+        };
         let cmd = match key {
             's' | 'S' => format!("/service start {}", row.id),
             'x' | 'X' => format!("/service stop {}", row.id),
@@ -1020,9 +1030,6 @@ impl TuiInner {
                     } else {
                         self.switch_view(TuiView::Chat);
                     }
-                } else if matches!(code, CtKeyCode::F(2)) {
-                    self.popup.close();
-                    self.open_agent_picker();
                 } else if self.view == TuiView::Chat
                     && self.active_approval.is_none()
                     && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Up))
@@ -1068,10 +1075,10 @@ impl TuiInner {
                     )
                 {
                     return true;
-                } else if self.active_approval.is_some() {
+                } else if self.view == TuiView::Chat && self.active_approval.is_some() {
                     // `REQ-03.6` (OBLIGATORIO): `y`/`n` solo en `F1 Chat` con
-                    // aprobación pendiente — prohibido aprobar a ciegas desde
-                    // otra vista. Cualquier otra tecla se traga (arm de swallow).
+                    // aprobación pendiente. En Chat cualquier otra tecla se
+                    // traga (arm de swallow).
                     if let (Some(action), Some((agent, req, _, _))) = (
                         approval_key_action(self.view, code),
                         self.active_approval.clone(),
@@ -1090,6 +1097,16 @@ impl TuiInner {
                         self.approval_diff = None;
                         self.approval_impact = None;
                     }
+                } else if self.active_approval.is_some()
+                    && matches!(code, CtKeyCode::Char('y' | 'Y' | 'n' | 'N'))
+                {
+                    // `SDD-03` Fase 4: fuera de Chat, `y`/`n` a ciegas **nunca**
+                    // emiten Reply — aviso accionable; el resto de teclas
+                    // (Up/Down/PgUp/PgDn/f) sigue navegando F2..F5 libremente.
+                    self.set_status_hint(
+                        "Approval pending — press F1 to review diff in Chat before deciding"
+                            .to_string(),
+                    );
                 } else {
                     match self.view {
                         TuiView::Chat => {
@@ -1755,7 +1772,17 @@ impl TuiInner {
                     } else {
                         String::new()
                     };
-                    let mut lines = vec![input_snapshot.render_line("> ")];
+                    // `SDD-03` Fase 4: el aviso transitorio (`/view` inválido,
+                    // gate F3, …) también se ve en Chat — línea amarilla sobre
+                    // el input, TTL en `pump_idle`.
+                    let mut lines = Vec::new();
+                    if let Some(h) = &status_hint_snapshot {
+                        lines.push(Line::from(Span::styled(
+                            h.clone(),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    }
+                    lines.push(input_snapshot.render_line("> "));
                     if input_snapshot.is_empty() {
                         if let Some(next_q) = &queued_preview {
                             lines.push(Line::from(Span::styled(
@@ -2146,7 +2173,9 @@ pub(crate) fn resolve_live_llm_header(
             } else {
                 ReasoningEffort::parse(&snap.effort).ok()
             };
-            (snap.model, effort)
+            // `SDD-03` Fase 4: `provider/model` — el cambio de proveedor al
+            // vuelo se ve en la cabecera sin abrir la paleta.
+            (format!("{}/{}", snap.provider, snap.model), effort)
         }
         None => (fallback_model.to_string(), fallback_effort),
     }
@@ -2668,7 +2697,7 @@ mod tests {
             "stale-static-model",
             Some(ReasoningEffort::High),
         );
-        assert_eq!(model, "gemini-4-hydrogen");
+        assert_eq!(model, "gemini/gemini-4-hydrogen");
         assert_eq!(effort, None);
 
         // Hot-swap (lo que hace `apply_llm_target` en la frontera de tick):
@@ -2678,7 +2707,7 @@ mod tests {
             .expect("set_model sobre el perfil por defecto");
         handle.set_effort(Some(ReasoningEffort::High));
         let (model, effort) = resolve_live_llm_header(Some(&handle), "stale-static-model", None);
-        assert_eq!(model, "gemini-4-deuterium");
+        assert_eq!(model, "gemini/gemini-4-deuterium");
         assert_eq!(effort, Some(ReasoningEffort::High));
 
         // Sin handle: se degrada al arranque estático (fallback).

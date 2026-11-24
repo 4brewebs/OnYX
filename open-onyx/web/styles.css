@@ -417,6 +417,26 @@ p, li {
   font-family: var(--font-mono);
 }
 
+/* LLM target selector button (SDD-03 Fase 4): mismo look que el subtitle,
+   accesible como botón (focus visible, hover, aria-haspopup). */
+.llm-config-btn {
+  display: block;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.llm-config-btn:hover,
+.llm-config-btn:focus-visible {
+  text-decoration: underline;
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -1623,6 +1643,35 @@ dialog::backdrop {
 .agent-row-goal {
   font-size: 0.76rem;
   color: var(--ink-secondary);
+}
+
+/* LLM target dialog (SDD-03 Fase 4): reutiliza las filas de agentes para la
+   lista de perfiles; grid 2 columnas para provider/effort, 1 en móvil. */
+.llm-profile-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.llm-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.llm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.llm-field-wide {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 480px) {
+  .llm-fields {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Async Background Worktree Subagent Cards (per modern-web-guidance `card` & `natural-interactions`) */

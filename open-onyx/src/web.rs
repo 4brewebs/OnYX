@@ -252,6 +252,20 @@ pub struct WebTelemetrySnapshot {
     pub estimated_cost_usd: f64,
 }
 
+/// Metadatos públicos de un perfil LLM registrado (**SDD-03** Fase 4).
+///
+/// **Invariante de seguridad:** solo metadatos — `api_key`/`api_key_env`
+/// nunca salen del handle; este struct no puede contenerlos por construcción.
+#[derive(Clone, Debug, Serialize)]
+pub struct WebLlmProfileSnapshot {
+    pub id: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WebSubagentSnapshot {
     pub job_id: String,
@@ -279,6 +293,13 @@ pub struct WebStateSnapshot {
     /// Drivers disponibles para `/spawn` (`"native"` + ids de `[[external_drivers]]`, `SDD-10`).
     pub drivers: Vec<String>,
     pub effort: String,
+    /// `SDD-03` Fase 4: objetivo LLM vivo (selector en Web) — salen del
+    /// `LlmProfileHandle` (hot-swap en frontera de tick); sin handle, el
+    /// arranque estático y listas vacías.
+    pub profile_id: String,
+    pub provider: String,
+    pub profiles: Vec<WebLlmProfileSnapshot>,
+    pub available_providers: Vec<String>,
     pub vault_label: Option<String>,
     pub focused_agent_id: Option<u64>,
     pub agents: Vec<WebAgentSnapshot>,
@@ -1091,21 +1112,46 @@ impl WebRuntimeInner {
         };
 
         let next_version = guard.version.saturating_add(1);
-        // `SDD-03` Fase 3: cabecera viva — el objetivo LLM actual sale del
-        // handle (hot-swap en frontera de tick); sin handle, el arranque estático.
-        let (model, effort) = match &self.llm_profile {
-            Some(handle) => {
-                let snap = handle.public_snapshot();
-                (snap.model, snap.effort)
-            }
-            None => (
-                self.model_name.clone(),
-                self.reasoning_effort
-                    .map(ReasoningEffort::as_str)
-                    .unwrap_or("auto")
-                    .to_string(),
-            ),
-        };
+        // `SDD-03` Fase 3/4: cabecera viva + selector en Web — el objetivo
+        // LLM actual (id/perfil/provider/modelo/esfuerzo/perfiles
+        // registrados) sale del handle (hot-swap en frontera de tick); sin
+        // handle, el arranque estático y listas vacías (degrada al perfil CLI).
+        let llm = self
+            .llm_profile
+            .as_ref()
+            .map(|handle| handle.public_snapshot());
+        let (profile_id, provider, model, effort, profiles, available_providers) =
+            match llm.as_ref() {
+                Some(s) => (
+                    s.active_profile_id.clone(),
+                    s.provider.clone(),
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.profiles
+                        .iter()
+                        .map(|e| WebLlmProfileSnapshot {
+                            id: e.id.clone(),
+                            provider: e.provider.clone(),
+                            model: e.model.clone(),
+                            effort: e.effort.clone(),
+                            available: e.available,
+                            unavailable_reason: e.unavailable_reason.clone(),
+                        })
+                        .collect(),
+                    s.available_providers.clone(),
+                ),
+                None => (
+                    String::from("default"),
+                    String::new(),
+                    self.model_name.clone(),
+                    self.reasoning_effort
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("auto")
+                        .to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
         let snap = WebStateSnapshot {
             schema: "onyx.web.state.v1",
             version: next_version,
@@ -1116,6 +1162,10 @@ impl WebRuntimeInner {
             model,
             drivers: self.available_driver_ids(),
             effort,
+            profile_id,
+            provider,
+            profiles,
+            available_providers,
             vault_label: self.active_session_label(),
             focused_agent_id: guard.focused_agent_id,
             agents,
@@ -2017,6 +2067,7 @@ mod tests {
     use super::*;
     use onyx_soul_agents::{AgentConfig, AgentHost, AgentView, RecordingBridge, Reply};
     use onyx_workspace::{WorkspaceLedgerSystem, WorkspaceMode, WorkspaceToolBridge};
+    use std::env;
 
     fn in_memory_exchange(hub: &Arc<WebHub>, raw_req: &str) -> (String, bool) {
         let req = read_http_request(io::Cursor::new(raw_req.as_bytes()))
@@ -2263,6 +2314,115 @@ mod tests {
         let json = snapshot_json(&hub);
         assert!(json.contains("\"model\":\"gemini-4-deuterium\""), "{json}");
         assert!(json.contains("\"effort\":\"high\""), "{json}");
+    }
+
+    /// `SDD-03` Fase 4: el selector en Web lee el snapshot vivo —
+    /// `profile_id`/`provider`/`profiles`/`available_providers` salen del
+    /// handle (con perfil no disponible y su motivo), y **ninguna
+    /// `api_key`/`api_key_env` aparece en el JSON serializado** (invariante
+    /// de seguridad: el snapshot web solo lleva metadatos).
+    #[test]
+    fn web_state_snapshot_exposes_llm_profiles_without_credentials() {
+        use crate::llm_profile::{LlmConfig, LlmProvider};
+        use onyx_workspace::LlmProfileConfig;
+
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("web-llm-profiles-key-123456".to_string()),
+            None,
+        )
+        .unwrap();
+        let host = AgentHost::builder(1).build().unwrap();
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key-secret-do-not-leak".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        // Perfil OpenAI sin `api_key_env` resuelta → no disponible, con motivo.
+        let profiles = vec![LlmProfileConfig {
+            id: "openai-local".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-4.1-mini".to_string(),
+            effort: None,
+            api_base: None,
+            api_key_env: Some("ONYX_TEST_LLM_OPENAI_SECRET".to_string()),
+        }];
+        // Determinismo: aislar los envs de credenciales/base del CI para que
+        // `available_providers` salga solo del registro.
+        let saved = [
+            "ONYX_TEST_LLM_OPENAI_SECRET",
+            "OPENAI_API_KEY",
+            "OPENAI_API_BASE",
+            "OPENAI_BASE_URL",
+            "ONYX_API_KEY",
+        ]
+        .into_iter()
+        .map(|name| (name, env::var(name).ok()))
+        .collect::<Vec<_>>();
+        unsafe {
+            for (name, _) in &saved {
+                env::remove_var(name);
+            }
+        }
+        let handle = LlmProfileHandle::new(&startup, &profiles, false);
+        let web_driver = WebDriver::start(host.vocab(), &cfg, None, None)
+            .unwrap()
+            .with_model_info("stale-static-model", None)
+            .with_llm_profile(handle);
+        let web_handle = web_driver.handle();
+        let hub = Arc::clone(&web_driver.hub);
+        let snapshot_json = |hub: &Arc<WebHub>| {
+            hub.state
+                .lock()
+                .map(|g| g.snapshot_json.clone())
+                .unwrap_or_else(|_| "{}".to_string())
+        };
+
+        web_handle.render(host.graph());
+        let json = snapshot_json(&hub);
+
+        // Objetivo vivo: `profile_id` + `provider` + modelo/esfuerzo.
+        assert!(json.contains("\"profile_id\":\"default\""), "{json}");
+        assert!(json.contains("\"provider\":\"gemini\""), "{json}");
+        assert!(json.contains("\"model\":\"gemini-4-hydrogen\""), "{json}");
+        assert!(json.contains("\"effort\":\"auto\""), "{json}");
+        // Con OpenAI sin credenciales, solo Gemini queda disponible.
+        assert!(
+            json.contains("\"available_providers\":[\"gemini\"]"),
+            "{json}"
+        );
+
+        // Perfiles registrados: el no disponible sale deshabilitado con motivo.
+        assert!(json.contains("\"profiles\":["), "{json}");
+        assert!(json.contains("\"id\":\"openai-local\""), "{json}");
+        assert!(json.contains("\"available\":false"), "{json}");
+        assert!(
+            json.contains("ONYX_TEST_LLM_OPENAI_SECRET"),
+            "motivo accionable del perfil no disponible: {json}"
+        );
+
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(v) => env::set_var(name, v),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+
+        // Invariante de seguridad: 0 credenciales en el JSON serializado.
+        assert!(!json.contains("api_key"), "api_key en snapshot web: {json}");
+        assert!(
+            !json.contains("api_key_env"),
+            "api_key_env en snapshot web: {json}"
+        );
+        assert!(
+            !json.contains("startup-key-secret-do-not-leak"),
+            "valor de credencial en snapshot web: {json}"
+        );
     }
 
     #[test]
