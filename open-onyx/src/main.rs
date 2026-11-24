@@ -1419,6 +1419,7 @@ fn launch_web_serve(
     .with_stream_preview(stream_preview.clone())
     .with_telemetry(telemetry.clone())
     .with_model_info(llm.model.clone(), llm.effort)
+    .with_llm_profile(profile_handle.clone())
     .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
     .with_subagents(sub_handle.clone());
 

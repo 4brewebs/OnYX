@@ -1330,26 +1330,16 @@ impl TuiInner {
         // `SDD-03` Fase 3: cabecera LLM viva (`F1`) — si hay handle, el
         // objetivo actual (`/profile`/`/provider`/`/model`/`/effort` en
         // caliente); si no, el arranque/telemetría.
-        let (model_display, live_effort): (String, Option<ReasoningEffort>) =
-            match &self.llm_profile {
-                Some(handle) => {
-                    let snap = handle.public_snapshot();
-                    let effort = if snap.effort == "auto" {
-                        None
-                    } else {
-                        ReasoningEffort::parse(&snap.effort).ok()
-                    };
-                    (snap.model, effort)
-                }
-                None => (
-                    if self.model_name.is_empty() {
-                        self.telemetry.snapshot().model
-                    } else {
-                        self.model_name.clone()
-                    },
-                    self.reasoning_effort,
-                ),
-            };
+        let fallback_model = if self.model_name.is_empty() {
+            self.telemetry.snapshot().model
+        } else {
+            self.model_name.clone()
+        };
+        let (model_display, live_effort) = resolve_live_llm_header(
+            self.llm_profile.as_ref(),
+            &fallback_model,
+            self.reasoning_effort,
+        );
         let effort_display = live_effort.map(ReasoningEffort::as_str).unwrap_or("auto");
 
         if let Some(id) = active_agent {
@@ -2139,6 +2129,29 @@ pub(crate) fn format_header_title_with_trust(
     }
 }
 
+/// `SDD-03` Fase 3: cabecera LLM **viva**. Con handle presente, el objetivo
+/// actual (`/profile`/`/provider`/`/model`/`/effort` aplicados en caliente en
+/// la frontera de tick) opaca al campo estático de arranque; sin handle, se
+/// degrada al arranque/telemetría (`fallback_model`/`fallback_effort`).
+pub(crate) fn resolve_live_llm_header(
+    handle: Option<&LlmProfileHandle>,
+    fallback_model: &str,
+    fallback_effort: Option<ReasoningEffort>,
+) -> (String, Option<ReasoningEffort>) {
+    match handle {
+        Some(h) => {
+            let snap = h.public_snapshot();
+            let effort = if snap.effort == "auto" {
+                None
+            } else {
+                ReasoningEffort::parse(&snap.effort).ok()
+            };
+            (snap.model, effort)
+        }
+        None => (fallback_model.to_string(), fallback_effort),
+    }
+}
+
 /// Resolves which agent the TUI should display:
 /// - Automatically follows a newly created root agent (e.g. after `/new`).
 /// - Never lets a spawned subagent hijack focus away from the currently viewed agent.
@@ -2630,6 +2643,49 @@ mod tests {
             format_header_title_with_trust("BUILD", "env+job", true, "qwen38-27b", None),
             " openOnyx [BUILD] [SANDBOX:env+job] [UNTRUSTED] · qwen38-27b (effort:auto) "
         );
+    }
+
+    /// `SDD-03` Fase 3: la cabecera viva de la TUI sigue el objetivo LLM
+    /// hot-swap (el handle opaca al campo estático de arranque, que solo es
+    /// fallback sin handle). Regresión: el header "mentía" hasta reiniciar.
+    #[test]
+    fn live_llm_header_follows_hot_swapped_target() {
+        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider};
+
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let handle = LlmProfileHandle::new(&startup, &[], false);
+
+        // Con handle presente opaca el campo estático (aunque esté pueblado).
+        let (model, effort) = resolve_live_llm_header(
+            Some(&handle),
+            "stale-static-model",
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(model, "gemini-4-hydrogen");
+        assert_eq!(effort, None);
+
+        // Hot-swap (lo que hace `apply_llm_target` en la frontera de tick):
+        // la cabecera refleja el objetivo nuevo en el siguiente render.
+        handle
+            .set_model("gemini-4-deuterium")
+            .expect("set_model sobre el perfil por defecto");
+        handle.set_effort(Some(ReasoningEffort::High));
+        let (model, effort) = resolve_live_llm_header(Some(&handle), "stale-static-model", None);
+        assert_eq!(model, "gemini-4-deuterium");
+        assert_eq!(effort, Some(ReasoningEffort::High));
+
+        // Sin handle: se degrada al arranque estático (fallback).
+        let (model, effort) =
+            resolve_live_llm_header(None, "static-model", Some(ReasoningEffort::Low));
+        assert_eq!(model, "static-model");
+        assert_eq!(effort, Some(ReasoningEffort::Low));
     }
 
     #[test]

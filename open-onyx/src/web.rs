@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{ReasoningEffort, SessionTelemetryHandle};
 use crate::gemini::StreamPreviewHandle;
+use crate::llm_profile::LlmProfileHandle;
 use crate::pack::SharedPackStore;
 use crate::session::UiIdlePump;
 use crate::subagent::{
@@ -530,6 +531,10 @@ struct WebRuntimeInner {
     mode_handle: WorkspaceModeHandle,
     stream_preview: StreamPreviewHandle,
     telemetry: SessionTelemetryHandle,
+    /// `SDD-03` Fase 3: fuente live del objetivo LLM (hot-swap en frontera de
+    /// tick). Si existe, `model`/`effort` del snapshot salen de aquí; si no,
+    /// del arranque estático (`model_name`/`reasoning_effort`).
+    llm_profile: Option<LlmProfileHandle>,
     model_name: String,
     reasoning_effort: Option<ReasoningEffort>,
     session_label: Option<String>,
@@ -579,12 +584,18 @@ impl UiIdlePump for WebHandle {
         if let Ok(mut inner) = self.inner.lock() {
             let stream_dirty = inner.stream_preview.take_dirty();
             let telemetry_dirty = inner.telemetry.take_dirty();
+            // `SDD-03` Fase 3: un cambio LLM en caliente marca dirty → la
+            // cabecera (model/effort) se actualiza sin tocar el bucle determinista.
+            let llm_dirty = inner
+                .llm_profile
+                .as_ref()
+                .is_some_and(LlmProfileHandle::take_dirty);
             let dispatched = inner.dispatch_queued_if_idle(graph);
             let hub_dirty = self.hub.take_state_dirty();
 
             // Solo serializamos y difundimos `event: state` completo cuando realmente cambió
-            // el estado de sesión/telemetría/cola (0 trabajo de grafo en reposo o durante streaming).
-            if telemetry_dirty || dispatched || hub_dirty {
+            // el estado de sesión/telemetría/cola/objetivo LLM (0 trabajo de grafo en reposo o durante streaming).
+            if telemetry_dirty || dispatched || hub_dirty || llm_dirty {
                 inner.publish_snapshot(graph, true);
             }
 
@@ -639,6 +650,7 @@ impl WebDriver {
             mode_handle: WorkspaceModeHandle::default(),
             stream_preview: StreamPreviewHandle::default(),
             telemetry: SessionTelemetryHandle::default(),
+            llm_profile: None,
             model_name: String::new(),
             reasoning_effort: None,
             session_label: None,
@@ -725,6 +737,17 @@ impl WebDriver {
         if let Ok(mut inner) = self.inner.lock() {
             inner.model_name = model.into();
             inner.reasoning_effort = effort;
+        }
+        self
+    }
+
+    /// `SDD-03` Fase 3: conecta el handle LLM vivo a la cabecera — `model`/
+    /// `effort` del snapshot siguen el hot-swap (`/profile`/`/provider`/
+    /// `/model`/`/effort` en frontera de tick); sin handle, fallback al
+    /// arranque estático de [`WebDriver::with_model_info`].
+    pub fn with_llm_profile(self, profile: LlmProfileHandle) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.llm_profile = Some(profile);
         }
         self
     }
@@ -1068,6 +1091,21 @@ impl WebRuntimeInner {
         };
 
         let next_version = guard.version.saturating_add(1);
+        // `SDD-03` Fase 3: cabecera viva — el objetivo LLM actual sale del
+        // handle (hot-swap en frontera de tick); sin handle, el arranque estático.
+        let (model, effort) = match &self.llm_profile {
+            Some(handle) => {
+                let snap = handle.public_snapshot();
+                (snap.model, snap.effort)
+            }
+            None => (
+                self.model_name.clone(),
+                self.reasoning_effort
+                    .map(ReasoningEffort::as_str)
+                    .unwrap_or("auto")
+                    .to_string(),
+            ),
+        };
         let snap = WebStateSnapshot {
             schema: "onyx.web.state.v1",
             version: next_version,
@@ -1075,13 +1113,9 @@ impl WebRuntimeInner {
             mode: current_mode.as_label().to_string(),
             sandbox_badge,
             untrusted,
-            model: self.model_name.clone(),
+            model,
             drivers: self.available_driver_ids(),
-            effort: self
-                .reasoning_effort
-                .map(ReasoningEffort::as_str)
-                .unwrap_or("auto")
-                .to_string(),
+            effort,
             vault_label: self.active_session_label(),
             focused_agent_id: guard.focused_agent_id,
             agents,
@@ -2173,6 +2207,62 @@ mod tests {
             logout.contains("Clear-Site-Data: \"cookies\", \"storage\", \"cache\""),
             "{logout}"
         );
+    }
+
+    /// `SDD-03` Fase 3: la cabecera `model`/`effort` del snapshot web sigue el
+    /// objetivo LLM vivo (hot-swap en frontera de tick), no el campo estático
+    /// de arranque (regresión: la cabecera "mentía" hasta reiniciar).
+    #[test]
+    fn web_state_snapshot_model_and_effort_follow_live_llm_handle() {
+        use crate::llm_profile::{LlmConfig, LlmProvider};
+
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("web-live-llm-key-123456789".to_string()),
+            None,
+        )
+        .unwrap();
+        let host = AgentHost::builder(1).build().unwrap();
+        let startup = LlmConfig {
+            provider: LlmProvider::Gemini,
+            api_key: "startup-key".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            effort: None,
+            api_base: None,
+            project_instructions: String::new(),
+        };
+        let handle = LlmProfileHandle::new(&startup, &[], false);
+        let web_driver = WebDriver::start(host.vocab(), &cfg, None, None)
+            .unwrap()
+            // Campo estático deliberadamente antiguo: con handle presente debe
+            // quedar opacado por el objetivo vivo.
+            .with_model_info("stale-static-model", None)
+            .with_llm_profile(handle.clone());
+        let web_handle = web_driver.handle();
+        let hub = Arc::clone(&web_driver.hub);
+        let snapshot_json = |hub: &Arc<WebHub>| {
+            hub.state
+                .lock()
+                .map(|g| g.snapshot_json.clone())
+                .unwrap_or_else(|_| "{}".to_string())
+        };
+
+        // Tick 0: la cabecera muestra el objetivo de arranque del handle.
+        web_handle.render(host.graph());
+        let json = snapshot_json(&hub);
+        assert!(json.contains("\"model\":\"gemini-4-hydrogen\""), "{json}");
+        assert!(json.contains("\"effort\":\"auto\""), "{json}");
+
+        // Hot-swap (lo que hace `apply_llm_target` en la frontera de tick):
+        // el próximo render publica la cabecera actualizada.
+        handle
+            .set_model("gemini-4-deuterium")
+            .expect("set_model sobre el perfil por defecto");
+        handle.set_effort(Some(ReasoningEffort::High));
+        web_handle.render(host.graph());
+        let json = snapshot_json(&hub);
+        assert!(json.contains("\"model\":\"gemini-4-deuterium\""), "{json}");
+        assert!(json.contains("\"effort\":\"high\""), "{json}");
     }
 
     #[test]
