@@ -37,17 +37,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
       - name: Cargo Audit (RustSec advisories)
-        uses: rustsec/audit-check@v2
-        env:
-          # Override rust-toolchain.toml (MSRV 1.85.1): cargo-audit 0.23+ requires rustc >= 1.88
-          # and only parses Cargo.lock / Cargo.toml without compiling the workspace.
-          RUSTUP_TOOLCHAIN: stable
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
       - name: Cargo Deny (advisories, licenses, bans, sources)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

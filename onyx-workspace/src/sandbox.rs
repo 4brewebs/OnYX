@@ -1439,6 +1439,7 @@ fn bwrap_is_usable() -> bool {
             "bwrap",
             &[
                 "--die-with-parent",
+                "--unshare-pid",
                 "--ro-bind",
                 "/",
                 "/",
@@ -1463,6 +1464,7 @@ fn build_bwrap_command(
     let mut cmd = Command::new("bwrap");
     cmd.args([
         "--die-with-parent",
+        "--unshare-pid",
         "--new-session",
         "--ro-bind",
         "/",
@@ -1803,9 +1805,15 @@ mod win {
 
 #[cfg(not(windows))]
 mod unix_job {
-    use std::process::{Child, Command, Stdio};
+    use std::process::Child;
 
     use super::ProcessLimits;
+
+    const SIGKILL: i32 = 9;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
 
     /// Handle RAII a un grupo de procesos POSIX (`PGID`); al soltar o terminar mata `-pgid`.
     pub struct ProcessJob {
@@ -1828,11 +1836,13 @@ mod unix_job {
         pub fn terminate(&mut self) {
             if !self.terminated {
                 self.terminated = true;
-                let _ = Command::new("kill")
-                    .args(["-9", &format!("-{}", self.pgid)])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                if let Ok(pgid) = i32::try_from(self.pgid) {
+                    if pgid > 0 {
+                        unsafe {
+                            kill(-pgid, SIGKILL);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1929,5 +1939,44 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_job_terminate_kills_shell_and_grandchild_promptly() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use super::{ProcessJob, ProcessLimits, configure_process_isolation};
+
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 20"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_isolation(&mut cmd, false);
+
+        let mut child = cmd.spawn().expect("sh -c sleep 20 must spawn");
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut job = ProcessJob::assign(&child, ProcessLimits::default())
+            .expect("ProcessJob::assign must succeed on Unix");
+
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        job.terminate();
+        let _ = child.wait();
+        let mut out = String::new();
+        let mut err = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = stderr.read_to_string(&mut err);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "ProcessJob::terminate must kill shell and grandchild promptly instead of waiting 20s (took {elapsed:?})"
+        );
     }
 }
