@@ -28,8 +28,8 @@ pub use llm_profile::{
 };
 #[cfg(feature = "mcp")]
 pub use mcp::{
-    McpClient, McpDraft, McpError, McpRegistry, McpServerConfig, McpServerStatus, McpTransport,
-    StdioMcpClient, load_mcp_config, merge_mcp_configs,
+    HttpMcpClient, McpClient, McpDraft, McpError, McpRegistry, McpServerConfig, McpServerStatus,
+    McpTransport, StdioMcpClient, load_mcp_config, merge_mcp_configs,
 };
 pub use policy::{
     MergeDeltaVerdict, PermissionDecision, PermissionRules, WorkspacePolicy, classify_merge_delta,

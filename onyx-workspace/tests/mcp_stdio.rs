@@ -79,13 +79,20 @@ fn main() {
             enabled: false,
         },
     );
+    // `remote`: transporte HTTP contra un puerto loopback muerto (hermetic:
+    // sin red real). La Fase 4B handshakea de verdad → `Failed` rápido.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("local_addr").port()
+    };
     configs.insert(
         "remote".to_string(),
         McpServerConfig {
             transport: McpTransport::Http {
-                url: "https://mcp.example.com/sse".to_string(),
+                url: format!("http://127.0.0.1:{dead_port}/mcp"),
+                headers: Vec::new(),
             },
-            timeout_secs: 20,
+            timeout_secs: 5,
             enabled: true,
         },
     );
@@ -128,8 +135,8 @@ fn main() {
         status_of("off") == Some(&McpServerStatus::Disabled)
     );
     check!(
-        "discover: remote → HttpPending",
-        status_of("remote") == Some(&McpServerStatus::HttpPending)
+        "discover: remote (HTTP caído) → Failed (aislado, no aborta)",
+        matches!(status_of("remote"), Some(McpServerStatus::Failed(_)))
     );
     check!(
         "discover: slowmock Connected",
