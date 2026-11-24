@@ -1548,6 +1548,12 @@ fn launch_web_serve(
     let bound = web_driver.local_addr();
     let web_handle = web_driver.handle();
     let quit = web_driver.quit_flag();
+    // `SDD-04` 4C-audit: Ctrl+C limpio. 1er pulso: handler levanta
+    // `SERVE_SHUTDOWN` y el watcher lo propaga a `WebHub::quit` (+notify) para
+    // que `run_session` termine el bucle y guarde snapshot/transcript. 2º
+    // pulso: el SO termina el proceso por defecto.
+    let ctrl_c_guard = web::CtrlCGuard::new();
+    let _shutdown_watcher = web_driver.spawn_shutdown_watcher();
 
     println!("=== openOnyx Web UI (`serve`) ===");
     println!("  URL:        http://{bound}/");
@@ -1629,6 +1635,11 @@ fn launch_web_serve(
         },
     )?;
     drop(driver);
+    drop(ctrl_c_guard);
+    // `SDD-04` 4C-audit: defensivo — si el modo raw del terminal quedó activo
+    // (p. ej. un TUI previo en el mismo proceso), se restaura antes de devolver
+    // el control al shell (sin TUI en `serve`, normalmente es un no-op).
+    let _ = crossterm::terminal::disable_raw_mode();
     print_vault_summary(&cli.workspace, &effective_opts, shared_store.as_ref());
     Ok(())
 }
