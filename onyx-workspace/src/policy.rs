@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 
 use crate::external_driver::{builtin_external_driver_presets, load_external_drivers};
 use crate::impact::ImpactConfig;
+use crate::llm_profile::{LlmProfileConfig, load_llm_profiles};
 use crate::sandbox::{SandboxConfig, SandboxMode};
 use crate::state::WorkspaceMode;
 use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
@@ -742,6 +743,7 @@ pub struct WorkspacePolicy {
     pub trust: WorkspaceTrustReport,
     pub trust_warnings: Vec<String>,
     external_drivers: Vec<ExternalDriverConfig>,
+    llm_profiles: Vec<LlmProfileConfig>,
 }
 
 impl WorkspacePolicy {
@@ -765,6 +767,9 @@ impl WorkspacePolicy {
             trust: WorkspaceTrustReport::no_project_config(),
             trust_warnings: Vec::new(),
             external_drivers: builtin_external_driver_presets(),
+            // Sin presets: el perfil implícito de arranque CLI vive en el anfitrión
+            // (`LlmProfileHandle`, perfil `"default"`); aquí solo hay perfiles declarados.
+            llm_profiles: Vec::new(),
         })
     }
 
@@ -776,6 +781,17 @@ impl WorkspacePolicy {
     /// Establece la lista de drivers externos explícitamente (tests, overrides de serie).
     pub fn with_external_drivers(mut self, drivers: Vec<ExternalDriverConfig>) -> Self {
         self.external_drivers = drivers;
+        self
+    }
+
+    /// Perfiles LLM declarados en `[[llm_profiles]]` (`global < workspace (trusted)`; `SDD-03` hot-swap).
+    pub fn llm_profiles(&self) -> &[LlmProfileConfig] {
+        &self.llm_profiles
+    }
+
+    /// Establece la lista de perfiles LLM explícitamente (tests, overrides de arranque).
+    pub fn with_llm_profiles(mut self, profiles: Vec<LlmProfileConfig>) -> Self {
+        self.llm_profiles = profiles;
         self
     }
 
@@ -900,6 +916,19 @@ impl WorkspacePolicy {
                 warnings.extend(drv_warns);
             }
             Err(err) => warnings.push(format!("failed to parse `[[external_drivers]]`: {err}")),
+        }
+
+        // `[[llm_profiles]]` (`SDD-03` hot-swap): parse error → warning sin perfiles declarados.
+        match load_llm_profiles(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((profiles, llm_warns)) => {
+                self.llm_profiles = profiles;
+                warnings.extend(llm_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[[llm_profiles]]`: {err}")),
         }
 
         self.trust = trust;

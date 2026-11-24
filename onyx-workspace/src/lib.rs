@@ -3,6 +3,7 @@
 pub mod bridge;
 pub mod external_driver;
 pub mod impact;
+pub mod llm_profile;
 pub mod policy;
 pub mod sandbox;
 pub mod sprout;
@@ -19,6 +20,9 @@ pub use external_driver::{
 pub use impact::{
     ImpactAssessment, ImpactConfig, ImpactPatch, apply_impact_escalation,
     extract_unified_diff_line_ranges,
+};
+pub use llm_profile::{
+    LlmProfileConfig, load_llm_profiles, merge_llm_profiles, parse_llm_profiles_toml,
 };
 pub use policy::{
     MergeDeltaVerdict, PermissionDecision, PermissionRules, WorkspacePolicy, classify_merge_delta,
@@ -38,13 +42,15 @@ pub use sprout::{
     validate_exec_user,
 };
 pub use state::{
-    EffectReversibility, PendingCheckpoints, RecordedEffect, RecordedSubagent,
+    EffectReversibility, PendingCheckpoints, RecordedEffect, RecordedLlmProfile, RecordedSubagent,
     WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspaceVocab,
     all_recorded_effects, capture_git_tree_checkpoint, effects_after_tick, graph_subagent_records,
-    graph_workspace_mode, graph_workspace_plan, graph_workspace_services, is_effect_undone,
-    is_file_read, latest_undoable_effect, mark_latest_effect_undone, restore_git_tree_checkpoint,
-    restore_git_tree_checkpoint_for_targets, set_workspace_mode, set_workspace_plan,
-    set_workspace_services, undone_effects, update_subagent_status, upsert_subagent_record,
+    graph_workspace_llm_profile, graph_workspace_mode, graph_workspace_plan,
+    graph_workspace_services, is_effect_undone, is_file_read, latest_undoable_effect,
+    mark_latest_effect_undone, restore_git_tree_checkpoint,
+    restore_git_tree_checkpoint_for_targets, set_workspace_llm_profile, set_workspace_mode,
+    set_workspace_plan, set_workspace_services, undone_effects, update_subagent_status,
+    upsert_subagent_record,
 };
 pub use tools::{
     FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,

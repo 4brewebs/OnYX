@@ -144,6 +144,10 @@ pub struct WorkspaceVocab {
     pub subagent_spawn_tick: Attr,
     pub subagent_summary: Attr,
     pub subagent_touched_files: Attr,
+    pub llm_profile: Attr,
+    pub llm_provider: Attr,
+    pub llm_model: Attr,
+    pub llm_effort: Attr,
 }
 
 impl WorkspaceVocab {
@@ -178,6 +182,10 @@ impl WorkspaceVocab {
             subagent_spawn_tick: reg("ws.subagent.spawn_tick"),
             subagent_summary: reg("ws.subagent.summary"),
             subagent_touched_files: reg("ws.subagent.touched_files"),
+            llm_profile: reg("ws.llm.profile"),
+            llm_provider: reg("ws.llm.provider"),
+            llm_model: reg("ws.llm.model"),
+            llm_effort: reg("ws.llm.effort"),
         }
     }
 }
@@ -514,6 +522,60 @@ pub fn latest_undoable_effect<G: GraphView + ?Sized>(
         }
     }
     best
+}
+
+/// Estado modal LLM (perfil/proveedor/modelo/esfuerzo) persistido en el grafo EAV.
+/// Snapshots y transcripciones previas sin `ws.llm.*` devuelven `None` (degradación limpia).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedLlmProfile {
+    pub profile_id: String,
+    pub provider: String,
+    pub model: String,
+    /// `None`/`"auto"` cuando no se solicitó esfuerzo explícito.
+    pub effort: Option<String>,
+}
+
+/// Persiste el estado modal LLM activo en el grafo EAV (singleton, mismo patrón que
+/// `ws.mode`): un único concepto con `ws.llm.profile` / `ws.llm.provider` / `ws.llm.model`
+/// / `ws.llm.effort`, para que snapshots y `ONYXTR2` sean autocontenidos desde el tick 0.
+pub fn set_workspace_llm_profile<G: Graph + ?Sized>(
+    graph: &mut G,
+    ws: &WorkspaceVocab,
+    rec: &RecordedLlmProfile,
+) {
+    let id = graph
+        .query(&[ws.llm_profile])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| graph.create());
+    graph.set(id, ws.llm_profile, Value::Text(rec.profile_id.clone()));
+    graph.set(id, ws.llm_provider, Value::Text(rec.provider.clone()));
+    graph.set(id, ws.llm_model, Value::Text(rec.model.clone()));
+    graph.set(
+        id,
+        ws.llm_effort,
+        Value::Text(rec.effort.clone().unwrap_or_else(|| "auto".to_string())),
+    );
+}
+
+/// Lee el estado modal LLM persistido en el grafo EAV, si existe (retrocompatibilidad:
+/// grafo sin `ws.llm.profile` → `None`).
+pub fn graph_workspace_llm_profile<G: GraphView + ?Sized>(
+    graph: &G,
+    ws: &WorkspaceVocab,
+) -> Option<RecordedLlmProfile> {
+    let id = graph.query(&[ws.llm_profile]).into_iter().next()?;
+    let profile_id = prop_text(graph, id, ws.llm_profile)?;
+    let provider = prop_text(graph, id, ws.llm_provider)?;
+    let model = prop_text(graph, id, ws.llm_model)?;
+    let effort =
+        prop_text(graph, id, ws.llm_effort).filter(|s| !s.trim().is_empty() && s != "auto");
+    Some(RecordedLlmProfile {
+        profile_id,
+        provider,
+        model,
+        effort,
+    })
 }
 
 /// Persiste el `WorkspaceMode` actual en el grafo EAV para mantener el estado en snapshots y replays.
@@ -1237,5 +1299,63 @@ mod tests {
 
         let lib_file_id = ensure_file_node(&mut graph, &ws, "src/lib.rs");
         assert_eq!(lib_file_id, existing_file);
+    }
+
+    #[test]
+    fn set_graph_workspace_llm_profile_roundtrips_as_singleton() {
+        let mut graph = AgentGraph::new();
+        let ws = WorkspaceVocab::resolve(&mut graph);
+
+        assert!(
+            graph_workspace_llm_profile(&graph, &ws).is_none(),
+            "sin `ws.llm.*` persistido debe leer `None`"
+        );
+
+        let rec = RecordedLlmProfile {
+            profile_id: "qwen-local".to_string(),
+            provider: "openai".to_string(),
+            model: "qwen38-27b".to_string(),
+            effort: Some("high".to_string()),
+        };
+        set_workspace_llm_profile(&mut graph, &ws, &rec);
+        assert_eq!(graph_workspace_llm_profile(&graph, &ws), Some(rec));
+
+        // Un segundo cambio debe reconciliar sobre el MISMO concepto (singleton),
+        // igual que `ws.mode`.
+        let rec2 = RecordedLlmProfile {
+            profile_id: "custom".to_string(),
+            provider: "openai".to_string(),
+            model: "qwen38-30b".to_string(),
+            effort: None,
+        };
+        set_workspace_llm_profile(&mut graph, &ws, &rec2);
+        assert_eq!(
+            graph_workspace_llm_profile(&graph, &ws),
+            Some(RecordedLlmProfile {
+                profile_id: "custom".to_string(),
+                provider: "openai".to_string(),
+                model: "qwen38-30b".to_string(),
+                effort: None, // `"auto"` persistido se normaliza a `None`
+            })
+        );
+        let count = graph.query(&[ws.llm_profile]).len();
+        assert_eq!(count, 1, "el estado modal debe vivir en un solo concepto");
+    }
+
+    #[test]
+    fn graph_workspace_llm_profile_degrades_on_legacy_graphs() {
+        let mut graph = AgentGraph::new();
+        let ws = WorkspaceVocab::resolve(&mut graph);
+
+        // Snapshot "legacy": solo `ws.mode` presente (pre-`ws.llm.*`).
+        set_workspace_mode(&mut graph, &ws, WorkspaceMode::Build);
+        assert_eq!(
+            graph_workspace_mode(&graph, &ws),
+            Some(WorkspaceMode::Build)
+        );
+        assert!(
+            graph_workspace_llm_profile(&graph, &ws).is_none(),
+            "los snapshots previos sin `ws.llm.*` deben degradar a `None`"
+        );
     }
 }

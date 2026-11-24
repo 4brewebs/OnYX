@@ -2,6 +2,7 @@ mod command;
 mod context;
 mod external_driver;
 mod gemini;
+mod llm_profile;
 mod openai;
 mod ops;
 mod pack;
@@ -25,6 +26,7 @@ use gemini::{
     AsyncGeminiDriver, DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle,
     load_project_instructions,
 };
+use llm_profile::{LlmConfig, LlmProvider, validate_api_base};
 use onyx_soul_agents::{
     AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
 };
@@ -54,34 +56,6 @@ use vault::{
     resolve_read_transcript, resolve_write_storage, session_display_label,
 };
 use web::{DEFAULT_WEB_BIND, WebDriver, WebServerConfig};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LlmProvider {
-    Gemini,
-    OpenAi,
-}
-
-impl LlmProvider {
-    fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "gemini" => Ok(Self::Gemini),
-            "openai" => Ok(Self::OpenAi),
-            other => Err(format!(
-                "unsupported provider `{other}` (expected `gemini` or `openai`)"
-            )),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct LlmConfig {
-    provider: LlmProvider,
-    api_key: String,
-    model: String,
-    effort: Option<ReasoningEffort>,
-    api_base: Option<String>,
-    project_instructions: String,
-}
 
 struct CliArgs {
     mode: Mode,
@@ -663,100 +637,6 @@ fn allow_custom_auth_host_from_env() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower.ends_with(".localhost")
-}
-
-fn is_official_provider_host(provider: LlmProvider, host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    match provider {
-        LlmProvider::Gemini => lower == "generativelanguage.googleapis.com",
-        LlmProvider::OpenAi => lower == "api.openai.com",
-    }
-}
-
-/// Valida `--api-base` (y variables `*_API_BASE`):
-/// - Permite `http://` **solo** en loopback (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`).
-/// - Exige `https://` para cualquier host remoto.
-/// - Bloquea envío de credenciales (`api_key` no vacía) a hosts remotos no oficiales salvo
-///   opt-in explícito (`--allow-custom-auth-host` o `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`).
-fn validate_api_base(
-    provider: LlmProvider,
-    raw_url: &str,
-    has_api_key: bool,
-    allow_custom_auth_host: bool,
-) -> Result<String, String> {
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("--api-base must not be empty".to_string());
-    }
-    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!(
-            "invalid --api-base `{trimmed}`: whitespace/control characters not allowed"
-        ));
-    }
-
-    let (is_https, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
-        (false, r)
-    } else {
-        return Err(format!(
-            "invalid --api-base `{trimmed}`: scheme must be `https://` (or `http://` for loopback hosts)"
-        ));
-    };
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(format!("invalid --api-base `{trimmed}`: missing host"));
-    }
-    if authority.contains('@') {
-        return Err(format!(
-            "invalid --api-base `{trimmed}`: embedded credentials (`user:pass@host`) are not allowed"
-        ));
-    }
-
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((ipv6, tail)) = bracketed.split_once(']') else {
-            return Err(format!(
-                "invalid --api-base `{trimmed}`: unclosed IPv6 bracket"
-            ));
-        };
-        if !tail.is_empty() && !tail.starts_with(':') {
-            return Err(format!(
-                "invalid --api-base `{trimmed}`: invalid authority after `]`"
-            ));
-        }
-        ipv6
-    } else {
-        authority.split(':').next().unwrap_or("")
-    };
-
-    if host.is_empty() {
-        return Err(format!("invalid --api-base `{trimmed}`: empty host"));
-    }
-
-    let loopback = is_loopback_host(host);
-    if !is_https && !loopback {
-        return Err(format!(
-            "refusing insecure `http://` --api-base for remote host `{host}`: use `https://` (`http://` is only permitted for loopback hosts like `localhost`, `127.0.0.1`, or `[::1]`)"
-        ));
-    }
-
-    if !loopback
-        && !is_official_provider_host(provider, host)
-        && has_api_key
-        && !allow_custom_auth_host
-    {
-        return Err(format!(
-            "refusing to send API key to non-official remote host `{host}`: pass `--allow-custom-auth-host` (or set `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`) to explicitly authorize sending credentials to this endpoint"
-        ));
-    }
-
-    Ok(trimmed.to_string())
 }
 
 fn resolve_llm_config(
