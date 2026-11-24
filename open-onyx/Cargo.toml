@@ -21,7 +21,7 @@ blake3 = { workspace = true }
 crossterm = { workspace = true }
 flate2 = { workspace = true }
 onyx-soul-agents = { workspace = true }
-onyx-workspace = { workspace = true, features = ["scent"] }
+onyx-workspace = { workspace = true, features = ["scent", "mcp"] }
 ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

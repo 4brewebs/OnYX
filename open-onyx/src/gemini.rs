@@ -336,7 +336,7 @@ pub(crate) fn build_request_body_with_context(
     let declarations: Vec<JsonValue> =
         WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
             .into_iter()
-            .filter(|s| req.tools.iter().any(|t| t == s.name))
+            .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
             .map(|s| {
                 json!({
                     "name": s.name,

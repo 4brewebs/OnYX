@@ -400,7 +400,7 @@ pub(crate) fn build_anthropic_request_body(
     let mut tools: Vec<JsonValue> =
         WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
             .into_iter()
-            .filter(|s| req.tools.iter().any(|t| t == s.name))
+            .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
             .map(|s| {
                 let mut params = s.parameters;
                 lowercase_json_schema_types(&mut params);
@@ -1646,7 +1646,10 @@ mod tests {
 
         // Firma en caché para el primer `call` de la corrida → `false`.
         let mut cache = HashMap::new();
-        cache.insert((1u64, 0usize), vec![json!({"type": "thinking", "signature": "s"})]);
+        cache.insert(
+            (1u64, 0usize),
+            vec![json!({"type": "thinking", "signature": "s"})],
+        );
         let turns = vec![ProjectedTurn::User("goal".to_string()), tool_call(0)];
         assert!(!history_missing_thinking(&turns, 1, &cache));
     }

@@ -215,7 +215,10 @@ impl PermissionRules {
             (Some(_), None) => PermissionDecision::Ask,
             (None, Some(_)) => PermissionDecision::Allow,
             (None, None) => {
-                if is_mutating_tool(tool) {
+                // `SDD-04 REQ-04.4`: toda herramienta `mcp__*` requiere aprobación por
+                // defecto (equivalente a mutante para el fallback, aunque no muten el
+                // workspace local).
+                if is_mutating_tool(tool) || tool.starts_with("mcp__") {
                     PermissionDecision::Ask
                 } else {
                     PermissionDecision::Allow
@@ -471,9 +474,21 @@ fn match_permission_rule(rule: &str, tool: &str, subject: &str) -> Option<usize>
         (trimmed, "*")
     };
 
-    if rule_tool != "*" && rule_tool != tool {
+    // Parte `tool`: exacta, comodín `*`, o glob (`*`/`?`) — p. ej. `deny = ["mcp__github__*"]`
+    // (`SDD-04 REQ-04.4`). Los globs de tool aportan su número de caracteres literales a la
+    // especificidad para que un patrón concreto (`mcp__github__*`) prevalezca sobre uno
+    // genérico (`mcp__*`) en la decisión `ask`/`allow`.
+    let tool_specificity = if rule_tool.contains('*') || rule_tool.contains('?') {
+        let tool_re = compile_glob_regex(rule_tool, true).ok()?;
+        if !tool_re.is_match(tool) {
+            return None;
+        }
+        rule_tool.chars().filter(|c| *c != '*' && *c != '?').count()
+    } else if rule_tool == "*" || rule_tool == tool {
+        0
+    } else {
         return None;
-    }
+    };
 
     let match_slash_for_star = matches!(tool, "shell_exec" | "service_exec");
     let re = compile_glob_regex(subject_glob, match_slash_for_star).ok()?;
@@ -485,7 +500,7 @@ fn match_permission_rule(rule: &str, tool: &str, subject: &str) -> Option<usize>
         .chars()
         .filter(|c| *c != '*' && *c != '?')
         .count();
-    Some(specificity)
+    Some(tool_specificity + specificity)
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -1075,7 +1090,10 @@ impl WorkspacePolicy {
         tool: &str,
         args_json: &str,
     ) -> PermissionDecision {
-        if is_mutating_tool(tool) && !mode.allows_mutation() {
+        // `SDD-04 REQ-04.4`: en `Plan`/`Explore`, cualquier `mcp__*` queda `Deny` aunque
+        // no sea mutante local: un servidor MCP remoto ejecuta procesos/red fuera del
+        // control de `WorkspaceToolBridge`.
+        if (is_mutating_tool(tool) || tool.starts_with("mcp__")) && !mode.allows_mutation() {
             return PermissionDecision::Deny;
         }
         if matches!(tool, "fs_write" | "fs_edit") {

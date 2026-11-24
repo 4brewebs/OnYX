@@ -4,6 +4,8 @@ pub mod bridge;
 pub mod external_driver;
 pub mod impact;
 pub mod llm_profile;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod policy;
 pub mod sandbox;
 pub mod sprout;
@@ -23,6 +25,11 @@ pub use impact::{
 };
 pub use llm_profile::{
     LlmProfileConfig, load_llm_profiles, merge_llm_profiles, parse_llm_profiles_toml,
+};
+#[cfg(feature = "mcp")]
+pub use mcp::{
+    McpClient, McpDraft, McpError, McpRegistry, McpServerConfig, McpServerStatus, McpTransport,
+    StdioMcpClient, load_mcp_config, merge_mcp_configs,
 };
 pub use policy::{
     MergeDeltaVerdict, PermissionDecision, PermissionRules, WorkspacePolicy, classify_merge_delta,

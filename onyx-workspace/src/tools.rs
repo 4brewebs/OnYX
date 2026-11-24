@@ -23,12 +23,18 @@ use crate::sandbox::{
 };
 use crate::sprout::SproutSupervisor;
 use crate::state::WorkspaceMode;
+use std::borrow::Cow;
 
 /// Descripción declarativa de una herramienta del workspace para inyectar en LLMs.
+///
+/// `name` y `description` son `Cow<'static, str>` para que `mcp.rs` pueda
+/// construir schemas dinámicos (`Owned`) sin clonaciones por llamada al
+/// proveedor (SDD-04 Fase 3B); los schemas estáticos siguen siendo
+/// `Borrowed` a coste cero.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolSchema {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     pub parameters: JsonValue,
     pub requires_approval: bool,
 }
@@ -49,6 +55,8 @@ pub struct WorkspaceTools {
     scent_index: Arc<Mutex<onyx_scent::WorkspaceIndex>>,
     #[cfg(feature = "scent")]
     seen_outlines: SeenOutlinesMap,
+    #[cfg(feature = "mcp")]
+    mcp: Option<Arc<crate::mcp::McpRegistry>>,
 }
 
 /// Indica si el nombre de herramienta corresponde al protocolo de subagentes asíncronos (`SDD-09`).
@@ -89,7 +97,33 @@ impl WorkspaceTools {
             scent_index: Arc::new(Mutex::new(onyx_scent::WorkspaceIndex::new())),
             #[cfg(feature = "scent")]
             seen_outlines: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         }
+    }
+
+    /// Adjunta el registro de servidores MCP (`SDD-04 REQ-04.3`/`REQ-04.4`): los schemas
+    /// `mcp__*` se sirven vía [`Self::all_tool_schemas`] y el despacho ocurre en
+    /// [`Self::execute_with_tick`] antes del comodín `unknown tool`.
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp_registry(mut self, registry: Arc<crate::mcp::McpRegistry>) -> Self {
+        self.mcp = Some(registry);
+        self
+    }
+
+    /// Schemas estáticos + dinámicos de MCP (`mcp__<server>__<tool>`, siempre con
+    /// `requires_approval = true`).
+    #[cfg(feature = "mcp")]
+    pub fn all_tool_schemas(
+        &self,
+        include_subagents: bool,
+        driver_ids: &[String],
+    ) -> Vec<ToolSchema> {
+        let mut out = Self::schemas_with_subagents_and_drivers(include_subagents, driver_ids);
+        if let Some(registry) = &self.mcp {
+            out.extend(registry.tool_schemas());
+        }
+        out
     }
 
     pub fn with_cancel_flag(mut self, cancel_flag: Arc<AtomicBool>) -> Self {
@@ -304,8 +338,8 @@ impl WorkspaceTools {
 
     pub fn subagent_schema() -> ToolSchema {
         ToolSchema {
-            name: "spawn_agent",
-            description: "Delegate a scoped subtask to a child subagent and suspend until the child completes.",
+            name: "spawn_agent".into(),
+            description: "Delegate a scoped subtask to a child subagent and suspend until the child completes.".into(),
             parameters: json!({
                 "type": "OBJECT",
                 "properties": {
@@ -336,8 +370,8 @@ impl WorkspaceTools {
         };
         vec![
             ToolSchema {
-                name: "spawn_subagent",
-                description: "Launch an asynchronous subagent in an isolated Git worktree without blocking the root agent. Returns `job_id` immediately.",
+                name: "spawn_subagent".into(),
+                description: "Launch an asynchronous subagent in an isolated Git worktree without blocking the root agent. Returns `job_id` immediately.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -351,8 +385,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "subagent_status",
-                description: "Inspect the status, touched files, and summary of one (`job_id`) or all asynchronous worktree subagents.",
+                name: "subagent_status".into(),
+                description: "Inspect the status, touched files, and summary of one (`job_id`) or all asynchronous worktree subagents.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -362,8 +396,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "subagent_merge",
-                description: "Perform a 3-way Git merge-tree reconciliation of a finished async subagent's worktree into the root working tree without moving HEAD, then clean up the worktree and temporary branch.",
+                name: "subagent_merge".into(),
+                description: "Perform a 3-way Git merge-tree reconciliation of a finished async subagent's worktree into the root working tree without moving HEAD, then clean up the worktree and temporary branch.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -374,8 +408,8 @@ impl WorkspaceTools {
                 requires_approval: true,
             },
             ToolSchema {
-                name: "subagent_discard",
-                description: "Cancel (if running) and permanently discard an async subagent's worktree and temporary branch, terminating any child processes cleanly first.",
+                name: "subagent_discard".into(),
+                description: "Cancel (if running) and permanently discard an async subagent's worktree and temporary branch, terminating any child processes cleanly first.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -409,8 +443,8 @@ impl WorkspaceTools {
         #[cfg_attr(not(feature = "scent"), allow(unused_mut))]
         let mut out = vec![
             ToolSchema {
-                name: "fs_read",
-                description: "Read a UTF-8 file from the workspace, optionally by 1-based inclusive line range.",
+                name: "fs_read".into(),
+                description: "Read a UTF-8 file from the workspace, optionally by 1-based inclusive line range.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -423,8 +457,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "fs_list",
-                description: "List files and directories inside the workspace, skipping ignored directories.",
+                name: "fs_list".into(),
+                description: "List files and directories inside the workspace, skipping ignored directories.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -435,8 +469,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "fs_write",
-                description: "Create or overwrite a UTF-8 file in the workspace.",
+                name: "fs_write".into(),
+                description: "Create or overwrite a UTF-8 file in the workspace.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -448,8 +482,8 @@ impl WorkspaceTools {
                 requires_approval: true,
             },
             ToolSchema {
-                name: "fs_edit",
-                description: "Replace one unique substring (`old_text`/`new_text`) or multiple sequential hunks atomically (`edits`) in an existing file.",
+                name: "fs_edit".into(),
+                description: "Replace one unique substring (`old_text`/`new_text`) or multiple sequential hunks atomically (`edits`) in an existing file.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -474,8 +508,8 @@ impl WorkspaceTools {
                 requires_approval: true,
             },
             ToolSchema {
-                name: "code_search",
-                description: "Search for a literal or regex pattern across workspace files with optional glob filters, case-insensitivity, and context lines.",
+                name: "code_search".into(),
+                description: "Search for a literal or regex pattern across workspace files with optional glob filters, case-insensitivity, and context lines.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -493,8 +527,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "glob_files",
-                description: "Find workspace files matching a glob pattern (e.g. `crates/**/*.rs` or `**/*SKILL.md`), skipping ignored directories without requiring approval.",
+                name: "glob_files".into(),
+                description: "Find workspace files matching a glob pattern (e.g. `crates/**/*.rs` or `**/*SKILL.md`), skipping ignored directories without requiring approval.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -508,8 +542,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "git_status",
-                description: "Show concise repository status (`git status --short --branch`) without requiring approval.",
+                name: "git_status".into(),
+                description: "Show concise repository status (`git status --short --branch`) without requiring approval.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {}
@@ -517,8 +551,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "git_diff",
-                description: "Inspect unified git diff (`git diff --no-color`) for the working tree or a relative path without requiring approval.",
+                name: "git_diff".into(),
+                description: "Inspect unified git diff (`git diff --no-color`) for the working tree or a relative path without requiring approval.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -530,8 +564,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "load_skill",
-                description: "Load an on-demand protocol or stack guide (e.g. `scent`, `rust`, or workspace SKILL.md) without requiring approval.",
+                name: "load_skill".into(),
+                description: "Load an on-demand protocol or stack guide (e.g. `scent`, `rust`, or workspace SKILL.md) without requiring approval.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -542,8 +576,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "plan_update",
-                description: "Publish or update a structured multi-step progress checklist (`[x]`, `[>]`, `[ ]`) rendered in the TUI without requiring approval. Never call `plan_update` multiple times in a row without executing real workspace tools in between; for conceptual questions or answers that do not inspect or modify the workspace, omit `plan_update` or call it at most once.",
+                name: "plan_update".into(),
+                description: "Publish or update a structured multi-step progress checklist (`[x]`, `[>]`, `[ ]`) rendered in the TUI without requiring approval. Never call `plan_update` multiple times in a row without executing real workspace tools in between; for conceptual questions or answers that do not inspect or modify the workspace, omit `plan_update` or call it at most once.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -566,8 +600,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "shell_exec",
-                description: "Execute a shell command in the workspace root directory.",
+                name: "shell_exec".into(),
+                description: "Execute a shell command in the workspace root directory.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -578,8 +612,8 @@ impl WorkspaceTools {
                 requires_approval: true,
             },
             ToolSchema {
-                name: "service_status",
-                description: "Return a compact @TOON v1 status table of all local processes and containers declared in `sprout.toml` without requiring approval.",
+                name: "service_status".into(),
+                description: "Return a compact @TOON v1 status table of all local processes and containers declared in `sprout.toml` without requiring approval.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {}
@@ -587,8 +621,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "service_start",
-                description: "Start a local process or container service (`id`) or all enabled services (`all: true`) from `sprout.toml` in topological DAG order, waiting for readiness probes (`ready_port`, `ready_log`, `ready_cmd`).",
+                name: "service_start".into(),
+                description: "Start a local process or container service (`id`) or all enabled services (`all: true`) from `sprout.toml` in topological DAG order, waiting for readiness probes (`ready_port`, `ready_log`, `ready_cmd`).".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -600,8 +634,8 @@ impl WorkspaceTools {
                 requires_approval: true,
             },
             ToolSchema {
-                name: "service_stop",
-                description: "Stop one service (`id`) or all active services (`all: true`) from `sprout.toml`, running `stop_cmd`/`down` and terminating their process trees cleanly.",
+                name: "service_stop".into(),
+                description: "Stop one service (`id`) or all active services (`all: true`) from `sprout.toml`, running `stop_cmd`/`down` and terminating their process trees cleanly.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -612,8 +646,8 @@ impl WorkspaceTools {
                 requires_approval: true,
             },
             ToolSchema {
-                name: "service_logs",
-                description: "Read recent lines from a service's in-memory log ring-buffer (optionally filtered by literal text or regex, scrubbed for secrets) without requiring approval.",
+                name: "service_logs".into(),
+                description: "Read recent lines from a service's in-memory log ring-buffer (optionally filtered by literal text or regex, scrubbed for secrets) without requiring approval.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -627,8 +661,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             },
             ToolSchema {
-                name: "service_exec",
-                description: "Execute a command inside a `kind = \"container\"` service via `docker exec` / `nerdctl exec` with sanitized environment, bounded timeout, and secret scrubbing.",
+                name: "service_exec".into(),
+                description: "Execute a command inside a `kind = \"container\"` service via `docker exec` / `nerdctl exec` with sanitized environment, bounded timeout, and secret scrubbing.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -644,8 +678,8 @@ impl WorkspaceTools {
         #[cfg(feature = "scent")]
         {
             out.push(ToolSchema {
-                name: "scent_outline",
-                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, or Java files.",
+                name: "scent_outline".into(),
+                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, or Java files.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -659,8 +693,8 @@ impl WorkspaceTools {
                 requires_approval: false,
             });
             out.push(ToolSchema {
-                name: "scent_impact",
-                description: "Trace semantic AST call impact around a target symbol as ranked @TOON v1 tuples (epicenter, callers, callees, line ranges).",
+                name: "scent_impact".into(),
+                description: "Trace semantic AST call impact around a target symbol as ranked @TOON v1 tuples (epicenter, callers, callees, line ranges).".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -788,6 +822,18 @@ impl WorkspaceTools {
                 let args: ScentImpactArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid scent_impact args: {e}"))?;
                 self.scent_impact(args)
+            }
+            // `SDD-04 REQ-04.3`: herramientas MCP (`mcp__<server>__<tool>`), despachadas
+            // antes del comodín `unknown tool`; la salida ya pasó por `truncate_utf8` +
+            // `scrub_secrets` dentro de `McpRegistry::call`.
+            #[cfg(feature = "mcp")]
+            _ if tool.starts_with("mcp__") => {
+                let registry = self.mcp.as_ref().ok_or_else(|| {
+                    format!("MCP tool `{tool}` requested but no MCP registry is attached (SDD-04)")
+                })?;
+                let args: JsonValue = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid MCP tool args for `{tool}`: {e}"))?;
+                registry.call(tool, &args).map_err(|e| e.to_string())
             }
             _ => Err(format!("unknown workspace tool `{tool}`")),
         }
@@ -1526,7 +1572,7 @@ fn read_pipe_capped<R: Read + Send + 'static>(
     })
 }
 
-fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
