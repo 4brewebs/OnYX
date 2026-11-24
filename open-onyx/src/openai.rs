@@ -198,7 +198,9 @@ pub(crate) fn build_openai_request_body(
     body
 }
 
-fn lowercase_json_schema_types(val: &mut JsonValue) {
+/// Normaliza los `type` de un JSON Schema a minúsculas (la API OpenAI los exige
+/// así y Anthropic también). `pub(crate)` para reutilizarla en `anthropic.rs`.
+pub(crate) fn lowercase_json_schema_types(val: &mut JsonValue) {
     match val {
         JsonValue::Object(map) => {
             if let Some(JsonValue::String(ty)) = map.get_mut("type") {
@@ -273,10 +275,10 @@ pub(crate) fn parse_openai_response(
     }
 }
 
-const MAX_TRANSIENT_RETRIES: usize = 2;
-const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
+pub(crate) const MAX_TRANSIENT_RETRIES: usize = 2;
+pub(crate) const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
 
-fn is_retryable_stream_error(err: &str) -> bool {
+pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("decoding chunks")
         || lower.contains("unexpected eof")

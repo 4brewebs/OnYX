@@ -1,3 +1,4 @@
+mod anthropic;
 mod command;
 mod context;
 mod external_driver;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::{Duration, SystemTime};
 
+use anthropic::{AnthropicResponder, DEFAULT_ANTHROPIC_MODEL};
 use command::{CommandSpawnerSystem, PendingSessionAction, PendingSystemNotes};
 use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
@@ -213,7 +215,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
             "--provider" => {
                 let p = args
                     .next()
-                    .ok_or("--provider requires `gemini` or `openai`")?;
+                    .ok_or("--provider requires `gemini`, `openai` or `anthropic`")?;
                 provider = Some(LlmProvider::parse(&p)?);
             }
             "--model" => {
@@ -514,7 +516,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -532,8 +534,8 @@ fn help_text() -> String {
 
 OPTIONS:
   -w, --workspace <dir>    Target workspace directory (default: current working directory)
-      --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
-      --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
+      --provider <name>    LLM backend: `gemini` (default), `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio) or `anthropic` (native Messages API)
+      --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`, Anthropic `__ANTHROPIC_MODEL__`)
       --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`)
       --api-base <url>     Custom API base URL (`http://` allowed on loopback only; remote hosts require `https://`)
       --allow-custom-auth-host
@@ -603,7 +605,7 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
   /profile [id]             List LLM profiles or switch to a registered one (`[[llm_profiles]]`)
-  /provider <gemini|openai>
+  /provider <gemini|openai|anthropic>
                           Hot-swap the LLM provider without restarting the session
   /model <name>             Change the LLM model of the active target (custom model)
   /effort [auto|low|medium|high]
@@ -621,9 +623,9 @@ PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
   Session Vault            `.onyx/vault/<session>/` stores snapshots + `.tr` together (`.onyx/vault/unassigned/` for standalone `.tr`; auto-ignored by Git)
 
 ENVIRONMENT VARIABLES:
-  GEMINI_API_KEY, OPENAI_API_KEY, ONYX_API_KEY
-  ONYX_PROVIDER            Default provider (`gemini` | `openai`)
-  ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
+  GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, ONYX_API_KEY
+  ONYX_PROVIDER            Default provider (`gemini` | `openai` | `anthropic`)
+  ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL` as fallbacks)
   ONYX_EFFORT              Default reasoning/thinking effort (`low` | `medium` | `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`)
   ONYX_AUTO_SAVE           Enable `--auto-save` by default (`1` | `true` | `yes` | `on`)
   ONYX_ALLOW_CUSTOM_AUTH_HOST
@@ -635,9 +637,11 @@ ENVIRONMENT VARIABLES:
   ONYX_WEB_CORS_ORIGIN     Optional allowed browser origin for external SPAs (e.g. `http://localhost:5173`)
   GEMINI_API_BASE          Custom Gemini API endpoint
   OPENAI_API_BASE / OPENAI_BASE_URL
-                           Custom OpenAI-compatible API endpoint"#
+                           Custom OpenAI-compatible API endpoint
+  ANTHROPIC_API_BASE       Custom Anthropic API endpoint (default `https://api.anthropic.com`)"#
         .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
-        .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL);
+        .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL)
+        .replace("__ANTHROPIC_MODEL__", DEFAULT_ANTHROPIC_MODEL);
 
     format!("openOnyx {version} — Deterministic Coding Agent Harness\n\n{usage_str}\n\n{body}")
 }
@@ -678,6 +682,8 @@ fn resolve_llm_config(
                     LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
                         .ok()
                         .filter(|s| !s.trim().is_empty()),
+                    // Anthropic: `--thinking-budget` llega en Fase 2 (`SDD-04`).
+                    LlmProvider::Anthropic => None,
                 });
             match env_val {
                 Some(raw) => Some(ReasoningEffort::parse(&raw)?),
@@ -766,6 +772,43 @@ fn resolve_llm_config(
                 project_instructions,
             })
         }
+        LlmProvider::Anthropic => {
+            let raw_api_base = cli
+                .api_base
+                .clone()
+                .or_else(|| env::var("ANTHROPIC_API_BASE").ok())
+                .filter(|s| !s.trim().is_empty());
+            let api_key = env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| env::var("ONYX_API_KEY"))
+                .map_err(|_| "ANTHROPIC_API_KEY environment variable is not set")?;
+            let api_base = match raw_api_base {
+                Some(raw) => Some(validate_api_base(
+                    provider,
+                    &raw,
+                    !api_key.trim().is_empty(),
+                    allow_custom_auth_host,
+                )?),
+                None => None,
+            };
+            let model = cli
+                .model
+                .clone()
+                .or_else(|| env::var("ONYX_MODEL").ok().filter(|s| !s.trim().is_empty()))
+                .or_else(|| {
+                    env::var("ANTHROPIC_MODEL")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string());
+            Ok(LlmConfig {
+                provider,
+                api_key,
+                model,
+                effort,
+                api_base,
+                project_instructions,
+            })
+        }
     }
 }
 
@@ -793,6 +836,9 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
             LlmProvider::OpenAi => env::var("OPENAI_MODEL")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            LlmProvider::Anthropic => env::var("ANTHROPIC_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         })
         .unwrap_or_else(|| provider.default_model().to_string());
     // Misma precedencia que [`resolve_llm_config`]: `--effort` de CLI primero — el
@@ -809,6 +855,8 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
                 LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
                     .ok()
                     .filter(|s| !s.trim().is_empty()),
+                // Anthropic: `--thinking-budget` llega en Fase 2 (`SDD-04`).
+                LlmProvider::Anthropic => None,
             })
             .and_then(|raw| ReasoningEffort::parse(&raw).ok()),
     };
@@ -864,6 +912,17 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
+                .with_external_driver_ids(driver_ids.to_vec());
+            if let Some(tel) = telemetry {
+                r = r.with_telemetry(tel);
+            }
+            Box::new(r)
+        }
+        LlmProvider::Anthropic => {
+            let mut r = AnthropicResponder::new(llm.api_key.clone(), llm.model.clone())
+                .with_api_base(llm.api_base.clone())
+                .with_project_instructions(llm.project_instructions.clone())
+                .with_context_config(ctx_cfg)
                 .with_external_driver_ids(driver_ids.to_vec());
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);

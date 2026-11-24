@@ -173,6 +173,7 @@ pub fn load_project_instructions(workspace_root: &Path) -> String {
     combined
 }
 
+#[derive(Debug)]
 pub(crate) struct QueuedToolCall {
     pub name: String,
     pub args: String,

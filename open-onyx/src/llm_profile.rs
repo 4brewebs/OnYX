@@ -19,6 +19,7 @@ use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::anthropic::DEFAULT_ANTHROPIC_MODEL;
 use crate::context::ReasoningEffort;
 use crate::gemini::DEFAULT_GEMINI_MODEL;
 use crate::openai::DEFAULT_OPENAI_MODEL;
@@ -29,18 +30,20 @@ use onyx_workspace::{LlmProfileConfig, RecordedLlmProfile};
 pub(crate) enum LlmProvider {
     Gemini,
     OpenAi,
+    Anthropic,
 }
 
 impl LlmProvider {
     /// Todos los proveedores, en orden estable (para snapshots deterministas).
-    pub(crate) const ALL: [LlmProvider; 2] = [Self::Gemini, Self::OpenAi];
+    pub(crate) const ALL: [LlmProvider; 3] = [Self::Gemini, Self::OpenAi, Self::Anthropic];
 
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "gemini" => Ok(Self::Gemini),
             "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
             other => Err(format!(
-                "unsupported provider `{other}` (expected `gemini` or `openai`)"
+                "unsupported provider `{other}` (expected `gemini`, `openai` or `anthropic`)"
             )),
         }
     }
@@ -49,6 +52,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => "gemini",
             Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
         }
     }
 
@@ -57,6 +61,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => DEFAULT_GEMINI_MODEL,
             Self::OpenAi => DEFAULT_OPENAI_MODEL,
+            Self::Anthropic => DEFAULT_ANTHROPIC_MODEL,
         }
     }
 
@@ -65,6 +70,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => "GEMINI_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
+            Self::Anthropic => "ANTHROPIC_API_KEY",
         }
     }
 
@@ -74,6 +80,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => &["GEMINI_API_BASE"],
             Self::OpenAi => &["OPENAI_API_BASE", "OPENAI_BASE_URL"],
+            Self::Anthropic => &["ANTHROPIC_API_BASE"],
         }
     }
 }
@@ -101,6 +108,7 @@ fn is_official_provider_host(provider: LlmProvider, host: &str) -> bool {
     match provider {
         LlmProvider::Gemini => lower == "generativelanguage.googleapis.com",
         LlmProvider::OpenAi => lower == "api.openai.com",
+        LlmProvider::Anthropic => lower == "api.anthropic.com",
     }
 }
 
@@ -529,6 +537,7 @@ impl LlmProfileHandle {
                 (None, Some(b)) => Some((String::new(), Some(b))),
                 (None, None) => None,
             },
+            LlmProvider::Anthropic => key.map(|k| (k, base)),
         }
     }
 
