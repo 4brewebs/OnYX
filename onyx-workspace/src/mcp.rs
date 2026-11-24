@@ -23,17 +23,21 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value as JsonValue, json};
 
 use crate::policy::{
     array_brackets_closed_pub, parse_toml_string_array_pub, strip_toml_comment_pub,
 };
-use crate::sandbox::{ProcessJob, ProcessLimits, configure_process_isolation};
+use crate::sandbox::{
+    NetworkPolicy, ProcessJob, ProcessLimits, SandboxConfig, apply_sanitized_env,
+    clean_process_path, configure_process_isolation, ensure_sandbox_tmp_dir,
+    resolve_process_binary,
+};
 use crate::tools::{ToolSchema, scrub_secrets, truncate_utf8};
 
 /// Timeout por defecto (segundos) de cada llamada JSON-RPC a un servidor MCP.
@@ -261,36 +265,55 @@ fn validate_mcp_server_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `url` debe ser `https://`, salvo hosts loopback (`127.0.0.1`, `localhost`, `::1`)
-/// que pueden usar `http://`.
+/// `url` debe ser `https://`, salvo hosts loopback (`127.0.0.1`, `localhost`,
+/// `::1`) que pueden usar `http://`.
+///
+/// Hardening Fase 3B → 4A: la *authority* termina en el primer `/`, `?` o `#`;
+/// el userinfo (`user@host`) queda prohibido porque ocultaría el host real
+/// (p. ej. `http://localhost:80@evil.com/mcp`); los IPv6 van entre corchetes
+/// (`http://[::1]:8787/mcp`).
 fn validate_mcp_url(url: &str) -> Result<(), String> {
-    if let Some(rest) = url.strip_prefix("https://") {
-        if !rest.split('/').next().unwrap_or("").is_empty() {
-            return Ok(());
-        }
+    let trimmed = url.trim();
+    let (rest, is_https) = if let Some(rest) = trimmed.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return Err(format!(
+            "`url` must start with `https://` (or loopback `http://`): `{url}`"
+        ));
+    };
+    // Authority: hasta el primer `/`, `?` o `#`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
         return Err(format!("`url` has no host: `{url}`"));
     }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let host = rest.split('/').next().unwrap_or("");
-        if is_loopback_host(host) {
-            return Ok(());
-        }
+    if authority.contains('@') {
         return Err(format!(
-            "http transport requires `https://` (or `http://` on a loopback host): `{url}`"
+            "userinfo (`@`) is not allowed in MCP `url` (it would hide the real host): `{url}`"
         ));
     }
+    if is_https {
+        return Ok(());
+    }
+    let bare_host = if let Some(inner) = authority.strip_prefix('[') {
+        // IPv6 entre corchetes: `[::1]` o `[::1]:8787`.
+        inner.split(']').next().unwrap_or("")
+    } else {
+        // `host:port` (IPv4/hostname): el host es todo lo que queda ANTES del
+        // último `:` (la autoridad IPv4 nunca lleva más `:` que el del puerto).
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    if is_loopback_host(bare_host) {
+        return Ok(());
+    }
     Err(format!(
-        "`url` must start with `https://` (or loopback `http://`): `{url}`"
+        "http transport requires `https://` (or `http://` on a loopback host): `{url}`"
     ))
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    let bare = host
-        .split(':')
-        .next()
-        .unwrap_or(host)
-        .trim_matches(|c| c == '[' || c == ']');
-    matches!(bare, "127.0.0.1" | "localhost" | "::1")
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1")
 }
 
 /// Un valor de `env` válido es exactamente `${NOMBRE}` (identificador ASCII).
@@ -305,6 +328,9 @@ fn is_env_ref(value: &str) -> bool {
 /// Parsea el bloque MCP de un `config.toml` (global o workspace).
 /// Devuelve el borrador; [`merge_mcp_configs`] convierte en configs finales.
 pub(crate) fn parse_mcp_config(content: &str) -> Result<McpDraft, String> {
+    // BOM UTF-8 (edición con Notepad & cía.): `read_to_string` lo conserva al
+    // inicio de la cadena y rompería la primera línea (`[mcp]` etc.).
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let lines: Vec<&str> = content.lines().collect();
     let mut draft = McpDraft::default();
     let mut section: Option<&str> = None; // "mcp" | nombre de servidor
@@ -672,7 +698,7 @@ pub fn load_mcp_config(
         if path.is_file() {
             if !trust_project {
                 warnings.push(format!(
-                    "MCP config in `{}` ignored: workspace is not trusted (use `--trust` or `onyx trust`)"
+                    "MCP config in `{}` ignored: workspace is not trusted (use `--trust-workspace` or `openonyx trust`)"
                         ,
                     path.display()
                 ));
@@ -724,12 +750,14 @@ enum InboxMsg {
 }
 
 impl McpSession {
-    /// Mata el proceso (y su árbol vía `ProcessJob`) y libera la sesión.
+    /// Mata el proceso (y su árbol vía `ProcessJob`) y libera la sesión. El `wait`
+    /// tras el `kill` evita dejar zombis en Unix (el `Child` es recolectado aquí).
     fn kill(&mut self) {
         if let Some(job) = self.job.as_mut() {
             job.terminate();
         }
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -739,7 +767,9 @@ pub struct StdioMcpClient {
     name: String,
     cfg: McpServerConfig,
     session: Mutex<Option<McpSession>>,
-    cached_tools: Mutex<Vec<ToolSchema>>,
+    /// `None` hasta que el handshake ha completado; `Some(tools)` son los
+    /// schemas cacheados de ese handshake.
+    cached_tools: Mutex<Option<Vec<ToolSchema>>>,
 }
 
 impl fmt::Debug for StdioMcpClient {
@@ -757,7 +787,7 @@ impl StdioMcpClient {
             name,
             cfg,
             session: Mutex::new(None),
-            cached_tools: Mutex::new(Vec::new()),
+            cached_tools: Mutex::new(None),
         })
     }
 
@@ -768,17 +798,36 @@ impl StdioMcpClient {
                 self.name
             )));
         };
-        let mut cmd = Command::new(command);
+        // Resolución explícita de `command` contra `PATH`/`PATHEXT` **antes** de
+        // `Command::new` (misma vía que `external_driver`/`sandbox.rs`): los shims
+        // `npx`/`uvx`/`.cmd` funcionan en Windows y Linux.
+        let resolved = resolve_process_binary(command).ok_or_else(|| {
+            McpError::Transport(format!(
+                "MCP server `{}`: command `{command}` was not resolved against PATH{} (install it or use an absolute path)",
+                self.name,
+                if cfg!(windows) { "/PATHEXT" } else { "" }
+            ))
+        })?;
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let sandbox_tmp = ensure_sandbox_tmp_dir(&workspace_root)
+            .map_err(|e| McpError::Transport(format!("MCP server `{}`: {e}", self.name)))?;
+        let mut cmd = Command::new(&resolved.path);
         cmd.args(args)
+            .current_dir(clean_process_path(&workspace_root))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // `stderr` a la nada: un servidor defectuoso podría volcar secretos a
             // su stderr; nunca lo capturamos.
-            .stderr(Stdio::null())
-            .env_clear();
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
+            .stderr(Stdio::null());
+        // Entorno base seguro (misma vía que `sandbox.rs::apply_sanitized_env`):
+        // solo la allowlist de runtime/toolchain (`PATH`, `PATHEXT`, `COMSPEC`, ...),
+        // sin heredar credenciales; encima se añaden únicamente los `env` explícitos
+        // del bloque MCP (expandidos `${REF}`).
+        let sandbox_cfg = SandboxConfig {
+            network: NetworkPolicy::Unrestricted,
+            ..SandboxConfig::default()
+        };
+        apply_sanitized_env(&mut cmd, &sandbox_cfg, &workspace_root, &sandbox_tmp);
         for (k, v) in env {
             let expanded = expand_env_ref(v).ok_or_else(|| {
                 McpError::Transport(format!(
@@ -791,8 +840,9 @@ impl StdioMcpClient {
         configure_process_isolation(&mut cmd, true);
         let mut child = cmd.spawn().map_err(|e| {
             McpError::Transport(format!(
-                "MCP server `{}`: failed to spawn `{command}`: {e}",
-                self.name
+                "MCP server `{}`: failed to spawn `{}`: {e}",
+                self.name,
+                resolved.path.display()
             ))
         })?;
         let stdin = child
@@ -814,6 +864,7 @@ impl StdioMcpClient {
                     job.terminate();
                 }
                 let _ = child.kill();
+                let _ = child.wait();
                 McpError::Transport(format!("failed to start reader thread: {e}"))
             })?;
 
@@ -854,9 +905,21 @@ impl StdioMcpClient {
                 self.name
             )));
         }
+        // Deadline absoluto ANTES del loop: las notificaciones periódicas del
+        // servidor no pueden prolongar el timeout (cada `recv_timeout` consume
+        // solo el resto de presupuesto).
         let timeout = Duration::from_secs(timeout_secs.max(1));
+        let deadline = Instant::now() + timeout;
         loop {
-            match session.inbox.recv_timeout(timeout) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop_session_inplace(&mut guard);
+                return Err(McpError::Timeout {
+                    method: method.to_string(),
+                    secs: timeout_secs.max(1),
+                });
+            }
+            match session.inbox.recv_timeout(remaining) {
                 Ok(InboxMsg::Response(v)) if v.get("id").and_then(|i| i.as_u64()) == Some(id) => {
                     return extract_jsonrpc_result(&v, method);
                 }
@@ -923,11 +986,12 @@ fn drop_session_inplace(guard: &mut Option<McpSession>) {
 
 impl McpClient for StdioMcpClient {
     fn handshake(&self) -> Result<Vec<ToolSchema>, McpError> {
-        // Idempotencia: sesión viva + schemas cacheados → sin trabajo.
+        // Idempotencia: sesión viva + handshake ya completado (`Some`) → sin
+        // trabajo (aunque el servidor exponga 0 tools).
         {
             let cached = self.cached_tools.lock().unwrap();
-            if !cached.is_empty() && self.session.lock().unwrap().is_some() {
-                return Ok(cached.clone());
+            if cached.is_some() && self.session.lock().unwrap().is_some() {
+                return Ok(cached.clone().unwrap_or_default());
             }
         }
         {
@@ -937,73 +1001,88 @@ impl McpClient for StdioMcpClient {
                 *guard = Some(session);
             }
         }
-        let timeout = self.cfg.timeout_secs;
-        self.rpc(
-            "initialize",
-            json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "onyx", "version": "0.1" },
-            }),
-            timeout,
-        )?;
-        self.send_notification("notifications/initialized")?;
+        // El handshake post-spawn; si falla **después** del spawn, no dejamos
+        // una sesión a medio hacer (la siguiente llamada reutilizaría una
+        // conexión rota).
+        let outcome = (|| -> Result<Vec<ToolSchema>, McpError> {
+            let timeout = self.cfg.timeout_secs;
+            self.rpc(
+                "initialize",
+                json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "onyx", "version": "0.1" },
+                }),
+                timeout,
+            )?;
+            self.send_notification("notifications/initialized")?;
 
-        // tools/list con paginación `nextCursor` acotada.
-        let mut tools: Vec<ToolSchema> = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _page in 0..MCP_MAX_TOOLS_PAGES {
-            let params = match &cursor {
-                Some(c) => json!({ "cursor": c }),
-                None => json!({}),
-            };
-            let result = self.rpc("tools/list", params, timeout)?;
-            let list = result
-                .get("tools")
-                .and_then(|t| t.as_array())
-                .ok_or_else(|| {
-                    McpError::Transport(format!(
-                        "MCP server `{}`: tools/list returned no `tools` array",
-                        self.name
-                    ))
-                })?;
-            for item in list {
-                let name = item
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .filter(|n| !n.is_empty() && !n.contains("__"))
+            // tools/list con paginación `nextCursor` acotada.
+            let mut tools: Vec<ToolSchema> = Vec::new();
+            let mut cursor: Option<String> = None;
+            for _page in 0..MCP_MAX_TOOLS_PAGES {
+                let params = match &cursor {
+                    Some(c) => json!({ "cursor": c }),
+                    None => json!({}),
+                };
+                let result = self.rpc("tools/list", params, timeout)?;
+                let list = result
+                    .get("tools")
+                    .and_then(|t| t.as_array())
                     .ok_or_else(|| {
                         McpError::Transport(format!(
-                            "MCP server `{}`: malformed tool name (empty or contains `__`)",
+                            "MCP server `{}`: tools/list returned no `tools` array",
                             self.name
                         ))
-                    })?
-                    .to_string();
-                let description = item
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let parameters = item
-                    .get("inputSchema")
-                    .filter(|s| s.is_object())
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-                // REQ-04.4: toda herramienta MCP requiere aprobación por defecto.
-                tools.push(ToolSchema {
-                    name: Cow::Owned(format!("mcp__{}__{}", self.name, name)),
-                    description: Cow::Owned(description),
-                    parameters,
-                    requires_approval: true,
-                });
+                    })?;
+                for item in list {
+                    let name = item
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .filter(|n| !n.is_empty() && !n.contains("__"))
+                        .ok_or_else(|| {
+                            McpError::Transport(format!(
+                                "MCP server `{}`: malformed tool name (empty or contains `__`)",
+                                self.name
+                            ))
+                        })?
+                        .to_string();
+                    let description = item
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let parameters = item
+                        .get("inputSchema")
+                        .filter(|s| s.is_object())
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+                    // REQ-04.4: toda herramienta MCP requiere aprobación por defecto.
+                    tools.push(ToolSchema {
+                        name: Cow::Owned(format!("mcp__{}__{}", self.name, name)),
+                        description: Cow::Owned(description),
+                        parameters,
+                        requires_approval: true,
+                    });
+                }
+                match result.get("nextCursor").and_then(|c| c.as_str()) {
+                    Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
+                    _ => break,
+                }
             }
-            match result.get("nextCursor").and_then(|c| c.as_str()) {
-                Some(c) if !c.is_empty() => cursor = Some(c.to_string()),
-                _ => break,
+            *self.cached_tools.lock().unwrap() = Some(tools.clone());
+            Ok(tools)
+        })();
+        match outcome {
+            Ok(tools) => Ok(tools),
+            Err(e) => {
+                let mut guard = self.session.lock().unwrap();
+                if let Some(mut session) = guard.take() {
+                    session.kill();
+                }
+                Err(e)
             }
         }
-        *self.cached_tools.lock().unwrap() = tools.clone();
-        Ok(tools)
     }
 
     fn call_tool(&self, tool: &str, args: &JsonValue) -> Result<String, McpError> {
@@ -1071,6 +1150,14 @@ fn read_bounded_line(
         }
         match avail.iter().position(|&b| b == b'\n') {
             Some(pos) => {
+                // El `\n` puede llegar en un chunk posterior a varios sin
+                // newline: validar el tope también aquí, no solo en `None`.
+                if buf.len() + pos > cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("line exceeds {cap} bytes"),
+                    ));
+                }
                 buf.extend_from_slice(&avail[..pos]);
                 reader.consume(pos + 1);
                 return Ok(Some(buf));
@@ -1156,7 +1243,9 @@ pub(crate) fn split_prefixed_name(prefixed: &str) -> Option<(&str, &str)> {
 struct McpServerHandle {
     name: String,
     status: McpServerStatus,
-    client: Option<Arc<StdioMcpClient>>,
+    /// Cliente genérico por transporte (`StdioMcpClient` hoy; `HttpMcpClient`
+    /// en la Fase 4B) para que el despacho no dependa del transporte.
+    client: Option<Arc<dyn McpClient>>,
     tools: Vec<ToolSchema>,
 }
 
@@ -1396,6 +1485,39 @@ url = "http://mcp.example.com/sse"
         let draft = parse_mcp_config(content).expect("parse");
         let err = merge_mcp_configs(McpDraft::default(), draft).unwrap_err();
         assert!(err.contains("requires `https://`"), "{err}");
+    }
+
+    #[test]
+    fn url_accepts_ipv6_loopback_in_brackets() {
+        assert!(validate_mcp_url("http://127.0.0.1:3320/mcp").is_ok());
+        assert!(validate_mcp_url("http://[::1]:8787/mcp").is_ok());
+        assert!(validate_mcp_url("http://[0:0:0:0:0:0:0:1]/mcp").is_ok());
+        // La query/fragment terminan la authority (host sigue siendo loopback).
+        assert!(validate_mcp_url("http://127.0.0.1?x=1").is_ok());
+        assert!(validate_mcp_url("http://127.0.0.1#frag").is_ok());
+    }
+
+    #[test]
+    fn url_rejects_userinfo_and_non_loopback_ipv6() {
+        // `localhost:80@evil.com`: el userinfo ocultaría el host real.
+        let err = validate_mcp_url("http://localhost:80@evil.com/mcp").unwrap_err();
+        assert!(err.contains("userinfo"), "{err}");
+        let err = validate_mcp_url("http://[::1]:80@evil.com/mcp").unwrap_err();
+        assert!(err.contains("userinfo"), "{err}");
+        // El userinfo se rechaza también con `https://`.
+        assert!(validate_mcp_url("https://admin@mcp.example.com/sse").is_err());
+        // IPv6 no loopback: `http://` no es admisible.
+        let err = validate_mcp_url("http://[2001:db8::1]:8787/mcp").unwrap_err();
+        assert!(err.contains("requires `https://`"), "{err}");
+        // …mientras que con `https://` sí.
+        assert!(validate_mcp_url("https://[2001:db8::1]:8787/mcp").is_ok());
+    }
+
+    #[test]
+    fn url_rejects_empty_authority() {
+        assert!(validate_mcp_url("http://").is_err());
+        assert!(validate_mcp_url("https://").is_err());
+        assert!(validate_mcp_url("ftp://127.0.0.1:8787").is_err());
     }
 
     #[test]

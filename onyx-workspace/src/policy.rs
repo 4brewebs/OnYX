@@ -484,8 +484,14 @@ fn match_permission_rule(rule: &str, tool: &str, subject: &str) -> Option<usize>
             return None;
         }
         rule_tool.chars().filter(|c| *c != '*' && *c != '?').count()
-    } else if rule_tool == "*" || rule_tool == tool {
+    } else if rule_tool == "*" {
         0
+    } else if rule_tool == tool {
+        // La coincidencia exacta es siempre más específica que cualquier glob que
+        // también coincida (p. ej. `allow = ["mcp__mock__echo"]` vence a
+        // `ask = ["mcp__mock__*"]`): `tool.len() + 1` está por encima del máximo
+        // posible de chars literales de un glob coincidente (≤ `tool.len()`).
+        tool.len() + 1
     } else {
         return None;
     };
@@ -1288,6 +1294,59 @@ mod merge_delta_tests {
         assert_eq!(
             classify_merge_delta(&files(&[".onyx\\config.toml"])),
             MergeDeltaVerdict::Deny
+        );
+    }
+}
+
+#[cfg(test)]
+mod permission_rule_specificity_tests {
+    use super::*;
+
+    fn policy_with(deny: &[&str], ask: &[&str], allow: &[&str]) -> WorkspacePolicy {
+        WorkspacePolicy::new(std::env::temp_dir())
+            .expect("policy")
+            .with_permissions(PermissionRules {
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+                ask: ask.iter().map(|s| s.to_string()).collect(),
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+            })
+    }
+
+    #[test]
+    fn exact_allow_beats_generic_mcp_ask_glob() {
+        // Regresión `SDD-04` Fase 3B: la coincidencia exacta de `tool` tiene
+        // especificidad `tool.len() + 1`, por encima de cualquier glob coincidente.
+        let p = policy_with(&[], &["mcp__mock__*"], &["mcp__mock__echo"]);
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "mcp__mock__echo", "{}"),
+            PermissionDecision::Allow
+        );
+        // Un glob intermedio sigue pidiendo aprobación para el resto del servidor.
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "mcp__mock__big", "{}"),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn generic_ask_beats_generic_allow() {
+        let p = policy_with(&[], &["*"], &["*"]);
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "fs_read", "{}"),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn exact_deny_beats_exact_allow_on_mcp_tool() {
+        let p = policy_with(
+            &["mcp__mock__echo"],
+            &[],
+            &["mcp__mock__echo", "mcp__mock__*"],
+        );
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "mcp__mock__echo", "{}"),
+            PermissionDecision::Deny
         );
     }
 }
