@@ -11,6 +11,8 @@ mod session;
 mod subagent;
 mod tui;
 mod tui_input;
+mod tui_palette;
+mod tui_views;
 mod vault;
 mod web;
 
@@ -789,18 +791,23 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
                 .filter(|s| !s.trim().is_empty()),
         })
         .unwrap_or_else(|| provider.default_model().to_string());
-    let effort = env::var("ONYX_EFFORT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| match provider {
-            LlmProvider::Gemini => env::var("GEMINI_THINKING_LEVEL")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-            LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-        })
-        .and_then(|raw| ReasoningEffort::parse(&raw).ok());
+    // Misma precedencia que [`resolve_llm_config`]: `--effort` de CLI primero — el
+    // sellado de tick 0 del replay debe igualar al de la sesión en vivo.
+    let effort = match cli.effort {
+        Some(e) => Some(e),
+        None => env::var("ONYX_EFFORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| match provider {
+                LlmProvider::Gemini => env::var("GEMINI_THINKING_LEVEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+                LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+            })
+            .and_then(|raw| ReasoningEffort::parse(&raw).ok()),
+    };
     let raw_api_base = cli.api_base.clone().or_else(|| {
         provider
             .api_base_envs()
@@ -1188,6 +1195,7 @@ fn launch_interactive_chat(
         .with_telemetry(telemetry.clone())
         .with_context_config(ctx_cfg)
         .with_model_info(llm.model.clone(), llm.effort)
+        .with_llm_profile(profile_handle.clone())
         .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
         .with_subagents(sub_handle.clone());
     let tui_handle = tui.handle();
@@ -1789,17 +1797,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_timeout_ticks: 512,
                 ..config
             };
-            // `SDD-03` Fase 2: handle LLM best-effort (sin credenciales) para que el
-            // replay reproduzca el estado modal `ws.llm.*` idéntico al `chat` en vivo.
+            // `SDD-03` Fase 2 (Fase 3: registro leniente): handle **sin credenciales**
+            // y con todos los perfiles disponibles para que el replay reproduzca el
+            // estado modal `ws.llm.*` idéntico al `chat` en vivo en **cualquier
+            // máquina** (0 llamadas HTTP, 0 variables de entorno necesarias).
             let replay_llm = resolve_replay_llm_config(&cli)?;
-            let allow_custom_auth_host =
-                cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
             let replay_spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(replay_config.default_max_steps)
-                .with_llm_profile(LlmProfileHandle::new(
+                .with_llm_profile(LlmProfileHandle::new_for_replay(
                     &replay_llm,
                     policy.llm_profiles(),
-                    allow_custom_auth_host,
                 ));
 
             let (mut host, _ws_vocab) = build_host_with_options(
@@ -1888,13 +1895,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rewind_llm = resolve_replay_llm_config(&cli)?;
             let allow_custom_auth_host =
                 cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+            // Rama `--transcript`: replay 0-I/O → registro leniente (no exige
+            // credenciales en la máquina de replay). Rama en vivo: registro normal.
+            let llm_handle = if transcript.is_some() {
+                LlmProfileHandle::new_for_replay(&rewind_llm, policy.llm_profiles())
+            } else {
+                LlmProfileHandle::new(&rewind_llm, policy.llm_profiles(), allow_custom_auth_host)
+            };
             let spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(128)
-                .with_llm_profile(LlmProfileHandle::new(
-                    &rewind_llm,
-                    policy.llm_profiles(),
-                    allow_custom_auth_host,
-                ));
+                .with_llm_profile(llm_handle);
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
@@ -2004,7 +2014,8 @@ mod tests {
     };
     use ops::render_inspect;
     use session::{
-        SURFACE_APPROVAL, SURFACE_PLAN, active_surfaces, all_live_waiting_approval, build_host,
+        SURFACE_APPROVAL, SURFACE_PLAN, SURFACE_SERVICES, active_surfaces,
+        all_live_waiting_approval, build_host,
     };
 
     use super::*;
@@ -2040,7 +2051,8 @@ mod tests {
         assert_eq!(host.agent_state(id), Some(AgentState::WaitingApproval));
         assert!(all_live_waiting_approval(host.graph(), &host.vocab()));
 
-        let surfaces = active_surfaces(host.graph(), &host.vocab());
+        let ws_vocab = onyx_workspace::WorkspaceVocab::resolve_with(|name| host.attr(name));
+        let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
         let approval_surface = surfaces
             .iter()
             .find(|s| s.surface == SURFACE_APPROVAL)
@@ -2049,6 +2061,39 @@ mod tests {
         assert!(
             surfaces.iter().any(|s| s.surface == SURFACE_PLAN),
             "plan surface must be declared"
+        );
+    }
+
+    #[test]
+    fn active_surfaces_includes_services_surface_only_with_sprout_state() {
+        use onyx_soul_agents::{AgentGraph, AttrRegistry, Vocab};
+        use onyx_workspace::{WorkspaceVocab, set_workspace_services};
+
+        let mut graph = AgentGraph::new();
+        let vocab = Vocab::resolve(&mut graph);
+        let ws_vocab = WorkspaceVocab::resolve_with(|name| graph.attr(name));
+
+        // Sin servicios: solo las 4 superficies base, sin `SURFACE_SERVICES`.
+        let surfaces = active_surfaces(&graph, &vocab, &ws_vocab);
+        assert_eq!(surfaces.len(), 4, "{surfaces:?}");
+        assert!(
+            !surfaces.iter().any(|s| s.surface == SURFACE_SERVICES),
+            "services surface must be absent without ws.services.text"
+        );
+
+        // Con `ws.services.text` no vacío: se añade al final (orden estable).
+        set_workspace_services(&mut graph, &ws_vocab, "[READY] api (process :8080)");
+        let surfaces = active_surfaces(&graph, &vocab, &ws_vocab);
+        assert_eq!(surfaces.len(), 5, "{surfaces:?}");
+        let svc = surfaces
+            .iter()
+            .find(|s| s.surface == SURFACE_SERVICES)
+            .expect("services surface must be declared");
+        assert!(!svc.focused);
+        assert_eq!(
+            surfaces.last().map(|s| s.surface),
+            Some(SURFACE_SERVICES),
+            "services surface must keep the stable trailing position"
         );
     }
 
@@ -2669,9 +2714,18 @@ mod tests {
             graph_workspace_llm_profile(live_host.graph(), &live_ws).expect("ws.llm.* sellado");
         assert_eq!(live_rec.model, "gemini-4-deuterium");
 
-        // Replay: handle leniente con el **mismo shape** que el live (mismo
-        // provider/modelo/esfuerzo/base, otra clave) para que el sellado de
-        // tick 0 escriba el mismo `ws.llm.*` y la asignación EAV sea idéntica.
+        // La "máquina de replay" no tiene credenciales: se restaura el entorno
+        // antes del replay (replay 0-credenciales real, `SDD-03` Fase 3).
+        unsafe {
+            match saved_fast {
+                Some(v) => env::set_var(fast_key_env, v),
+                None => env::remove_var(fast_key_env),
+            }
+        }
+
+        // Replay: registro **leniente** con el **mismo shape** que el live (mismo
+        // provider/modelo/esfuerzo/base) para que el sellado de tick 0 escriba
+        // el mismo `ws.llm.*` y la asignación EAV sea idéntica.
         let replay_startup = LlmConfig {
             provider: LlmProvider::Gemini,
             api_key: "replay-key".to_string(),
@@ -2680,7 +2734,18 @@ mod tests {
             api_base: None,
             project_instructions: String::new(),
         };
-        let replay_handle = LlmProfileHandle::new(&replay_startup, &profiles, false);
+        let replay_handle = LlmProfileHandle::new_for_replay(&replay_startup, &profiles);
+        // Sin `fast_key_env` en el entorno, el perfil sigue disponible: en replay
+        // hay 0 llamadas HTTP y la disponibilidad por credenciales no aplica.
+        assert!(
+            replay_handle
+                .public_snapshot()
+                .profiles
+                .iter()
+                .all(|p| p.available),
+            "{:?}",
+            replay_handle.public_snapshot().profiles
+        );
         let replay_spawner = CommandSpawnerSystem::new(true)
             .with_llm_profile(replay_handle.clone())
             .with_telemetry(SessionTelemetryHandle::new("gemini-4-hydrogen", false));
@@ -2736,13 +2801,6 @@ mod tests {
             replay_handle.active_target().effort,
             live_handle.active_target().effort
         );
-
-        unsafe {
-            match saved_fast {
-                Some(v) => env::set_var(fast_key_env, v),
-                None => env::remove_var(fast_key_env),
-            }
-        }
     }
 
     #[test]

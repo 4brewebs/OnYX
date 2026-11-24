@@ -277,6 +277,11 @@ struct LlmRegistryState {
     startup_key: String,
     allow_custom_auth_host: bool,
     project_instructions: Arc<String>,
+    /// `openonyx replay` / `rewind --transcript` (`SDD-03` Fase 3): 0 llamadas
+    /// HTTP — todos los perfiles se marcan disponibles con clave vacía, de modo
+    /// que la reinyección de `/profile`/`/provider` reproduce el estado modal
+    /// `ws.llm.*` en cualquier máquina, sin credenciales.
+    replay_mode: bool,
 }
 
 /// Registro thread-safe de perfiles LLM y objetivo activo.
@@ -306,6 +311,26 @@ impl LlmProfileHandle {
         cfg: &LlmConfig,
         profiles: &[LlmProfileConfig],
         allow_custom_auth_host: bool,
+    ) -> Self {
+        Self::new_impl(cfg, profiles, allow_custom_auth_host, false)
+    }
+
+    /// Registro **leniente** para `openonyx replay` / `rewind --transcript`
+    /// (`SDD-03` Fase 3): no se hace ninguna llamada HTTP, así que la
+    /// disponibilidad por credenciales no aplica — **todos** los perfiles
+    /// declarados quedan disponibles con clave vacía y `set_provider` funciona
+    /// sin variables de entorno. Así un replay offline (0-I/O) reproduce el
+    /// estado modal `ws.llm.*` (y el fingerprint) de la sesión en vivo en
+    /// cualquier máquina, sin `GEMINI_API_KEY`/`OPENAI_API_KEY`.
+    pub(crate) fn new_for_replay(cfg: &LlmConfig, profiles: &[LlmProfileConfig]) -> Self {
+        Self::new_impl(cfg, profiles, false, true)
+    }
+
+    fn new_impl(
+        cfg: &LlmConfig,
+        profiles: &[LlmProfileConfig],
+        allow_custom_auth_host: bool,
+        replay_mode: bool,
     ) -> Self {
         let mut entries: Vec<LlmProfileEntry> = vec![LlmProfileEntry {
             id: "default".to_string(),
@@ -345,16 +370,30 @@ impl LlmProfileHandle {
                 }
             };
 
-            let (mut available, mut unavailable_reason, api_base) = match &p.api_base {
-                Some(raw) => {
-                    match validate_api_base(provider, raw, key_present, allow_custom_auth_host) {
-                        Ok(validated) => (true, None, Some(validated)),
-                        Err(err) => (false, Some(err), None),
+            // En replay no hay llamadas HTTP: la disponibilidad no se evalúa y la
+            // base se normaliza como en vivo cuando pasa la validación (si no,
+            // queda `None` — es inerte, no existe ninguna llamada que la use).
+            let (mut available, mut unavailable_reason, api_base) = if replay_mode {
+                (
+                    true,
+                    None,
+                    p.api_base.as_ref().and_then(|raw| {
+                        validate_api_base(provider, raw, true, allow_custom_auth_host).ok()
+                    }),
+                )
+            } else {
+                match &p.api_base {
+                    Some(raw) => {
+                        match validate_api_base(provider, raw, key_present, allow_custom_auth_host)
+                        {
+                            Ok(validated) => (true, None, Some(validated)),
+                            Err(err) => (false, Some(err), None),
+                        }
                     }
+                    None => (true, None, None),
                 }
-                None => (true, None, None),
             };
-            if available && !key_present {
+            if !replay_mode && available && !key_present {
                 available = false;
                 unavailable_reason = match &key_source {
                     LlmKeySource::Explicit(name) => Some(format!(
@@ -419,6 +458,7 @@ impl LlmProfileHandle {
             startup_key: cfg.api_key.clone(),
             allow_custom_auth_host,
             project_instructions: Arc::new(cfg.project_instructions.clone()),
+            replay_mode,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -544,14 +584,19 @@ impl LlmProfileHandle {
                 .join(", ");
             format!("unknown LLM profile `{id}` (available: {known})")
         })?;
-        if !entry.available {
+        if !entry.available && !st.replay_mode {
             let reason = entry
                 .unavailable_reason
                 .clone()
                 .unwrap_or_else(|| "no availability details".to_string());
             return Err(format!("LLM profile `{id}` is unavailable: {reason}"));
         }
-        let api_key = Self::resolve_entry_key(entry, &st.startup_key)?;
+        let api_key = if st.replay_mode {
+            // 0 llamadas HTTP en replay: clave vacía sin leer el entorno.
+            String::new()
+        } else {
+            Self::resolve_entry_key(entry, &st.startup_key)?
+        };
         st.active = LlmActiveState {
             profile_id: entry.id.clone(),
             provider: entry.provider,
@@ -586,7 +631,12 @@ impl LlmProfileHandle {
                     .find(|e| e.id == "default" && e.provider == provider && e.available)
             })
         {
-            let api_key = Self::resolve_entry_key(entry, &st.startup_key)?;
+            let api_key = if st.replay_mode {
+                // 0 llamadas HTTP en replay: clave vacía sin leer el entorno.
+                String::new()
+            } else {
+                Self::resolve_entry_key(entry, &st.startup_key)?
+            };
             st.active = LlmActiveState {
                 profile_id: entry.id.clone(),
                 provider,
@@ -596,12 +646,18 @@ impl LlmProfileHandle {
                 api_base: entry.api_base.clone(),
             };
         } else {
-            let Some((api_key, base)) = Self::env_credentials_for(provider) else {
-                return Err(format!(
-                    "no credentials for provider `{}`: set `{}` (or define an `[[llm_profiles]]` entry with `api_key_env`)",
-                    provider.as_str(),
-                    provider.api_key_env()
-                ));
+            let (api_key, base) = if st.replay_mode {
+                // 0 llamadas HTTP en replay: sin credenciales del entorno.
+                (String::new(), None)
+            } else {
+                let Some(creds) = Self::env_credentials_for(provider) else {
+                    return Err(format!(
+                        "no credentials for provider `{}`: set `{}` (or define an `[[llm_profiles]]` entry with `api_key_env`)",
+                        provider.as_str(),
+                        provider.api_key_env()
+                    ));
+                };
+                creds
             };
             let api_base = match base {
                 Some(raw) => Some(
@@ -1105,5 +1161,61 @@ mod tests {
         assert_eq!(t.profile_id, "custom");
         assert_eq!(t.model, "gemini-4-titanium");
         assert_eq!(t.effort, None);
+    }
+
+    /// `SDD-03` Fase 3: `new_for_replay` (máquina de replay **sin** credenciales)
+    /// marca todos los perfiles disponibles con clave vacía; `switch_profile` y
+    /// `set_provider` funcionan sin ninguna variable de entorno, porque en replay
+    /// hay 0 llamadas HTTP.
+    #[test]
+    fn new_for_replay_makes_all_profiles_available_without_credentials() {
+        let fast_env = "OPENONIX_TEST_LLM_REPLAY_FAST_0001";
+        let oai_env = "OPENONIX_TEST_LLM_REPLAY_OAI_0002";
+        // Hermeticidad: ni la env explícita de los perfiles ni las credenciales
+        // globales existen en la "máquina de replay".
+        let saved = without_env(&[
+            fast_env,
+            oai_env,
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "ONYX_API_KEY",
+        ]);
+
+        let startup = startup_cfg(LlmProvider::Gemini, "gemini-4-hydrogen", None);
+        let profiles = vec![
+            profile_cfg("fast", "gemini", "gemini-4-deuterium", None, Some(fast_env)),
+            profile_cfg("oai", "openai", "gpt-4o", None, Some(oai_env)),
+        ];
+        let handle = LlmProfileHandle::new_for_replay(&startup, &profiles);
+
+        // Todos los perfiles disponibles, sin leer el entorno.
+        let snap = handle.public_snapshot();
+        assert!(
+            snap.profiles.iter().all(|p| p.available),
+            "{:?}",
+            snap.profiles
+        );
+
+        // `/profile fast` en replay: cambia el objetivo con clave vacía.
+        let t = handle
+            .switch_profile("fast")
+            .expect("replay: perfil disponible");
+        assert_eq!(t.model, "gemini-4-deuterium");
+        assert_eq!(t.api_key, "", "replay no necesita credenciales");
+
+        // `/provider openai` en replay: sin `OPENAI_API_KEY`/`ONYX_API_KEY`.
+        let t = handle
+            .set_provider(LlmProvider::OpenAi)
+            .expect("replay: provider sin env");
+        assert_eq!(t.profile_id, "oai");
+        assert_eq!(t.model, "gpt-4o");
+        assert_eq!(t.api_key, "");
+
+        // Perfil desconocido sigue siendo un error accionable (no una clave).
+        assert!(handle.switch_profile("nope").is_err());
+
+        for (name, saved) in saved {
+            restore_test_env(&name, saved);
+        }
     }
 }

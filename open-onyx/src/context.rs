@@ -1027,11 +1027,14 @@ impl SessionTelemetry {
         }
     }
 
-    /// `SDD-03` Fase 2: registra un turno con el modelo/endpoint **de esa llamada**
-    /// (el modelo en vuelo puede diferir del del handle si hubo hot-swap antes de que
-    /// llegara la respuesta): coste estimado por el modelo real de la llamada.
+    /// `SDD-03` Fase 2 (corregido Fase 3): registra un turno usando el
+    /// modelo/endpoint **de esa llamada** solo para imputar el coste estimado —
+    /// la llamada en vuelo puede ser de otro modelo si hubo hot-swap antes de que
+    /// llegara la respuesta. El modelo **activo** (`model`/`is_local_endpoint`/
+    /// `model_context_tokens`) lo gestiona únicamente [`Self::set_active_model`]:
+    /// una respuesta tardía de una llamada vieja nunca lo revierte (la barra de
+    /// estado refleja el modelo al que se enviará la próxima llamada).
     pub fn record_turn_for(&mut self, model: &str, is_local_endpoint: bool, usage: TokenUsage) {
-        self.set_active_model(model, is_local_endpoint);
         self.last_turn = usage;
         self.cumulative.add_assign(usage);
         if !is_local_endpoint {
@@ -1500,9 +1503,10 @@ mod tests {
             },
         );
         let snap = handle.snapshot();
-        // La telemetría se re-sincroniza al modelo de la llamada (auto-corregible:
-        // la siguiente respuesta volverá a reflejar el modelo del hot-swap).
-        assert_eq!(snap.model, "gpt-4o");
+        // El coste se imputó a `gpt-4o`, pero el modelo **activo** sigue siendo el
+        // del hot-swap: una respuesta tardía nunca revierte `set_active_model`.
+        assert_eq!(snap.model, "gemini-2.5-pro");
+        assert_eq!(snap.model_context_tokens, 1_000_000);
         assert_eq!(snap.cumulative.input_tokens, 256_000);
         assert!(
             (snap.estimated_cost_usd - 2.64).abs() < 1e-9,
@@ -1510,7 +1514,9 @@ mod tests {
             snap.estimated_cost_usd
         );
 
-        // Un endpoint local nunca acumula coste, aunque el modelo sea desconocido.
+        // Una llamada de un endpoint local no acumula coste y tampoco toca el
+        // modelo activo (no es un hot-swap: la siguiente llamada sigue usando el
+        // modelo activo actual).
         handle.record_turn_for(
             "qwen3-local",
             true,
@@ -1522,16 +1528,17 @@ mod tests {
             },
         );
         let snap = handle.snapshot();
-        assert!(snap.is_local_endpoint);
+        assert_eq!(snap.model, "gemini-2.5-pro");
+        assert!(!snap.is_local_endpoint);
         assert!(
             (snap.estimated_cost_usd - 2.64).abs() < 1e-9,
             "{}",
             snap.estimated_cost_usd
         );
         assert_eq!(snap.cumulative.input_tokens, 261_000);
-        // El coste estimado deja de mostrarse en la barra de estado local.
+        // La barra sigue mostrando el coste estimado del modelo activo remoto.
         assert!(
-            !snap.format_status_bar().contains("~$"),
+            snap.format_status_bar().contains("~$"),
             "{}",
             snap.format_status_bar()
         );

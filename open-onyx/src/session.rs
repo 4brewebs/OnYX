@@ -15,6 +15,7 @@ use onyx_soul_agents::{
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
     WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
+    graph_workspace_services,
 };
 
 use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
@@ -39,9 +40,19 @@ pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
 pub const SURFACE_TRACE: SurfaceId = SurfaceId(2);
 pub const SURFACE_APPROVAL: SurfaceId = SurfaceId(3);
 pub const SURFACE_PLAN: SurfaceId = SurfaceId(4);
+/// `SDD-03` Fase 3: superficie de servicios Sprout, activa solo si el grafo tiene
+/// `ws.services.text` no vacío (vista `F3 Sprout`).
+pub const SURFACE_SERVICES: SurfaceId = SurfaceId(5);
 
-/// Declara las cuatro superficies lógicas activas para un tick según el estado del grafo.
-pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding; 4] {
+/// Declara las superficies lógicas activas para un tick según el estado del grafo.
+/// `SURFACE_SERVICES` se añade cuando existen servicios registrados
+/// (`ws.services.text` no vacío); el resto de constantes y bindings son
+/// invariantes (orden estable para replay).
+pub fn active_surfaces(
+    graph: &dyn GraphView,
+    vocab: &Vocab,
+    ws_vocab: &WorkspaceVocab,
+) -> Vec<SurfaceBinding> {
     let has_pending_approval = !pending_approvals(graph, vocab).is_empty();
     let any_active = graph.query(&[vocab.state]).into_iter().any(|id| {
         matches!(
@@ -51,7 +62,7 @@ pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding;
         )
     });
 
-    [
+    let mut surfaces = vec![
         SurfaceBinding {
             surface: SURFACE_STATUS,
             view: vocab.state,
@@ -72,7 +83,15 @@ pub fn active_surfaces(graph: &dyn GraphView, vocab: &Vocab) -> [SurfaceBinding;
             view: vocab.goal,
             focused: false,
         },
-    ]
+    ];
+    if graph_workspace_services(graph, ws_vocab).is_some() {
+        surfaces.push(SurfaceBinding {
+            surface: SURFACE_SERVICES,
+            view: ws_vocab.services_text,
+            focused: false,
+        });
+    }
+    surfaces
 }
 
 /// Extensión interna sobre `PlatformDriver` para consultar progreso de replay o
@@ -146,10 +165,14 @@ pub fn run_session<D: SessionDriver>(
     opts: &SessionOptions,
     stop: StopPolicy,
 ) -> io::Result<()> {
+    // `SDD-03` Fase 3: `SURFACE_SERVICES` depende de `ws.services.text`; el
+    // vocabulario workspace es determinista por nombre (misma resolución que
+    // `build_host_with_shared_store`).
+    let ws_vocab = WorkspaceVocab::resolve_with(|name| host.attr(name));
     match stop {
         StopPolicy::Settled { max_ticks } => {
             for _ in 0..max_ticks {
-                let surfaces = active_surfaces(host.graph(), &host.vocab());
+                let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                 host.step_with(driver, &surfaces);
                 if host.is_settled() {
                     break;
@@ -160,7 +183,7 @@ pub fn run_session<D: SessionDriver>(
         }
         StopPolicy::ReplayExhausted { max_ticks } => {
             for _ in 0..max_ticks {
-                let surfaces = active_surfaces(host.graph(), &host.vocab());
+                let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                 host.step_with(driver, &surfaces);
                 if driver.replay_remaining() == Some(0)
                     && (host.is_settled() || all_live_waiting_approval(host.graph(), &host.vocab()))
@@ -194,7 +217,7 @@ pub fn run_session<D: SessionDriver>(
                 let can_advance = !host.is_settled() && !all_blocked;
                 if can_advance || ui_queued || ready || needs_follow_up_tick {
                     let was_settled = host.is_settled();
-                    let surfaces = active_surfaces(host.graph(), &host.vocab());
+                    let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                     host.step_with(driver, &surfaces);
                     stepped_in_session = true;
                     // Un `IngressEvent::Command` tarda 1 tick en convertirse en

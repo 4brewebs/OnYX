@@ -149,6 +149,7 @@ pub enum SlashCommand {
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
     let cmd = raw.trim();
+    let lower = cmd.to_ascii_lowercase();
     if cmd == "/new" {
         return Some(SlashCommand::New(None));
     }
@@ -171,44 +172,48 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             Some(trimmed.to_string())
         }));
     }
-    if cmd == "/profile" {
+    // `SDD-03` Fase 3: la **palabra** del comando matchea case-insensitive
+    // (coherente con `is_immediate_slash_cmd` de TUI/Web y el patrón ASCII-safe
+    // de `/spawn`); el **argumento** se toma de `cmd` para conservar la case del
+    // usuario.
+    if lower == "/profile" {
         return Some(SlashCommand::Profile(None));
     }
-    if let Some(arg) = cmd.strip_prefix("/profile ") {
-        let trimmed = arg.trim();
+    if lower.starts_with("/profile ") {
+        let trimmed = cmd["/profile ".len()..].trim();
         return Some(SlashCommand::Profile(if trimmed.is_empty() {
             None
         } else {
             Some(trimmed.to_string())
         }));
     }
-    if cmd == "/provider" {
+    if lower == "/provider" {
         return Some(SlashCommand::Provider(None));
     }
-    if let Some(arg) = cmd.strip_prefix("/provider ") {
-        let trimmed = arg.trim();
+    if lower.starts_with("/provider ") {
+        let trimmed = cmd["/provider ".len()..].trim();
         return Some(SlashCommand::Provider(if trimmed.is_empty() {
             None
         } else {
             Some(trimmed.to_string())
         }));
     }
-    if cmd == "/model" {
+    if lower == "/model" {
         return Some(SlashCommand::Model(None));
     }
-    if let Some(arg) = cmd.strip_prefix("/model ") {
-        let trimmed = arg.trim();
+    if lower.starts_with("/model ") {
+        let trimmed = cmd["/model ".len()..].trim();
         return Some(SlashCommand::Model(if trimmed.is_empty() {
             None
         } else {
             Some(trimmed.to_string())
         }));
     }
-    if cmd == "/effort" {
+    if lower == "/effort" {
         return Some(SlashCommand::Effort(None));
     }
-    if let Some(arg) = cmd.strip_prefix("/effort ") {
-        let trimmed = arg.trim();
+    if lower.starts_with("/effort ") {
+        let trimmed = cmd["/effort ".len()..].trim();
         return Some(SlashCommand::Effort(if trimmed.is_empty() {
             None
         } else {
@@ -291,7 +296,6 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             Some(trimmed.to_string())
         }));
     }
-    let lower = cmd.to_ascii_lowercase();
     if lower == "/subagents" || lower == "/subagent" {
         return Some(SlashCommand::Subagents);
     }
@@ -1709,9 +1713,10 @@ mod tests {
         );
     }
 
-    /// `SDD-03` Fase 2: parseo de los comandos de cambio de LLM en caliente. Como
-    /// `/new` y `/mode`, el matching del comando es exacto (case-sensitive) y el
-    /// argumento (si existe) conserva la mayúscula del usuario.
+    /// `SDD-03` Fase 2 (Fase 3: palabra case-insensitive): parseo de los
+    /// comandos de cambio de LLM en caliente. La **palabra** del comando matchea
+    /// case-insensitive (como `is_immediate_slash_cmd` de TUI/Web y `/spawn`);
+    /// el **argumento** (si existe) conserva la mayúscula del usuario.
     #[test]
     fn parse_slash_llm_variants() {
         // Sin argumento → `None` (consulta de estado / nota de uso).
@@ -1771,7 +1776,23 @@ mod tests {
         );
         assert_eq!(parse_slash_command("/profil"), None);
         assert_eq!(parse_slash_command("/models"), None);
-        // El matching de estos comandos es exacto (case-sensitive), igual que `/new`.
-        assert_eq!(parse_slash_command("/PROFILE"), None);
+        // Palabra case-insensitive (coherente con `is_immediate_slash_cmd` de
+        // TUI/Web); el argumento conserva la case del usuario.
+        assert_eq!(
+            parse_slash_command("/PROFILE"),
+            Some(SlashCommand::Profile(None))
+        );
+        assert_eq!(
+            parse_slash_command("/Provider OPENAI"),
+            Some(SlashCommand::Provider(Some("OPENAI".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/MODEL Gemini-4-Helium"),
+            Some(SlashCommand::Model(Some("Gemini-4-Helium".to_string())))
+        );
+        assert_eq!(
+            parse_slash_command("/EFFORT High"),
+            Some(SlashCommand::Effort(Some("High".to_string())))
+        );
     }
 }

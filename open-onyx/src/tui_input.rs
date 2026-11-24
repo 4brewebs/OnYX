@@ -126,6 +126,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         insert: "/undo",
         description: "Revert latest reversible Git checkpoint",
     },
+    SlashCommandHint {
+        command: "/view",
+        insert: "/view ",
+        description: "Switch TUI view (chat|agents|sprout|plan|timeline)",
+    },
 ];
 
 /// Buffer de texto con cursor byte-exacto sobre fronteras UTF-8.
