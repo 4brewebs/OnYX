@@ -105,8 +105,20 @@ mod ctrl_c {
         fn SetConsoleCtrlHandler(handler: Option<CtrlHandler>, add_handler: i32) -> i32;
     }
 
-    /// 1er Ctrl+C → flag + `1` (manejado); 2º → `0` (default: terminar).
-    unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+
+    /// Solo `CTRL_C_EVENT`/`CTRL_BREAK_EVENT`/`CTRL_CLOSE_EVENT`: 1er pulso →
+    /// flag + `1` (manejado); 2º → `0` (default: terminar). Cualquier otro
+    /// evento (p. ej. `CTRL_LOGOFF_EVENT`) se delega al default (`0`).
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        if !matches!(
+            ctrl_type,
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT
+        ) {
+            return 0;
+        }
         if super::SERVE_SHUTDOWN.swap(true, Ordering::AcqRel) {
             0
         } else {
@@ -141,10 +153,11 @@ mod ctrl_c {
         fn signal(signum: i32, handler: usize) -> usize;
     }
 
-    /// Handler async-signal-safe: solo un store atómico + restaurar `SIG_DFL`
-    /// para que el 2º pulso termine el proceso por defecto.
+    /// Handler async-signal-safe: solo un store atómico (`Release`,
+    /// emparejado con los `Acquire` del watcher) + restaurar `SIG_DFL` para
+    /// que el 2º pulso termine el proceso por defecto.
     extern "C" fn handler(sig: i32) {
-        super::SERVE_SHUTDOWN.store(true, Ordering::Relaxed);
+        super::SERVE_SHUTDOWN.store(true, Ordering::Release);
         unsafe {
             signal(sig, SIG_DFL);
         }
@@ -169,6 +182,9 @@ mod ctrl_c {
 
 impl CtrlCGuard {
     pub fn new() -> Self {
+        // `SDD-04` 4C-audit: parte de estado limpio por si una `serve` previa
+        // en el mismo proceso (p. ej. tests) dejó la bandera levantada.
+        SERVE_SHUTDOWN.store(false, Ordering::Release);
         #[cfg(windows)]
         {
             ctrl_c::attach();
@@ -936,17 +952,21 @@ impl WebDriver {
     /// Watcher ligero (polling 5 ms) que, al ver `SERVE_SHUTDOWN` (1er Ctrl+C),
     /// propaga el apago a `WebHub::quit` y despierta los condvars para que
     /// `pump_idle` y el bucle `StopPolicy::Quit` terminen sin deadlock.
+    /// También termina si `WebHub::quit` ya fue puesto (p. ej. `drop` del
+    /// `WebDriver`) sin que haya Ctrl+C: no queda un hilo colgado.
     pub fn spawn_shutdown_watcher(&self) -> thread::JoinHandle<()> {
         let hub = Arc::clone(&self.hub);
         thread::Builder::new()
             .name("onyx-serve-shutdown".into())
             .spawn(move || {
-                while !SERVE_SHUTDOWN.load(Ordering::Acquire) {
+                while !SERVE_SHUTDOWN.load(Ordering::Acquire) && !hub.quit.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(5));
                 }
-                hub.quit.store(true, Ordering::Release);
-                hub.state_cv.notify_all();
-                hub.input_cv.notify_all();
+                if SERVE_SHUTDOWN.load(Ordering::Acquire) {
+                    hub.quit.store(true, Ordering::Release);
+                    hub.state_cv.notify_all();
+                    hub.input_cv.notify_all();
+                }
             })
             .expect("failed to spawn serve shutdown watcher")
     }

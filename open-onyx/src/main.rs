@@ -1392,6 +1392,10 @@ fn launch_web_serve(
     mcp_schemas: &Arc<Vec<ToolSchema>>,
     mcp_tool_names: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `SDD-04` 4C-audit: restaura `ENABLE_PROCESSED_INPUT`/isig ANTES de
+    // esperar Ctrl+C, por si el modo raw del terminal quedó activo (p. ej.
+    // un TUI previo en el mismo proceso); en `serve` normalmente es un no-op.
+    let _ = crossterm::terminal::disable_raw_mode();
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
     // caliente), idéntico a `launch_interactive_chat`.
@@ -1640,10 +1644,6 @@ fn launch_web_serve(
     )?;
     drop(driver);
     drop(ctrl_c_guard);
-    // `SDD-04` 4C-audit: defensivo — si el modo raw del terminal quedó activo
-    // (p. ej. un TUI previo en el mismo proceso), se restaura antes de devolver
-    // el control al shell (sin TUI en `serve`, normalmente es un no-op).
-    let _ = crossterm::terminal::disable_raw_mode();
     print_vault_summary(&cli.workspace, &effective_opts, shared_store.as_ref());
     Ok(())
 }
