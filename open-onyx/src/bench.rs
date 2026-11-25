@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -425,7 +425,7 @@ fn exec_bench_verify(policy: &WorkspacePolicy, command: &str, timeout: Duration)
                     } else {
                         #[cfg(windows)]
                         {
-                            let _ = Command::new("taskkill")
+                            let _ = std::process::Command::new("taskkill")
                                 .args(["/F", "/T", "/PID", &child.id().to_string()])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
@@ -879,6 +879,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use onyx_soul_agents::{AgentView, ConceptId, Logged, LoggedCommand};
 
