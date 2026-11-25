@@ -25,7 +25,8 @@ use crate::llm_profile::{LlmProfileHandle, LlmProvider, ResolvedLlmTarget, effor
 use crate::pack::SharedPackStore;
 use crate::subagent::{SubagentHandle, decode_proposal_command};
 use crate::time_debug::{
-    DET_STEP_LLM_CMD_PREFIX, decode_det_read_command, decode_det_shell_command,
+    DET_STEP_LLM_CMD_PREFIX, SealedGraphOp, decode_det_graph_command, decode_det_inject_command,
+    decode_det_read_command, decode_det_shell_command,
 };
 
 /// Acción de sesión solicitada por un comando slash que requiere operar sobre `AgentHost`,
@@ -71,6 +72,28 @@ pub enum SessionAction {
     Go,
     /// `/time` (`SDD-07` Fase 2): conmuta `frozen`.
     TimeToggle,
+    /// `/inject <texto>` (fix de auditoría Fase 2): memoria `user` sellada
+    /// (mismo patrón que [`SessionAction::DetShell`]): gate + bifurcación y
+    /// reinyección en-tick del comando sellado. En `openonyx replay` el
+    /// slash crudo es no-op (0 I/O).
+    Inject {
+        text: String,
+    },
+    /// `/graph drop-mem <seq|a..b>` (fix de auditoría Fase 2): sellado
+    /// `drop-mem`/`edit-mem`/`set-goal` reejecutado en-tick por el spawner.
+    GraphDropMem {
+        start: i64,
+        end: i64,
+    },
+    /// `/graph edit-mem <seq> <texto>` (fix de auditoría Fase 2).
+    GraphEditMem {
+        seq: i64,
+        text: String,
+    },
+    /// `/graph set-goal <texto>` (fix de auditoría Fase 2).
+    GraphSetGoal {
+        text: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -864,6 +887,85 @@ impl CommandSpawnerSystem {
     /// `SDD-07` Fase 2: `/graph inspect [agent|mem|ws]` — informe read-only
     /// determinista en memoria `system` del root (sin gate, sin efectos EAV
     /// más que la propia memoria).
+    /// Reejecuta una mutación de `/graph` sellada en-tick (fix de auditoría
+    /// Fase 2): `unrelate`+`destroy` por `mem_seq` inclusivo (sin decrementar
+    /// `mem_count`), reescrita de `mem_text` o de `goal`. Función pura de
+    /// (grafo, comando, tick): **no** se tocan atributos reservados
+    /// (`state`, `pending`, `steps`, `max_steps`) y en replay produce el mismo
+    /// EAV (0 I/O).
+    fn apply_det_graph_op(&mut self, ctx: &mut Ctx, v: &Vocab, now: u64, op: SealedGraphOp) {
+        let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) else {
+            return;
+        };
+        match op {
+            SealedGraphOp::DropMem { start, end } => {
+                let mut dropped = 0;
+                for mem in ctx.graph.related(root_id, v.rel_memory) {
+                    let in_range = matches!(
+                        ctx.graph.get(mem, v.mem_seq),
+                        Some(Value::Int(n)) if (start..=end).contains(&n)
+                    );
+                    if in_range {
+                        ctx.graph.unrelate(root_id, v.rel_memory, mem);
+                        ctx.graph.destroy(mem);
+                        dropped += 1;
+                    }
+                }
+                // Misma disciplina que `/compact`: la deduplicación de
+                // `fs_read` anclaba a lecturas que ya no están en contexto.
+                if let Some(tools) = &self.tools {
+                    tools.clear_seen_reads();
+                }
+                append_agent_memory(
+                    ctx.graph,
+                    v,
+                    root_id,
+                    "system",
+                    &format!(
+                        "[/graph drop-mem] Dropped {dropped} memory node(s) with mem_seq in [{start}..={end}]. `mem_count` stays monotonic (gaps are intentional)."
+                    ),
+                    now,
+                );
+            }
+            SealedGraphOp::EditMem { seq, text } => {
+                let mut found = false;
+                for mem in ctx.graph.related(root_id, v.rel_memory) {
+                    if matches!(
+                        ctx.graph.get(mem, v.mem_seq),
+                        Some(Value::Int(n)) if n == seq
+                    ) {
+                        ctx.graph.set(mem, v.mem_text, Value::Text(text.clone()));
+                        found = true;
+                        break;
+                    }
+                }
+                if let Some(tools) = &self.tools {
+                    tools.clear_seen_reads();
+                }
+                let note = if found {
+                    format!("[/graph edit-mem] Rewrote mem_seq {seq}.")
+                } else {
+                    format!(
+                        "[/graph edit-mem] No memory with mem_seq {seq} on root (seqs are monotonic; use `/graph inspect mem` to list them)."
+                    )
+                };
+                append_agent_memory(ctx.graph, v, root_id, "system", &note, now);
+            }
+            SealedGraphOp::SetGoal { text } => {
+                ctx.graph.set(root_id, v.goal, Value::Text(text.clone()));
+                let preview: String = text.chars().take(80).collect();
+                append_agent_memory(
+                    ctx.graph,
+                    v,
+                    root_id,
+                    "system",
+                    &format!("[/graph set-goal] Root goal rewritten.\n  goal: {preview}"),
+                    now,
+                );
+            }
+        }
+    }
+
     fn graph_inspect(&self, ctx: &mut Ctx, v: &Vocab, now: u64, scope: Option<String>) {
         let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) else {
             return;
@@ -1090,6 +1192,20 @@ impl OnyxSystem for CommandSpawnerSystem {
                     let report = format!("[det-read] `{}`{range}\n{}", result.path, result.content);
                     append_agent_memory(ctx.graph, &v, root_id, "observe", &report, now);
                 }
+                continue;
+            }
+            // Fix de auditoría Fase 2: memoria `user` sellada de `/inject`
+            // (0 I/O, 0 LLM; bit-a-bit en replay).
+            if let Some(result) = decode_det_inject_command(cmd) {
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    append_agent_memory(ctx.graph, &v, root_id, "user", &result.text, now);
+                }
+                continue;
+            }
+            // Fix de auditoría Fase 2: mutación sellada de `/graph`
+            // (función pura de (grafo, comando, tick): bit-a-bit en replay).
+            if let Some(op) = decode_det_graph_command(cmd) {
+                self.apply_det_graph_op(ctx, &v, now, op);
                 continue;
             }
             // `SDD-07` Fase 2: comando sellado `/step-llm`: reactiva el root
@@ -2026,12 +2142,11 @@ impl OnyxSystem for CommandSpawnerSystem {
                         self.llm_note(ctx, &v, now, &format!("[/read] {msg}"));
                     }
                     SlashCommand::Inject(text) => {
-                        // Memoria `user` verificada in-tick, **sin** `continue_agent`
-                        // y sin disparar LLM: queda en el historial para el siguiente
-                        // turno real (o un `/step-llm`). Documentado (spec SDD-07
-                        // §6.4): si `cursor < present`, la inyección se aplica sobre
-                        // el estado congelado y se perdería al bifurcar; la rama se
-                        // confirma en la siguiente acción mutante o `/go`.
+                        // Fix de auditoría Fase 2: el spawner solo **solicita**
+                        // la acción (no-op en `openonyx replay`, 0 I/O); en vivo
+                        // `apply_session_action` aplica gate + bifurcación y
+                        // reinyecta el sellado `/__onyx_det_inject` (memoria
+                        // `user` en-tick, 0 LLM).
                         if text.trim().is_empty() {
                             self.llm_note(
                                 ctx,
@@ -2039,8 +2154,8 @@ impl OnyxSystem for CommandSpawnerSystem {
                                 now,
                                 "[/inject] Usage: `/inject <text>` — appends verified user memory without spending an LLM turn.",
                             );
-                        } else if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
-                            append_agent_memory(ctx.graph, &v, root_id, "user", &text, now);
+                        } else {
+                            self.pending_action.set(SessionAction::Inject { text });
                         }
                     }
                     SlashCommand::Step(n) => {
@@ -2059,83 +2174,23 @@ impl OnyxSystem for CommandSpawnerSystem {
                         self.graph_inspect(ctx, &v, now, scope);
                     }
                     SlashCommand::GraphDropMem { start, end } => {
-                        // Cirugía in-tick (1 tick): `unrelate` + `destroy` por
-                        // `mem_seq` inclusivo. `mem_seq` es monótono: **no** se
-                        // decrementa `mem_count` (huecos intencionales, spec
-                        // SDD-07 §7); atributos reservados de agente (`state`,
-                        // `pending`, ...) nunca se tocan.
-                        let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) else {
-                            continue;
-                        };
-                        let mut dropped = 0;
-                        for mem in ctx.graph.related(root_id, v.rel_memory) {
-                            let in_range = matches!(
-                                ctx.graph.get(mem, v.mem_seq),
-                                Some(Value::Int(n)) if (start..=end).contains(&n)
-                            );
-                            if in_range {
-                                ctx.graph.unrelate(root_id, v.rel_memory, mem);
-                                ctx.graph.destroy(mem);
-                                dropped += 1;
-                            }
-                        }
-                        // Misma disciplina que `/compact`: la deduplicación de
-                        // `fs_read` anclaba a lecturas que ya no están en contexto.
-                        if let Some(tools) = &self.tools {
-                            tools.clear_seen_reads();
-                        }
-                        append_agent_memory(
-                            ctx.graph,
-                            &v,
-                            root_id,
-                            "system",
-                            &format!(
-                                "[/graph drop-mem] Dropped {dropped} memory node(s) with mem_seq in [{start}..={end}]. `mem_count` stays monotonic (gaps are intentional)."
-                            ),
-                            now,
-                        );
+                        // Fix de auditoría Fase 2: el spawner solo **solicita**
+                        // la mutación (no-op en `openonyx replay`, 0 I/O); en
+                        // vivo `apply_session_action` aplica gate +
+                        // bifurcación y reinyecta el sellado
+                        // `/__onyx_det_graph` (`drop-mem`/`edit-mem`/`set-goal`
+                        // reejecutado en-tick; `mem_seq` monótono, atributos
+                        // reservados intactos — spec SDD-07 §7).
+                        self.pending_action
+                            .set(SessionAction::GraphDropMem { start, end });
                     }
                     SlashCommand::GraphEditMem { seq, text } => {
-                        let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) else {
-                            continue;
-                        };
-                        let mut found = false;
-                        for mem in ctx.graph.related(root_id, v.rel_memory) {
-                            if matches!(
-                                ctx.graph.get(mem, v.mem_seq),
-                                Some(Value::Int(n)) if n == seq
-                            ) {
-                                ctx.graph.set(mem, v.mem_text, Value::Text(text.clone()));
-                                found = true;
-                                break;
-                            }
-                        }
-                        if let Some(tools) = &self.tools {
-                            tools.clear_seen_reads();
-                        }
-                        let note = if found {
-                            format!("[/graph edit-mem] Rewrote mem_seq {seq}.")
-                        } else {
-                            format!(
-                                "[/graph edit-mem] No memory with mem_seq {seq} on root (seqs are monotonic; use `/graph inspect mem` to list them)."
-                            )
-                        };
-                        append_agent_memory(ctx.graph, &v, root_id, "system", &note, now);
+                        self.pending_action
+                            .set(SessionAction::GraphEditMem { seq, text });
                     }
                     SlashCommand::GraphSetGoal(text) => {
-                        let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) else {
-                            continue;
-                        };
-                        ctx.graph.set(root_id, v.goal, Value::Text(text.clone()));
-                        let preview: String = text.chars().take(80).collect();
-                        append_agent_memory(
-                            ctx.graph,
-                            &v,
-                            root_id,
-                            "system",
-                            &format!("[/graph set-goal] Root goal rewritten.\n  goal: {preview}"),
-                            now,
-                        );
+                        self.pending_action
+                            .set(SessionAction::GraphSetGoal { text });
                     }
                     SlashCommand::GraphInvalid(msg) => {
                         self.llm_note(ctx, &v, now, &format!("[/graph] {msg}"));

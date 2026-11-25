@@ -327,14 +327,22 @@ impl TimeDebugState {
 
     /// Captura la frontera de tick `tick` en el ring y realza `present_tick`
     /// (= **último tick completado**; solo crece durante la ejecución
-    /// normal). Si no hay congelación, el cursor sigue al presente.
+    /// normal). Avance del cursor (fix de auditoría Fase 2):
+    /// - sin congelación → el cursor sigue al presente;
+    /// - congelado **en el presente** (`cursor >= prev_present`) → el cursor
+    ///   sigue al presente **sin descongelar** (las acciones selladas `/step`
+    ///   y el borde de sesión no bifurcan de un presente que ya es el cursor);
+    /// - congelado **mirando el pasado** (`cursor < prev_present`) → el
+    ///   cursor queda anclado: la siguiente mutación bifurca desde él.
     pub fn record_tick(&self, tick: u64, bytes: &[u8]) {
         if let Ok(mut ring) = self.ring.lock() {
             ring.push(tick, bytes);
         }
-        self.present_tick.fetch_max(tick, Ordering::Release);
-        if !self.is_frozen() {
-            self.cursor_tick.store(tick, Ordering::Release);
+        let prev_present = self.present_tick.fetch_max(tick, Ordering::AcqRel);
+        let new_present = prev_present.max(tick);
+        let cur = self.cursor_tick.load(Ordering::Acquire);
+        if !self.is_frozen() || cur >= prev_present {
+            self.cursor_tick.store(new_present, Ordering::Release);
         }
     }
 
@@ -832,6 +840,70 @@ pub fn decode_det_read_command(raw_cmd: &str) -> Option<SealedReadResult> {
     serde_json::from_str(payload).ok()
 }
 
+/// Prefijo interno reservado para el comando sellado de `/inject`
+/// (fix de auditoría Fase 2): el spawner reinyecta la memoria `user`
+/// determinista en-tick (0 I/O, 0 LLM).
+pub const DET_INJECT_CMD_PREFIX: &str = "/__onyx_det_inject ";
+
+/// Prefijo interno reservado para el comando sellado de los subcomandos
+/// **mutantes** de `/graph` (fix de auditoría Fase 2).
+pub const DET_GRAPH_CMD_PREFIX: &str = "/__onyx_det_graph ";
+
+/// Memoria `user` verificada de `/inject <texto>` (sin LLM).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedInject {
+    pub text: String,
+}
+
+/// Operación mutante de `/graph` sellada y reejecutada en-tick por el
+/// spawner (función pura de (grafo, comando, tick): bit-a-bit en replay).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum SealedGraphOp {
+    DropMem { start: i64, end: i64 },
+    EditMem { seq: i64, text: String },
+    SetGoal { text: String },
+}
+
+impl SealedGraphOp {
+    /// Etiqueta del subcomando (notas accionables y tag del hito en `pack.rs`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            SealedGraphOp::DropMem { .. } => "drop-mem",
+            SealedGraphOp::EditMem { .. } => "edit-mem",
+            SealedGraphOp::SetGoal { .. } => "set-goal",
+        }
+    }
+}
+
+/// Serializa un [`SealedInject`] como comando interno determinista
+/// grabable en `ONYXTR2`.
+pub fn encode_det_inject_command(r: &SealedInject) -> String {
+    let payload = serde_json::to_string(r).unwrap_or_else(|_| "{}".to_string());
+    format!("{DET_INJECT_CMD_PREFIX}{payload}")
+}
+
+/// Decodifica un comando sellado `/__onyx_det_inject {...}` (misma
+/// disciplina que [`decode_det_shell_command`]).
+pub fn decode_det_inject_command(raw_cmd: &str) -> Option<SealedInject> {
+    let payload = raw_cmd.trim().strip_prefix(DET_INJECT_CMD_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// Serializa un [`SealedGraphOp`] como comando interno determinista
+/// grabable en `ONYXTR2`.
+pub fn encode_det_graph_command(op: &SealedGraphOp) -> String {
+    let payload = serde_json::to_string(op).unwrap_or_else(|_| "{}".to_string());
+    format!("{DET_GRAPH_CMD_PREFIX}{payload}")
+}
+
+/// Decodifica un comando sellado `/__onyx_det_graph {...}` (misma
+/// disciplina que [`decode_det_shell_command`]).
+pub fn decode_det_graph_command(raw_cmd: &str) -> Option<SealedGraphOp> {
+    let payload = raw_cmd.trim().strip_prefix(DET_GRAPH_CMD_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// Trunca a como mucho `max_bytes` sin partir un carácter `UTF-8`.
 pub fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
@@ -1171,6 +1243,46 @@ mod tests {
     }
 
     // --- Gate: try_acquire_llm_turn ----------------------------------------
+
+    /// Fix de auditoría Fase 2: semántica del cursor en `record_tick`.
+    #[test]
+    fn record_tick_cursor_follows_present_at_frontier_and_anchors_in_past() {
+        let state = TimeDebugState::new(None);
+        let payload = onyx_soul_agents::AgentGraph::new().export();
+        // Sin congelación: el cursor sigue al presente (= último tick
+        // completado).
+        for tick in 0..2u64 {
+            state.record_tick(tick, &payload);
+        }
+        assert_eq!(state.present(), 1);
+        assert_eq!(state.cursor(), 1);
+
+        // (a) Congelado EN el presente (`cursor == present`): `record_tick`
+        // avanza ambos manteniendo `frozen == true` (0 bifurcaciones).
+        state.freeze();
+        state.record_tick(2, &payload);
+        assert!(state.is_frozen(), "no debe descongelar");
+        assert_eq!(state.present(), 2);
+        assert_eq!(
+            state.cursor(),
+            2,
+            "congelado en el presente: el cursor sigue al presente"
+        );
+
+        // (b) Congelado MIRANDO el pasado (`cursor < present`): `record_tick`
+        // deja el cursor anclado (la siguiente mutación bifurcará desde él).
+        state.scrub_to(0).unwrap();
+        assert!(state.is_frozen());
+        assert_eq!(state.cursor(), 0);
+        state.record_tick(3, &payload);
+        assert!(state.is_frozen());
+        assert_eq!(state.present(), 3);
+        assert_eq!(
+            state.cursor(),
+            0,
+            "congelado mirando el pasado: el cursor queda anclado"
+        );
+    }
 
     #[test]
     fn llm_turn_gate_unfrozen_frozen_budget() {
@@ -1565,6 +1677,65 @@ mod tests {
         );
         assert_eq!(decode_det_read_command("/__onyx_det_shell {}"), None);
         assert_eq!(decode_det_read_command("/read notes.md"), None);
+    }
+
+    /// Fix de auditoría Fase 2: codecs de `/inject` y `/graph` sellados.
+    #[test]
+    fn det_inject_and_graph_codecs_round_trip_and_reject_corruption() {
+        let inj = SealedInject {
+            text: "remember: use `--locked` in CI".to_string(),
+        };
+        let wire_inj = encode_det_inject_command(&inj);
+        assert!(wire_inj.starts_with(DET_INJECT_CMD_PREFIX), "{wire_inj}");
+        assert_eq!(decode_det_inject_command(&wire_inj), Some(inj.clone()));
+        assert_eq!(
+            decode_det_inject_command("/__onyx_det_inject {\"text\":"),
+            None
+        );
+        assert_eq!(
+            decode_det_inject_command("/__onyx_det_inject {\"n\":1}"),
+            None
+        );
+        assert_eq!(decode_det_inject_command("/inject hi"), None);
+
+        for op in [
+            SealedGraphOp::DropMem { start: 1, end: 2 },
+            SealedGraphOp::EditMem {
+                seq: 3,
+                text: "rewrote".to_string(),
+            },
+            SealedGraphOp::SetGoal {
+                text: "brand new goal".to_string(),
+            },
+        ] {
+            let wire = encode_det_graph_command(&op);
+            assert!(wire.starts_with(DET_GRAPH_CMD_PREFIX), "{wire}");
+            assert_eq!(decode_det_graph_command(&wire), Some(op.clone()));
+        }
+        // Etiquetas estables (tag del hito `cmd:/graph-mutate` en `pack.rs`).
+        assert_eq!(
+            SealedGraphOp::DropMem { start: 1, end: 2 }.label(),
+            "drop-mem"
+        );
+        assert_eq!(
+            SealedGraphOp::EditMem {
+                seq: 1,
+                text: "x".into()
+            }
+            .label(),
+            "edit-mem"
+        );
+        assert_eq!(
+            SealedGraphOp::SetGoal { text: "x".into() }.label(),
+            "set-goal"
+        );
+        assert_eq!(decode_det_graph_command("/__onyx_det_graph [1,2"), None);
+        assert_eq!(
+            decode_det_graph_command("/__onyx_det_graph {\"op\":\"Inspect\"}"),
+            None
+        );
+        assert_eq!(decode_det_graph_command("/__onyx_det_inject {}"), None);
+        assert_eq!(decode_det_graph_command("/graph drop-mem 1"), None);
     }
 
     #[test]

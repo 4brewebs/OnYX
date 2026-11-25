@@ -28,8 +28,9 @@ use crate::pack::{
 };
 use crate::subagent::{MergePreviewState, SubagentHandle, effective_merge_decision};
 use crate::time_debug::{
-    DET_SEALED_OUTPUT_CAP_BYTES, SealedReadResult, SealedShellResult, TimeDebugSnapshotStore,
-    TimeDebugState, check_mutation_gate, confirm_branch_from_cursor, encode_det_read_command,
+    DET_SEALED_OUTPUT_CAP_BYTES, SealedGraphOp, SealedInject, SealedReadResult, SealedShellResult,
+    TimeDebugSnapshotStore, TimeDebugState, check_mutation_gate, confirm_branch_from_cursor,
+    encode_det_graph_command, encode_det_inject_command, encode_det_read_command,
     encode_det_shell_command, truncate_utf8_safe,
 };
 
@@ -633,8 +634,86 @@ pub fn apply_session_action(
             emit_session_note(host, &ctx.pending_notes, &msg);
             return Some(sealed);
         }
+        SessionAction::Inject { text } => {
+            // Fix de auditoría Fase 2: gate + bifurcación + memoria `user`
+            // sellada (reinyectada en-tick por el spawner, 0 LLM, 0 I/O).
+            if let Err(check) = check_mutation_gate(
+                host.graph(),
+                &host.vocab(),
+                llm_in_flight,
+                running_subagents(ctx),
+            ) {
+                let msg = format!("[/inject] Blocked: {}", check.reason().unwrap_or_default());
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            let branch_note = match ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                Ok(Some(note)) => Some(note),
+                Ok(None) => None,
+                Err(err) => {
+                    emit_session_note(host, &ctx.pending_notes, &err);
+                    return None;
+                }
+            };
+            let sealed = encode_det_inject_command(&SealedInject { text: text.clone() });
+            let mut msg = format!("[/inject] Staged user memory (sealed, 0 LLM tokens): `{text}`.");
+            if let Some(note) = branch_note {
+                msg.push_str(&note);
+            }
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return Some(sealed);
+        }
+        SessionAction::GraphDropMem { .. }
+        | SessionAction::GraphEditMem { .. }
+        | SessionAction::GraphSetGoal { .. } => {
+            // Fix de auditoría Fase 2: gate + bifurcación + mutación sellada
+            // (`/graph drop-mem|edit-mem|set-goal` reejecutada en-tick por el
+            // spawner; bit-a-bit en `openonyx replay`).
+            let op = match &action {
+                SessionAction::GraphDropMem { start, end } => SealedGraphOp::DropMem {
+                    start: *start,
+                    end: *end,
+                },
+                SessionAction::GraphEditMem { seq, text } => SealedGraphOp::EditMem {
+                    seq: *seq,
+                    text: text.clone(),
+                },
+                SessionAction::GraphSetGoal { text } => {
+                    SealedGraphOp::SetGoal { text: text.clone() }
+                }
+                _ => unreachable!("brazo /graph de apply_session_action"),
+            };
+            if let Err(check) = check_mutation_gate(
+                host.graph(),
+                &host.vocab(),
+                llm_in_flight,
+                running_subagents(ctx),
+            ) {
+                let msg = format!("[/graph] Blocked: {}", check.reason().unwrap_or_default());
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            let branch_note = match ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                Ok(Some(note)) => Some(note),
+                Ok(None) => None,
+                Err(err) => {
+                    emit_session_note(host, &ctx.pending_notes, &err);
+                    return None;
+                }
+            };
+            let sealed = encode_det_graph_command(&op);
+            let mut msg = format!("[/graph {:}] Applied (sealed, 0 LLM tokens).", op.label());
+            if let Some(note) = branch_note {
+                msg.push_str(&note);
+            }
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return Some(sealed);
+        }
         SessionAction::Step(n) => {
-            // `SDD-07` Fase 2: N ticks deterministas con 0 LLM (requiere frozen).
+            // `SDD-07` Fase 2 (fix de auditoría): N ticks deterministas con
+            // 0 LLM (requiere frozen); gate de mutación + bifurcación si
+            // `cursor < present` **antes** de avanzar (misma disciplina que
+            // `DetShell`/`DetRead`).
             let Some(td) = &ctx.time_debug else {
                 let msg = "[/step] Time debug is not available in this session.".to_string();
                 emit_session_note(host, &ctx.pending_notes, &msg);
@@ -647,15 +726,36 @@ pub fn apply_session_action(
                 emit_session_note(host, &ctx.pending_notes, &msg);
                 return None;
             }
+            if let Err(check) = check_mutation_gate(
+                host.graph(),
+                &host.vocab(),
+                llm_in_flight,
+                running_subagents(ctx),
+            ) {
+                let msg = format!("[/step] Blocked: {}", check.reason().unwrap_or_default());
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            let branch_note = match ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                Ok(Some(note)) => Some(note),
+                Ok(None) => None,
+                Err(err) => {
+                    emit_session_note(host, &ctx.pending_notes, &err);
+                    return None;
+                }
+            };
             let n = (*n).clamp(1, 64);
             for _ in 0..n {
                 host.step(&mut HeadlessDriver::new());
                 td.record_tick(host.ticks() - 1, &host.graph().export());
             }
-            let msg = format!(
+            let mut msg = format!(
                 "[step] Advanced {n} deterministic tick(s) with 0 LLM; clock at tick {} (frozen).",
                 host.ticks()
             );
+            if let Some(note) = branch_note {
+                msg.push_str(&note);
+            }
             emit_session_note(host, &ctx.pending_notes, &msg);
             return None;
         }
@@ -888,6 +988,10 @@ pub fn apply_session_action(
         | SessionAction::SpawnSubagent { .. }
         | SessionAction::DetShell { .. }
         | SessionAction::DetRead { .. }
+        | SessionAction::Inject { .. }
+        | SessionAction::GraphDropMem { .. }
+        | SessionAction::GraphEditMem { .. }
+        | SessionAction::GraphSetGoal { .. }
         | SessionAction::Step(_)
         | SessionAction::StepLlm
         | SessionAction::Go
