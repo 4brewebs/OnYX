@@ -2029,7 +2029,7 @@ exit 0
     /// ejecuta `stop_cmd`/`down` y suelta todos los `ProcessJob` garantizando cero procesos
     /// huérfanos".
     #[test]
-    #[ignore = "BUG: los hilos internos (monitor child.wait y lectores de stdout/stderr) retienen Arc<SproutInner>; Drop no se ejecuta al soltar el último clon público mientras el servicio vive (sprout.rs:1448-1606)"]
+    #[ignore = "BUG: FIX-30 los hilos internos (monitor child.wait y lectores de stdout/stderr) retienen Arc<SproutInner>; Drop no se ejecuta al soltar el último clon público mientras el servicio vive (sprout.rs:1448-1606)"]
     fn dropping_last_supervisor_clone_runs_stop_cmd_and_kills_service() {
         let ws = TempWs::new("sup_drop");
         let s = sup(
