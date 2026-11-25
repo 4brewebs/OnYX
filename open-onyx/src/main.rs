@@ -1348,7 +1348,10 @@ fn launch_interactive_chat(
         if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ws_vocab) {
             mode_handle.set(restored_mode);
         }
-        time_debug.set_present(host.ticks());
+        // `SDD-07` (fix de auditoría): presente = **último tick completado**
+        // (el step de restore ejecutó `target_tick`), alineado con el
+        // `MilestoneSnapshotSystem`.
+        time_debug.set_present(host.ticks().saturating_sub(1));
         if let Some(src) = &plan.branched_from {
             pending_notes.push(format!(
                 "[resume] Restored milestone tick {} into branch `{}` (source `{}` preserved).",
@@ -1598,7 +1601,10 @@ fn launch_web_serve(
         if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ws_vocab) {
             mode_handle.set(restored_mode);
         }
-        time_debug.set_present(host.ticks());
+        // `SDD-07` (fix de auditoría): presente = **último tick completado**
+        // (el step de restore ejecutó `target_tick`), alineado con el
+        // `MilestoneSnapshotSystem`.
+        time_debug.set_present(host.ticks().saturating_sub(1));
     }
 
     let stream_preview = StreamPreviewHandle::new();

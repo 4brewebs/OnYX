@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use onyx_soul_agents::{
     AgentGraph, AgentHost, Graph, GraphView, HeadlessDriver, OnyxError, SnapshotStore, Vocab,
-    pending_approvals, pending_requests,
+    pending_approvals, pending_tool_calls,
 };
 use onyx_workspace::{
     RecordedEffect, WorkspaceTools, WorkspaceVocab, effects_after_tick,
@@ -314,19 +314,26 @@ impl TimeDebugState {
         self.present_tick.load(Ordering::Acquire)
     }
 
-    /// Fija la frontera de presente (p. ej. tras `--resume --tick`).
+    /// Fija la frontera de presente **y el cursor**: `tick` es el **último
+    /// tick completado** de la nueva línea temporal (p. ej. tras
+    /// `--resume --tick` o `/rewind`). Convención única (alineada con
+    /// `MilestoneSnapshotSystem`, que sella hitos en `host.ticks() - 1`).
     pub fn set_present(&self, tick: u64) {
         self.present_tick.store(tick, Ordering::Release);
+        self.cursor_tick.store(tick, Ordering::Release);
     }
 
     /// Captura la frontera de tick `tick` en el ring y realza `present_tick`
-    /// (solo crece durante la ejecución normal).
+    /// (= **último tick completado**; solo crece durante la ejecución
+    /// normal). Si no hay congelación, el cursor sigue al presente.
     pub fn record_tick(&self, tick: u64, bytes: &[u8]) {
         if let Ok(mut ring) = self.ring.lock() {
             ring.push(tick, bytes);
         }
-        self.present_tick
-            .fetch_max(tick.saturating_add(1), Ordering::Release);
+        self.present_tick.fetch_max(tick, Ordering::Release);
+        if !self.is_frozen() {
+            self.cursor_tick.store(tick, Ordering::Release);
+        }
     }
 
     /// Ticks scrubeables: anillo RAM ∪ hitos en disco ∪ presente en vivo.
@@ -429,7 +436,9 @@ impl TimeDebugState {
         };
         let next = if delta < 0 {
             let steps = delta.unsigned_abs() as usize;
-            if steps >= idx {
+            // `steps == idx` alcanza `available[0]` (fix de auditoría: el
+            // límite inferior es inclusive).
+            if steps > idx {
                 return Err(TimeDebugError(format!(
                     "no hay {steps} tick(s) anteriores scrubeables (cursor {current})"
                 )));
@@ -491,11 +500,9 @@ impl TimeDebugState {
     }
 
     fn load_tick_bytes(&self, tick: u64) -> Result<Vec<u8>, TimeDebugError> {
-        if tick == self.present() {
-            return Err(TimeDebugError(format!(
-                "tick {tick} es el presente en vivo: usa el grafo del host (no hace falta preview)"
-            )));
-        }
+        // Fix de auditoría: `present` es un tick **real** (el último
+        // completado, capturado en el ring), no un tick fantasma: se busca
+        // en ring/pack como cualquier otro.
         if let Ok(ring) = self.ring.lock() {
             if let Some(bytes) = ring.get(tick) {
                 return Ok(bytes.to_vec());
@@ -505,6 +512,12 @@ impl TimeDebugState {
             if let Ok(bytes) = pack.load(&tick.to_string()) {
                 return Ok(bytes);
             }
+        }
+        if tick == self.present() {
+            return Err(TimeDebugError(format!(
+                "tick {tick} es el presente en vivo y su frontera no está en el anillo ni \
+                 en disco: usa el grafo del host (no hace falta preview)"
+            )));
         }
         Err(TimeDebugError(format!(
             "no hay bytes para tick {tick} (purgado del anillo RAM y sin hito en disco); \
@@ -563,7 +576,10 @@ pub struct MutationGateCheck {
     pub llm_in_flight: usize,
     pub running_subagents: usize,
     pub pending_approvals: usize,
-    pub pending_llm_requests: usize,
+    /// Tool calls en ejecución externa (`AgentState::Acting`). Fix de
+    /// auditoría: sustituye a `pending_llm_requests` — congelar en `Thinking`
+    /// con `llm_in_flight == 0` (breakpoint pre-LLM) **sí** permite mutar.
+    pub pending_tool_calls: usize,
 }
 
 impl MutationGateCheck {
@@ -571,7 +587,7 @@ impl MutationGateCheck {
         self.llm_in_flight == 0
             && self.running_subagents == 0
             && self.pending_approvals == 0
-            && self.pending_llm_requests == 0
+            && self.pending_tool_calls == 0
     }
 
     /// Razón accionable del primer bloqueo (si lo hay).
@@ -591,10 +607,10 @@ impl MutationGateCheck {
                 "{} aprobación(es) pendiente(s): resuélvelas antes de mutar",
                 self.pending_approvals
             ))
-        } else if self.pending_llm_requests > 0 {
+        } else if self.pending_tool_calls > 0 {
             Some(format!(
-                "{} request(s) LLM sin responder: espera a que se asiente antes de mutar",
-                self.pending_llm_requests
+                "{} tool call(s) pendientes: espera a que se asienten antes de mutar",
+                self.pending_tool_calls
             ))
         } else {
             None
@@ -614,7 +630,7 @@ pub fn check_mutation_gate(
         llm_in_flight,
         running_subagents,
         pending_approvals: pending_approvals(graph, v).len(),
-        pending_llm_requests: pending_requests(graph, v).len(),
+        pending_tool_calls: pending_tool_calls(graph, v).len(),
     };
     if check.allowed() {
         Ok(check)
@@ -626,7 +642,7 @@ pub fn check_mutation_gate(
 /// Confirma la bifurcación desde `cursor` (el futuro queda preservado):
 ///
 /// 1. Gate de mutación (`llm_in_flight == 0`, sin subagentes `Running`, sin
-///    aprobaciones ni requests pendientes).
+///    aprobaciones ni tool calls pendientes).
 /// 2. `effects_after_tick(grafo_vivo, cursor)`: **solo RAM** (0 probe host, 0 I/O).
 /// 3. Si algún efecto lleva `tree_sha`: `restore_git_tree_checkpoint_for_targets`
 ///    (elimina además los `fs_write` untracked creados tras el checkpoint).
@@ -824,26 +840,58 @@ mod tests {
         for tick in 0..6 {
             state.record_tick(tick, &payload);
         }
-        assert_eq!(state.present(), 6);
+        // `present_tick` = **último tick completado** (5, no 6: no existe tick
+        // fantasma), y sin congelación el cursor sigue al presente.
+        assert_eq!(state.present(), 5);
+        assert_eq!(state.cursor(), 5);
 
         state.scrub_to(2).unwrap();
         assert!(state.is_frozen(), "scrub a < present auto-congela");
         assert_eq!(state.cursor(), 2);
-        assert_eq!(state.present(), 6);
+        assert_eq!(state.present(), 5);
 
-        // Invariante: el futuro no es scrubeable.
-        let err = state.scrub_to(7).unwrap_err();
+        // Invariante: el futuro no es scrubeable (`present + 1` no existe).
+        let err = state.scrub_to(6).unwrap_err();
         assert!(err.0.contains("futuro"), "{err}");
 
         // Volver al presente descongela.
-        state.scrub_to(6).unwrap();
+        state.scrub_to(5).unwrap();
         assert!(!state.is_frozen());
-        assert_eq!(state.cursor(), 6);
+        assert_eq!(state.cursor(), 5);
+        assert_eq!(state.cursor(), state.present());
 
         state.scrub_to(4).unwrap();
         state.return_to_present();
         assert!(!state.is_frozen());
         assert_eq!(state.cursor(), state.present());
+    }
+
+    /// Fix de auditoría: `scrub_delta(-n)` puede alcanzar `available[0]`
+    /// (`steps == idx`), y desde el presente da el tick inmediatamente
+    /// anterior (sin tick fantasma).
+    #[test]
+    fn scrub_delta_negative_reaches_first_available_tick() {
+        let state = TimeDebugState::new(None).with_ring_limits(64, usize::MAX);
+        let payload = vec![b'e'; 8];
+        for tick in 0..3 {
+            state.record_tick(tick, &payload);
+        }
+        assert_eq!(state.available_ticks(), vec![0, 1, 2]);
+        // Desde el presente (2): -1 → 1 (el tick inmediatamente anterior).
+        assert_eq!(state.scrub_delta(-1).unwrap(), 1);
+        assert!(state.is_frozen());
+        // Otro -1 → 0: exactamente `idx` pasos (el caso que fallaba con `>=`).
+        assert_eq!(
+            state.scrub_delta(-1).unwrap(),
+            0,
+            "debe alcanzarse available[0] con steps == idx"
+        );
+        // Un paso más allá del límite inferior: error accionable.
+        let err = state.scrub_delta(-1).unwrap_err();
+        assert!(err.0.contains("no hay"), "{err}");
+        // El límite superior sigue funcionando: desde 0, +2 → presente.
+        assert_eq!(state.scrub_delta(2).unwrap(), 2);
+        assert!(!state.is_frozen());
     }
 
     #[test]
@@ -858,8 +906,9 @@ mod tests {
         for tick in 0..4 {
             state.record_tick(tick, &payload);
         }
-        // present = 4 (ring), hitos = 100/140 (imposibles: > present) → solo ring + presente.
-        assert_eq!(state.available_ticks(), vec![0, 1, 2, 3, 4]);
+        // present = 3 (último tick completado, en el ring), hitos = 100/140
+        // (imposibles: > present) → solo ring.
+        assert_eq!(state.available_ticks(), vec![0, 1, 2, 3]);
 
         // Hitos en disco dentro del rango: se incluyen.
         let dir2 = temp_dir("avail2");
@@ -870,7 +919,7 @@ mod tests {
         for tick in 0..5 {
             state2.record_tick(tick, &payload);
         }
-        assert_eq!(state2.available_ticks(), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(state2.available_ticks(), vec![0, 1, 2, 3, 4]);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
     }
@@ -888,8 +937,9 @@ mod tests {
             state.record_tick(tick, &payload);
         }
         state.ring.lock().unwrap().clear();
-        // Tras «restart» (ring vacío): solo hitos en disco de esta rama + presente.
-        assert_eq!(state.available_ticks(), vec![2, 3, 4]);
+        // Tras «restart» (ring vacío): solo hitos en disco de esta rama +
+        // presente (= 3, que aquí ya es hito).
+        assert_eq!(state.available_ticks(), vec![2, 3]);
         assert!(state.tick_available(2));
         assert!(state.tick_available(3));
         assert!(!state.tick_available(1), "tick del ring ya no está");
@@ -976,20 +1026,19 @@ mod tests {
             .unwrap_or_default();
 
         state.freeze();
-        // La frontera más reciente (presente-1) coincide con el grafo vivo:
-        // el snapshot se capturó justo después del último step (consistencia
-        // del anillo RAM).
-        let last = present - 1;
-        state.scrub_to(last).unwrap();
-        let preview_last = state.preview_graph(last).unwrap();
+        // El anillo en el presente (último tick completado) coincide con el
+        // grafo vivo: el snapshot se capturó justo después del último step
+        // (consistencia del anillo RAM).
+        let preview_present = state.preview_graph(present).unwrap();
         assert_eq!(
-            preview_last.export(),
+            preview_present.export(),
             host.graph().export(),
-            "el anillo en la frontera final debe coincidir con el grafo vivo"
+            "el anillo en el presente debe coincidir con el grafo vivo"
         );
-        // Dos ticks atrás sí debe diferir (el grafo acumula conceptos).
-        let earlier = present - 2;
+        // Un tick atrás sí debe diferir (el grafo acumula conceptos).
+        let earlier = present - 1;
         state.scrub_to(earlier).unwrap();
+        assert!(state.is_frozen());
         let preview_earlier = state.preview_graph(earlier).unwrap();
         assert_ne!(
             preview_earlier.export(),
@@ -1083,7 +1132,7 @@ mod tests {
     // --- check_mutation_gate ------------------------------------------------
 
     #[test]
-    fn mutation_gate_rejects_inflight_running_and_pending() {
+    fn mutation_gate_allows_thinking_but_rejects_tool_calls_inflight_and_subagents() {
         let (mut host, _ws_vocab) =
             crate::session::build_host(1, AgentConfig::default(), None, None).unwrap();
         let v = host.vocab();
@@ -1091,13 +1140,48 @@ mod tests {
         let ok = check_mutation_gate(host.graph(), &v, 0, 0).unwrap();
         assert!(ok.allowed());
 
-        // Agente `Thinking` con request pendiente → bloqueado por la cola LLM.
+        // Fix de auditoría: agente `Thinking` con `llm_in_flight == 0`
+        // (breakpoint pre-LLM) **sí** permite mutar.
         host.spawn(&onyx_soul_agents::AgentSpec::new("tester", "wait"));
         let mut driver = onyx_soul_agents::HeadlessDriver::new();
         host.step(&mut driver);
+        let ok = check_mutation_gate(host.graph(), &v, 0, 0).unwrap();
+        assert_eq!(ok.pending_tool_calls, 0);
+        assert!(ok.allowed());
+
+        // Agente `Acting` con tool call pendiente → bloqueado (el tool debe
+        // estar en el spec para que el runtime acepte la llamada).
+        host.spawn(
+            &onyx_soul_agents::AgentSpec::new("worker", "run a tool")
+                .with_tools(["fs_write"].iter().copied()),
+        );
+        let mut driver = onyx_soul_agents::RecordingBridge::new(
+            host.vocab(),
+            |req: &onyx_soul_agents::AgentView| {
+                if req.memory.iter().any(|(k, _)| k == "call") {
+                    None
+                } else {
+                    Some(onyx_soul_agents::Reply::call_structured(
+                        req.agent,
+                        req.request,
+                        "fs_write",
+                        r#"{"path":"x.txt","content":"x"}"#,
+                    ))
+                }
+            },
+        );
+        // Avanza hasta que la tool call quede pendiente (el registro puede
+        // tardar 1 tick).
+        for _ in 0..4 {
+            if onyx_soul_agents::pending_tool_calls(host.graph(), &v).is_empty() {
+                host.step(&mut driver);
+            } else {
+                break;
+            }
+        }
         let err = check_mutation_gate(host.graph(), &v, 0, 0).unwrap_err();
-        assert_eq!(err.pending_llm_requests, 1);
-        assert!(err.reason().unwrap().contains("sin responder"));
+        assert_eq!(err.pending_tool_calls, 1);
+        assert!(err.reason().unwrap().contains("tool"), "{:?}", err.reason());
 
         // LLM en vuelo / subagente en ejecución → razón correspondiente.
         let err = check_mutation_gate(host.graph(), &v, 2, 0).unwrap_err();
@@ -1247,10 +1331,13 @@ mod tests {
         let spec = onyx_soul_agents::AgentSpec::new("tester", "wait");
         host.spawn(&spec);
         let mut driver = onyx_soul_agents::HeadlessDriver::new();
-        host.step(&mut driver);
+        host.step(&mut driver); // tick 0
         let state = TimeDebugState::new(None);
         state.record_tick(0, &host.graph().export());
+        host.step(&mut driver); // tick 1: el agente sigue `Thinking`
+        state.record_tick(1, &host.graph().export());
         state.scrub_to(0).unwrap();
+        assert!(state.is_frozen());
         let err =
             confirm_branch_from_cursor(&mut host, &state, &dir, &ws_vocab, &tools, None, 1, 0)
                 .unwrap_err();

@@ -516,6 +516,18 @@ pub fn apply_session_action(
             }
             ctx.tools.clear_seen_reads();
 
+            // `SDD-07` (fix de auditoría): el depurador temporal se sincroniza
+            // con la nueva línea temporal: el futuro antiguo (anillo) dejó de
+            // existir, la caché de preview es obsoleta y presente = cursor =
+            // `target_tick` (último tick completado de la línea activa).
+            if let Some(td) = &ctx.time_debug {
+                if let Ok(mut ring) = td.ring_arc().lock() {
+                    ring.truncate_after(target_tick);
+                }
+                td.clear_preview_cache();
+                td.set_present(target_tick);
+            }
+
             let mut summary = if target_tick != requested_tick {
                 format!(
                     "[/rewind] Restored milestone tick {target_tick} (requested {requested_tick}); clock at tick {}.",
