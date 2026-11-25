@@ -279,6 +279,7 @@ impl WorkspaceTools {
                 "service_exec",
                 "scent_outline",
                 "scent_impact",
+                "scent_references",
             ]
         }
         #[cfg(not(feature = "scent"))]
@@ -326,6 +327,7 @@ impl WorkspaceTools {
                 "service_exec",
                 "scent_outline",
                 "scent_impact",
+                "scent_references",
                 "spawn_agent",
                 "spawn_subagent",
                 "subagent_status",
@@ -725,7 +727,7 @@ impl WorkspaceTools {
         {
             out.push(ToolSchema {
                 name: "scent_outline".into(),
-                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, or Java files.".into(),
+                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, Java, TypeScript, JavaScript, Go, or C/C++ files.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -748,6 +750,22 @@ impl WorkspaceTools {
                         "max_hops": { "type": "INTEGER", "description": "Optional diffusion hop radius (1..=6, default 3)." },
                         "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public neighbor symbols." },
                         "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test neighbors (scope:test)." },
+                        "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (1..=500, default 250)." }
+                    },
+                    "required": ["target"]
+                }),
+                requires_approval: false,
+            });
+            out.push(ToolSchema {
+                name: "scent_references".into(),
+                description: "Resolve exact AST definitions and direct cross-references (callers, callees, implementors, type users) for a symbol as @TOON v1 tuples.".into(),
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": { "type": "STRING", "description": "Symbol name, Type::method, or file::symbol to resolve." },
+                        "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public referencing symbols." },
+                        "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test references (scope:test)." },
                         "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
                         "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (1..=500, default 250)." }
                     },
@@ -871,6 +889,12 @@ impl WorkspaceTools {
                 let args: ScentImpactArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid scent_impact args: {e}"))?;
                 self.scent_impact(args)
+            }
+            #[cfg(feature = "scent")]
+            "scent_references" => {
+                let args: ScentReferencesArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid scent_references args: {e}"))?;
+                self.scent_references(args)
             }
             // `SDD-04 REQ-04.3`: herramientas MCP (`mcp__<server>__<tool>`), despachadas
             // antes del comodín `unknown tool`; la salida ya pasó por `truncate_utf8` +
@@ -1675,6 +1699,30 @@ impl WorkspaceTools {
             .map_err(|e| e.to_string())?;
         Ok(truncate_utf8(&toon, self.policy.max_output_bytes))
     }
+
+    #[cfg(feature = "scent")]
+    fn scent_references(&self, args: ScentReferencesArgs) -> Result<String, String> {
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_workspace(&self.policy.root)
+            .map_err(|e| e.to_string())?;
+        let opts = onyx_scent::ToonPageOptions {
+            cursor: args.cursor.unwrap_or(0),
+            max_rows: args
+                .max_rows
+                .unwrap_or(onyx_scent::DEFAULT_MAX_ROWS)
+                .clamp(1, 500),
+            public_only: args.public_only.unwrap_or(false),
+            exclude_tests: args.exclude_tests.unwrap_or(false),
+            ..onyx_scent::ToonPageOptions::default()
+        };
+        let toon = idx
+            .references_toon(&args.target, opts)
+            .map_err(|e| e.to_string())?;
+        Ok(truncate_utf8(&toon, self.policy.max_output_bytes))
+    }
 }
 
 fn read_pipe_capped<R: Read + Send + 'static>(
@@ -1876,6 +1924,16 @@ struct ScentOutlineArgs {
 struct ScentImpactArgs {
     target: String,
     max_hops: Option<u8>,
+    public_only: Option<bool>,
+    exclude_tests: Option<bool>,
+    cursor: Option<usize>,
+    max_rows: Option<usize>,
+}
+
+#[cfg(feature = "scent")]
+#[derive(Deserialize)]
+struct ScentReferencesArgs {
+    target: String,
     public_only: Option<bool>,
     exclude_tests: Option<bool>,
     cursor: Option<usize>,

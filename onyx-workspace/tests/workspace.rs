@@ -483,8 +483,10 @@ fn scent_tools_emit_toon_outline_and_impact_respecting_policy() {
 
     assert!(WorkspaceTools::all_tool_names().contains(&"scent_outline"));
     assert!(WorkspaceTools::all_tool_names().contains(&"scent_impact"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"scent_references"));
     assert!(!WorkspaceTools::approval_required_names().contains(&"scent_outline"));
     assert!(!WorkspaceTools::approval_required_names().contains(&"scent_impact"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"scent_references"));
 
     let outline = tools.execute("scent_outline", r#"{"path":"src"}"#).unwrap();
     assert!(outline.starts_with("@TOON v1"), "{outline}");
@@ -495,6 +497,37 @@ fn scent_tools_emit_toon_outline_and_impact_respecting_policy() {
         .unwrap();
     assert!(impact.starts_with("@TOON v1"), "{impact}");
     assert!(impact.contains("src/lib.rs::entry"), "{impact}");
+
+    // `SDD-05` REQ-05.3: `scent_references` resuelve definición + referencias directas.
+    let references = tools
+        .execute("scent_references", r#"{"target":"leaf"}"#)
+        .unwrap();
+    assert!(references.starts_with("@TOON v1"), "{references}");
+    assert!(
+        references.contains("src/lib.rs::leaf | defined_at"),
+        "{references}"
+    );
+    assert!(
+        references.contains("src/lib.rs::leaf | called_by | src/lib.rs::entry"),
+        "{references}"
+    );
+
+    // En el lado inverso: `entry` emite `calls` hacia `leaf`.
+    let entry_refs = tools
+        .execute("scent_references", r#"{"target":"entry"}"#)
+        .unwrap();
+    assert!(
+        entry_refs.contains("src/lib.rs::entry | calls | src/lib.rs::leaf"),
+        "{entry_refs}"
+    );
+
+    let unknown_err = tools
+        .execute("scent_references", r#"{"target":"does_not_exist"}"#)
+        .unwrap_err();
+    assert!(
+        unknown_err.contains("not found") || unknown_err.contains("does_not_exist"),
+        "{unknown_err}"
+    );
 
     let traversal_err = tools
         .execute("scent_outline", r#"{"path":"../outside"}"#)

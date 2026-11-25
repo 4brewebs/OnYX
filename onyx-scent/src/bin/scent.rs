@@ -39,6 +39,21 @@ enum Commands {
         #[arg(long, default_value_t = 250)]
         max_rows: usize,
     },
+    /// Emit @TOON v1 definitions and direct cross-references for a symbol
+    References {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
+        #[arg(long, default_value_t = 250)]
+        max_rows: usize,
+        #[arg(long)]
+        public_only: bool,
+        #[arg(long)]
+        exclude_tests: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,6 +94,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ToonPageOptions {
                     cursor,
                     max_rows,
+                    ..ToonPageOptions::default()
+                },
+            )?;
+            print!("{out}");
+        }
+        Commands::References {
+            root,
+            target,
+            cursor,
+            max_rows,
+            public_only,
+            exclude_tests,
+        } => {
+            index.index_workspace(&root)?;
+            let out = index.references_toon(
+                &target,
+                ToonPageOptions {
+                    cursor,
+                    max_rows,
+                    public_only,
+                    exclude_tests,
                     ..ToonPageOptions::default()
                 },
             )?;

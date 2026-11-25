@@ -32,6 +32,10 @@ pub enum SupportedLang {
     Rust,
     Python,
     Java,
+    TypeScript,
+    JavaScript,
+    Go,
+    Cpp,
 }
 
 impl SupportedLang {
@@ -40,6 +44,10 @@ impl SupportedLang {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
             "java" => Some(Self::Java),
+            "ts" | "tsx" => Some(Self::TypeScript),
+            "js" | "jsx" | "mjs" => Some(Self::JavaScript),
+            "go" => Some(Self::Go),
+            "c" | "h" | "cpp" | "hpp" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -49,6 +57,10 @@ impl SupportedLang {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::Java => "java",
+            Self::TypeScript => "typescript",
+            Self::JavaScript => "javascript",
+            Self::Go => "go",
+            Self::Cpp => "cpp",
         }
     }
 }
@@ -63,6 +75,8 @@ pub enum EntityKind {
     Trait,
     Class,
     Interface,
+    TypeAlias,
+    Component,
 }
 
 impl EntityKind {
@@ -75,11 +89,13 @@ impl EntityKind {
             Self::Trait => "trait",
             Self::Class => "class",
             Self::Interface => "interface",
+            Self::TypeAlias => "type_alias",
+            Self::Component => "component",
         }
     }
 
     pub fn is_callable(self) -> bool {
-        matches!(self, Self::Function | Self::Method)
+        matches!(self, Self::Function | Self::Method | Self::Component)
     }
 }
 
