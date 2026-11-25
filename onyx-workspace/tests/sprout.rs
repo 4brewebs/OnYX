@@ -2024,4 +2024,40 @@ exit 0
         assert!(out.contains("exit_code: 0"), "{out}");
         assert_eq!(cli_calls(&ws).len(), 1);
     }
+
+    /// Rustdoc de `SproutSupervisor`: "Al destruirse el último clon (`Drop` del `Arc` interior),
+    /// ejecuta `stop_cmd`/`down` y suelta todos los `ProcessJob` garantizando cero procesos
+    /// huérfanos".
+    #[test]
+    #[ignore = "BUG: los hilos internos (monitor child.wait y lectores de stdout/stderr) retienen Arc<SproutInner>; Drop no se ejecuta al soltar el último clon público mientras el servicio vive (sprout.rs:1448-1606)"]
+    fn dropping_last_supervisor_clone_runs_stop_cmd_and_kills_service() {
+        let ws = TempWs::new("sup_drop");
+        let s = sup(
+            &ws,
+            "[services.srv]\ncmd = \"echo UP; exec sleep 5\"\nready_log = \"UP\"\nstop_cmd = \"echo bye >> stopped.txt\"\n",
+        );
+        s.start("srv", WAIT).unwrap();
+        let pid: u32 = row(&s.status_toon().unwrap(), "srv")[4].parse().unwrap();
+        let clone = s.clone();
+        drop(s);
+        assert!(
+            !ws.path().join("stopped.txt").exists(),
+            "a live clone keeps services running"
+        );
+        drop(clone);
+        assert_eq!(
+            read(&ws, "stopped.txt"),
+            "bye\n",
+            "dropping the last clone must run stop_cmd synchronously"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            wait_until(Duration::from_secs(2), || !Path::new(&format!(
+                "/proc/{pid}"
+            ))
+            .exists()),
+            "service process {pid} must not outlive the supervisor"
+        );
+        let _ = pid;
+    }
 }
