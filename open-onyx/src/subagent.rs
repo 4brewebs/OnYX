@@ -2217,7 +2217,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let (mut host, ws_vocab) = build_host(1, cfg.clone(), None, None).unwrap();
-        host.spawn(&make_spec("delegate and merge", true));
+        host.spawn(&make_spec("delegate and merge", true, &[]));
 
         let mgr = SubagentManager::with_worktree_base_dir(policy, 1, sub_factory, Some(&wt_base))
             .with_root_tools(tools.clone());
@@ -2302,7 +2302,7 @@ mod tests {
         // Pure offline replay: 0 threads, 0 worktrees, 0 disk touches — identical fingerprint!
         let tr = Transcript::from_bytes(&tr_bytes).unwrap();
         let (mut replay_host, _) = build_host(1, cfg, None, None).unwrap();
-        replay_host.spawn(&make_spec("delegate and merge", true));
+        replay_host.spawn(&make_spec("delegate and merge", true, &[]));
         let mut replay_driver = ReplayBridge::new(tr).wrapping(HeadlessDriver::new());
         for _ in 0..256 {
             replay_host.step(&mut replay_driver);
@@ -2399,6 +2399,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -3151,7 +3152,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let (mut host, ws_vocab) = build_host(1, cfg, None, None).unwrap();
-        host.spawn(&make_spec("modify hot public symbol", false));
+        host.spawn(&make_spec("modify hot public symbol", false, &[]));
 
         let mgr =
             SubagentManager::with_worktree_base_dir(policy.clone(), 1, sub_factory, Some(&wt_base))
@@ -3301,7 +3302,7 @@ mod tests {
         let spawner = crate::command::CommandSpawnerSystem::new(true);
         let (mut host, ws_vocab) =
             build_host(1, cfg.clone(), None, Some(Box::new(spawner))).unwrap();
-        host.spawn(&make_spec("delegate in background", true));
+        host.spawn(&make_spec("delegate in background", true, &[]));
 
         let mgr = SubagentManager::with_worktree_base_dir(policy, 1, sub_factory, Some(&wt_base))
             .with_root_tools(tools.clone());
@@ -3396,7 +3397,7 @@ mod tests {
         let replay_spawner = crate::command::CommandSpawnerSystem::new(true);
         let (mut replay_host, _) =
             build_host(1, cfg, None, Some(Box::new(replay_spawner))).unwrap();
-        replay_host.spawn(&make_spec("delegate in background", true));
+        replay_host.spawn(&make_spec("delegate in background", true, &[]));
         let mut replay_driver = ReplayBridge::new(tr).wrapping(HeadlessDriver::new());
         for _ in 0..512 {
             replay_host.step(&mut replay_driver);
@@ -3821,7 +3822,7 @@ mod tests {
         let (mut host, ws_vocab) = build_host(1, cfg, None, None).unwrap();
         // `auto_approve=false`: `subagent_merge` pasa por el gate de aprobación del spec,
         // de modo que la decisión `Ask`/`Allow` del driver realmente aplica.
-        host.spawn(&make_spec("touch governance", false));
+        host.spawn(&make_spec("touch governance", false, &[]));
 
         let mgr = SubagentManager::with_worktree_base_dir(
             policy,
@@ -3958,7 +3959,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let (mut host, ws_vocab) = build_host(1, cfg.clone(), None, None).unwrap();
-        host.spawn(&make_spec("delegate to external cli", true));
+        host.spawn(&make_spec("delegate to external cli", true, &[]));
 
         let mgr = SubagentManager::with_worktree_base_dir(
             policy,
@@ -4081,7 +4082,7 @@ mod tests {
         // Replay offline: host nuevo + `ReplayBridge` solo (sin `SubagentManager` → 0 I/O
         // estructural; sin `SubagentManagerDriver` → la CLI nunca se re-ejecuta).
         let (mut replay_host, _) = build_host(1, cfg, None, None).unwrap();
-        replay_host.spawn(&make_spec("delegate to external cli", true));
+        replay_host.spawn(&make_spec("delegate to external cli", true, &[]));
         let mut replay_driver = ReplayBridge::new(tr).wrapping(HeadlessDriver::new());
         for _ in 0..512 {
             replay_host.step(&mut replay_driver);

@@ -14,7 +14,7 @@
     { key: '/mode plan', desc: 'Switch to read-only PLAN mode' },
     { key: '/mode build', desc: 'Switch to BUILD mode (edits enabled)' },
     { key: '/profile', desc: 'List LLM profiles or switch to a registered one (`<id>`)' },
-    { key: '/provider openai', desc: 'Hot-swap LLM provider (`gemini|openai`)' },
+    { key: '/provider openai', desc: 'Hot-swap LLM provider (`gemini|openai|anthropic`)' },
     { key: '/model <name>', desc: 'Change the LLM model of the active target' },
     { key: '/effort high', desc: 'Set LLM reasoning effort (`auto|low|medium|high`)' },
     { key: '/undo', desc: 'Revert latest reversible Git checkpoint' },

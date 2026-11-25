@@ -27,9 +27,10 @@ openonyx [--help | -h | --version | -V]
 | Flag | Applies To | Description / Default |
 | --- | --- | --- |
 | `-w, --workspace <dir>` | All | Target workspace directory (default: current working directory). |
-| `--provider <gemini\|openai>` | `chat`, `run`, `rewind` | LLM backend (`gemini` default; `openai` for OpenAI/OpenRouter/Ollama/vLLM/LM Studio). |
-| `--model <name>` | `chat`, `run`, `rewind` | Model name (defaults: `gemini-4-hydrogen` on Gemini, `gpt-4o` on OpenAI). |
-| `--effort <low\|medium\|high>` | `chat`, `run`, `rewind` | Reasoning/thinking effort (`thinkingLevel` / `reasoning_effort`). |
+| `--provider <gemini\|openai\|anthropic>` | `chat`, `run`, `rewind` | LLM backend (`gemini` default; `openai` for OpenAI/OpenRouter/Ollama/vLLM/LM Studio; `anthropic` for the native Messages API). |
+| `--model <name>` | `chat`, `run`, `rewind` | Model name (defaults: `gemini-4-hydrogen` on Gemini, `gpt-4o` on OpenAI, `claude-sonnet-4-5` on Anthropic). |
+| `--effort <low\|medium\|high>` | `chat`, `run`, `rewind` | Reasoning/thinking effort (`thinkingLevel` / `reasoning_effort`; on `anthropic` it maps to a thinking budget of 2048/8192/16384 unless an explicit budget is set). |
+| `--thinking-budget <n>` | `chat`, `run`, `rewind` | Anthropic extended-thinking budget in tokens (`0` = off, or `1024..=60000`; or `ANTHROPIC_THINKING_BUDGET`). Raises `max_tokens` above the budget. |
 | `--api-base <url>` | `chat`, `run`, `rewind` | Custom API base URL (`http://` allowed only on loopback `localhost`/`127.0.0.1`/`[::1]`; remote hosts require `https://`). |
 | `--allow-custom-auth-host` | `chat`, `run`, `rewind` | Explicit opt-in to send API keys to non-official remote HTTPS endpoints (or `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`). |
 | `--trust-workspace` | `chat`, `run`, `rewind`, `serve` | Trust the current workspace in memory for this run (without writing `~/.onyx/trusted_workspaces.toml`). |
@@ -65,18 +66,21 @@ openonyx [--help | -h | --version | -V]
 
 | Variable | Provider | Description |
 | --- | --- | --- |
-| `ONYX_PROVIDER` | All | Default provider (`gemini` \| `openai`). |
+| `ONYX_PROVIDER` | All | Default provider (`gemini` \| `openai` \| `anthropic`). |
 | `GEMINI_API_KEY` | Gemini | Google AI Studio API key (fallback: `ONYX_API_KEY`). |
 | `OPENAI_API_KEY` | OpenAI | API key for `--provider openai` (fallback: `ONYX_API_KEY`; optional with local `--api-base`). |
-| `ONYX_API_KEY` | Both | Shared fallback key if provider-specific key is unset. |
-| `ONYX_MODEL` | Both | Default model override (fallbacks: `ONYX_GEMINI_MODEL`, `OPENAI_MODEL`). |
-| `ONYX_EFFORT` | Both | Default reasoning effort (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`). |
+| `ANTHROPIC_API_KEY` | Anthropic | API key for `--provider anthropic` (fallback: `ONYX_API_KEY`). |
+| `ONYX_API_KEY` | All | Shared fallback key if provider-specific key is unset. |
+| `ONYX_MODEL` | All | Default model override (fallbacks: `ONYX_GEMINI_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`). |
+| `ONYX_EFFORT` | All | Default reasoning effort (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`; on Anthropic, `ANTHROPIC_THINKING_BUDGET` governs thinking). |
 | `ONYX_AUTO_SAVE` | Both | Enable `--auto-save` by default (`1` \| `true` \| `yes` \| `on`) storing sessions in `.onyx/vault/`. |
 | `ONYX_MAX_SUBAGENTS` | Both | Max parallel async subagent worktrees (used when `--max-subagents <n>` is omitted; default: `3`). |
 | `GEMINI_API_BASE` | Gemini | Custom Gemini API base URL. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Custom OpenAI-compatible API endpoint (default: `https://api.openai.com/v1`). |
+| `ANTHROPIC_API_BASE` | Anthropic | Custom Anthropic API base URL (default: `https://api.anthropic.com`). |
+| `ANTHROPIC_THINKING_BUDGET` | Anthropic | Extended-thinking budget in tokens (`0` = off, or `1024..=60000`); takes precedence over the `--effort`-derived budget. |
 
-> **LLM & driver config in `config.toml`:** beyond flags and environment variables, `.onyx/config.toml` accepts `[[llm_profiles]]` (chapter 03, section 2.6) and `[[external_drivers]]` (chapter 03, section 2.7) blocks. A profile's key resolves in the order `api_key_env` → the provider's standard variable → `ONYX_API_KEY`.
+> **LLM, driver & MCP config in `config.toml`:** beyond flags and environment variables, `.onyx/config.toml` accepts `[[llm_profiles]]` (chapter 03, section 2.6), `[[external_drivers]]` (chapter 03, section 2.7), and `[mcp.servers.<name>]` (chapter 03, section 2.8) blocks. A profile's key resolves in the order `api_key_env` → the provider's standard variable → `ONYX_API_KEY`.
 
 ---
 
@@ -87,6 +91,8 @@ Local inference servers and proxies (vLLM, LiteLLM, nginx, Cloudflare) occasiona
 `open-onyx/src/openai.rs` builds in two automatic safeguards:
 1. **Completed-SSE EOF tolerance**: if a chunk decode error happens after `finish_reason` / `[DONE]` with complete assistant content or `tool_calls`, the response is accepted cleanly instead of failing the turn.
 2. **Automatic transient retries with backoff**: retries transient transport/408/429/5xx/stream errors up to **2 times** (`400ms`, `1200ms`) before surfacing an error to the agent.
+
+The native `open-onyx/src/anthropic.rs` adapter applies the same retry policy (`408`, `429`, `500`, `502`, `503`, `504`, and Anthropic's own `overloaded_error` `529`), honoring the `retry-after` header when the server sends it.
 
 ---
 
@@ -129,6 +135,13 @@ Live `/rewind <tick>` requires no active agents (`thinking`, `acting`, `waiting_
 - `bin` found but the `--version` probe (3 s deadline, sanitized environment) times out: `[ERR]`; if it errors out instead (e.g., wrong flags): `[WARN]`.
 - `prompt_transport = "arg"` on Windows: `[WARN]` when the binary resolves to a `.cmd`/`.bat` wrapper (rejected at spawn time).
 - `network_allowlist` without `--sandbox strict-container`: `[WARN]` — the allowlist is advisory outside `strict-container`; a declared driver without `network_allowlist` is `LocalhostOnly` unless the sandbox relaxes it.
+
+### 10. An MCP server does not connect, or `[mcp.servers.*]` is ignored
+`openonyx doctor` audits the servers declared in `[mcp.servers.<name>]` (chapter 03, section 2.8) with a 5 s-capped handshake (a dead server can never hang `doctor`):
+- `Connected` or `Disabled`: informational `[CHECK]`.
+- `Failed(...)` (missing binary, handshake timeout, server error): actionable `[ERR]` with an already-scrubbed message; the session keeps running without that server (failure isolation).
+- **Untrusted** workspace with project `[mcp.servers.*]`: `[WARN]` `MCP config in ... ignored: workspace is not trusted (use --trust-workspace or openonyx trust)` — approve with `openonyx trust` or use `--trust-workspace`.
+- `mcp__*` tools always ask for approval in `BUILD` and are `Deny` in `PLAN`/`EXPLORE`; to auto-approve them, declare `allow = ["mcp__<server>__*"]` in `.onyx/config.toml` (trusted workspace).
 
 ---
 

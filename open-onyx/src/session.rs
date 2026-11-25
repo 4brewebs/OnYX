@@ -205,7 +205,9 @@ pub fn run_session<D: SessionDriver>(
             let mut needs_follow_up_tick = false;
             let mut stepped_in_session = false;
             let shared_store = action_ctx.as_ref().and_then(|c| c.snapshot_store.clone());
-            while !quit.load(Ordering::Relaxed) {
+            // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del
+            // watcher de apago de `serve` (`spawn_shutdown_watcher`).
+            while !quit.load(Ordering::Acquire) {
                 let ui_queued = ui.has_queued_events();
                 let ready =
                     llm_ready.load(Ordering::Acquire) || bridge_ready.load(Ordering::Acquire);
@@ -831,14 +833,18 @@ pub fn build_host_with_shared_store(
     Ok((host, ws_vocab))
 }
 
-pub fn make_spec(goal: &str, auto_approve: bool) -> AgentSpec {
-    let mut spec = AgentSpec::new("openonyx", goal).with_tools(
-        WorkspaceTools::all_tool_names_with_subagents()
-            .iter()
-            .copied(),
-    );
+pub fn make_spec(goal: &str, auto_approve: bool, mcp_tools: &[String]) -> AgentSpec {
+    let mut tool_names: Vec<&str> = WorkspaceTools::all_tool_names_with_subagents().to_vec();
+    // `SDD-04 REQ-04.3`: tools MCP `mcp__*` del registro de arranque (orden
+    // determinista: built-in primero, MCP después).
+    tool_names.extend(mcp_tools.iter().map(|t| t.as_str()));
+    let mut spec = AgentSpec::new("openonyx", goal).with_tools(tool_names);
     if !auto_approve {
-        spec = spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
+        // `SDD-04 REQ-04.4`: los tools MCP `mcp__*` requieren aprobación cuando no
+        // hay auto-approve (misma regla que los built-in mutantes).
+        let mut approval: Vec<&str> = WorkspaceTools::approval_required_names().to_vec();
+        approval.extend(mcp_tools.iter().map(|t| t.as_str()));
+        spec = spec.with_approval_tools(approval);
     }
     spec
 }

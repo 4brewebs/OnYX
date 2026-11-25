@@ -11,8 +11,8 @@ use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
 use onyx_soul_agents::{
     EventBus, GraphView, PlatformDriver, SurfaceBinding, Vocab, pending_requests,
 };
-use onyx_workspace::WorkspaceTools;
 use onyx_workspace::tools::{discover_skills_summary, scrub_secrets};
+use onyx_workspace::{ToolSchema, WorkspaceTools};
 use serde_json::{Value as JsonValue, json};
 #[cfg(test)]
 use std::collections::HashSet;
@@ -118,6 +118,9 @@ pub(crate) struct GeminiSharedState {
     /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
     /// esquema dinámico de `spawn_subagent` (`driver` opcional).
     pub(crate) driver_ids: Vec<String>,
+    /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el body filtradas por los tools del spec del agente.
+    pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
 }
 
 /// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
@@ -173,6 +176,7 @@ pub fn load_project_instructions(workspace_root: &Path) -> String {
     combined
 }
 
+#[derive(Debug)]
 pub(crate) struct QueuedToolCall {
     pub name: String,
     pub args: String,
@@ -232,7 +236,7 @@ fn build_request_body_with_budget(
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: ContextBudget,
 ) -> JsonValue {
-    build_request_body_with_context(req, thought_signatures, budget.into(), "", None, &[])
+    build_request_body_with_context(req, thought_signatures, budget.into(), "", None, &[], &[])
 }
 
 const BASE_INSTRUCTION: &str = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Do not re-read unchanged files or repeat `scent_outline` queries already summarized in your history unless the file was modified. Never create temporary helper scripts or scratch directories inside the workspace repository; use built-in tools (`glob_files`, `code_search`, `scent_outline`) for counting and inspection. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step workspace tasks, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`), but never call `plan_update` multiple times in a row without executing real workspace tools in between; for purely conceptual questions or single-step answers that do not inspect or modify the workspace, omit `plan_update` (or call it at most once). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
@@ -267,6 +271,7 @@ pub(crate) fn build_request_body_with_context(
     project_instructions: &str,
     effort: Option<ReasoningEffort>,
     driver_ids: &[String],
+    mcp_schemas: &[ToolSchema],
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut contents: Vec<JsonValue> = Vec::with_capacity(projected.turns.len());
@@ -332,10 +337,10 @@ pub(crate) fn build_request_body_with_context(
         }
     }
 
-    let declarations: Vec<JsonValue> =
+    let mut declarations: Vec<JsonValue> =
         WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
             .into_iter()
-            .filter(|s| req.tools.iter().any(|t| t == s.name))
+            .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
             .map(|s| {
                 json!({
                     "name": s.name,
@@ -344,6 +349,21 @@ pub(crate) fn build_request_body_with_context(
                 })
             })
             .collect();
+    // `SDD-04 REQ-04.3`: declaraciones MCP `mcp__*` (schemas del registro,
+    // filtradas por los tools del spec y normalizados al formato
+    // `functionDeclarations` de Gemini: ver `sanitize_gemini_mcp_schema`).
+    for s in mcp_schemas
+        .iter()
+        .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
+    {
+        let mut params = s.parameters.clone();
+        sanitize_gemini_mcp_schema(&mut params);
+        declarations.push(json!({
+            "name": s.name,
+            "description": s.description,
+            "parameters": params
+        }));
+    }
 
     let system_text = system_instruction_text(project_instructions);
 
@@ -367,6 +387,74 @@ pub(crate) fn build_request_body_with_context(
         });
     }
     body
+}
+
+/// `SDD-04 REQ-04.3`: normaliza un `inputSchema` de tool MCP al formato de
+/// `functionDeclarations` de Gemini:
+/// - `type` → MAYÚSCULAS (`OBJECT`, `STRING`, `INTEGER`, `NUMBER`, `BOOLEAN`, `ARRAY`);
+/// - `["string", "null"]` → `"STRING"` + `"nullable": true`;
+/// - elimina recursivamente los metadatos que Gemini rechaza: `$schema`,
+///   `additionalProperties`, `$id`, `$defs`, `definitions`, `default`, `examples`,
+///   `title`.
+fn sanitize_gemini_mcp_schema(val: &mut JsonValue) {
+    const STRIP_KEYS: [&str; 8] = [
+        "$schema",
+        "additionalProperties",
+        "$id",
+        "$defs",
+        "definitions",
+        "default",
+        "examples",
+        "title",
+    ];
+    match val {
+        JsonValue::Object(map) => {
+            if let Some(ty) = map.get("type").and_then(|v| v.as_str()) {
+                map.insert(
+                    "type".to_string(),
+                    JsonValue::String(ty.to_ascii_uppercase()),
+                );
+            } else if let Some(JsonValue::Array(tys)) = map.get("type") {
+                // Clonamos el array: mutar `map` con `tys` vivo no compila
+                // (préstamo inmutable pendiente del `map.get`).
+                let tys: Vec<JsonValue> = tys.to_vec();
+                if tys
+                    .iter()
+                    .any(|t| t.as_str().is_some_and(|s| s.eq_ignore_ascii_case("null")))
+                {
+                    map.insert("nullable".to_string(), JsonValue::Bool(true));
+                }
+                let kept: Vec<JsonValue> = tys
+                    .into_iter()
+                    .filter(|t| t.as_str().is_none_or(|s| !s.eq_ignore_ascii_case("null")))
+                    .map(|t| match t.as_str() {
+                        Some(s) => JsonValue::String(s.to_ascii_uppercase()),
+                        None => t,
+                    })
+                    .collect();
+                match kept.len() {
+                    1 => {
+                        map.insert("type".to_string(), kept.into_iter().next().unwrap());
+                    }
+                    _ => {
+                        map.insert("type".to_string(), JsonValue::Array(kept));
+                    }
+                };
+            }
+            for key in STRIP_KEYS {
+                map.remove(key);
+            }
+            for v in map.values_mut() {
+                sanitize_gemini_mcp_schema(v);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr {
+                sanitize_gemini_mcp_schema(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parsea una respuesta `generateContent` (REST o SSE acumulada) y registra
@@ -717,6 +805,12 @@ impl GeminiResponder {
         self.shared.driver_ids = driver_ids;
         self
     }
+
+    /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
+    pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
+        self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
 }
 
 impl Responder for GeminiResponder {
@@ -740,6 +834,7 @@ impl Responder for GeminiResponder {
                 &self.shared.project_instructions,
                 self.shared.effort,
                 &self.shared.driver_ids,
+                &self.shared.mcp_schemas,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -853,6 +948,7 @@ impl AsyncGeminiDriver {
                 &self.shared.project_instructions,
                 self.shared.effort,
                 &self.shared.driver_ids,
+                &self.shared.mcp_schemas,
             )
         };
         let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
@@ -1057,6 +1153,77 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_gemini_mcp_schema_normalizes_types_and_strips_metadata() {
+        // `inputSchema` MCP realista (draft 2020-12, tipos con `null`, metadatos).
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Echo params",
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": ["string", "null"],
+                    "description": "Text to echo back",
+                    "default": "hello",
+                    "examples": ["a", "b"]
+                },
+                "count": { "type": "integer", "minimum": 1 },
+                "ratio": { "type": "number" },
+                "dry_run": { "type": "boolean" },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "additionalProperties": true
+                },
+                "meta": {
+                    "type": "object",
+                    "properties": {
+                        "score": { "type": ["number", "null"] }
+                    }
+                }
+            },
+            "$id": "urn:echo:1",
+            "definitions": { "x": { "type": "string" } },
+            "$defs": { "y": { "type": "boolean" } }
+        });
+        sanitize_gemini_mcp_schema(&mut schema);
+
+        // Tipos en MAYÚSCULAS.
+        assert_eq!(schema["type"], "OBJECT");
+        let props = schema["properties"].as_object().unwrap();
+        assert_eq!(props["count"]["type"], "INTEGER");
+        assert_eq!(props["ratio"]["type"], "NUMBER");
+        assert_eq!(props["dry_run"]["type"], "BOOLEAN");
+        assert_eq!(props["tags"]["type"], "ARRAY");
+        assert_eq!(props["tags"]["items"]["type"], "STRING");
+
+        // `["string","null"]` → `"STRING"` + `nullable: true` (también anidado).
+        assert_eq!(props["message"]["type"], "STRING");
+        assert_eq!(props["message"]["nullable"], true);
+        assert_eq!(props["meta"]["properties"]["score"]["type"], "NUMBER");
+        assert_eq!(props["meta"]["properties"]["score"]["nullable"], true);
+
+        // Metadatos prohibidos eliminados (recursivo y en raíz).
+        for key in [
+            "$schema",
+            "title",
+            "$id",
+            "definitions",
+            "$defs",
+            "default",
+            "examples",
+        ] {
+            assert!(schema.get(key).is_none(), "root kept {key}");
+        }
+        assert!(props["message"].get("default").is_none());
+        assert!(props["message"].get("examples").is_none());
+        assert!(props["tags"].get("additionalProperties").is_none());
+
+        // Lo legítimo se conserva.
+        assert_eq!(props["message"]["description"], "Text to echo back");
+        assert_eq!(props["count"]["minimum"], 1);
+    }
+
+    #[test]
     fn queued_calls_are_cleared_after_tool_error_or_denial() {
         let shared = GeminiSharedState::default();
         push_queued_calls(
@@ -1217,6 +1384,7 @@ mod tests {
             TieredContextConfig::default(),
             &loaded,
             Some(ReasoningEffort::High),
+            &[],
             &[],
         );
         let serialized = serde_json::to_string(&body).unwrap();

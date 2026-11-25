@@ -136,7 +136,7 @@ pub enum SlashCommand {
     Trust(Option<String>),
     /// `/profile [id]` (`SDD-03` Fase 2): cambia a un perfil LLM registrado o lista los disponibles.
     Profile(Option<String>),
-    /// `/provider <gemini|openai>` (`SDD-03` Fase 2): conmuta el provider LLM en caliente.
+    /// `/provider <gemini|openai|anthropic>` (`SDD-03` Fase 2): conmuta el provider LLM en caliente.
     Provider(Option<String>),
     /// `/model <name>` (`SDD-03` Fase 2): cambia el modelo del objetivo LLM activo.
     Model(Option<String>),
@@ -425,6 +425,13 @@ pub struct CommandSpawnerSystem {
     max_steps_per_turn: i64,
     force_new_agent: bool,
     counter: usize,
+    /// Nombres de tools MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`):
+    /// se añaden a los tools del spec de cada agente (orden determinista).
+    mcp_tool_names: Vec<String>,
+    /// `SDD-04` 4C-audit: handle a `WorkspaceTools` para que `/compact` limpie
+    /// `seen_reads` (los anclajes de deduplicación apuntan a lecturas que el
+    /// compactado acaba de sacar del contexto).
+    tools: Option<WorkspaceTools>,
 }
 
 impl CommandSpawnerSystem {
@@ -445,6 +452,8 @@ impl CommandSpawnerSystem {
             max_steps_per_turn: 128,
             force_new_agent: false,
             counter: 0,
+            mcp_tool_names: Vec::new(),
+            tools: None,
         }
     }
 
@@ -501,6 +510,20 @@ impl CommandSpawnerSystem {
         self
     }
 
+    /// Tools MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el spec de cada agente nuevo.
+    pub fn with_mcp_tool_names(mut self, mcp_tool_names: Vec<String>) -> Self {
+        self.mcp_tool_names = mcp_tool_names;
+        self
+    }
+
+    /// `SDD-04` 4C-audit: habilita que `/compact` limpie la caché de
+    /// deduplicación de `fs_read` (`WorkspaceTools::clear_seen_reads`).
+    pub fn with_tools(mut self, tools: WorkspaceTools) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
     fn spawn_spec<G: GraphView + ?Sized>(
         &mut self,
         graph: &G,
@@ -509,14 +532,16 @@ impl CommandSpawnerSystem {
     ) -> AgentSpec {
         let existing = graph.query(&[v.state]).len();
         self.counter = self.counter.max(existing) + 1;
-        let mut spec = AgentSpec::new(format!("openonyx-{}", self.counter), goal).with_tools(
-            WorkspaceTools::all_tool_names_with_subagents()
-                .iter()
-                .copied(),
-        );
+        let mut tool_names: Vec<&str> = WorkspaceTools::all_tool_names_with_subagents().to_vec();
+        tool_names.extend(self.mcp_tool_names.iter().map(|t| t.as_str()));
+        let mut spec =
+            AgentSpec::new(format!("openonyx-{}", self.counter), goal).with_tools(tool_names);
         if !self.auto_approve {
-            spec =
-                spec.with_approval_tools(WorkspaceTools::approval_required_names().iter().copied());
+            // `SDD-04 REQ-04.4`: los tools MCP `mcp__*` requieren aprobación cuando no
+            // hay auto-approve (misma regla que los built-in mutantes).
+            let mut approval: Vec<&str> = WorkspaceTools::approval_required_names().to_vec();
+            approval.extend(self.mcp_tool_names.iter().map(|t| t.as_str()));
+            spec = spec.with_approval_tools(approval);
         }
         spec
     }
@@ -967,6 +992,13 @@ impl OnyxSystem for CommandSpawnerSystem {
                         }
                     }
                     SlashCommand::Compact(focus) => {
+                        // `SDD-04` 4C-audit: tras el compactado, los anclajes de
+                        // deduplicación de `fs_read` están obsoletos (el contexto
+                        // ya perdió la lectura original); se limpian para que la
+                        // siguiente `fs_read` devuelva el contenido completo.
+                        if let Some(tools) = &self.tools {
+                            tools.clear_seen_reads();
+                        }
                         if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
                             let (goal, memory) =
                                 read_agent_memory_ordered(&*ctx.graph, &v, root_id);

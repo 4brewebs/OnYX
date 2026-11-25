@@ -15,11 +15,27 @@ exclude = ["snapshots/", "snaps*/", "*.tr", "*.onyxpack", "*.onyxpack.tmp"]
 [features]
 default = []
 scent = ["dep:onyx-scent"]
+mcp = ["dep:ureq"]
+
+# TEST-04.2: servidor MCP *mock* `stdio` re-ejecutable (portable Windows+Linux,
+# sin python/node en CI). Como `harness = false`, `main()` es el propio protocolo
+# cuando `ONYX_MCP_MOCK_ROLE=server`, y la suite E2E cuando `cargo test` lo invoca.
+[[test]]
+name = "mcp_stdio"
+harness = false
+required-features = ["mcp"]
+
+# TEST-04.2 (Fase 4B): mock HTTP MCP in-proceso sobre `127.0.0.1:0`
+# (JSON directo, SSE, `Mcp-Session-Id`, headers `${VAR}`, scrub, aislamiento).
+[[test]]
+name = "mcp_http"
+required-features = ["mcp"]
 
 [dependencies]
 blake3 = { workspace = true }
 onyx-scent = { workspace = true, optional = true }
 onyx-soul-agents = { workspace = true }
+ureq = { workspace = true, optional = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

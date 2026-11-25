@@ -1,3 +1,4 @@
+mod anthropic;
 mod command;
 mod context;
 mod external_driver;
@@ -16,6 +17,7 @@ mod tui_views;
 mod vault;
 mod web;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::{Duration, SystemTime};
 
+use anthropic::{AnthropicResponder, DEFAULT_ANTHROPIC_MODEL, parse_thinking_budget};
 use command::{CommandSpawnerSystem, PendingSessionAction, PendingSystemNotes};
 use context::{ReasoningEffort, SessionTelemetryHandle, TieredContextConfig};
 use gemini::{
@@ -31,12 +34,14 @@ use gemini::{
 use llm_driver::DynamicLlmDriver;
 use llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider, ResolvedLlmTarget, validate_api_base};
 use onyx_soul_agents::{
-    AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Responder, Transcript,
+    AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply, Responder,
+    Transcript, Verb,
 };
 use onyx_workspace::{
-    NetworkPolicy, PendingCheckpoints, SandboxMode, WorkspaceMode, WorkspaceModeHandle,
-    WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools, evaluate_workspace_trust,
-    graph_workspace_mode, list_trusted_workspaces, revoke_workspace_trust, trust_workspace,
+    McpRegistry, McpServerStatus, NetworkPolicy, PendingCheckpoints, SandboxMode, ToolSchema,
+    WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
+    evaluate_workspace_trust, graph_workspace_mode, list_trusted_workspaces, load_mcp_config,
+    revoke_workspace_trust, trust_workspace,
 };
 use openai::{DEFAULT_OPENAI_MODEL, OpenAiResponder};
 use ops::{reconcile_rewind_effects, run_doctor, run_inspect};
@@ -67,6 +72,9 @@ struct CliArgs {
     provider: Option<LlmProvider>,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    /// `--thinking-budget <tokens>` (Anthropic extended thinking, `REQ-04.2`):
+    /// `Some(0)` = off explícito, `Some(n)` = 1024..=60000, `None` = se deriva de `--effort`.
+    thinking_budget: Option<u64>,
     api_base: Option<String>,
     allow_custom_auth_host: bool,
     trust_workspace: bool,
@@ -98,6 +106,7 @@ impl CliArgs {
             provider: None,
             model: None,
             effort: None,
+            thinking_budget: None,
             api_base: None,
             allow_custom_auth_host: false,
             trust_workspace: false,
@@ -173,6 +182,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut provider: Option<LlmProvider> = None;
     let mut model: Option<String> = None;
     let mut effort: Option<ReasoningEffort> = None;
+    let mut thinking_budget: Option<u64> = None;
     let mut api_base: Option<String> = None;
     let mut allow_custom_auth_host = false;
     let mut trust_workspace_flag = false;
@@ -213,7 +223,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
             "--provider" => {
                 let p = args
                     .next()
-                    .ok_or("--provider requires `gemini` or `openai`")?;
+                    .ok_or("--provider requires `gemini`, `openai` or `anthropic`")?;
                 provider = Some(LlmProvider::parse(&p)?);
             }
             "--model" => {
@@ -228,6 +238,12 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     .next()
                     .ok_or("--effort requires `low`, `medium`, or `high`")?;
                 effort = Some(ReasoningEffort::parse(&e)?);
+            }
+            "--thinking-budget" => {
+                let s = args
+                    .next()
+                    .ok_or("--thinking-budget requires a token count (0 or >= 1024)")?;
+                thinking_budget = Some(parse_thinking_budget(&s)?);
             }
             "--api-base" => {
                 let u = args.next().ok_or("--api-base requires a URL")?;
@@ -489,6 +505,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         provider,
         model,
         effort,
+        thinking_budget,
         api_base,
         allow_custom_auth_host,
         trust_workspace: trust_workspace_flag,
@@ -514,7 +531,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai>] [--model <name>] [--effort <low|medium|high>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -526,15 +543,17 @@ fn help_text() -> String {
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
   rewind <dir> <tick>      Restore git checkpoints to <tick> (or prior milestone) and replay/continue
-  doctor                   Verify workspace git repository, sandbox, Workspace Trust, snapshot packs, and transcripts
+  doctor                   Verify workspace git repository, sandbox, Workspace Trust, MCP servers (`[mcp.servers.*]`), snapshot packs, and transcripts
   trust                    Approve, check, list, or revoke Workspace Trust hashes (`~/.onyx/trusted_workspaces.toml`)
   serve                    Serve embedded mobile-first PWA + JSON/SSE API (`/api/v1/...`) over HTTP/1.1 (0 tokio)
 
 OPTIONS:
   -w, --workspace <dir>    Target workspace directory (default: current working directory)
-      --provider <name>    LLM backend: `gemini` (default) or `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio)
-      --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`)
-      --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`)
+      --provider <name>    LLM backend: `gemini` (default), `openai` (OpenAI-compatible / Ollama / vLLM / LM Studio) or `anthropic` (native Messages API)
+      --model <name>       Model name (defaults: Gemini `__GEMINI_MODEL__`, OpenAI `__OPENAI_MODEL__`, Anthropic `__ANTHROPIC_MODEL__`)
+      --effort <level>     Reasoning/thinking effort: `low`, `medium`, or `high` (or `ONYX_EFFORT`); for `anthropic` it maps to a thinking budget (low 2048 / medium 8192 / high 16384) when no explicit budget is set
+      --thinking-budget <n>
+                            Anthropic extended thinking budget in tokens (`0` = off, or 1024..=60000; or `ANTHROPIC_THINKING_BUDGET`). Raises `max_tokens` above the budget; without it, `--effort` maps to a budget for `anthropic`
       --api-base <url>     Custom API base URL (`http://` allowed on loopback only; remote hosts require `https://`)
       --allow-custom-auth-host
                            Explicit opt-in to send API keys to non-official remote HTTPS `--api-base` hosts (or `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`)
@@ -603,7 +622,7 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /mode [plan|build|explore]
                            Switch or toggle workspace mode
   /profile [id]             List LLM profiles or switch to a registered one (`[[llm_profiles]]`)
-  /provider <gemini|openai>
+  /provider <gemini|openai|anthropic>
                           Hot-swap the LLM provider without restarting the session
   /model <name>             Change the LLM model of the active target (custom model)
   /effort [auto|low|medium|high]
@@ -616,14 +635,15 @@ PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
   ONYX.md / AGENTS.md      Loaded from ~/.onyx/ and the workspace root into system instructions
   .onyx/skills/<name>/SKILL.md (also skills/, ~/.onyx/skills/)
                            Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
+  [mcp.servers.<name>]     MCP servers from `config.toml` (global `~/.onyx/config.toml` and, if trusted, workspace): `transport = "stdio"` (`command`/`args`/`env`) or `"http"` (`url`/`headers`), `timeout_secs`, `enabled`. Their tools appear as `mcp__<server>__<tool>`, always approval-gated, `Deny` in PLAN/EXPLORE, audited by `openonyx doctor`
   Live Plan & Services     Right-hand panels (`plan_update` + `sprout.toml`) shown automatically when width >= 100 columns
   User Manual              Full guide available in `docs/manual/index.md`
   Session Vault            `.onyx/vault/<session>/` stores snapshots + `.tr` together (`.onyx/vault/unassigned/` for standalone `.tr`; auto-ignored by Git)
 
 ENVIRONMENT VARIABLES:
-  GEMINI_API_KEY, OPENAI_API_KEY, ONYX_API_KEY
-  ONYX_PROVIDER            Default provider (`gemini` | `openai`)
-  ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL` as fallbacks)
+  GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, ONYX_API_KEY
+  ONYX_PROVIDER            Default provider (`gemini` | `openai` | `anthropic`)
+  ONYX_MODEL               Default model override (`ONYX_GEMINI_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL` as fallbacks)
   ONYX_EFFORT              Default reasoning/thinking effort (`low` | `medium` | `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`)
   ONYX_AUTO_SAVE           Enable `--auto-save` by default (`1` | `true` | `yes` | `on`)
   ONYX_ALLOW_CUSTOM_AUTH_HOST
@@ -635,9 +655,13 @@ ENVIRONMENT VARIABLES:
   ONYX_WEB_CORS_ORIGIN     Optional allowed browser origin for external SPAs (e.g. `http://localhost:5173`)
   GEMINI_API_BASE          Custom Gemini API endpoint
   OPENAI_API_BASE / OPENAI_BASE_URL
-                           Custom OpenAI-compatible API endpoint"#
+                           Custom OpenAI-compatible API endpoint
+  ANTHROPIC_API_BASE       Custom Anthropic API endpoint (default `https://api.anthropic.com`)
+  ANTHROPIC_THINKING_BUDGET
+                           Anthropic extended thinking budget in tokens (`0` = off, or 1024..=60000); overrides the `--effort`-derived budget"#
         .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
-        .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL);
+        .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL)
+        .replace("__ANTHROPIC_MODEL__", DEFAULT_ANTHROPIC_MODEL);
 
     format!("openOnyx {version} — Deterministic Coding Agent Harness\n\n{usage_str}\n\n{body}")
 }
@@ -678,6 +702,9 @@ fn resolve_llm_config(
                     LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
                         .ok()
                         .filter(|s| !s.trim().is_empty()),
+                    // Anthropic: el thinking lo gobierna `--thinking-budget` /
+                    // `ANTHROPIC_THINKING_BUDGET` (no hay env de effort).
+                    LlmProvider::Anthropic => None,
                 });
             match env_val {
                 Some(raw) => Some(ReasoningEffort::parse(&raw)?),
@@ -687,6 +714,20 @@ fn resolve_llm_config(
     };
 
     let allow_custom_auth_host = cli.allow_custom_auth_host || allow_custom_auth_host_from_env();
+
+    // `REQ-04.2`: presupuesto explícito de extended thinking, resuelto una vez
+    // antes del match: la CLI manda; el env se valida con el mismo contrato
+    // (`0` = off, >= 1024, <= 60000) y un valor inválido es **error duro**
+    // (mismo trato que el flag CLI). Se puebla en los tres proveedores para
+    // conservarlo en caliente (`/provider anthropic`).
+    let thinking_budget = match cli.thinking_budget {
+        Some(value) => Some(value),
+        None => env::var("ANTHROPIC_THINKING_BUDGET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|raw| parse_thinking_budget(&raw))
+            .transpose()?,
+    };
 
     match provider {
         LlmProvider::Gemini => {
@@ -722,6 +763,7 @@ fn resolve_llm_config(
                 api_key,
                 model,
                 effort,
+                thinking_budget,
                 api_base,
                 project_instructions,
             })
@@ -762,6 +804,45 @@ fn resolve_llm_config(
                 api_key,
                 model,
                 effort,
+                thinking_budget,
+                api_base,
+                project_instructions,
+            })
+        }
+        LlmProvider::Anthropic => {
+            let raw_api_base = cli
+                .api_base
+                .clone()
+                .or_else(|| env::var("ANTHROPIC_API_BASE").ok())
+                .filter(|s| !s.trim().is_empty());
+            let api_key = env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| env::var("ONYX_API_KEY"))
+                .map_err(|_| "ANTHROPIC_API_KEY environment variable is not set")?;
+            let api_base = match raw_api_base {
+                Some(raw) => Some(validate_api_base(
+                    provider,
+                    &raw,
+                    !api_key.trim().is_empty(),
+                    allow_custom_auth_host,
+                )?),
+                None => None,
+            };
+            let model = cli
+                .model
+                .clone()
+                .or_else(|| env::var("ONYX_MODEL").ok().filter(|s| !s.trim().is_empty()))
+                .or_else(|| {
+                    env::var("ANTHROPIC_MODEL")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string());
+            Ok(LlmConfig {
+                provider,
+                api_key,
+                model,
+                effort,
+                thinking_budget,
                 api_base,
                 project_instructions,
             })
@@ -793,6 +874,9 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
             LlmProvider::OpenAi => env::var("OPENAI_MODEL")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            LlmProvider::Anthropic => env::var("ANTHROPIC_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         })
         .unwrap_or_else(|| provider.default_model().to_string());
     // Misma precedencia que [`resolve_llm_config`]: `--effort` de CLI primero — el
@@ -809,6 +893,9 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
                 LlmProvider::OpenAi => env::var("OPENAI_REASONING_EFFORT")
                     .ok()
                     .filter(|s| !s.trim().is_empty()),
+                // Anthropic: el thinking lo gobierna `--thinking-budget` /
+                // `ANTHROPIC_THINKING_BUDGET` (no hay env de effort).
+                LlmProvider::Anthropic => None,
             })
             .and_then(|raw| ReasoningEffort::parse(&raw).ok()),
     };
@@ -834,6 +921,7 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
         api_key: String::new(),
         model,
         effort,
+        thinking_budget: None,
         api_base,
         project_instructions: String::new(),
     })
@@ -843,6 +931,7 @@ fn build_sync_responder(
     llm: &LlmConfig,
     telemetry: Option<SessionTelemetryHandle>,
     driver_ids: &[String],
+    mcp_schemas: &Arc<Vec<ToolSchema>>,
 ) -> Box<dyn Responder> {
     let ctx_cfg = TieredContextConfig::for_model(&llm.model);
     match llm.provider {
@@ -852,7 +941,8 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
-                .with_external_driver_ids(driver_ids.to_vec());
+                .with_external_driver_ids(driver_ids.to_vec())
+                .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -864,7 +954,22 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
-                .with_external_driver_ids(driver_ids.to_vec());
+                .with_external_driver_ids(driver_ids.to_vec())
+                .with_mcp_schemas(Arc::clone(mcp_schemas));
+            if let Some(tel) = telemetry {
+                r = r.with_telemetry(tel);
+            }
+            Box::new(r)
+        }
+        LlmProvider::Anthropic => {
+            let mut r = AnthropicResponder::new(llm.api_key.clone(), llm.model.clone())
+                .with_api_base(llm.api_base.clone())
+                .with_project_instructions(llm.project_instructions.clone())
+                .with_context_config(ctx_cfg)
+                .with_effort(llm.effort)
+                .with_thinking_budget(llm.thinking_budget)
+                .with_external_driver_ids(driver_ids.to_vec())
+                .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
                 r = r.with_telemetry(tel);
             }
@@ -881,6 +986,7 @@ fn llm_config_from_target(target: &ResolvedLlmTarget) -> LlmConfig {
         api_key: target.api_key.clone(),
         model: target.model.clone(),
         effort: target.effort,
+        thinking_budget: target.thinking_budget,
         api_base: target.api_base.clone(),
         project_instructions: target.project_instructions.to_string(),
     }
@@ -895,7 +1001,7 @@ fn pin_subagent_responder_factory(handle: LlmProfileHandle) -> PinnedResponderFa
     Arc::new(move || {
         let target = handle.active_target();
         let llm = llm_config_from_target(&target);
-        Box::new(move || build_sync_responder(&llm, None, &[]))
+        Box::new(move || build_sync_responder(&llm, None, &[], &Arc::default()))
     })
 }
 
@@ -1026,6 +1132,7 @@ fn resolve_max_subagents(cli: Option<usize>) -> usize {
     .max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_interactive_chat(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -1034,6 +1141,8 @@ fn launch_interactive_chat(
     base_opts: &SessionOptions,
     resume_override: Option<(&Path, Option<u64>)>,
     driver_ids: &[String],
+    mcp_schemas: &Arc<Vec<ToolSchema>>,
+    mcp_tool_names: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
@@ -1129,8 +1238,10 @@ fn launch_interactive_chat(
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
     let bridge_ready = Arc::new(AtomicBool::new(false));
     let sub_llm = llm.clone();
-    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
-    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids
+    // ni MCP (los subagentes no reciben tools `mcp__*` en su spec).
+    let sub_factory: ResponderFactory =
+        Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
         .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
@@ -1139,8 +1250,11 @@ fn launch_interactive_chat(
     let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(chat_config.default_max_steps)
+        .with_mcp_tool_names(mcp_tool_names.to_vec())
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
+        // `SDD-04` 4C-audit: `/compact` limpia `seen_reads`.
+        .with_tools(tools.clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
         .with_pending_notes(pending_notes.clone())
@@ -1245,6 +1359,7 @@ fn launch_interactive_chat(
         .with_stream_preview(stream_preview)
         .with_telemetry(telemetry)
         .with_external_driver_ids(driver_ids.to_vec())
+        .with_mcp_schemas(Arc::clone(mcp_schemas))
         .wrapping(sub_driver),
     );
 
@@ -1266,6 +1381,7 @@ fn launch_interactive_chat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_web_serve(
     cli: &CliArgs,
     policy: &WorkspacePolicy,
@@ -1274,7 +1390,13 @@ fn launch_web_serve(
     base_opts: &SessionOptions,
     web_cfg: WebServerConfig,
     driver_ids: &[String],
+    mcp_schemas: &Arc<Vec<ToolSchema>>,
+    mcp_tool_names: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `SDD-04` 4C-audit: restaura `ENABLE_PROCESSED_INPUT`/isig ANTES de
+    // esperar Ctrl+C, por si el modo raw del terminal quedó activo (p. ej.
+    // un TUI previo en el mismo proceso); en `serve` normalmente es un no-op.
+    let _ = crossterm::terminal::disable_raw_mode();
     let llm = resolve_llm_config(cli, &cli.workspace)?;
     // `SDD-03` Fase 2: registro de perfiles + objetivo LLM dinámico (hot-swap en
     // caliente), idéntico a `launch_interactive_chat`.
@@ -1362,8 +1484,10 @@ fn launch_web_serve(
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
     let bridge_ready = Arc::new(AtomicBool::new(false));
     let sub_llm = llm.clone();
-    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
-    let sub_factory: ResponderFactory = Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+    // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids
+    // ni MCP (los subagentes no reciben tools `mcp__*` en su spec).
+    let sub_factory: ResponderFactory =
+        Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
         .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
@@ -1372,8 +1496,11 @@ fn launch_web_serve(
     let sub_handle = SubagentHandle::new(sub_manager);
     let mut spawner = CommandSpawnerSystem::new(cli.auto_approve)
         .with_max_steps(serve_config.default_max_steps)
+        .with_mcp_tool_names(mcp_tool_names.to_vec())
         .with_mode_handle(mode_handle.clone())
         .with_sprout(tools.sprout().clone())
+        // `SDD-04` 4C-audit: `/compact` limpia `seen_reads`.
+        .with_tools(tools.clone())
         .with_workspace_root(cli.workspace.clone())
         .with_pending_action(pending_action.clone())
         .with_pending_notes(pending_notes.clone())
@@ -1430,6 +1557,12 @@ fn launch_web_serve(
     let bound = web_driver.local_addr();
     let web_handle = web_driver.handle();
     let quit = web_driver.quit_flag();
+    // `SDD-04` 4C-audit: Ctrl+C limpio. 1er pulso: handler levanta
+    // `SERVE_SHUTDOWN` y el watcher lo propaga a `WebHub::quit` (+notify) para
+    // que `run_session` termine el bucle y guarde snapshot/transcript. 2º
+    // pulso: el SO termina el proceso por defecto.
+    let ctrl_c_guard = web::CtrlCGuard::new();
+    let _shutdown_watcher = web_driver.spawn_shutdown_watcher();
 
     println!("=== openOnyx Web UI (`serve`) ===");
     println!("  URL:        http://{bound}/");
@@ -1493,6 +1626,7 @@ fn launch_web_serve(
         .with_stream_preview(stream_preview)
         .with_telemetry(telemetry)
         .with_external_driver_ids(driver_ids.to_vec())
+        .with_mcp_schemas(Arc::clone(mcp_schemas))
         .wrapping(sub_driver),
     );
 
@@ -1510,6 +1644,7 @@ fn launch_web_serve(
         },
     )?;
     drop(driver);
+    drop(ctrl_c_guard);
     print_vault_summary(&cli.workspace, &effective_opts, shared_store.as_ref());
     Ok(())
 }
@@ -1589,6 +1724,74 @@ fn run_trust_command(
     Ok(())
 }
 
+/// Tope de salida de una llamada a tool MCP en sesión en vivo (`SDD-04 REQ-04.4`):
+/// los resultados se truncan a 32 KiB antes de llegar al LLM.
+const MCP_LIVE_MAX_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// `SDD-04 REQ-04.4`: extrae de una `Transcript` los tools `mcp__*` que la
+/// sesión original invocó (entradas `Verb::Call`), en orden determinista
+/// (`BTreeSet`), para que un replay offline los declare en el spec de sus
+/// agentes sin tocar disco ni red (0 I/O).
+fn extract_mcp_tools_from_transcript(tr: &Transcript) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for entry in &tr.entries {
+        if entry.reply.verb != Verb::Call {
+            continue;
+        }
+        let (tool, _args) = Reply::parse_call_payload(&entry.reply.payload);
+        if tool.starts_with("mcp__") {
+            names.insert(tool.to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// `SDD-04 REQ-04.3`: registro MCP de arranque con **descubrimiento vivo**. Solo
+/// los modos interactivos/en vivo (chat, run, serve, rewind en vivo) lo cargan;
+/// `doctor` audita los servidores con su propio timeout corto (TEST-04.4) y
+/// `replay`/`inspect` no hacen I/O. `None` si no hay configuración MCP.
+///
+/// Ningún fallo aborta la sesión: cada servidor fallido/untrusted solo emite un
+/// aviso en `stderr` y se descarta.
+fn load_mcp_registry(policy: &WorkspacePolicy, workspace: &Path) -> Option<Arc<McpRegistry>> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    // `SDD-04 4C-audit`: un fallo de configuración no debe silenciar el diagnóstico;
+    // se loguea en stderr y MCP queda desactivado (MCP disabled) sin abortar.
+    let (configs, warnings) = match load_mcp_config(
+        home.as_deref(),
+        Some(workspace),
+        policy.trust.config_trusted,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[openOnyx mcp] config error (MCP disabled): {e}");
+            return None;
+        }
+    };
+    for w in &warnings {
+        eprintln!("[openOnyx mcp] {w}");
+    }
+    if configs.is_empty() {
+        return None;
+    }
+    let registry =
+        McpRegistry::discover_from_config(&configs, MCP_LIVE_MAX_OUTPUT_BYTES, Some(workspace));
+    for (name, status) in registry.server_statuses() {
+        match status {
+            McpServerStatus::Failed(msg) => {
+                eprintln!("[openOnyx mcp] server `{name}` unavailable: {msg}");
+            }
+            McpServerStatus::Disabled => {
+                eprintln!("[openOnyx mcp] server `{name}` disabled in config; not loaded.");
+            }
+            _ => {}
+        }
+    }
+    Some(Arc::new(registry))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = match parse_args() {
         Ok(c) => c,
@@ -1644,7 +1847,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sandbox
             .elevate_for_auto_approve(cli.sandbox_mode.is_some());
     }
-    let tools = WorkspaceTools::new(policy.clone());
+    // `SDD-04 REQ-04.3`: descubrimiento MCP vivo solo en modos interactivos/en
+    // vivo; `doctor` (auditoría propia) y los modos offline no lo cargan.
+    // `SDD-04 REQ-04.4`: `rewind --transcript` no interactivo es replay 0-I/O y
+    // `--dry-run` no hace I/O: en ambos casos los tools `mcp__*` salen del
+    // transcript (ver `extract_mcp_tools_from_transcript`), no del registro.
+    let mcp_registry: Option<Arc<McpRegistry>> = match &cli.mode {
+        Mode::Doctor { .. } | Mode::Replay(_) | Mode::Inspect { .. } => None,
+        Mode::Rewind {
+            transcript: Some(_),
+            ..
+        } if !cli.interactive => None,
+        _ if cli.dry_run => None,
+        _ => load_mcp_registry(&policy, &cli.workspace),
+    };
+    let tools = match mcp_registry.as_ref() {
+        Some(registry) => {
+            WorkspaceTools::new(policy.clone()).with_mcp_registry(Arc::clone(registry))
+        }
+        None => WorkspaceTools::new(policy.clone()),
+    };
+    // Schemas `mcp__*` conectados (vacío si no hay registro) para los bodies LLM.
+    let mcp_schemas: Arc<Vec<ToolSchema>> = mcp_registry
+        .as_ref()
+        .map(|r| Arc::new(r.tool_schemas()))
+        .unwrap_or_default();
+    let mcp_tool_names: Vec<String> = mcp_schemas.iter().map(|s| s.name.to_string()).collect();
 
     // `SDD-10`: ids de los drivers de harness CLI registrados (siempre al menos
     // el preset integrado `opencode`), para los esquemas de `spawn_subagent` y el manager.
@@ -1706,12 +1934,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (mut host, ws_vocab) =
                 build_host_with_options(1, config, &run_opts, None, Some(checkpoints.clone()))?;
 
-            host.spawn(&make_spec(goal, cli.auto_approve));
+            host.spawn(&make_spec(goal, cli.auto_approve, &mcp_tool_names));
 
             let sub_llm = llm.clone();
-            // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids.
+            // Los workers de subagente no llaman a `spawn_subagent` (sin recursión): sin driver ids
+            // ni MCP (los subagentes no reciben tools `mcp__*` en su spec).
             let sub_factory: ResponderFactory =
-                Arc::new(move || build_sync_responder(&sub_llm, None, &[]));
+                Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
             let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
                 .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
                 .with_root_tools(tools.clone());
@@ -1733,7 +1962,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),
-                build_sync_responder(&llm, Some(telemetry.clone()), &driver_ids),
+                build_sync_responder(&llm, Some(telemetry.clone()), &driver_ids, &mcp_schemas),
             )
             .wrapping(sub_driver);
 
@@ -1767,6 +1996,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &session_opts,
                 resume_arg,
                 &driver_ids,
+                &mcp_schemas,
+                &mcp_tool_names,
             )?;
         }
         Mode::Replay(path) => {
@@ -1793,6 +2024,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let bytes = fs::read(&resolved_tr)?;
             let transcript = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
+            // `SDD-04 REQ-04.4`: replay offline real — los tools `mcp__*` del
+            // spec salen del transcript (0 I/O: sin `load_mcp_registry` ni
+            // handshake), no de un registro en vivo.
+            let replay_mcp_tools = extract_mcp_tools_from_transcript(&transcript);
             let has_commands = transcript
                 .commands
                 .iter()
@@ -1809,6 +2044,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let replay_llm = resolve_replay_llm_config(&cli)?;
             let replay_spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(replay_config.default_max_steps)
+                .with_mcp_tool_names(replay_mcp_tools.clone())
                 .with_llm_profile(LlmProfileHandle::new_for_replay(
                     &replay_llm,
                     policy.llm_profiles(),
@@ -1822,7 +2058,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(PendingCheckpoints::default()),
             )?;
             if !has_commands {
-                host.spawn(&make_spec("replay", cli.auto_approve));
+                host.spawn(&make_spec("replay", cli.auto_approve, &replay_mcp_tools));
             }
 
             // Replay determinista puro: NO toca disco ni llama a Gemini.
@@ -1867,6 +2103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &session_opts,
                     Some((resolved_dir.as_path(), Some(*tick))),
                     &driver_ids,
+                    &mcp_schemas,
+                    &mcp_tool_names,
                 )?;
                 return Ok(());
             }
@@ -1907,9 +2145,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 LlmProfileHandle::new(&rewind_llm, policy.llm_profiles(), allow_custom_auth_host)
             };
+            // `SDD-04 REQ-04.4`: en el replay offline (`--transcript` no
+            // interactivo, sin registro MCP vivo) el transcript se parsea
+            // **antes** de construir el spawner para extraer los tools
+            // `mcp__*` grabados (y se reusa después, sin doble lectura).
+            let rewind_transcript: Option<Transcript> = if !cli.interactive {
+                transcript
+                    .as_ref()
+                    .map(|tr_path| {
+                        let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
+                        let bytes = fs::read(&resolved_tr).map_err(|e| e.to_string())?;
+                        Transcript::from_bytes(&bytes).map_err(|e| e.to_string())
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            // En la rama en vivo el spec necesita las tools `mcp__*` para poder
+            // invocarlas; en la rama `--transcript` el spec debe incluirlas igual
+            // (extraídas del transcript en el replay offline) para que el replay
+            // valide las llamadas grabadas en la sesión original.
+            let rewind_mcp_tools = match rewind_transcript.as_ref() {
+                Some(tr) => extract_mcp_tools_from_transcript(tr),
+                None => mcp_tool_names.to_vec(),
+            };
             let spawner = CommandSpawnerSystem::new(cli.auto_approve)
                 .with_max_steps(128)
-                .with_llm_profile(llm_handle);
+                .with_llm_profile(llm_handle)
+                .with_mcp_tool_names(rewind_mcp_tools);
             let (mut host, ws_vocab) = build_host_with_checkpoints(
                 1,
                 config,
@@ -1924,10 +2187,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host.set_tick(next_tick);
 
             let rewind_opts = SessionOptions::default();
-            if let Some(tr_path) = transcript {
-                let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
-                let bytes = fs::read(&resolved_tr)?;
-                let tr = Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?;
+            let replay_tr: Option<Transcript> = match (transcript.as_ref(), rewind_transcript) {
+                (Some(_tr_path), Some(tr)) => Some(tr), // ya parseado para la extracción
+                (Some(tr_path), None) => {
+                    let resolved_tr = resolve_read_transcript(&cli.workspace, tr_path);
+                    let bytes = fs::read(&resolved_tr)?;
+                    Some(Transcript::from_bytes(&bytes).map_err(|e| e.to_string())?)
+                }
+                (None, _) => None,
+            };
+            if let Some(tr) = replay_tr {
                 let mut driver = ReplayBridge::new(tr)
                     .starting_at(next_tick)
                     .wrapping(HeadlessDriver::new());
@@ -1949,10 +2218,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_checkpoints(checkpoints)
                     .require_read_before_edit(true)
                     .wrapping(cli_driver);
-                let mut driver =
-                    RecordingBridge::new(host.vocab(), build_sync_responder(&llm, None, &[]))
-                        .starting_at(next_tick)
-                        .wrapping(ws_bridge);
+                let mut driver = RecordingBridge::new(
+                    host.vocab(),
+                    build_sync_responder(&llm, None, &[], &mcp_schemas),
+                )
+                .starting_at(next_tick)
+                .wrapping(ws_bridge);
 
                 run_session(
                     &mut host,
@@ -2001,6 +2272,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &session_opts,
                 web_cfg,
                 &driver_ids,
+                &mcp_schemas,
+                &mcp_tool_names,
             )?;
         }
         Mode::Help | Mode::Version | Mode::Trust { .. } => unreachable!(),
@@ -2015,7 +2288,7 @@ mod tests {
 
     use onyx_soul_agents::{AgentHost, AgentState, IngressEvent, OnyxEvent, Reply};
     use onyx_workspace::{
-        graph_workspace_llm_profile, graph_workspace_mode, latest_undoable_effect,
+        McpClient, graph_workspace_llm_profile, graph_workspace_mode, latest_undoable_effect,
     };
     use ops::render_inspect;
     use session::{
@@ -2416,6 +2689,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2577,6 +2851,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2682,6 +2957,7 @@ mod tests {
             api_key: "live-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2736,6 +3012,7 @@ mod tests {
             api_key: "replay-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2817,7 +3094,7 @@ mod tests {
         fs::create_dir_all(&snap_dir).unwrap();
 
         let (mut host, _) = build_host(1, AgentConfig::default(), Some(&snap_dir), None).unwrap();
-        host.spawn(&make_spec("check doctor", true));
+        host.spawn(&make_spec("check doctor", true, &[]));
         host.request_snapshot("0");
         host.step(&mut HeadlessDriver::new());
 
@@ -4377,5 +4654,401 @@ ready_log = "READY_BUS"
         )));
         assert!(host.run_until_settled(&mut driver, 12));
         assert_eq!(host.result(root).as_deref(), Some("recovered after cancel"));
+    }
+
+    /// Mock MCP in-memoria (sin red) con contador de calls para tests E2E
+    /// (`SDD-04` REQ-04.4/04.5, 4C-audit).
+    struct ApprovalMockMcpClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl onyx_workspace::McpClient for ApprovalMockMcpClient {
+        fn handshake(&self) -> Result<Vec<ToolSchema>, onyx_workspace::McpError> {
+            Ok(vec![ToolSchema {
+                name: std::borrow::Cow::Owned("mcp__mock__echo".to_string()),
+                description: std::borrow::Cow::Owned("echo de texto".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } }
+                }),
+                requires_approval: true,
+            }])
+        }
+
+        fn call_tool(
+            &self,
+            tool: &str,
+            args: &serde_json::Value,
+        ) -> Result<String, onyx_workspace::McpError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            Ok(format!("mcp-echo:{tool}:{text}"))
+        }
+    }
+
+    /// `SDD-04` REQ-04.4 (4C-audit): en modo `Build` **sin auto-approve**, una
+    /// llamada a `mcp__mock__echo` entra en `WaitingApproval` (el mock NO se
+    /// llama hasta la aprobación: `calls == 0`) y al aprobarse se despacha
+    /// exactamente una vez (`calls == 1`).
+    #[test]
+    fn mcp_tool_waits_for_approval_in_build_mode_without_auto_approve() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-mcp-approval-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(ApprovalMockMcpClient {
+            calls: Arc::clone(&calls),
+        });
+        let schemas = client.handshake().expect("mock handshake");
+        let registry = Arc::new(McpRegistry::with_client(
+            2048,
+            "mock",
+            client.clone(),
+            schemas,
+        ));
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+
+        let spawner = CommandSpawnerSystem::new(false) // sin auto-approve
+            .with_mode_handle(mode_handle.clone())
+            .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
+        let (mut host, ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "use the mock echo".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .wrapping(headless);
+        let mut turn = 0usize;
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            turn += 1;
+            if turn == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "mcp__mock__echo",
+                    r#"{"text":"hola mcp"}"#,
+                ))
+            } else {
+                Some(Reply::done(req.agent, req.request, "mcp echo approved"))
+            }
+        })
+        .wrapping(ws_bridge);
+
+        // tick 0: comando → `spawn_event`; tick 1: agente `Thinking` y el
+        // responder encola el `Call` (su `present`); tick 2: el runtime aplica
+        // el `Call` → `WaitingApproval` (sin auto-approve, `mcp__*` exige
+        // aprobación en el spec).
+        host.step(&mut driver);
+        host.step(&mut driver);
+        host.step(&mut driver);
+        let root = host.agents()[0];
+        // Sin auto-approve, la tool `mcp__*` queda en `WaitingApproval`…
+        assert_eq!(
+            host.agent_state(root),
+            Some(AgentState::WaitingApproval),
+            "la llamada MCP debe esperar aprobación"
+        );
+        // …y el cliente NO se llama antes de aprobar (0 I/O).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        // Un humano aprueba: el bridge despacha la llamada exactamente una vez.
+        let pending = &host.pending_approvals()[0];
+        assert_eq!(
+            pending.pending_approval.as_ref().unwrap().tool,
+            "mcp__mock__echo"
+        );
+        host.push(Reply::approve(pending.agent, pending.request).to_event());
+        assert!(host.run_until_settled(&mut driver, 32));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "la aprobación debe despazar exactamente una llamada al mock"
+        );
+        assert_eq!(host.result(root).as_deref(), Some("mcp echo approved"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-04` REQ-04.4 (4C-audit): en modo `Plan`, una llamada a `mcp__*`
+    /// queda bloqueada **incluso** con `auto_approve = true` y regla `allow`
+    /// explícita `mcp__*`: el gate de modo del bridge la niega y el cliente
+    /// nunca se llama (`calls == 0`).
+    #[test]
+    fn mcp_tool_blocked_in_plan_mode_even_with_auto_approve_and_allow_rule() {
+        use onyx_workspace::PermissionRules;
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-mcp-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(ApprovalMockMcpClient {
+            calls: Arc::clone(&calls),
+        });
+        let schemas = client.handshake().expect("mock handshake");
+        let registry = Arc::new(McpRegistry::with_client(
+            2048,
+            "mock",
+            client.clone(),
+            schemas,
+        ));
+        let policy = WorkspacePolicy::new(&dir)
+            .unwrap()
+            .with_permissions(PermissionRules {
+                allow: vec!["mcp__*".to_string()],
+                ..PermissionRules::default()
+            });
+        let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Plan);
+
+        let spawner = CommandSpawnerSystem::new(true) // auto-approve
+            .with_mode_handle(mode_handle.clone())
+            .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
+        let (mut host, ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "use the mock echo".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(ws_vocab)
+            .wrapping(headless);
+        let mut turn = 0usize;
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            turn += 1;
+            if turn == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "mcp__mock__echo",
+                    r#"{"text":"hola mcp"}"#,
+                ))
+            } else {
+                Some(Reply::done(req.agent, req.request, "blocked in plan"))
+            }
+        })
+        .wrapping(ws_bridge);
+
+        host.step(&mut driver);
+        host.step(&mut driver);
+        let root = host.agents()[0];
+        assert!(host.run_until_settled(&mut driver, 32));
+        // El gate de modo bloquea el despacho: el mock nunca se llama.
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "el modo Plan debe bloquear la llamada MCP aunque haya allow + auto-approve"
+        );
+        // El agente recibió un tool_error con el motivo de modo.
+        let view = host.view(root);
+        assert!(
+            view.memory
+                .iter()
+                .any(|(kind, text)| kind == "tool_error" && text.contains("Plan")),
+            "el tool_error debe mencionar el modo Plan: {:?}",
+            view.memory
+        );
+        assert_eq!(host.result(root).as_deref(), Some("blocked in plan"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-04` REQ-04.5 (4C-audit): una llamada en vivo a una tool
+    /// `mcp__<server>__<tool>` **sin auto-approve** (con `McpClient`
+    /// in-memoria inyectado vía `McpRegistry::with_client`, sin red) queda
+    /// grabada en el transcript ONYXTR2 junto con su `Reply::approve` y su
+    /// observación; el replay (con los tools `mcp__*` **extraídos del
+    /// transcript** vía `extract_mcp_tools_from_transcript`, sin hardcodear ni
+    /// registro vivo) reproduce la sesión con **0 I/O**: el contador de calls
+    /// del mock no cambia y el resultado final es idéntico.
+    #[test]
+    fn mcp_tool_call_and_its_observation_replay_without_io() {
+        use onyx_workspace::{McpClient, McpError, McpRegistry, PermissionRules, ToolSchema};
+        use std::borrow::Cow;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MockMcpClient {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl McpClient for MockMcpClient {
+            fn handshake(&self) -> Result<Vec<ToolSchema>, McpError> {
+                Ok(vec![ToolSchema {
+                    name: Cow::Owned("mcp__mock__echo".to_string()),
+                    description: Cow::Owned("echo de texto".to_string()),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }),
+                    requires_approval: true,
+                }])
+            }
+
+            fn call_tool(&self, tool: &str, args: &serde_json::Value) -> Result<String, McpError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                Ok(format!("mcp-echo:{tool}:{text}"))
+            }
+        }
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("openonyx-mcp-replay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let client = Arc::new(MockMcpClient {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let schemas = client.handshake().expect("mock handshake");
+        let registry = Arc::new(McpRegistry::with_client(
+            2048,
+            "mock",
+            client.clone(),
+            schemas,
+        ));
+        // `SDD-04 REQ-04.4` (4C-audit): sin auto-approve la llamada MCP pasa por
+        // `WaitingApproval`; la regla `allow mcp__*` hace que el bridge
+        // auto-apruebe y la `Reply::approve` quede **grabada** en el transcript
+        // (el replay la reproduce).
+        let policy = WorkspacePolicy::new(&dir)
+            .unwrap()
+            .with_permissions(PermissionRules {
+                allow: vec!["mcp__*".to_string()],
+                ..PermissionRules::default()
+            });
+        let tools = WorkspaceTools::new(policy).with_mcp_registry(registry);
+        let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
+
+        let spawner = CommandSpawnerSystem::new(false) // sin auto-approve
+            .with_mode_handle(mode_handle.clone())
+            .with_mcp_tool_names(vec!["mcp__mock__echo".to_string()]);
+        let (mut live_host, live_ws_vocab) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(spawner)),
+        )
+        .unwrap();
+
+        let mut headless = HeadlessDriver::new();
+        headless.push_event(OnyxEvent::Ingress(IngressEvent::Command(
+            "use the mock echo".to_string(),
+        )));
+        let ws_bridge = WorkspaceToolBridge::new(live_host.vocab(), tools)
+            .with_mode_handle(mode_handle)
+            .with_workspace_vocab(live_ws_vocab)
+            .wrapping(headless);
+        let mut turn = 0usize;
+        let mut driver = RecordingBridge::new(live_host.vocab(), |req: &AgentView| {
+            turn += 1;
+            if turn == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "mcp__mock__echo",
+                    r#"{"text":"hola mcp"}"#,
+                ))
+            } else {
+                Some(Reply::done(req.agent, req.request, "mcp echo done"))
+            }
+        })
+        .wrapping(ws_bridge);
+
+        live_host.step(&mut driver);
+        live_host.step(&mut driver);
+        assert!(live_host.run_until_settled(&mut driver, 32));
+        let root = live_host.agents()[0];
+        assert_eq!(live_host.result(root).as_deref(), Some("mcp echo done"));
+        // El despacho en vivo llamó al mock exactamente una vez (I/O real).
+        assert_eq!(client.calls.load(Ordering::Acquire), 1);
+        // La observación y la aprobación quedaron grabadas en el transcript.
+        let tr_bytes = driver.transcript().to_bytes();
+        let tr_text = String::from_utf8_lossy(&tr_bytes);
+        assert!(
+            tr_text.contains("mcp-echo:echo:hola mcp"),
+            "el transcript debe contener la observación MCP"
+        );
+        assert!(
+            tr_text.contains("approve"),
+            "el transcript debe contener la `Reply::approve` (4C-audit: !auto_approve)"
+        );
+
+        // Replay: los tools `mcp__*` del spec salen del transcript (sin
+        // hardcodear ni registro vivo) y el spec replica el live (sin
+        // auto-approve) para que el replay sea idéntico, con 0 I/O.
+        let decoded = Transcript::from_bytes(&tr_bytes).expect("decodificar ONYXTR2");
+        let replay_mcp_tools = extract_mcp_tools_from_transcript(&decoded);
+        assert_eq!(
+            replay_mcp_tools,
+            vec!["mcp__mock__echo".to_string()],
+            "el transcript debe extraer la tool MCP invocada"
+        );
+        let (mut replay_host, _) = build_host(
+            1,
+            AgentConfig {
+                default_max_steps: 16,
+                default_timeout_ticks: 64,
+                ..AgentConfig::default()
+            },
+            None,
+            Some(Box::new(
+                CommandSpawnerSystem::new(false).with_mcp_tool_names(replay_mcp_tools),
+            )),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(decoded).wrapping(HeadlessDriver::new());
+        // `run_session` + `ReplayExhausted`: `run_until_settled` devolvería
+        // "asentado" en el primer tick (sin agentes) antes de que el comando
+        // reinyectado se convierta en `spawn_event` y en agente.
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 64 },
+        )
+        .unwrap();
+        let rroot = replay_host.agents()[0];
+        assert_eq!(replay_host.result(rroot).as_deref(), Some("mcp echo done"));
+        // 0 I/O durante el replay: el contador del mock no cambia.
+        assert_eq!(
+            client.calls.load(Ordering::Acquire),
+            1,
+            "el replay no debe volver a llamar al cliente MCP"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

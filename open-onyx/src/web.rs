@@ -59,6 +59,157 @@ const ASSET_LOGO_JPG: &[u8] = include_bytes!("../web/logo.jpg");
 
 const CSP_HEADER: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'";
 
+// ── Ctrl+C limpio en `serve` (4C-audit) ───────────────────────────────────────
+
+/// 1er pulso de Ctrl+C/SIGTERM: el handler de señal la levanta (solo atomics,
+/// async-signal-safe) y un watcher ([`WebDriver::spawn_shutdown_watcher`]) la
+/// propaga a `WebHub::quit` + `notify_all` sobre los condvars para que
+/// `run_session` (`StopPolicy::Quit`) termine el bucle y guarde snapshot y
+/// transcript en menos de ~35 ms, sin deadlock.
+static SERVE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Simula el 1er pulso de Ctrl+C/SIGTERM para tests: misma semántica que el
+/// handler de señal (store `Release` sobre `SERVE_SHUTDOWN`).
+#[cfg(test)]
+pub(crate) fn mark_serve_shutdown_request() {
+    SERVE_SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// Solo para tests: restablece la bandera tras una prueba.
+#[cfg(test)]
+pub(crate) fn reset_serve_shutdown_request() {
+    SERVE_SHUTDOWN.store(false, Ordering::Relaxed);
+}
+
+/// RAII: instala el handler de Ctrl+C/SIGTERM para `openonyx serve`.
+///
+/// - 1er pulso: levanta `SERVE_SHUTDOWN`; el proceso sigue vivo (apago limpio).
+/// - 2º pulso: comportamiento por defecto (el SO termina el proceso).
+/// - `Drop` restaura el handler previo; nunca hace `std::process::exit`.
+#[cfg(windows)]
+pub struct CtrlCGuard;
+
+#[cfg(unix)]
+pub struct CtrlCGuard {
+    prev_sigint: usize,
+    prev_sigterm: usize,
+}
+
+#[cfg(windows)]
+mod ctrl_c {
+    use std::sync::atomic::Ordering;
+
+    type CtrlHandler = unsafe extern "system" fn(u32) -> i32;
+
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<CtrlHandler>, add_handler: i32) -> i32;
+    }
+
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+
+    /// Solo `CTRL_C_EVENT`/`CTRL_BREAK_EVENT`/`CTRL_CLOSE_EVENT`: 1er pulso →
+    /// flag + `1` (manejado); 2º → `0` (default: terminar). Cualquier otro
+    /// evento (p. ej. `CTRL_LOGOFF_EVENT`) se delega al default (`0`).
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        if !matches!(
+            ctrl_type,
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT
+        ) {
+            return 0;
+        }
+        if super::SERVE_SHUTDOWN.swap(true, Ordering::AcqRel) {
+            0
+        } else {
+            1
+        }
+    }
+
+    pub(super) fn attach() {
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+
+    pub(super) fn detach() {
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 0);
+        }
+    }
+}
+
+#[cfg(unix)]
+mod ctrl_c {
+    use std::sync::atomic::Ordering;
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SIG_DFL: usize = 0;
+
+    /// FFI directo a libc (sin añadir la crate `libc`: el `Cargo.lock` es
+    /// invariante de SDD-04).
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+
+    /// Handler async-signal-safe: solo un store atómico (`Release`,
+    /// emparejado con los `Acquire` del watcher) + restaurar `SIG_DFL` para
+    /// que el 2º pulso termine el proceso por defecto.
+    extern "C" fn handler(sig: i32) {
+        super::SERVE_SHUTDOWN.store(true, Ordering::Release);
+        unsafe {
+            signal(sig, SIG_DFL);
+        }
+    }
+
+    pub(super) fn attach() -> (usize, usize) {
+        unsafe {
+            (
+                signal(SIGINT, handler as usize),
+                signal(SIGTERM, handler as usize),
+            )
+        }
+    }
+
+    pub(super) fn detach(prev_sigint: usize, prev_sigterm: usize) {
+        unsafe {
+            signal(SIGINT, prev_sigint);
+            signal(SIGTERM, prev_sigterm);
+        }
+    }
+}
+
+impl CtrlCGuard {
+    pub fn new() -> Self {
+        // `SDD-04` 4C-audit: parte de estado limpio por si una `serve` previa
+        // en el mismo proceso (p. ej. tests) dejó la bandera levantada.
+        SERVE_SHUTDOWN.store(false, Ordering::Release);
+        #[cfg(windows)]
+        {
+            ctrl_c::attach();
+            Self
+        }
+        #[cfg(unix)]
+        {
+            let (prev_sigint, prev_sigterm) = ctrl_c::attach();
+            Self {
+                prev_sigint,
+                prev_sigterm,
+            }
+        }
+    }
+}
+
+impl Drop for CtrlCGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        ctrl_c::detach();
+        #[cfg(unix)]
+        ctrl_c::detach(self.prev_sigint, self.prev_sigterm);
+    }
+}
+
 /// Configuración validada para arrancar `openonyx serve`.
 #[derive(Clone, Debug)]
 pub struct WebServerConfig {
@@ -595,7 +746,9 @@ impl UiIdlePump for WebHandle {
         // Espera breve sobre Condvar (35ms): despierta al instante si llega un comando web,
         // sin consumir CPU y sin avanzar `host.ticks()`.
         if let Ok(guard) = self.hub.state.lock() {
-            if guard.incoming_events.is_empty() && !self.hub.quit.load(Ordering::Relaxed) {
+            // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del
+            // watcher de apago (`spawn_shutdown_watcher`).
+            if guard.incoming_events.is_empty() && !self.hub.quit.load(Ordering::Acquire) {
                 let _ = self
                     .hub
                     .input_cv
@@ -794,6 +947,28 @@ impl WebDriver {
 
     pub fn quit_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.hub.quit)
+    }
+
+    /// Watcher ligero (polling 5 ms) que, al ver `SERVE_SHUTDOWN` (1er Ctrl+C),
+    /// propaga el apago a `WebHub::quit` y despierta los condvars para que
+    /// `pump_idle` y el bucle `StopPolicy::Quit` terminen sin deadlock.
+    /// También termina si `WebHub::quit` ya fue puesto (p. ej. `drop` del
+    /// `WebDriver`) sin que haya Ctrl+C: no queda un hilo colgado.
+    pub fn spawn_shutdown_watcher(&self) -> thread::JoinHandle<()> {
+        let hub = Arc::clone(&self.hub);
+        thread::Builder::new()
+            .name("onyx-serve-shutdown".into())
+            .spawn(move || {
+                while !SERVE_SHUTDOWN.load(Ordering::Acquire) && !hub.quit.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if SERVE_SHUTDOWN.load(Ordering::Acquire) {
+                    hub.quit.store(true, Ordering::Release);
+                    hub.state_cv.notify_all();
+                    hub.input_cv.notify_all();
+                }
+            })
+            .expect("failed to spawn serve shutdown watcher")
     }
 }
 
@@ -1336,7 +1511,9 @@ struct HttpRequest {
 }
 
 fn accept_loop(listener: TcpListener, hub: Arc<WebHub>) {
-    while !hub.quit.load(Ordering::Relaxed) {
+    // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del watcher
+    // de apago (`spawn_shutdown_watcher`).
+    while !hub.quit.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let conn_hub = Arc::clone(&hub);
@@ -1808,7 +1985,9 @@ fn handle_sse_stream(
     let mut last_stream_ver = 0u64;
     let mut last_ping = Instant::now();
 
-    while !hub.quit.load(Ordering::Relaxed) {
+    // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del watcher
+    // de apago (`spawn_shutdown_watcher`).
+    while !hub.quit.load(Ordering::Acquire) {
         let (state_payload, stream_payload) = {
             let Ok(mut guard) = hub.state.lock() else {
                 break;
@@ -2279,6 +2458,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2338,6 +2518,7 @@ mod tests {
             api_key: "startup-key-secret-do-not-leak".to_string(),
             model: "gemini-4-hydrogen".to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
         };
@@ -2598,5 +2779,56 @@ mod tests {
             "hello onyx web\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-04` 4C-audit: el 1er Ctrl+C (simulado con la misma llamada que
+    /// hace el handler de señal) propaga `SERVE_SHUTDOWN` → `WebHub::quit`
+    /// mediante el watcher, y `pump_idle` se sale sin el wait de 35 ms
+    /// (sin deadlock). El guard RAII restaura el handler previo al salir.
+    #[test]
+    fn serve_shutdown_request_propagates_to_quit_flag_and_wakes_idle_pump() {
+        reset_serve_shutdown_request();
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("test-api-key-1234567890".to_string()),
+            None,
+        )
+        .unwrap();
+        let host = AgentHost::builder(1).build().unwrap();
+        let driver = WebDriver::start(host.vocab(), &cfg, None, None).unwrap();
+        let handle = driver.handle();
+        let quit = driver.quit_flag();
+
+        let guard = CtrlCGuard::new();
+        let watcher = driver.spawn_shutdown_watcher();
+        assert!(!quit.load(Ordering::Acquire));
+
+        // Simula el 1er Ctrl+C: la misma llamada que ejecuta el handler.
+        mark_serve_shutdown_request();
+
+        // El watcher (polling 5 ms) propaga la bandera a `WebHub::quit`.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !quit.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "el watcher debe propagar SERVE_SHUTDOWN a quit"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Con `quit` activo, `pump_idle` no hace el wait de 35 ms.
+        let t0 = Instant::now();
+        handle.pump_idle(host.graph());
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(30),
+            "pump_idle debe salir sin el wait de 35 ms al apagar, tardó {elapsed:?}"
+        );
+
+        drop(guard);
+        watcher
+            .join()
+            .expect("el watcher termina tras propagar el apago");
+        reset_serve_shutdown_request();
     }
 }

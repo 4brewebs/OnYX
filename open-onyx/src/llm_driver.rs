@@ -21,6 +21,11 @@ use onyx_soul_agents::{
     EventBus, GraphView, PlatformDriver, Reply, SurfaceBinding, Vocab, pending_requests,
 };
 
+use crate::anthropic::{
+    AnthropicSharedState, AnthropicStreamTarget, DEFAULT_ANTHROPIC_API_BASE,
+    anthropic_messages_url, build_anthropic_request_body, effective_thinking_budget,
+    execute_anthropic_stream_http,
+};
 use crate::context::{SessionTelemetryHandle, TieredContextConfig};
 use crate::gemini::{
     DEFAULT_GEMINI_API_BASE, GeminiSharedState, GeminiStreamTarget, InFlightGuard,
@@ -41,6 +46,7 @@ pub struct DynamicLlmDriver {
     profile_handle: LlmProfileHandle,
     gemini_shared: GeminiSharedState,
     openai_shared: OpenAiSharedState,
+    anthropic_shared: AnthropicSharedState,
     dispatched: HashSet<(u64, u64)>,
     in_flight_count: Arc<AtomicUsize>,
     has_ready: Arc<AtomicBool>,
@@ -58,21 +64,26 @@ impl DynamicLlmDriver {
         has_ready: Arc<AtomicBool>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
-        // Cola de tool calls compartida entre los dos estados de provider.
+        // Cola de tool calls compartida entre los tres estados de provider.
         let pending_calls = PendingCallQueue::default();
         let gemini_shared = GeminiSharedState {
             pending_calls: Arc::clone(&pending_calls),
             ..GeminiSharedState::default()
         };
         let openai_shared = OpenAiSharedState {
-            pending_calls,
+            pending_calls: Arc::clone(&pending_calls),
             ..OpenAiSharedState::default()
+        };
+        let anthropic_shared = AnthropicSharedState {
+            pending_calls,
+            ..AnthropicSharedState::default()
         };
         Self {
             vocab,
             profile_handle,
             gemini_shared,
             openai_shared,
+            anthropic_shared,
             dispatched: HashSet::new(),
             in_flight_count,
             has_ready,
@@ -95,13 +106,24 @@ impl DynamicLlmDriver {
 
     pub fn with_telemetry(mut self, telemetry: SessionTelemetryHandle) -> Self {
         self.gemini_shared.telemetry = Some(telemetry.clone());
-        self.openai_shared.telemetry = Some(telemetry);
+        self.openai_shared.telemetry = Some(telemetry.clone());
+        self.anthropic_shared.telemetry = Some(telemetry);
         self
     }
 
     pub fn with_external_driver_ids(mut self, driver_ids: Vec<String>) -> Self {
         self.gemini_shared.driver_ids = driver_ids.clone();
-        self.openai_shared.driver_ids = driver_ids;
+        self.openai_shared.driver_ids = driver_ids.clone();
+        self.anthropic_shared.driver_ids = driver_ids;
+        self
+    }
+
+    /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el body de los tres providers.
+    pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<onyx_workspace::ToolSchema>>) -> Self {
+        self.gemini_shared.mcp_schemas = Arc::clone(&mcp_schemas);
+        self.openai_shared.mcp_schemas = Arc::clone(&mcp_schemas);
+        self.anthropic_shared.mcp_schemas = mcp_schemas;
         self
     }
 }
@@ -179,6 +201,7 @@ impl PlatformDriver for DynamicLlmDriver {
                             &shared.project_instructions,
                             shared.effort,
                             &shared.driver_ids,
+                            &shared.mcp_schemas,
                         )
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
@@ -222,6 +245,7 @@ impl PlatformDriver for DynamicLlmDriver {
                         shared.effort,
                         true,
                         &shared.driver_ids,
+                        &shared.mcp_schemas,
                     );
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
@@ -233,6 +257,59 @@ impl PlatformDriver for DynamicLlmDriver {
                                 api_key: &api_key,
                                 agent,
                                 request,
+                                shared: &shared,
+                                preview: thread_preview.as_ref(),
+                                model: &model,
+                                is_local_endpoint: is_local,
+                            },
+                            body,
+                        );
+                        if tx.send(reply).is_ok() {
+                            ready_flag.store(true, Ordering::Release);
+                        }
+                    });
+                }
+                LlmProvider::Anthropic => {
+                    let base = target
+                        .api_base
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_BASE.to_string());
+                    let url = anthropic_messages_url(&base);
+                    let mut shared = self.anthropic_shared.clone();
+                    shared.context_config = ctx_cfg;
+                    shared.project_instructions = project_instructions.clone();
+                    shared.thinking_budget = target.thinking_budget;
+                    let body = {
+                        let thinking_blocks = shared
+                            .thinking_blocks
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        let thinking_budget =
+                            effective_thinking_budget(shared.thinking_budget, effort);
+                        build_anthropic_request_body(
+                            &req,
+                            &model,
+                            ctx_cfg,
+                            &shared.project_instructions,
+                            true,
+                            &shared.driver_ids,
+                            &thinking_blocks,
+                            thinking_budget,
+                            &shared.mcp_schemas,
+                        )
+                    };
+                    let ready_flag = Arc::clone(&self.has_ready);
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let _guard = guard;
+                        let reply = execute_anthropic_stream_http(
+                            AnthropicStreamTarget {
+                                url: &url,
+                                api_key: &api_key,
+                                agent,
+                                request,
+                                call_index,
                                 shared: &shared,
                                 preview: thread_preview.as_ref(),
                                 model: &model,

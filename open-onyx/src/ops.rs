@@ -11,12 +11,13 @@ use onyx_soul_agents::{
     AgentConfig, AgentGraph, Graph, GraphView, HeadlessDriver, Transcript, Value,
 };
 use onyx_workspace::{
-    ExternalDriverConfig, NetworkPolicy, ProcessJob, ProcessLimits, PromptTransport,
-    RecordedEffect, SandboxConfig, SandboxDriverKind, SandboxMode, SubagentNetworkPolicy,
-    WorkspacePolicy, WorktreeManager, all_recorded_effects, apply_sanitized_env,
-    audit_sprout_workspace, builtin_external_driver_presets, check_git_version, clean_process_path,
-    configure_process_isolation, detect_sandbox_capabilities, effects_after_tick,
-    graph_workspace_mode, graph_workspace_plan, is_effect_undone, resolve_process_binary,
+    ExternalDriverConfig, McpRegistry, McpServerStatus, NetworkPolicy, ProcessJob, ProcessLimits,
+    PromptTransport, RecordedEffect, SandboxConfig, SandboxDriverKind, SandboxMode,
+    SubagentNetworkPolicy, WorkspacePolicy, WorktreeManager, all_recorded_effects,
+    apply_sanitized_env, audit_sprout_workspace, builtin_external_driver_presets,
+    check_git_version, clean_process_path, configure_process_isolation,
+    detect_sandbox_capabilities, effects_after_tick, graph_workspace_mode, graph_workspace_plan,
+    is_effect_undone, load_mcp_config, resolve_process_binary,
     restore_git_tree_checkpoint_for_targets,
 };
 use serde::Serialize;
@@ -641,6 +642,21 @@ pub fn run_doctor(
             trust.status_label()
         ));
     }
+    // `SDD-04` TEST-04.4: auditoría de los servidores MCP declarados
+    // (`[mcp.servers.*]`) respetando Workspace Trust, con timeout acotado a 5 s.
+    let mcp_home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    audit_mcp_servers(
+        &mut report,
+        mcp_home.as_deref(),
+        workspace,
+        loaded_policy
+            .as_ref()
+            .is_some_and(|p| p.trust.config_trusted),
+        32 * 1024,
+    );
+
     if let Some(ref pol) = loaded_policy {
         for warn in &pol.trust_warnings {
             report.warnings.push(warn.clone());
@@ -978,6 +994,75 @@ fn probe_driver_version(path: &Path) -> DriverVersionProbe {
 /// `doctor` —; un **driver declarado** en `config.toml` cuyo bin falte da `[ERR]`
 /// accionable. La `ExternalHarnessAllowlist` solo es `[CHECK]` (enforzada) con el modo de
 /// sandbox activo `StrictContainer`; en el resto de modos es `[WARN]` advisory.
+/// `SDD-04` TEST-04.4: auditoría de los servidores MCP declarados
+/// (`[mcp.servers.*]`) respetando Workspace Trust.
+///
+/// El doctor hace un handshake **acotado a 5 s** por servidor (`min(cfg.timeout_secs, 5)`):
+/// un servidor caído no puede colgar `doctor`. Mapeo de severidad:
+/// - `Connected{n}` → `[CHECK]` informativo.
+/// - `Disabled` → `[CHECK]` informativo.
+/// - `Failed(msg)` → `[ERR]` accionable (el mensaje ya fue scrubbeado en
+///   `discover_from_config`).
+/// - workspace no confiado → las advertencias de `load_mcp_config` (que ya
+///   mencionan `openonyx trust`) → `[WARN]`, sin descubrimiento de workspace.
+fn audit_mcp_servers(
+    report: &mut DoctorReport,
+    global_root: Option<&Path>,
+    workspace: &Path,
+    config_trusted: bool,
+    max_output_bytes: usize,
+) {
+    let (configs, warnings) = match load_mcp_config(global_root, Some(workspace), config_trusted) {
+        Ok(v) => v,
+        Err(e) => {
+            report.errors.push(format!(
+                "mcp config: failed to parse/merge `[mcp.servers.*]`: {e}"
+            ));
+            return;
+        }
+    };
+    for w in warnings {
+        report.warnings.push(w);
+    }
+    if configs.is_empty() {
+        return;
+    }
+    // Timeout de doctor: nunca espera más de 5 s por servidor.
+    let audit_configs: BTreeMap<String, _> = configs
+        .into_iter()
+        .map(|(name, mut cfg)| {
+            cfg.timeout_secs = cfg.timeout_secs.min(5);
+            (name, cfg)
+        })
+        .collect();
+    let registry =
+        McpRegistry::discover_from_config(&audit_configs, max_output_bytes, Some(workspace));
+    for (name, status) in registry.server_statuses() {
+        match status {
+            McpServerStatus::Connected { tool_count } => {
+                report.checks.push(format!(
+                    "mcp server `{name}` connected ({tool_count} tool(s))"
+                ));
+            }
+            McpServerStatus::Disabled => {
+                report.checks.push(format!(
+                    "mcp server `{name}` disabled in config (not loaded)"
+                ));
+            }
+            McpServerStatus::Failed(msg) => {
+                report
+                    .errors
+                    .push(format!("mcp server `{name}` failed handshake: {msg}"));
+            }
+            McpServerStatus::HttpPending => {
+                report
+                    .warnings
+                    .push(format!("mcp server `{name}`: http transport pending"));
+            }
+        }
+    }
+}
+
 fn audit_external_driver(
     report: &mut DoctorReport,
     d: &ExternalDriverConfig,
@@ -1401,6 +1486,192 @@ mod tests {
             "enforced allowlist must not also be [WARN] advisory: {:?}",
             report.warnings
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Mock HTTP MCP mínimo (JSON directo) para el doctor: `initialize` (con
+    /// `Mcp-Session-Id`), `notifications/initialized` (202) y `tools/list`
+    /// (1 tool). Mismo patrón hermetic de `tests/mcp_http.rs`.
+    fn spawn_mcp_doctor_mock(listener: std::net::TcpListener) {
+        thread::spawn(move || {
+            for stream in listener.incoming().filter_map(Result::ok) {
+                let mut stream = stream;
+                let _ = doctor_mock_conn(&mut stream);
+            }
+        });
+    }
+
+    fn doctor_mock_conn(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut head = String::new();
+        let mut line = String::new();
+        while !head.contains("\r\n\r\n") {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(());
+            }
+            head.push_str(&line);
+        }
+        let content_length = head
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("Content-Length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let id = req.get("id").cloned();
+        let (status, payload, with_session) = match method {
+            "initialize" => (
+                200,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": { "name": "onyx-doctor-mock", "version": "0.1" }
+                    }
+                })
+                .to_string(),
+                true,
+            ),
+            "notifications/initialized" => (202, String::new(), false),
+            "tools/list" => (
+                200,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "tools": [
+                        { "name": "echo", "description": "echo de texto",
+                          "inputSchema": { "type": "object", "properties": {} } }
+                    ] }
+                })
+                .to_string(),
+                true,
+            ),
+            _ => (404, String::new(), true),
+        };
+        let reason = if status == 202 { "Accepted" } else { "OK" };
+        let mut out = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
+        if with_session {
+            out.push_str("Mcp-Session-Id: onyx-doctor-session\r\n");
+        }
+        out.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        ));
+        out.push_str(&payload);
+        stream.write_all(out.as_bytes())?;
+        stream.flush()
+    }
+
+    /// `SDD-04` TEST-04.4: `openonyx doctor` audita `[mcp.servers.*]` respetando
+    /// Workspace Trust y con timeout acotado a 5 s: HTTP loopback sano → `[CHECK]`
+    /// conectado; puerto muerto → `[ERR]` accionable; `enabled = false` → `[CHECK]`
+    /// deshabilitado; workspace no confiado → `[WARN]` con `openonyx trust` y sin
+    /// descubrimiento de servidores.
+    #[test]
+    fn doctor_audits_mcp_servers() {
+        let tmp = std::env::temp_dir().join(format!(
+            "openonyx_doctor_mcp_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let workspace = tmp.join("ws");
+        let global = tmp.join("global");
+        fs::create_dir_all(workspace.join(".onyx")).unwrap();
+        fs::create_dir_all(&global).unwrap();
+
+        // Mock HTTP MCP sano en loopback (1 tool).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let port = listener.local_addr().expect("local_addr").port();
+        spawn_mcp_doctor_mock(listener);
+
+        // Puerto loopback muerto (fallo rápido y hermetic).
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+            let p = l.local_addr().expect("local_addr").port();
+            drop(l);
+            p
+        };
+
+        fs::write(
+            workspace.join(".onyx").join("config.toml"),
+            format!(
+                r#"
+[mcp.servers.ok]
+transport = "http"
+url = "http://127.0.0.1:{port}/mcp"
+timeout_secs = 99
+
+[mcp.servers.dead]
+transport = "http"
+url = "http://127.0.0.1:{dead}/mcp"
+timeout_secs = 99
+
+[mcp.servers.off]
+transport = "http"
+url = "http://127.0.0.1:1/mcp"
+enabled = false
+"#
+            ),
+        )
+        .unwrap();
+
+        // 1) Confiable: los tres estados se reportan y el timeout 99 s se acota a 5 s
+        //    (el test no puede colgar por eso).
+        let mut report = DoctorReport::default();
+        audit_mcp_servers(&mut report, Some(&global), &workspace, true, 32 * 1024);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains("mcp server `ok`") && c.contains("connected (1 tool(s))")),
+            "ok server must be [CHECK] connected: {:?}",
+            report.checks
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.contains("mcp server `off`") && c.contains("disabled")),
+            "off server must be [CHECK] disabled: {:?}",
+            report.checks
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("mcp server `dead`") && e.contains("failed handshake")),
+            "dead server must be [ERR] accionable: {:?}",
+            report.errors
+        );
+        assert!(report.warnings.is_empty(), "{report:?}");
+
+        // 2) No confiado: la config de workspace se ignora con `[WARN]` accionable
+        //    (sin descubrimiento de servidores del workspace).
+        let mut report = DoctorReport::default();
+        audit_mcp_servers(&mut report, Some(&global), &workspace, false, 32 * 1024);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("not trusted") && w.contains("openonyx trust")),
+            "untrusted must warn with `openonyx trust`: {report:?}"
+        );
+        assert!(
+            report.checks.iter().all(|c| !c.contains("mcp server")),
+            "untrusted must not discover workspace servers: {report:?}"
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
 
         let _ = fs::remove_dir_all(&tmp);
     }

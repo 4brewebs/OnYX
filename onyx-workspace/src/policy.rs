@@ -215,7 +215,10 @@ impl PermissionRules {
             (Some(_), None) => PermissionDecision::Ask,
             (None, Some(_)) => PermissionDecision::Allow,
             (None, None) => {
-                if is_mutating_tool(tool) {
+                // `SDD-04 REQ-04.4`: toda herramienta `mcp__*` requiere aprobación por
+                // defecto (equivalente a mutante para el fallback, aunque no muten el
+                // workspace local).
+                if is_mutating_tool(tool) || tool.starts_with("mcp__") {
                     PermissionDecision::Ask
                 } else {
                     PermissionDecision::Allow
@@ -471,9 +474,27 @@ fn match_permission_rule(rule: &str, tool: &str, subject: &str) -> Option<usize>
         (trimmed, "*")
     };
 
-    if rule_tool != "*" && rule_tool != tool {
+    // Parte `tool`: exacta, comodín `*`, o glob (`*`/`?`) — p. ej. `deny = ["mcp__github__*"]`
+    // (`SDD-04 REQ-04.4`). Los globs de tool aportan su número de caracteres literales a la
+    // especificidad para que un patrón concreto (`mcp__github__*`) prevalezca sobre uno
+    // genérico (`mcp__*`) en la decisión `ask`/`allow`.
+    let tool_specificity = if rule_tool.contains('*') || rule_tool.contains('?') {
+        let tool_re = compile_glob_regex(rule_tool, true).ok()?;
+        if !tool_re.is_match(tool) {
+            return None;
+        }
+        rule_tool.chars().filter(|c| *c != '*' && *c != '?').count()
+    } else if rule_tool == "*" {
+        0
+    } else if rule_tool == tool {
+        // La coincidencia exacta es siempre más específica que cualquier glob que
+        // también coincida (p. ej. `allow = ["mcp__mock__echo"]` vence a
+        // `ask = ["mcp__mock__*"]`): `tool.len() + 1` está por encima del máximo
+        // posible de chars literales de un glob coincidente (≤ `tool.len()`).
+        tool.len() + 1
+    } else {
         return None;
-    }
+    };
 
     let match_slash_for_star = matches!(tool, "shell_exec" | "service_exec");
     let re = compile_glob_regex(subject_glob, match_slash_for_star).ok()?;
@@ -485,7 +506,7 @@ fn match_permission_rule(rule: &str, tool: &str, subject: &str) -> Option<usize>
         .chars()
         .filter(|c| *c != '*' && *c != '?')
         .count();
-    Some(specificity)
+    Some(tool_specificity + specificity)
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -1075,7 +1096,10 @@ impl WorkspacePolicy {
         tool: &str,
         args_json: &str,
     ) -> PermissionDecision {
-        if is_mutating_tool(tool) && !mode.allows_mutation() {
+        // `SDD-04 REQ-04.4`: en `Plan`/`Explore`, cualquier `mcp__*` queda `Deny` aunque
+        // no sea mutante local: un servidor MCP remoto ejecuta procesos/red fuera del
+        // control de `WorkspaceToolBridge`.
+        if (is_mutating_tool(tool) || tool.starts_with("mcp__")) && !mode.allows_mutation() {
             return PermissionDecision::Deny;
         }
         if matches!(tool, "fs_write" | "fs_edit") {
@@ -1270,6 +1294,59 @@ mod merge_delta_tests {
         assert_eq!(
             classify_merge_delta(&files(&[".onyx\\config.toml"])),
             MergeDeltaVerdict::Deny
+        );
+    }
+}
+
+#[cfg(test)]
+mod permission_rule_specificity_tests {
+    use super::*;
+
+    fn policy_with(deny: &[&str], ask: &[&str], allow: &[&str]) -> WorkspacePolicy {
+        WorkspacePolicy::new(std::env::temp_dir())
+            .expect("policy")
+            .with_permissions(PermissionRules {
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+                ask: ask.iter().map(|s| s.to_string()).collect(),
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+            })
+    }
+
+    #[test]
+    fn exact_allow_beats_generic_mcp_ask_glob() {
+        // Regresión `SDD-04` Fase 3B: la coincidencia exacta de `tool` tiene
+        // especificidad `tool.len() + 1`, por encima de cualquier glob coincidente.
+        let p = policy_with(&[], &["mcp__mock__*"], &["mcp__mock__echo"]);
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "mcp__mock__echo", "{}"),
+            PermissionDecision::Allow
+        );
+        // Un glob intermedio sigue pidiendo aprobación para el resto del servidor.
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "mcp__mock__big", "{}"),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn generic_ask_beats_generic_allow() {
+        let p = policy_with(&[], &["*"], &["*"]);
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "fs_read", "{}"),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn exact_deny_beats_exact_allow_on_mcp_tool() {
+        let p = policy_with(
+            &["mcp__mock__echo"],
+            &[],
+            &["mcp__mock__echo", "mcp__mock__*"],
+        );
+        assert_eq!(
+            p.evaluate_permission_in_mode(WorkspaceMode::Build, "mcp__mock__echo", "{}"),
+            PermissionDecision::Deny
         );
     }
 }

@@ -89,7 +89,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/provider",
         insert: "/provider ",
-        description: "Hot-swap LLM provider (`gemini|openai`)",
+        description: "Hot-swap LLM provider (`gemini|openai|anthropic`)",
     },
     SlashCommandHint {
         command: "/rewind",

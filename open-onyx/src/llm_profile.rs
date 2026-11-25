@@ -19,6 +19,7 @@ use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::anthropic::DEFAULT_ANTHROPIC_MODEL;
 use crate::context::ReasoningEffort;
 use crate::gemini::DEFAULT_GEMINI_MODEL;
 use crate::openai::DEFAULT_OPENAI_MODEL;
@@ -29,18 +30,20 @@ use onyx_workspace::{LlmProfileConfig, RecordedLlmProfile};
 pub(crate) enum LlmProvider {
     Gemini,
     OpenAi,
+    Anthropic,
 }
 
 impl LlmProvider {
     /// Todos los proveedores, en orden estable (para snapshots deterministas).
-    pub(crate) const ALL: [LlmProvider; 2] = [Self::Gemini, Self::OpenAi];
+    pub(crate) const ALL: [LlmProvider; 3] = [Self::Gemini, Self::OpenAi, Self::Anthropic];
 
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "gemini" => Ok(Self::Gemini),
             "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
             other => Err(format!(
-                "unsupported provider `{other}` (expected `gemini` or `openai`)"
+                "unsupported provider `{other}` (expected `gemini`, `openai` or `anthropic`)"
             )),
         }
     }
@@ -49,6 +52,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => "gemini",
             Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
         }
     }
 
@@ -57,6 +61,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => DEFAULT_GEMINI_MODEL,
             Self::OpenAi => DEFAULT_OPENAI_MODEL,
+            Self::Anthropic => DEFAULT_ANTHROPIC_MODEL,
         }
     }
 
@@ -65,6 +70,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => "GEMINI_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
+            Self::Anthropic => "ANTHROPIC_API_KEY",
         }
     }
 
@@ -74,6 +80,7 @@ impl LlmProvider {
         match self {
             Self::Gemini => &["GEMINI_API_BASE"],
             Self::OpenAi => &["OPENAI_API_BASE", "OPENAI_BASE_URL"],
+            Self::Anthropic => &["ANTHROPIC_API_BASE"],
         }
     }
 }
@@ -85,6 +92,10 @@ pub(crate) struct LlmConfig {
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
+    /// Presupuesto explícito de extended thinking Anthropic (`REQ-04.2`):
+    /// `--thinking-budget` / `ANTHROPIC_THINKING_BUDGET` (`Some(0)` = off
+    /// explícito; `None` = se deriva de `--effort`). Solo aplica a Anthropic.
+    pub(crate) thinking_budget: Option<u64>,
     pub(crate) api_base: Option<String>,
     pub(crate) project_instructions: String,
 }
@@ -101,6 +112,7 @@ fn is_official_provider_host(provider: LlmProvider, host: &str) -> bool {
     match provider {
         LlmProvider::Gemini => lower == "generativelanguage.googleapis.com",
         LlmProvider::OpenAi => lower == "api.openai.com",
+        LlmProvider::Anthropic => lower == "api.anthropic.com",
     }
 }
 
@@ -196,6 +208,9 @@ pub(crate) struct ResolvedLlmTarget {
     pub(crate) provider: LlmProvider,
     pub(crate) model: String,
     pub(crate) effort: Option<ReasoningEffort>,
+    /// Presupuesto explícito de extended thinking Anthropic (`REQ-04.2`),
+    /// conservado en caliente al cambiar provider/modelo/esfuerzo.
+    pub(crate) thinking_budget: Option<u64>,
     pub(crate) api_key: String,
     pub(crate) api_base: Option<String>,
     pub(crate) is_local_endpoint: bool,
@@ -266,6 +281,7 @@ struct LlmActiveState {
     provider: LlmProvider,
     model: String,
     effort: Option<ReasoningEffort>,
+    thinking_budget: Option<u64>,
     api_key: String,
     api_base: Option<String>,
 }
@@ -452,6 +468,7 @@ impl LlmProfileHandle {
                 provider: cfg.provider,
                 model: cfg.model.clone(),
                 effort: cfg.effort,
+                thinking_budget: cfg.thinking_budget,
                 api_key: cfg.api_key.clone(),
                 api_base: cfg.api_base.clone(),
             },
@@ -529,6 +546,7 @@ impl LlmProfileHandle {
                 (None, Some(b)) => Some((String::new(), Some(b))),
                 (None, None) => None,
             },
+            LlmProvider::Anthropic => key.map(|k| (k, base)),
         }
     }
 
@@ -550,6 +568,7 @@ impl LlmProfileHandle {
             provider: st.active.provider,
             model: st.active.model.clone(),
             effort: st.active.effort,
+            thinking_budget: st.active.thinking_budget,
             api_key: st.active.api_key.clone(),
             api_base: st.active.api_base.clone(),
             is_local_endpoint,
@@ -602,6 +621,7 @@ impl LlmProfileHandle {
             provider: entry.provider,
             model: entry.model.clone(),
             effort: entry.effort,
+            thinking_budget: st.active.thinking_budget,
             api_key,
             api_base: entry.api_base.clone(),
         };
@@ -642,6 +662,7 @@ impl LlmProfileHandle {
                 provider,
                 model: entry.model.clone(),
                 effort: st.active.effort,
+                thinking_budget: st.active.thinking_budget,
                 api_key,
                 api_base: entry.api_base.clone(),
             };
@@ -678,6 +699,7 @@ impl LlmProfileHandle {
                 provider,
                 model: provider.default_model().to_string(),
                 effort: st.active.effort,
+                thinking_budget: st.active.thinking_budget,
                 api_key,
                 api_base,
             };
@@ -807,6 +829,7 @@ mod tests {
             api_key: "startup-key".to_string(),
             model: model.to_string(),
             effort: None,
+            thinking_budget: None,
             api_base: api_base.map(|s| s.to_string()),
             project_instructions: String::new(),
         }

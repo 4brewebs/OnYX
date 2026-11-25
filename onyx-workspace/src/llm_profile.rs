@@ -71,9 +71,9 @@ impl PartialProfile {
         let provider = self.provider.ok_or_else(|| {
             format!("config.toml line {line_no}: profile `{id}` missing required `provider`")
         })?;
-        if provider != "gemini" && provider != "openai" {
+        if provider != "gemini" && provider != "openai" && provider != "anthropic" {
             return Err(format!(
-                "config.toml line {line_no}: profile `{id}` `provider` must be `\"gemini\"` or `\"openai\"`, got `{provider}`"
+                "config.toml line {line_no}: profile `{id}` `provider` must be `\"gemini\"`, `\"openai\"` or `\"anthropic\"`, got `{provider}`"
             ));
         }
         let model = self.model.ok_or_else(|| {
@@ -410,7 +410,7 @@ enabled = true
         assert!(reserved_custom.contains("reserved"), "{reserved_custom}");
 
         let bad_provider = parse_llm_profiles_toml(
-            "[[llm_profiles]]\nid = \"ok\"\nprovider = \"anthropic\"\nmodel = \"m\"\n",
+            "[[llm_profiles]]\nid = \"ok\"\nprovider = \"mistral\"\nmodel = \"m\"\n",
         )
         .unwrap_err();
         assert!(bad_provider.contains("provider"), "{bad_provider}");
@@ -451,6 +451,21 @@ enabled = true
         )
         .unwrap_err();
         assert!(dup_key.contains("duplicate key"), "{dup_key}");
+    }
+
+    #[test]
+    fn parser_accepts_anthropic_provider() {
+        let profiles = parse_llm_profiles_toml(
+            "[[llm_profiles]]\nid = \"claude-prod\"\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-4-5\"\neffort = \"medium\"\napi_key_env = \"ANTHROPIC_API_KEY\"\n",
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 1);
+        let p = &profiles[0];
+        assert_eq!(p.id, "claude-prod");
+        assert_eq!(p.provider, "anthropic");
+        assert_eq!(p.model, "claude-sonnet-4-5");
+        assert_eq!(p.effort.as_deref(), Some("medium"));
+        assert_eq!(p.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
     }
 
     fn profile(id: &str, provider: &str, model: &str) -> LlmProfileConfig {

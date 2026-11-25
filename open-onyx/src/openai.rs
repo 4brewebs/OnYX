@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use onyx_soul_agents::{AgentView, ConceptId, Reply, Responder};
-use onyx_workspace::WorkspaceTools;
+use onyx_workspace::{ToolSchema, WorkspaceTools};
 use serde_json::{Value as JsonValue, json};
 
 use crate::context::{
@@ -41,6 +41,9 @@ pub(crate) struct OpenAiSharedState {
     /// ids de drivers de harness CLI externos habilitados (`SDD-10` Fase 1): enriquecen el
     /// esquema dinámico de `spawn_subagent` (`driver` opcional).
     pub(crate) driver_ids: Vec<String>,
+    /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
+    /// declaran en el body filtradas por los tools del spec del agente.
+    pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
 }
 
 fn tool_call_args_as_string(raw: &JsonValue) -> String {
@@ -57,6 +60,7 @@ fn tool_call_args_as_string(raw: &JsonValue) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_openai_request_body(
     req: &AgentView,
     model: &str,
@@ -65,6 +69,7 @@ pub(crate) fn build_openai_request_body(
     effort: Option<ReasoningEffort>,
     stream: bool,
     driver_ids: &[String],
+    mcp_schemas: &[ToolSchema],
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut messages = Vec::with_capacity(projected.turns.len() + 1);
@@ -163,10 +168,10 @@ pub(crate) fn build_openai_request_body(
         }
     }
 
-    let tools: Vec<JsonValue> =
+    let mut tools: Vec<JsonValue> =
         WorkspaceTools::schemas_with_subagents_and_drivers(true, driver_ids)
             .into_iter()
-            .filter(|s| req.tools.iter().any(|t| t == s.name))
+            .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
             .map(|s| {
                 let mut params = s.parameters;
                 lowercase_json_schema_types(&mut params);
@@ -180,6 +185,23 @@ pub(crate) fn build_openai_request_body(
                 })
             })
             .collect();
+    // `SDD-04 REQ-04.3`: tools MCP `mcp__*` (schemas del registro, filtradas por
+    // los tools del spec; `type` normalizadas a minúsculas, que exige la API).
+    for s in mcp_schemas
+        .iter()
+        .filter(|s| req.tools.iter().any(|t| t.as_str() == s.name.as_ref()))
+    {
+        let mut params = s.parameters.clone();
+        lowercase_json_schema_types(&mut params);
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": s.name,
+                "description": s.description,
+                "parameters": params
+            }
+        }));
+    }
 
     let mut body = json!({
         "model": model,
@@ -198,7 +220,9 @@ pub(crate) fn build_openai_request_body(
     body
 }
 
-fn lowercase_json_schema_types(val: &mut JsonValue) {
+/// Normaliza los `type` de un JSON Schema a minúsculas (la API OpenAI los exige
+/// así y Anthropic también). `pub(crate)` para reutilizarla en `anthropic.rs`.
+pub(crate) fn lowercase_json_schema_types(val: &mut JsonValue) {
     match val {
         JsonValue::Object(map) => {
             if let Some(JsonValue::String(ty)) = map.get_mut("type") {
@@ -273,10 +297,10 @@ pub(crate) fn parse_openai_response(
     }
 }
 
-const MAX_TRANSIENT_RETRIES: usize = 2;
-const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
+pub(crate) const MAX_TRANSIENT_RETRIES: usize = 2;
+pub(crate) const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
 
-fn is_retryable_stream_error(err: &str) -> bool {
+pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("decoding chunks")
         || lower.contains("unexpected eof")
@@ -285,6 +309,9 @@ fn is_retryable_stream_error(err: &str) -> bool {
         || lower.contains("connection aborted")
         || lower.contains("broken pipe")
         || lower.contains("timed out")
+        // `REQ-04.1`: `error` event in-stream de Anthropic con
+        // `error.type == "overloaded_error"` (p. ej. 529) es reintenable.
+        || lower.contains("overloaded_error")
 }
 
 fn can_accept_partial_sse_eof(
@@ -676,6 +703,12 @@ impl OpenAiResponder {
         self.shared.driver_ids = driver_ids;
         self
     }
+
+    /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
+    pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
+        self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
 }
 
 impl Responder for OpenAiResponder {
@@ -693,6 +726,7 @@ impl Responder for OpenAiResponder {
             self.shared.effort,
             false,
             &self.shared.driver_ids,
+            &self.shared.mcp_schemas,
         );
         Some(execute_openai_http(
             &url,
@@ -749,6 +783,7 @@ mod tests {
             Some(ReasoningEffort::Medium),
             true,
             &[],
+            &[],
         );
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["stream"], true);
@@ -767,6 +802,51 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn openai_request_body_declares_mcp_tools_filtered_by_spec_with_lowercase_types() {
+        use std::borrow::Cow;
+        let mut req = dummy_agent_view(1, 3);
+        req.tools = vec![
+            "fs_read".to_string(),
+            "mcp__mock__echo".to_string(),
+            // En el spec pero ausente del registro: no debe declararse.
+            "mcp__mock__ghost".to_string(),
+        ];
+        let mcp = vec![ToolSchema {
+            name: Cow::Owned("mcp__mock__echo".to_string()),
+            description: Cow::Owned("echo de texto".to_string()),
+            // Tipos en mayúsculas: la normalización debe dejarlos en minúsculas.
+            parameters: json!({"type": "OBJECT", "properties": {"text": {"type": "String"}}}),
+            requires_approval: true,
+        }];
+        let body = build_openai_request_body(
+            &req,
+            "gpt-4o",
+            TieredContextConfig::default(),
+            "",
+            None,
+            true,
+            &[],
+            &mcp,
+        );
+        let tools = body["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"mcp__mock__echo"), "{names:?}");
+        assert!(!names.contains(&"mcp__mock__ghost"), "{names:?}");
+        let mcp_tool = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "mcp__mock__echo")
+            .unwrap();
+        assert_eq!(mcp_tool["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            mcp_tool["function"]["parameters"]["properties"]["text"]["type"],
+            "string"
+        );
     }
 
     #[test]
