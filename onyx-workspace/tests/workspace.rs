@@ -3429,6 +3429,156 @@ fn isolated_spawn_agent_children_merge_cleanly_without_moving_head() {
     );
 }
 
+/// TEST-05.5 (A3): dos padres independientes en el mismo `AgentHost` lanzan `worker-a`
+/// (`a.rs`) y `worker-b` (`b.rs`) **en paralelo, mismo tick**; los dos *worktrees*
+/// aislados coexisten en disco a la vez (`onyx_subagent_worktree_count == 2`) antes de
+/// finalizar, la raíz queda intacta en vuelo y ambos se aplican limpios vía 3-way.
+#[test]
+fn isolated_two_parents_parallel_children_have_two_live_worktrees() {
+    let dir = TempDir::new("iso-two-parents");
+    init_git_repo(&dir.0);
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+    fs::write(dir.0.join("b.rs"), "B1\n").unwrap();
+    git_commit_all(&dir.0, "initial");
+    let head_before = git_head_sha(&dir.0);
+
+    let wt_base = TempDir::new("iso-two-parents-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 48,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(11)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    // El hijo hereda las herramientas del padre: sin `fs_write` en el spec, las llamadas
+    // del hijo serían `denied` (igual que en TEST-05.4 (1)).
+    let spec_a = AgentSpec::new("parent-1", "delegate a.rs edit")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_read", "fs_write"])
+        .with_timeout_ticks(48);
+    let spec_b = AgentSpec::new("parent-2", "delegate b.rs edit")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_read", "fs_write"])
+        .with_timeout_ticks(48);
+    // Dos spawns en el mismo host antes del primer tick: los dos hijos nacen en paralelo.
+    host.spawn(&spec_a);
+    host.spawn(&spec_b);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| match req
+        .name
+        .as_str()
+    {
+        "worker-a" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"a.rs","content":"A2 isolated\n"}"#,
+            ))
+        }
+        "worker-b" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"b.rs","content":"B2 isolated\n"}"#,
+            ))
+        }
+        "worker-a" | "worker-b" => Some(Reply::done(req.agent, req.request, "done")),
+        "parent-1" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                SPAWN_AGENT_TOOL,
+                r#"{"name":"worker-a","goal":"edit a.rs","isolated":true}"#,
+            ))
+        }
+        "parent-2" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                SPAWN_AGENT_TOOL,
+                r#"{"name":"worker-b","goal":"edit b.rs","isolated":true}"#,
+            ))
+        }
+        _ => Some(Reply::done(req.agent, req.request, "delegated")),
+    });
+
+    // Tick a tick hasta que ambos *worktrees* coexisten en disco (los dos hijos corren en
+    // paralelo): en ese instante la raíz debe quedar intacta. (Los padres pueden terminar
+    // antes que sus hijos: la señal de paralelismo son los dos worktrees vivos.)
+    let mut in_flight = false;
+    for _ in 0..32 {
+        host.step(&mut driver);
+        if onyx_subagent_worktree_count(&dir.0) == 2 {
+            assert_eq!(
+                fs::read_to_string(dir.0.join("a.rs")).unwrap(),
+                "A1\n",
+                "la raíz debe quedar intacta mientras corren los hijos"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.0.join("b.rs")).unwrap(),
+                "B1\n",
+                "la raíz debe quedar intacta mientras corren los hijos"
+            );
+            in_flight = true;
+            break;
+        }
+    }
+    assert!(
+        in_flight,
+        "los dos worktrees aislados nunca coexistieron en disco"
+    );
+
+    assert!(host.run_until_settled(&mut driver, 64));
+    let agents = host.agents();
+    assert_eq!(agents.len(), 4, "2 padres + 2 hijos aislados");
+    assert!(
+        agents
+            .iter()
+            .all(|a| host.agent_state(*a) == Some(AgentState::Done)),
+        "todos los agentes deben terminar en Done"
+    );
+
+    // Dos resultados `Pending`; aplicar cada uno: 3-way limpio y secuencial.
+    let results = driver.results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    for r in &results {
+        assert_eq!(r.state, IsolatedWorktreeState::Pending);
+        assert!(!r.sub_commit.is_empty());
+        assert!(r.ok, "child must be Done");
+        assert_eq!(r.changed_files.len(), 1, "{r:?}");
+        assert_eq!(driver.apply(r.child_id).unwrap(), r.changed_files);
+    }
+    assert_eq!(
+        fs::read_to_string(dir.0.join("a.rs")).unwrap(),
+        "A2 isolated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.0.join("b.rs")).unwrap(),
+        "B2 isolated\n"
+    );
+
+    // `HEAD` no se ha movido; 0 *worktrees* y 0 ramas `onyx/sub/*` residuales.
+    assert_eq!(git_head_sha(&dir.0), head_before);
+    assert_eq!(onyx_subagent_worktree_count(&dir.0), 0);
+    for r in &results {
+        assert!(!git_branch_exists(&dir.0, &r.handle.branch_name));
+    }
+    assert!(
+        driver
+            .results()
+            .iter()
+            .all(|r| matches!(r.state, IsolatedWorktreeState::Applied))
+    );
+}
+
 /// TEST-05.4 (1b): `discard_isolated_worktree` elimina *worktree* + rama `onyx/sub/*`
 /// sin tocar `root` ni mover `HEAD`; el resultado queda `Discarded`.
 #[test]

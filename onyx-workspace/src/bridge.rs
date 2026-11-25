@@ -338,13 +338,39 @@ impl WorkspaceToolBridge {
     }
 
     /// Sincroniza subagentes aislados (`SDD-05` REQ-05.5) en cada `present`:
-    /// - Crea perezosamente el *worktree* de cada hijo recién nacido de un
+    /// - Finaliza de inmediato los slots existentes cuyo hijo es terminal (`Done`/`Failed`)
+    ///   o ya no existe en el grafo, **independientemente del estado actual del padre**
+    ///   (el padre puede haberse reanudado antes de este `present` y dejar
+    ///   `WaitingChildren`/`pending_tool == "spawn_agent"`): sin esto el 3-way se perdería
+    ///   y el *worktree* colgaría hasta el `Drop`.
+    /// - Después crea perezosamente el *worktree* de cada hijo recién nacido de un
     ///   `spawn_agent(isolated: true)` pendiente (error accionable pegajoso si no es
     ///   repo-Git / Git < 2.38 / fallo de creación, sin tocar `root`).
-    /// - Finaliza los hijos terminales (`Done`/`Failed`): captura el commit, evalúa el 3-way;
-    ///   `NoOp` → retira el *worktree* ya; `Clean`/`Conflict` → guarda un resultado `Pending`.
     fn sync_isolated_worktrees(&mut self, graph: &dyn GraphView) {
         let v = self.vocab;
+
+        // 1) Slots existentes: finalización incondicional si el hijo es terminal o
+        //    desapareció del grafo; si sigue activo, se conserva el slot.
+        let existing: Vec<(u64, IsolatedSlot)> = std::mem::take(&mut self.isolated_slots)
+            .into_iter()
+            .collect();
+        for (child_id, slot) in existing {
+            let child = ConceptId(child_id);
+            let raw_state = graph_text(graph, child, v.state);
+            let terminal = raw_state
+                .as_deref()
+                .and_then(AgentState::parse)
+                .is_some_and(AgentState::is_terminal);
+            if terminal || raw_state.is_none() {
+                self.finalize_isolated_child(graph, child, slot);
+            } else {
+                self.isolated_slots.insert(child_id, slot);
+            }
+        }
+
+        // 2) Hijos recién nacidos: solo padres `WaitingChildren` con `spawn_agent`
+        //    aislado pendiente; se crea slot si el hijo aún no lo tiene (ni resultado
+        //    ni error pegajoso).
         let mut parents: Vec<ConceptId> = Vec::new();
         for id in graph.query(&[v.state, v.pending_tool]) {
             let Some(state) = graph_text(graph, id, v.state).and_then(|s| AgentState::parse(&s))
@@ -373,23 +399,15 @@ impl WorkspaceToolBridge {
                     continue;
                 }
                 let child = *child;
-                let terminal = graph_text(graph, child, v.state)
-                    .and_then(|s| AgentState::parse(&s))
-                    .is_some_and(AgentState::is_terminal);
-
-                if let Some(slot) = self.isolated_slots.remove(&child.0) {
-                    if terminal {
-                        self.finalize_isolated_child(graph, child, slot);
-                    } else {
-                        self.isolated_slots.insert(child.0, slot);
-                    }
-                    continue;
-                }
-                if self.isolated_results.contains_key(&child.0)
+                if self.isolated_slots.contains_key(&child.0)
+                    || self.isolated_results.contains_key(&child.0)
                     || self.isolated_errors.contains_key(&child.0)
                 {
                     continue;
                 }
+                let terminal = graph_text(graph, child, v.state)
+                    .and_then(|s| AgentState::parse(&s))
+                    .is_some_and(AgentState::is_terminal);
                 if terminal {
                     // Primera observación ya terminal: no se creó *worktree*, no hay nada que hacer.
                     continue;

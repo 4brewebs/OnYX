@@ -1593,6 +1593,11 @@ pub struct SubagentManagerDriver {
     proactive_notifications: bool,
     current_poll: u64,
     last_completed_proposals: Vec<SubagentProposal>,
+    /// Propuestas de *worktrees* aislados drenadas en `present` y pendientes de notificar
+    /// en el próximo `poll` (`SDD-05` REQ-05.5 pulido A2): misma semántica que los jobs
+    /// `spawn_subagent` — entran en `last_completed_proposals` y, si `proactive_notifications`,
+    /// se emiten como `IngressEvent::Command(encode_proposal_command(..))`.
+    pending_isolated_proposals: Vec<SubagentProposal>,
 }
 
 impl SubagentManagerDriver {
@@ -1611,6 +1616,7 @@ impl SubagentManagerDriver {
             proactive_notifications: false,
             current_poll: 0,
             last_completed_proposals: Vec::new(),
+            pending_isolated_proposals: Vec::new(),
         }
     }
 
@@ -1785,7 +1791,15 @@ impl PlatformDriver for SubagentManagerDriver {
         if let Some(inner) = self.inner.as_mut() {
             inner.poll(bus);
         }
-        let completed = self.handle.poll_completions_with_flags();
+        let mut completed = self.handle.poll_completions_with_flags();
+        // *Worktrees* aislados drenados en `present` (`SDD-05` REQ-05.5): se notifican con
+        // la misma semántica que los jobs `spawn_subagent` (`cancelled` siempre `false`:
+        // la vía aislada no tiene cancelación, solo `ok`/`!ok`).
+        if !self.pending_isolated_proposals.is_empty() {
+            for proposal in std::mem::take(&mut self.pending_isolated_proposals) {
+                completed.push((proposal, false));
+            }
+        }
         if !completed.is_empty() {
             self.last_completed_proposals = completed.iter().map(|(p, _)| p.clone()).collect();
             if self.proactive_notifications {
@@ -1891,7 +1905,28 @@ impl PlatformDriver for SubagentManagerDriver {
             // Drenado (`SDD-05` REQ-05.5): *worktrees* aislados finalizados → jobs
             // `Done`/`Failed` del manager, visibles en `subagent_status`/`merge`/`discard`.
             for (wt_handle, proposal) in bridge.take_completed_isolated_worktrees() {
-                let _ = self.handle.register_completed_worktree(wt_handle, proposal);
+                match self
+                    .handle
+                    .register_completed_worktree(wt_handle.clone(), proposal.clone())
+                {
+                    // Registro correcto: la propuesta se notifica en el próximo `poll`
+                    // (pulido A2) con la semántica proactiva de `spawn_subagent`.
+                    Ok(()) => self.pending_isolated_proposals.push(proposal),
+                    // Registro fallido (job duplicado, lock envenenado…): el resultado ya
+                    // quedó `Transferred` en el puente; no dejar fugado el *worktree* —
+                    // limpieza best-effort sin abortar la sesión.
+                    Err(reason) => {
+                        eprintln!(
+                            "[subagent] failed to register isolated worktree `{}`: {reason}",
+                            proposal.job_id
+                        );
+                        if let Some(policy) = self.policy.as_ref() {
+                            if let Ok(mgr) = WorktreeManager::new(&policy.root) {
+                                let _ = mgr.remove_worktree(&wt_handle);
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(inner) = self.inner.as_mut() {
