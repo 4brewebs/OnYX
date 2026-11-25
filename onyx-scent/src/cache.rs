@@ -209,6 +209,11 @@ pub(crate) fn deserialize_cache(bytes: &[u8]) -> Result<BTreeMap<String, ParsedF
         );
     }
 
+    // Sin bytes sobrantes tras la última entrada (payload truncado de forma maliciosa o corrupto).
+    if cur.pos != cur.bytes.len() {
+        return Err(invalid(PATH, "trailing bytes after last entry"));
+    }
+
     Ok(entries)
 }
 

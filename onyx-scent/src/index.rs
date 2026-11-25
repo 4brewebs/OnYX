@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cache;
@@ -26,6 +27,9 @@ const MAX_MULTI_TARGET_MATCHES: usize = 6;
 /// recientes, incluso de igual tamaño, siempre verifican el hash).
 const STAT_ONLY_MIN_MTIME_AGE: Duration = Duration::from_secs(2);
 const CACHE_FALLBACK_NAME: &str = "scent.idx";
+/// Secuencia global de temp files de caché: sin colisiones si varios hilos del mismo
+/// proceso llaman a `save_cache` a la vez (tests en paralelo, subagentes).
+static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Summary metrics for an incremental workspace indexing pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -138,7 +142,9 @@ impl WorkspaceIndex {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| CACHE_FALLBACK_NAME.to_string());
-        let tmp = path.with_file_name(format!("{stem}.tmp.{}", std::process::id()));
+        let seq = CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp = path.with_file_name(format!("{stem}.tmp.{pid}.{seq}"));
         fs::write(&tmp, &payload).map_err(|e| ScentError::Io {
             path: tmp.display().to_string(),
             message: e.to_string(),
@@ -267,11 +273,18 @@ impl WorkspaceIndex {
 
             if cache_hit {
                 if let Some(cached) = self.cache.get_mut(rel_path) {
+                    let stat_changed = cached.file_len != file_len
+                        || cached.mtime_secs != mtime_secs
+                        || cached.mtime_nanos != mtime_nanos;
                     cached.file_len = file_len;
                     cached.mtime_secs = mtime_secs;
                     cached.mtime_nanos = mtime_nanos;
+                    // Reescritura solo si el stat validado cambió de verdad (evita
+                    // persistir `.onyx/scent.idx` en reloads íntegros de hash).
+                    if stat_changed {
+                        self.dirty = true;
+                    }
                 }
-                self.dirty = true;
                 stats.cache_hits += 1;
             } else {
                 let source = String::from_utf8(bytes).map_err(|e| ScentError::Parse {
@@ -700,6 +713,93 @@ impl WorkspaceIndex {
         }
 
         stale.into_iter().collect()
+    }
+
+    /// `SDD-05` REQ-05.4: `scope:test` entities reachable via reverse edges
+    /// (`CalledBy`, `UsedByType`, `Implements`) in up to `max_hops` hops from the entities
+    /// inside `rel_path`. When `line_ranges` (1-based inclusive) is provided and non-empty,
+    /// the seed narrows to the entities intersecting those ranges (otherwise every entity
+    /// of the file). Test epicenters themselves are included (editing inside a test file).
+    /// Returns sorted unique `qualified_name`s (`rel_path::Symbol`).
+    pub fn impacted_tests_for_path(
+        &self,
+        rel_path: &str,
+        line_ranges: Option<&[(usize, usize)]>,
+        max_hops: usize,
+    ) -> Vec<String> {
+        if self.arena.nodes.is_empty() {
+            return Vec::new();
+        }
+        let norm = rel_path
+            .trim()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+        if norm.is_empty() {
+            return Vec::new();
+        }
+        let ranges: Vec<(usize, usize)> = match line_ranges {
+            Some(ranges) => ranges.iter().map(|&(s, e)| (s.min(e), s.max(e))).collect(),
+            None => Vec::new(),
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for node in &self.arena.nodes {
+            if node.file != norm {
+                continue;
+            }
+            if !ranges.is_empty()
+                && !ranges
+                    .iter()
+                    .any(|(s, e)| node.start_line <= *e && node.end_line >= *s)
+            {
+                continue;
+            }
+            seeds.insert(node.id);
+        }
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+
+        let max_h = max_hops.clamp(1, 6);
+        let mut visited: BTreeSet<usize> = seeds.clone();
+        let mut queue: VecDeque<(usize, usize)> = seeds.iter().map(|&id| (id, 0)).collect();
+        let mut tests: BTreeSet<String> = BTreeSet::new();
+        for id in &seeds {
+            if let Some(node) = self.arena.nodes.get(*id) {
+                if node.is_test {
+                    tests.insert(node.qualified_name.clone());
+                }
+            }
+        }
+
+        while let Some((cur, depth)) = queue.pop_front() {
+            if depth >= max_h {
+                continue;
+            }
+            for edge in &self.arena.edges {
+                if edge.source_id != cur {
+                    continue;
+                }
+                if !matches!(
+                    edge.kind,
+                    RelationKind::CalledBy | RelationKind::UsedByType | RelationKind::Implements
+                ) {
+                    continue;
+                }
+                if visited.insert(edge.target_id) {
+                    if let Some(node) = self.arena.nodes.get(edge.target_id) {
+                        if node.is_test {
+                            tests.insert(node.qualified_name.clone());
+                        }
+                    }
+                    queue.push_back((edge.target_id, depth + 1));
+                }
+            }
+        }
+
+        tests.into_iter().collect()
     }
 }
 

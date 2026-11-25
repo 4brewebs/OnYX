@@ -12,6 +12,7 @@ use crate::llm_profile::{LlmProfileConfig, load_llm_profiles};
 use crate::sandbox::{SandboxConfig, SandboxMode};
 use crate::state::WorkspaceMode;
 use crate::trust::{WorkspaceTrustReport, evaluate_workspace_trust};
+use crate::verify::VerifyConfig;
 use crate::worktree::{ExternalDriverConfig, SubagentNetworkPolicy};
 
 /// Resultado de evaluar las reglas de permisos para una herramienta y sus argumentos.
@@ -761,6 +762,8 @@ pub struct WorkspacePolicy {
     pub ignore_deny: bool,
     pub sandbox: SandboxConfig,
     pub impact: ImpactConfig,
+    /// Verify-on-Edit guiado por impacto (`SDD-05` REQ-05.4): opt-in por configuración.
+    pub verify: VerifyConfig,
     pub trust: WorkspaceTrustReport,
     pub trust_warnings: Vec<String>,
     external_drivers: Vec<ExternalDriverConfig>,
@@ -785,6 +788,7 @@ impl WorkspacePolicy {
             ignore_deny: false,
             sandbox: SandboxConfig::default(),
             impact: ImpactConfig::default(),
+            verify: VerifyConfig::default(),
             trust: WorkspaceTrustReport::no_project_config(),
             trust_warnings: Vec::new(),
             external_drivers: builtin_external_driver_presets(),
@@ -926,6 +930,20 @@ impl WorkspacePolicy {
             Err(err) => warnings.push(format!("failed to parse `[impact]`: {err}")),
         }
 
+        // `[verify]` + `[[verify.rules]]` (`SDD-05` REQ-05.4): Workspace Trust Gate — un
+        // proyecto no confiado ignora su `[verify]` por completo (con aviso accionable).
+        match VerifyConfig::load_from_paths_with_trust(
+            global_path.as_deref(),
+            Some(project_path.as_path()),
+            trust_project,
+        ) {
+            Ok((ver, ver_warns)) => {
+                self.verify = ver;
+                warnings.extend(ver_warns);
+            }
+            Err(err) => warnings.push(format!("failed to parse `[verify]`: {err}")),
+        }
+
         // `[[external_drivers]]` (`SDD-10` Fase 1): parse error → warning + presets intactos.
         match load_external_drivers(
             global_path.as_deref(),
@@ -966,6 +984,12 @@ impl WorkspacePolicy {
     /// Establece la configuración `[impact]` explícita (*Scent-Heated Approval*).
     pub fn with_impact(mut self, impact: ImpactConfig) -> Self {
         self.impact = impact;
+        self
+    }
+
+    /// Establece la configuración `[verify]` explícita (Verify-on-Edit, `SDD-05` REQ-05.4; tests).
+    pub fn with_verify(mut self, verify: VerifyConfig) -> Self {
+        self.verify = verify;
         self
     }
 

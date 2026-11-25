@@ -1116,11 +1116,12 @@ impl WorkspaceTools {
         fs::write(&path, args.content.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
         self.invalidate_seen_file(&path);
-        Ok(format!(
-            "wrote {} bytes to {}",
-            args.content.len(),
-            args.path
-        ))
+        let mut obs = format!("wrote {} bytes to {}", args.content.len(), args.path);
+        // `SDD-05` REQ-05.4: solo tras escritura exitosa (nunca si falló arriba).
+        if let Some(block) = self.verify_after_edit(&path, None) {
+            obs.push_str(&block);
+        }
+        Ok(obs)
     }
 
     fn fs_edit(&self, args: FsEditArgs) -> Result<String, String> {
@@ -1129,6 +1130,13 @@ impl WorkspaceTools {
         let path = self.policy.resolve_existing(&args.path)?;
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+
+        // `SDD-05` REQ-05.4: rangos 1-based inclusivos de cada hunk sobre el contenido
+        // original (radio de impacto AST del Verify-on-Edit).
+        let edited_ranges: Vec<(usize, usize)> = hunks
+            .iter()
+            .filter_map(|h| snippet_line_range(&content, &h.old_text))
+            .collect();
 
         let mut working = content;
         let mut trimmed_count = 0usize;
@@ -1152,20 +1160,68 @@ impl WorkspaceTools {
         fs::write(&path, working.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
         self.invalidate_seen_file(&path);
-        if trimmed_count > 0 {
-            Ok(format!(
+        let mut obs = if trimmed_count > 0 {
+            format!(
                 "edited `{}` ({} replacement(s), {} line-trimmed)",
                 args.path,
                 hunks.len(),
                 trimmed_count
-            ))
+            )
         } else {
-            Ok(format!(
-                "edited `{}` ({} replacement(s))",
-                args.path,
-                hunks.len()
-            ))
+            format!("edited `{}` ({} replacement(s))", args.path, hunks.len())
+        };
+        // `SDD-05` REQ-05.4: solo tras edición exitosa (nunca si falló arriba).
+        if let Some(block) = self.verify_after_edit(&path, Some(&edited_ranges)) {
+            obs.push_str(&block);
         }
+        Ok(obs)
+    }
+
+    /// Bucle Verify-on-Edit tras una mutación exitosa (`SDD-05` REQ-05.4). Devuelve el
+    /// bloque `[verify: ...]` a adjuntar a la observación, o `None` si `[verify]` está
+    /// apagado, no hay reglas o ninguna empareja (la salida del tool queda intacta).
+    fn verify_after_edit(
+        &self,
+        abs_path: &std::path::Path,
+        #[cfg_attr(not(feature = "scent"), allow(unused_variables))] line_ranges: Option<
+            &[(usize, usize)],
+        >,
+    ) -> Option<String> {
+        if !self.policy.verify.on_edit || self.policy.verify.rules.is_empty() {
+            return None;
+        }
+        let rel_path = abs_path
+            .strip_prefix(&self.policy.root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if rel_path.is_empty() {
+            return None;
+        }
+
+        // Radio de impacto AST: símbolos `scope:test` alcanzables en ≤ 2 hops desde el
+        // archivo/líneas editados. Sin feature `scent` (o índice no disponible) se
+        // degrada limpiamente a matching solo por el rel_path editado.
+        let impacted_tests: Vec<String> = {
+            #[cfg(feature = "scent")]
+            {
+                let mut guard = self.scent_index.lock().ok()?;
+                let _ = guard.index_workspace_with_cache(&self.policy.root);
+                guard.impacted_tests_for_path(
+                    &rel_path,
+                    line_ranges,
+                    crate::verify::IMPACTED_TEST_MAX_HOPS,
+                )
+            }
+            #[cfg(not(feature = "scent"))]
+            {
+                Vec::new()
+            }
+        };
+
+        crate::verify::run_verify_on_edit(&self.policy, &rel_path, &impacted_tests, || {
+            self.is_cancelled()
+        })
     }
 
     fn load_skill(&self, args: LoadSkillArgs) -> Result<String, String> {
@@ -1725,7 +1781,7 @@ impl WorkspaceTools {
     }
 }
 
-fn read_pipe_capped<R: Read + Send + 'static>(
+pub(crate) fn read_pipe_capped<R: Read + Send + 'static>(
     pipe: Option<R>,
     cap: usize,
 ) -> thread::JoinHandle<String> {
@@ -1964,6 +2020,22 @@ fn extract_edit_hunks(args: &FsEditArgs) -> Result<Vec<FsEditHunk>, String> {
         );
     }
     Ok(hunks)
+}
+
+/// Rango de líneas 1-based inclusivo `(start_line, end_line)` del primer `needle` dentro de
+/// `content` (`None` si no aparece). `SDD-05` REQ-05.4: alimenta el radio de impacto AST
+/// del Verify-on-Edit con las líneas realmente tocadas por un hunk de `fs_edit`.
+fn snippet_line_range(content: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let byte_start = content.find(needle)?;
+    let start_line = content[..byte_start].matches('\n').count() + 1;
+    let end_line = start_line
+        + content[byte_start..byte_start + needle.len()]
+            .matches('\n')
+            .count();
+    Some((start_line, end_line))
 }
 
 fn apply_single_edit_in_memory(

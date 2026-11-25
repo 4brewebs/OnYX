@@ -7,11 +7,12 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     NetworkPolicy, PendingCheckpoints, PermissionDecision, PermissionRules, ProcessJob,
-    ProcessLimits, SandboxConfig, SandboxMode, ServiceKind, SproutConfig, WorkspaceLedgerSystem,
-    WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
-    WorkspaceVocab, capture_git_tree_checkpoint, detect_sandbox_capabilities,
-    discover_skills_summary, effects_after_tick, graph_workspace_plan, graph_workspace_services,
-    is_file_read, latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
+    ProcessLimits, SandboxConfig, SandboxMode, ServiceKind, SproutConfig, VerifyConfig, VerifyRule,
+    WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
+    WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, capture_git_tree_checkpoint,
+    detect_sandbox_capabilities, discover_skills_summary, effects_after_tick, graph_workspace_plan,
+    graph_workspace_services, is_file_read, latest_undoable_effect, preview_tool_diff,
+    restore_git_tree_checkpoint,
 };
 
 struct TempDir(PathBuf);
@@ -2949,4 +2950,190 @@ fn for_worktree_derives_non_offline_network_for_external_harness_allowlist() {
         )
         .unwrap();
     assert_eq!(derived.sandbox.network, NetworkPolicy::LocalhostOnly);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `SDD-05` REQ-05.4 / TEST-05.3 — Verify-on-Edit E2E (portable Windows + Linux).
+//
+// El sandbox se fija a `SandboxMode::Off` para que el comando de verificación use
+// `plain_shell_command` (shell nativo del SO: `pwsh`/`sh`) sin capas adicionales,
+// manteniendo la E2E determinista y portable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Policy con `[verify]` explícito y sandbox `Off` (comando de verificación vía shell nativo).
+fn verify_policy(dir: &std::path::Path, verify: VerifyConfig) -> WorkspacePolicy {
+    WorkspacePolicy::new(dir)
+        .unwrap()
+        .with_sandbox(SandboxConfig {
+            mode: SandboxMode::Off,
+            ..Default::default()
+        })
+        .with_verify(verify)
+}
+
+/// Comando de verificación portable que sale `0` si `src/lib.rs` contiene `MARKER_OK`,
+/// o emite `verify-fail: MARKER_OK missing` a stdout y sale `1` en caso contrario.
+fn verify_content_check_cmd() -> String {
+    if cfg!(windows) {
+        "if (Select-String -Path 'src/lib.rs' -Pattern 'MARKER_OK' -Quiet) { echo verify-ok } else { echo 'verify-fail: MARKER_OK missing'; exit 1 }"
+            .to_string()
+    } else {
+        "if grep -q MARKER_OK src/lib.rs; then echo verify-ok; else echo 'verify-fail: MARKER_OK missing'; exit 1; fi"
+            .to_string()
+    }
+}
+
+#[test]
+fn verify_on_edit_fails_on_introduced_break_then_passes_after_fix() {
+    let dir = TempDir::new("verify_failpass");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::write(
+        dir.0.join("src/lib.rs"),
+        "pub fn compute() -> i32 { MARKER_OK }\n",
+    )
+    .unwrap();
+
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: verify_content_check_cmd(),
+            max_secs: None,
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    // 1) Introducir un fallo: `MARKER_OK` -> `MARKER_BAD` → regla falla (exit 1).
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"MARKER_OK","new_text":"MARKER_BAD"}"#,
+        )
+        .unwrap();
+    assert!(obs.contains("[verify: FAIL]"), "{obs}");
+    assert!(obs.contains("(exit 1)"), "{obs}");
+    assert!(obs.contains("verify-fail: MARKER_OK missing"), "{obs}");
+    assert!(
+        obs.contains("(Fix the error before finishing the turn.)"),
+        "{obs}"
+    );
+
+    // 2) Corregir: `MARKER_BAD` -> `MARKER_OK` → regla pasa.
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"MARKER_BAD","new_text":"MARKER_OK"}"#,
+        )
+        .unwrap();
+    assert!(obs.contains("[verify: PASS]"), "{obs}");
+    assert!(obs.contains("rule(s) succeeded"), "{obs}");
+}
+
+#[test]
+fn verify_on_edit_emits_no_block_when_path_outside_glob() {
+    let dir = TempDir::new("verify_outside");
+    fs::write(dir.0.join("notes.txt"), "hello\n").unwrap();
+
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: "echo should-never-run".to_string(),
+            max_secs: None,
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    // Editar un `.txt` fuera de la glob `**/*.rs` → sin bloque `[verify: ...]`.
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"notes.txt","old_text":"hello","new_text":"bye"}"#,
+        )
+        .unwrap();
+    assert!(!obs.contains("[verify:"), "{obs}");
+    assert!(obs.starts_with("edited"), "{obs}");
+}
+
+#[test]
+fn verify_on_edit_slow_rule_is_killed_and_reports_timeout() {
+    let dir = TempDir::new("verify_timeout");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::write(dir.0.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+
+    let slow_cmd = if cfg!(windows) {
+        "Start-Sleep -Seconds 5"
+    } else {
+        "sleep 5"
+    };
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: slow_cmd.to_string(),
+            max_secs: Some(1),
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    let start = std::time::Instant::now();
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"{ 1 }","new_text":"{ 2 }"}"#,
+        )
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(obs.contains("[verify: FAIL]"), "{obs}");
+    assert!(obs.contains("timed out after 1s"), "{obs}");
+    // El `ProcessJob` mata el proceso a los ~1 s: mucho antes del sleep de 5 s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "took {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "scent")]
+#[test]
+fn verify_on_edit_reports_impacted_tests_in_pass_summary() {
+    let dir = TempDir::new("verify_impacted");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::create_dir_all(dir.0.join("tests")).unwrap();
+    fs::write(
+        dir.0.join("src/lib.rs"),
+        "pub fn target_fn() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("tests/target_test.rs"),
+        "#[test]\nfn test_target() {\n    let _ = target_fn();\n}\n",
+    )
+    .unwrap();
+
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: "echo verify-ok".to_string(),
+            max_secs: None,
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    // Editar `target_fn` (llamado por `test_target` a 1 hop) → resumen PASS con
+    // `impacted_tests` que incluye el test alcanzable.
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"{ 1 }","new_text":"{ 2 }"}"#,
+        )
+        .unwrap();
+    assert!(obs.contains("[verify: PASS]"), "{obs}");
+    assert!(obs.contains("impacted_tests:"), "{obs}");
+    assert!(obs.contains("test_target"), "{obs}");
 }

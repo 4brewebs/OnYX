@@ -12,6 +12,7 @@ pub mod sprout;
 pub mod state;
 pub mod tools;
 pub mod trust;
+pub mod verify;
 pub mod worktree;
 
 pub use bridge::WorkspaceToolBridge;
@@ -68,6 +69,10 @@ pub use trust::{
     ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,
     default_trust_store_path, evaluate_workspace_trust, hash_file_blake3, list_trusted_workspaces,
     normalize_workspace_key, revoke_workspace_trust, trust_workspace,
+};
+pub use verify::{
+    IMPACTED_TEST_MAX_HOPS, VERIFY_DIAGNOSTIC_CAP_BYTES, VERIFY_MAX_SECS_DEFAULT, VerifyConfig,
+    VerifyPatch, VerifyRule, run_verify_on_edit,
 };
 pub use worktree::{
     ExternalDriverConfig, GitVersion, MIN_GIT_VERSION, ONYX_WT_DIR_ENV, PromptTransport,
