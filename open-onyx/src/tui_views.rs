@@ -16,7 +16,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::pack::SnapshotMeta;
 use crate::subagent::SubagentJobSummary;
 use crate::tui::AgentRow;
 
@@ -670,29 +669,40 @@ pub fn render_plan_diff_view(
     f.render_widget(widget, chunks[1]);
 }
 
-/// Renderiza `F5 Timeline`: hitos de `SharedPackStore` (`/rewind` / `/fork`).
+/// Renderiza `F5 Timeline` (`SDD-07` Fase 3): los ticks scrubeables **reales**
+/// sobre `TimeDebugState::available_ticks()` — anillo RAM (`[ram]`), hitos en
+/// disco (`[pack:<tag>]`) y presente en vivo (`[present]`) — con `▶` en el
+/// cursor del depurador y `▸` en la selección de la vista.
 pub fn render_timeline_view(
     f: &mut Frame<'_>,
     area: Rect,
-    entries: &[SnapshotMeta],
+    rows: &[(u64, String)],
+    cursor: u64,
+    present: u64,
     selected: usize,
-    latest_tick: Option<u64>,
 ) {
     if area.width < 40 || area.height < 4 {
         return;
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if entries.is_empty() {
+    if rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no snapshots yet — ticks save as the session progresses)",
+            "  (no scrubeable ticks yet — ticks appear as the session progresses)",
             Style::default().fg(Color::DarkGray),
         )));
     }
-    for (idx, meta) in entries.iter().enumerate() {
+    for (idx, (tick, tag)) in rows.iter().enumerate() {
         let is_sel = idx == selected;
-        let is_latest = Some(meta.tick) == latest_tick;
+        let is_cursor = *tick == cursor;
+        let is_present = *tick == present;
         let marker = if is_sel { "▸" } else { " " };
-        let star = if is_latest { " * current" } else { "" };
+        let tag_color = if tag == "present" {
+            Color::Yellow
+        } else if tag.starts_with("pack:") {
+            Color::Cyan
+        } else {
+            Color::Green
+        };
         let base = if is_sel {
             Style::default()
                 .fg(Color::White)
@@ -701,29 +711,39 @@ pub fn render_timeline_view(
             Style::default().fg(Color::White)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {marker} "), base),
+            Span::styled(format!("{marker} "), base),
             Span::styled(
-                format!("#t{:<6} ", meta.tick),
+                format!("#t{tick:<6} "),
                 if is_sel {
                     base
                 } else {
                     Style::default().fg(Color::Cyan)
                 },
             ),
-            Span::styled(format!("{:<16} ", meta.tag), base),
+            Span::styled(format!("[{tag}]"), Style::default().fg(tag_color)),
             Span::styled(
-                format!("stored:{}B  ", meta.stored_len),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!("cksum:{:016x}{}", meta.checksum, star),
-                Style::default().fg(Color::DarkGray),
+                if is_cursor {
+                    " ▶ cursor".to_string()
+                } else if is_present {
+                    " (present)".to_string()
+                } else {
+                    String::new()
+                },
+                if is_cursor || is_present {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
             ),
         ]));
     }
     let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
-            .title(" Timeline (F5) — Up/Down select · Enter /rewind <tick> · f /fork · Esc back ")
+            .title(
+                " Timeline (F5) — Up/Down select · Enter scrub (frozen preview) · r /rewind <tick> (disk) · f /fork · Esc back ",
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );

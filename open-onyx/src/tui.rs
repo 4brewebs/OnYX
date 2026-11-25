@@ -4,15 +4,21 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::{PI, TAU};
-use std::io::{self, Stdout};
+use std::io;
+#[cfg(not(test))]
+use std::io::Stdout;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crossterm::event::{self, Event, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+// `SDD-07` Fase 3: en tests la TUI corre sobre `TestBackend` (0 raw mode,
+// 0 alternate screen) — estos imports solo existen en la build de
+// producción (CI `-D warnings` con `--all-targets` incluye el target test).
+#[cfg(not(test))]
 use crossterm::{
-    event::{self, Event, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -27,7 +33,6 @@ use onyx_workspace::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols::Marker,
@@ -49,6 +54,7 @@ use crate::subagent::{
     MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentJobSummary,
     effective_merge_decision,
 };
+use crate::time_debug::TimeDebugState;
 use crate::tui_input::{
     InputBuffer, InputHistory, PopupState, QueuedPrompts, WorkspaceFileIndex, render_input_popup,
 };
@@ -63,6 +69,13 @@ use crate::tui_views::{
 };
 use crate::vault::session_display_label;
 use onyx_workspace::{all_recorded_effects, is_effect_undone};
+
+/// `SDD-07` Fase 3: en tests la TUI corre sobre `ratatui::backend::TestBackend`
+/// (0 terminal real); en producción, `CrosstermBackend` sobre `stdout`.
+#[cfg(not(test))]
+type TuiTerminal = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
+#[cfg(test)]
+type TuiTerminal = Terminal<ratatui::backend::TestBackend>;
 
 const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(90);
 const SPINNER_STEP_RAD: f64 = 0.35;
@@ -84,7 +97,7 @@ pub(crate) struct AgentRow {
 }
 
 struct TuiInner {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: TuiTerminal,
     vocab: Vocab,
     ws_vocab: Option<WorkspaceVocab>,
     workspace_root: Option<PathBuf>,
@@ -100,6 +113,10 @@ struct TuiInner {
     reasoning_effort: Option<ReasoningEffort>,
     session_label: Option<String>,
     snapshot_store: Option<SharedPackStore>,
+    /// `SDD-07` Fase 3: motor del depurador temporal compartido por el bucle
+    /// de sesión (banner ámbar, teclas `Alt+←/→`, `Ctrl+T`, `Esc` seguro y
+    /// bloqueo de envío al LLM bajo `TimeFreeze`).
+    time_debug: Option<TimeDebugState>,
     seen_compact_count: usize,
     input: InputBuffer,
     history: InputHistory,
@@ -241,11 +258,21 @@ pub struct TuiDriver {
 
 impl TuiDriver {
     pub fn new(vocab: Vocab) -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        #[cfg(not(test))]
+        let terminal = {
+            enable_raw_mode()?;
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen)?;
+            let backend = ratatui::backend::CrosstermBackend::new(stdout);
+            Terminal::new(backend)?
+        };
+        #[cfg(test)]
+        let terminal = {
+            // 160x40: ancho suficiente para el banner ámbar completo de
+            // `SDD-07` (`⏸ TIME FROZEN … · revert on branch: N file(s)`).
+            let backend = ratatui::backend::TestBackend::new(160, 40);
+            Terminal::new(backend)?
+        };
         Ok(Self {
             inner: Rc::new(RefCell::new(TuiInner {
                 terminal,
@@ -264,6 +291,7 @@ impl TuiDriver {
                 reasoning_effort: None,
                 session_label: None,
                 snapshot_store: None,
+                time_debug: None,
                 seen_compact_count: 0,
                 input: InputBuffer::default(),
                 history: InputHistory::default(),
@@ -348,6 +376,18 @@ impl TuiDriver {
         {
             let mut inner = self.inner.borrow_mut();
             inner.ws_vocab = Some(ws_vocab);
+        }
+        self
+    }
+
+    /// `SDD-07` Fase 3: conecta el motor del depurador temporal al TUI
+    /// (banner ámbar, scrubbing `Alt+←/→`, `Ctrl+T`, `Esc` seguro y bloqueo
+    /// de envío al LLM bajo `TimeFreeze`). Sin este builder la TUI funciona
+    /// en modo vivo clásico (0 cambios).
+    pub fn with_time_debug(self, state: TimeDebugState) -> Self {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.time_debug = Some(state);
         }
         self
     }
@@ -440,8 +480,11 @@ impl TuiInner {
     }
 
     fn shutdown_inner(&mut self) -> io::Result<()> {
-        disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        #[cfg(not(test))]
+        {
+            disable_raw_mode()?;
+            execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        }
         self.terminal.show_cursor()?;
         Ok(())
     }
@@ -518,6 +561,70 @@ impl TuiInner {
         self.status_hint_at = Some(Instant::now());
     }
 
+    /// `SDD-07` Fase 3: ¿hay un estado "tiempo" no-presente que deba mostrarse
+    /// en el banner ámbar y proteger con `Esc` seguro? Congelado, o con el
+    /// cursor anclado en el pasado (mirando una rama histórica).
+    fn time_frozen_active(&self) -> bool {
+        self.time_debug
+            .as_ref()
+            .is_some_and(|td| td.is_frozen() || td.cursor() < td.present())
+    }
+
+    /// `SDD-07` Fase 3: teclas universales del depurador temporal —
+    /// `Alt+←`/`Alt+→` (scrub −1/+1 sobre `available_ticks()`, aviso breve en
+    /// `status_hint` si el extremo/error) y `Ctrl+T` (toggle efímero
+    /// freeze/return_to_present). **Nunca** tocan `InputBuffer`: sin colisión
+    /// con la escritura. Devuelve `true` solo si la tecla la consumió.
+    fn handle_time_debug_key(&mut self, code: CtKeyCode, modifiers: KeyModifiers) -> bool {
+        let alt_only =
+            modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL);
+        if alt_only {
+            // El borrow de `time_debug` se resuelve en el `and_then` antes de
+            // tocar `self` mutable (`set_status_hint`).
+            let err = match code {
+                CtKeyCode::Left => self
+                    .time_debug
+                    .as_ref()
+                    .and_then(|td| td.scrub_delta(-1).err()),
+                CtKeyCode::Right => self
+                    .time_debug
+                    .as_ref()
+                    .and_then(|td| td.scrub_delta(1).err()),
+                _ => return false,
+            };
+            if err.is_none() && self.time_debug.is_none() {
+                return false;
+            }
+            if let Some(e) = err {
+                self.set_status_hint(e.to_string());
+            }
+            return true;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL)
+            && !modifiers.contains(KeyModifiers::ALT)
+            && matches!(code, CtKeyCode::Char('t' | 'T'))
+        {
+            let frozen = self.time_debug.as_ref().is_some_and(|td| {
+                if td.is_frozen() {
+                    td.return_to_present();
+                } else {
+                    td.freeze();
+                }
+                td.is_frozen()
+            });
+            if self.time_debug.is_none() {
+                return false;
+            }
+            self.set_status_hint(if frozen {
+                "TIME FROZEN — Alt+←/→ scrub, /go resume, Esc present.".to_string()
+            } else {
+                "Back at present (live) — Esc again to quit.".to_string()
+            });
+            return true;
+        }
+        false
+    }
+
     /// `SDD-03` Fase 3: cambia la vista efímera (`F1..F5` / `/view` / paleta).
     /// 100 % efímera: no toca el grafo ni el bucle determinista.
     fn switch_view(&mut self, view: TuiView) {
@@ -534,7 +641,11 @@ impl TuiInner {
             .llm_profile
             .as_ref()
             .map(LlmProfileHandle::public_snapshot);
-        let items = build_palette_items(profiles.as_ref(), &self.last_agent_rows);
+        let items = build_palette_items(
+            profiles.as_ref(),
+            &self.last_agent_rows,
+            self.time_debug.as_ref(),
+        );
         self.palette.open_with(items);
     }
 
@@ -758,11 +869,48 @@ impl TuiInner {
 
     /// `F5 Timeline`: Up/Down selecciona hito; Enter encola `/rewind <tick>`;
     /// `f` encola `/fork` (todo por el bus determinista).
+    /// `SDD-07` Fase 3: filas de `F5 Timeline` sobre los ticks scrubeables
+    /// **reales** (`TimeDebugState::available_ticks()` = anillo RAM ∪ hitos
+    /// en disco ∪ presente), con su etiqueta: `[present]`, `[pack:<tag>]` o
+    /// `[ram]`. Sin depurador temporal, fallback a los hitos de disco
+    /// (comportamiento `SDD-03`).
+    fn timeline_rows(&self) -> Vec<(u64, String)> {
+        let Some(td) = self.time_debug.as_ref() else {
+            return self
+                .snapshot_store
+                .as_ref()
+                .map(|s| {
+                    s.entries()
+                        .iter()
+                        .map(|m| (m.tick, format!("pack:{}", m.tag)))
+                        .collect()
+                })
+                .unwrap_or_default();
+        };
+        let mut pack_tags = std::collections::BTreeMap::new();
+        if let Some(s) = &self.snapshot_store {
+            for m in s.entries() {
+                pack_tags.insert(m.tick, m.tag.clone());
+            }
+        }
+        let present = td.present();
+        td.available_ticks()
+            .into_iter()
+            .map(|t| {
+                let tag = if t == present {
+                    "present".to_string()
+                } else if let Some(tag) = pack_tags.remove(&t) {
+                    format!("pack:{tag}")
+                } else {
+                    "ram".to_string()
+                };
+                (t, tag)
+            })
+            .collect()
+    }
+
     fn handle_timeline_view_key(&mut self, code: CtKeyCode) -> bool {
-        let count = self
-            .snapshot_store
-            .as_ref()
-            .map_or(0, |s| s.entries().len());
+        let count = self.timeline_rows().len();
         match code {
             CtKeyCode::Up => {
                 if count > 0 {
@@ -781,19 +929,60 @@ impl TuiInner {
                 true
             }
             CtKeyCode::Enter => {
-                let entries = self
-                    .snapshot_store
-                    .as_ref()
-                    .map(SharedPackStore::entries)
-                    .unwrap_or_default();
-                if let Some(meta) = entries.get(self.timeline_selected) {
-                    self.queued
-                        .push(OnyxEvent::Ingress(IngressEvent::Command(format!(
-                            "/rewind {}",
-                            meta.tick
-                        ))));
+                // `SDD-07` Fase 3: Enter → `scrub_to` del depurador: a
+                // `< present` auto-congela y vuelve a `F1 Chat` con **preview
+                // congelado** (0 disco hasta que una acción mutante confirme
+                // la bifurcación). Sin depurador, fallback SDD-03: `/rewind`.
+                if let Some((tick, _)) = self.timeline_rows().get(self.timeline_selected) {
+                    // El borrow de `time_debug` muere al copiar `(cursor,
+                    // present)` antes de mutar `self` (switch_view/hint).
+                    let outcome: Option<Result<(u64, u64), String>> =
+                        self.time_debug.as_ref().map(|td| {
+                            td.scrub_to(*tick)
+                                .map(|()| (td.cursor(), td.present()))
+                                .map_err(|e| e.to_string())
+                        });
+                    if let Some(outcome) = outcome {
+                        match outcome {
+                            Ok((cursor, present)) => {
+                                self.switch_view(TuiView::Chat);
+                                if cursor < present {
+                                    self.set_status_hint(format!(
+                                        "Scrubbed to tick {tick} (frozen preview) — /go resume, Esc present, mutation branches here."
+                                    ));
+                                }
+                            }
+                            Err(msg) => self.set_status_hint(msg),
+                        }
+                    } else {
+                        self.queued
+                            .push(OnyxEvent::Ingress(IngressEvent::Command(format!(
+                                "/rewind {tick}"
+                            ))));
+                    }
                 } else {
-                    self.set_status_hint("F5 Timeline: no snapshot selected.".to_string());
+                    self.set_status_hint("F5 Timeline: no tick selected.".to_string());
+                }
+                true
+            }
+            CtKeyCode::Char('r' | 'R') => {
+                // `/rewind <tick>`: solo tiene sentido sobre hitos en disco
+                // (`[pack:<tag>]` / `[present]`); un tick `[ram]` no tiene
+                // snapshot para restaurar.
+                if let Some((tick, tag)) = self.timeline_rows().get(self.timeline_selected) {
+                    if tag.starts_with("pack:") || tag == "present" {
+                        self.queued
+                            .push(OnyxEvent::Ingress(IngressEvent::Command(format!(
+                                "/rewind {tick}"
+                            ))));
+                    } else {
+                        self.set_status_hint(
+                            "F5 Timeline: 'r' /rewind solo sobre hitos en disco ([pack:*])."
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    self.set_status_hint("F5 Timeline: no tick selected.".to_string());
                 }
                 true
             }
@@ -857,6 +1046,24 @@ impl TuiInner {
                 let cmd = self.input.as_str().trim().to_string();
                 self.input.clear();
                 self.popup.close();
+                // `SDD-07` Fase 3 (crítico UX): bajo TimeFreeze (o con el
+                // cursor anclado en el pasado) un prompt normal **no se
+                // envía** al LLM — un turno desordenado rompería la
+                // bit-a-bit del replay. `/…` y `!…` sí se encolan: son las
+                // vías de escape del depurador (`/go`, `/inject`, `/graph`).
+                if self.time_frozen_active()
+                    && !cmd.is_empty()
+                    && !cmd.starts_with('/')
+                    && !cmd.starts_with('!')
+                {
+                    self.input.set_text(cmd);
+                    self.sync_popup();
+                    self.set_status_hint(
+                        "Paused in TIME FROZEN: use /go to resume or /inject to stage memory (Esc to return to present)"
+                            .to_string(),
+                    );
+                    return;
+                }
                 // `SDD-03` Fase 3: `/view` es un comando de nivel TUI — cambia
                 // de vista sin tocar el bus ni la historia.
                 if let Some(outcome) = parse_view_command(&cmd) {
@@ -946,196 +1153,223 @@ impl TuiInner {
                 if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     return false;
                 }
-                let is_ctrl_c = modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
-                if is_ctrl_c {
-                    self.quit.store(true, Ordering::Relaxed);
-                    return true;
-                }
-                // `SDD-03` Fase 3: paleta `Ctrl+K` — prioridad máxima (salvo
-                // Ctrl+C) y traga todas las teclas mientras está abierta.
-                if self.palette.is_open() {
-                    self.handle_palette_key(code, modifiers);
-                    return true;
-                }
-                if modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(code, CtKeyCode::Char('k' | 'K'))
-                {
-                    self.open_palette();
-                    return true;
-                }
-                if self.agent_picker_open {
-                    match code {
-                        CtKeyCode::Esc | CtKeyCode::F(2) => {
-                            self.agent_picker_open = false;
-                        }
-                        CtKeyCode::Up | CtKeyCode::Char('k') => {
-                            let len = self.last_agent_ids.len();
-                            if len > 0 {
-                                self.agent_picker_idx = if self.agent_picker_idx == 0 {
-                                    len - 1
-                                } else {
-                                    self.agent_picker_idx - 1
-                                };
-                            }
-                        }
-                        CtKeyCode::Down | CtKeyCode::Char('j') => {
-                            let len = self.last_agent_ids.len();
-                            if len > 0 {
-                                self.agent_picker_idx = (self.agent_picker_idx + 1) % len;
-                            }
-                        }
-                        CtKeyCode::Enter => {
-                            if let Some(&chosen) = self.last_agent_ids.get(self.agent_picker_idx) {
-                                self.focused_agent = Some(chosen);
-                                self.scroll_from_bottom = 0;
-                            }
-                            self.agent_picker_open = false;
-                        }
-                        _ => {}
-                    }
-                    return true;
-                }
-                // `SDD-03` Fase 3: `F1..F5` — cambio de vista efímera
-                // (cierra popup y aviso; `F6+` cae al resto de la cadena).
-                if let CtKeyCode::F(n) = code {
-                    if let Some(view) = TuiView::from_key(n) {
-                        self.switch_view(view);
-                        return true;
-                    }
-                }
-                if self.popup.is_open() && self.active_approval.is_none() {
-                    match code {
-                        CtKeyCode::Esc => {
-                            self.popup.close();
-                            return true;
-                        }
-                        CtKeyCode::Up => {
-                            self.popup.move_up();
-                            return true;
-                        }
-                        CtKeyCode::Down => {
-                            self.popup.move_down();
-                            return true;
-                        }
-                        CtKeyCode::Tab | CtKeyCode::Enter => {
-                            if self.popup.accept_into(&mut self.input) {
-                                self.history.reset_navigation();
-                                self.sync_popup();
-                            }
-                            return true;
-                        }
-                        _ => {}
-                    }
-                }
-                if matches!(code, CtKeyCode::Esc) {
-                    // `SDD-03` Fase 3: Esc sale solo desde `F1 Chat`; en el
-                    // resto de vistas vuelve a `F1 Chat`.
-                    if self.view == TuiView::Chat {
-                        self.quit.store(true, Ordering::Relaxed);
-                    } else {
-                        self.switch_view(TuiView::Chat);
-                    }
-                } else if self.view == TuiView::Chat
-                    && self.active_approval.is_none()
-                    && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Up))
-                        || (modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(code, CtKeyCode::Char('p' | 'P'))))
-                {
-                    if let Some(prev) = self.history.prev(self.input.as_str()) {
-                        self.input.set_text(prev);
-                        self.popup.close();
-                    }
-                } else if self.view == TuiView::Chat
-                    && self.active_approval.is_none()
-                    && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Down))
-                        || (modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(code, CtKeyCode::Char('n' | 'N'))))
-                {
-                    if let Some(next) = self.history.next() {
-                        self.input.set_text(next);
-                        self.popup.close();
-                    }
-                } else if self.active_approval.is_none()
-                    && modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(code, CtKeyCode::Char('x' | 'X'))
-                {
-                    self.pending_prompts.clear();
-                } else if self.view == TuiView::Chat
-                    && self.active_approval.is_none()
-                    && !self.input.is_empty()
-                    && matches!(code, CtKeyCode::Home | CtKeyCode::End)
-                {
-                    if matches!(code, CtKeyCode::Home) {
-                        self.input.move_home();
-                    } else {
-                        self.input.move_end();
-                    }
-                    self.sync_popup();
-                } else if self.view == TuiView::Chat
-                    && apply_scroll_key(
-                        &mut self.scroll_from_bottom,
-                        self.last_viewport_height,
-                        code,
-                        modifiers,
-                    )
-                {
-                    return true;
-                } else if self.view == TuiView::Chat && self.active_approval.is_some() {
-                    // `REQ-03.6` (OBLIGATORIO): `y`/`n` solo en `F1 Chat` con
-                    // aprobación pendiente. En Chat cualquier otra tecla se
-                    // traga (arm de swallow).
-                    if let (Some(action), Some((agent, req, _, _))) = (
-                        approval_key_action(self.view, code),
-                        self.active_approval.clone(),
-                    ) {
-                        match action {
-                            ApprovalKeyAction::Approve => {
-                                self.queued.push(Reply::approve(agent, req).to_event());
-                            }
-                            ApprovalKeyAction::Deny => {
-                                self.queued.push(
-                                    Reply::deny(agent, req, "denied by user in TUI").to_event(),
-                                );
-                            }
-                        }
-                        self.active_approval = None;
-                        self.approval_diff = None;
-                        self.approval_impact = None;
-                    }
-                } else if self.active_approval.is_some()
-                    && matches!(code, CtKeyCode::Char('y' | 'Y' | 'n' | 'N'))
-                {
-                    // `SDD-03` Fase 4: fuera de Chat, `y`/`n` a ciegas **nunca**
-                    // emiten Reply — aviso accionable; el resto de teclas
-                    // (Up/Down/PgUp/PgDn/f) sigue navegando F2..F5 libremente.
-                    self.set_status_hint(
-                        "Approval pending — press F1 to review diff in Chat before deciding"
-                            .to_string(),
-                    );
-                } else {
-                    match self.view {
-                        TuiView::Chat => {
-                            self.handle_chat_view_key(code, modifiers);
-                        }
-                        TuiView::Agents => {
-                            self.handle_agents_view_key(code);
-                        }
-                        TuiView::Sprout => {
-                            self.handle_sprout_view_key(code);
-                        }
-                        TuiView::PlanDiff => {
-                            self.handle_plan_diff_key(code);
-                        }
-                        TuiView::Timeline => {
-                            self.handle_timeline_view_key(code);
-                        }
-                    }
-                }
-                true
+                self.dispatch_key(code, modifiers)
             }
             _ => false,
         }
+    }
+
+    /// `SDD-03` Fase 3 + `SDD-07` Fase 3: dispatch de teclado (extraído de
+    /// `poll_crossterm` para testearlo sin terminal real).
+    fn dispatch_key(&mut self, code: CtKeyCode, modifiers: KeyModifiers) -> bool {
+        let is_ctrl_c = modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(code, CtKeyCode::Char('c') | CtKeyCode::Char('C'));
+        if is_ctrl_c {
+            self.quit.store(true, Ordering::Relaxed);
+            return true;
+        }
+        // `SDD-03` Fase 3: paleta `Ctrl+K` — prioridad máxima (salvo
+        // Ctrl+C) y traga todas las teclas mientras está abierta.
+        if self.palette.is_open() {
+            self.handle_palette_key(code, modifiers);
+            return true;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, CtKeyCode::Char('k' | 'K')) {
+            self.open_palette();
+            return true;
+        }
+        if self.agent_picker_open {
+            match code {
+                CtKeyCode::Esc | CtKeyCode::F(2) => {
+                    self.agent_picker_open = false;
+                }
+                CtKeyCode::Up | CtKeyCode::Char('k') => {
+                    let len = self.last_agent_ids.len();
+                    if len > 0 {
+                        self.agent_picker_idx = if self.agent_picker_idx == 0 {
+                            len - 1
+                        } else {
+                            self.agent_picker_idx - 1
+                        };
+                    }
+                }
+                CtKeyCode::Down | CtKeyCode::Char('j') => {
+                    let len = self.last_agent_ids.len();
+                    if len > 0 {
+                        self.agent_picker_idx = (self.agent_picker_idx + 1) % len;
+                    }
+                }
+                CtKeyCode::Enter => {
+                    if let Some(&chosen) = self.last_agent_ids.get(self.agent_picker_idx) {
+                        self.focused_agent = Some(chosen);
+                        self.scroll_from_bottom = 0;
+                    }
+                    self.agent_picker_open = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
+        // `SDD-07` Fase 3: teclas del depurador temporal universales
+        // (`Alt+←/→`, `Ctrl+T`): funcionan en cualquier vista y **nunca**
+        // tocan `InputBuffer` (sin colisiones con la escritura).
+        if self.handle_time_debug_key(code, modifiers) {
+            return true;
+        }
+        // `SDD-03` Fase 3: `F1..F5` — cambio de vista efímera
+        // (cierra popup y aviso; `F6+` cae al resto de la cadena).
+        if let CtKeyCode::F(n) = code {
+            if let Some(view) = TuiView::from_key(n) {
+                self.switch_view(view);
+                return true;
+            }
+        }
+        if self.popup.is_open() && self.active_approval.is_none() {
+            match code {
+                CtKeyCode::Esc => {
+                    self.popup.close();
+                    return true;
+                }
+                CtKeyCode::Up => {
+                    self.popup.move_up();
+                    return true;
+                }
+                CtKeyCode::Down => {
+                    self.popup.move_down();
+                    return true;
+                }
+                CtKeyCode::Tab | CtKeyCode::Enter => {
+                    // `SDD-07` Fase 3: con `Enter` y el input ya igual al
+                    // completado (slash sin argumento: `/go`, `/time`,
+                    // `/cancel`…), la tecla es un **envío**, no un aceptado:
+                    // se cierra el popup y la tecla cae al brazo de envío de
+                    // `F1 Chat`. `Tab` sigue siendo aceptado puro.
+                    if code == CtKeyCode::Enter && self.popup.selected_matches_input(&self.input) {
+                        self.popup.close();
+                    } else {
+                        if self.popup.accept_into(&mut self.input) {
+                            self.history.reset_navigation();
+                            self.sync_popup();
+                        }
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if matches!(code, CtKeyCode::Esc) {
+            // `SDD-07` Fase 3 (seguridad UX crítica): con TimeFreeze activo,
+            // Esc **vuelve al presente** (no cierra la aplicación, 0
+            // mutación en disco); un segundo Esc ya en vivo sí cierra.
+            if self.view == TuiView::Chat && self.time_frozen_active() {
+                if let Some(td) = &self.time_debug {
+                    td.return_to_present();
+                }
+                self.set_status_hint("Back at present (live) — Esc again to quit.".to_string());
+                return true;
+            }
+            // `SDD-03` Fase 3: Esc sale solo desde `F1 Chat`; en el
+            // resto de vistas vuelve a `F1 Chat`.
+            if self.view == TuiView::Chat {
+                self.quit.store(true, Ordering::Relaxed);
+            } else {
+                self.switch_view(TuiView::Chat);
+            }
+        } else if self.view == TuiView::Chat
+            && self.active_approval.is_none()
+            && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Up))
+                || (modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, CtKeyCode::Char('p' | 'P'))))
+        {
+            if let Some(prev) = self.history.prev(self.input.as_str()) {
+                self.input.set_text(prev);
+                self.popup.close();
+            }
+        } else if self.view == TuiView::Chat
+            && self.active_approval.is_none()
+            && ((modifiers.contains(KeyModifiers::ALT) && matches!(code, CtKeyCode::Down))
+                || (modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, CtKeyCode::Char('n' | 'N'))))
+        {
+            if let Some(next) = self.history.next() {
+                self.input.set_text(next);
+                self.popup.close();
+            }
+        } else if self.active_approval.is_none()
+            && modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(code, CtKeyCode::Char('x' | 'X'))
+        {
+            self.pending_prompts.clear();
+        } else if self.view == TuiView::Chat
+            && self.active_approval.is_none()
+            && !self.input.is_empty()
+            && matches!(code, CtKeyCode::Home | CtKeyCode::End)
+        {
+            if matches!(code, CtKeyCode::Home) {
+                self.input.move_home();
+            } else {
+                self.input.move_end();
+            }
+            self.sync_popup();
+        } else if self.view == TuiView::Chat
+            && apply_scroll_key(
+                &mut self.scroll_from_bottom,
+                self.last_viewport_height,
+                code,
+                modifiers,
+            )
+        {
+            return true;
+        } else if self.view == TuiView::Chat && self.active_approval.is_some() {
+            // `REQ-03.6` (OBLIGATORIO): `y`/`n` solo en `F1 Chat` con
+            // aprobación pendiente. En Chat cualquier otra tecla se
+            // traga (arm de swallow).
+            if let (Some(action), Some((agent, req, _, _))) = (
+                approval_key_action(self.view, code),
+                self.active_approval.clone(),
+            ) {
+                match action {
+                    ApprovalKeyAction::Approve => {
+                        self.queued.push(Reply::approve(agent, req).to_event());
+                    }
+                    ApprovalKeyAction::Deny => {
+                        self.queued
+                            .push(Reply::deny(agent, req, "denied by user in TUI").to_event());
+                    }
+                }
+                self.active_approval = None;
+                self.approval_diff = None;
+                self.approval_impact = None;
+            }
+        } else if self.active_approval.is_some()
+            && matches!(code, CtKeyCode::Char('y' | 'Y' | 'n' | 'N'))
+        {
+            // `SDD-03` Fase 4: fuera de Chat, `y`/`n` a ciegas **nunca**
+            // emiten Reply — aviso accionable; el resto de teclas
+            // (Up/Down/PgUp/PgDn/f) sigue navegando F2..F5 libremente.
+            self.set_status_hint(
+                "Approval pending — press F1 to review diff in Chat before deciding".to_string(),
+            );
+        } else {
+            match self.view {
+                TuiView::Chat => {
+                    self.handle_chat_view_key(code, modifiers);
+                }
+                TuiView::Agents => {
+                    self.handle_agents_view_key(code);
+                }
+                TuiView::Sprout => {
+                    self.handle_sprout_view_key(code);
+                }
+                TuiView::PlanDiff => {
+                    self.handle_plan_diff_key(code);
+                }
+                TuiView::Timeline => {
+                    self.handle_timeline_view_key(code);
+                }
+            }
+        }
+        true
     }
 }
 
@@ -1698,20 +1932,46 @@ impl TuiInner {
             0
         };
         let timeline_view_data = (view == TuiView::Timeline).then(|| {
-            let entries = self
-                .snapshot_store
-                .as_ref()
-                .map(SharedPackStore::entries)
-                .unwrap_or_default();
-            if entries.is_empty() {
+            let rows = self.timeline_rows();
+            if rows.is_empty() {
                 self.timeline_selected = 0;
             } else {
-                self.timeline_selected = self.timeline_selected.min(entries.len() - 1);
+                self.timeline_selected = self.timeline_selected.min(rows.len() - 1);
             }
-            let latest_tick = entries.iter().map(|m| m.tick).max();
-            (entries, self.timeline_selected, latest_tick)
+            let (cursor, present) = self
+                .time_debug
+                .as_ref()
+                .map_or((0, 0), |td| (td.cursor(), td.present()));
+            (rows, cursor, present, self.timeline_selected)
         });
         let status_hint_snapshot = self.status_hint.clone();
+        // `SDD-07` Fase 3: snapshot del depurador temporal para el banner
+        // ámbar de `F1 Chat` (el closure `draw` no puede capturar `self`).
+        // Incluye `· revert on branch: N file(s)` cuando el cursor mira el
+        // pasado: **solo RAM** (`effects_after_tick`), 0 I/O.
+        let time_banner: Option<String> = self
+            .time_debug
+            .as_ref()
+            .filter(|_| view == TuiView::Chat)
+            .filter(|td| td.is_frozen() || td.cursor() < td.present())
+            .map(|td| {
+                let mut banner = format!(
+                    "⏸ TIME FROZEN · tick {} / present {} · Alt+←/→ scrub · \
+                     !cmd /graph /step /step-llm · /go resume · Esc present",
+                    td.cursor(),
+                    td.present()
+                );
+                if td.cursor() < td.present() {
+                    let files = self
+                        .ws_vocab
+                        .as_ref()
+                        .map(|wv| td.pending_revert_files(graph, wv).len())
+                        .unwrap_or(0);
+                    banner.push_str(&format!(" · revert on branch: {files} file(s)"));
+                }
+                banner
+            });
+        let time_frozen_render = time_banner.is_some();
         let palette_open = self.palette.is_open();
         let palette_visible: Vec<PaletteItem> = if palette_open {
             self.palette.visible_items().into_iter().cloned().collect()
@@ -1732,7 +1992,7 @@ impl TuiInner {
                     TuiView::Agents => " F2 Agents — Up/Down select · Enter focus → F1 Chat · Esc back ",
                     TuiView::Sprout => " F3 Sprout — Up/Down · s start · x stop · r restart · a all · f follow · Esc back ",
                     TuiView::PlanDiff => " F4 Plan & Diff — Up/Down scroll · Esc back ",
-                    TuiView::Timeline => " F5 Timeline — Up/Down select · Enter /rewind · f /fork · Esc back ",
+                    TuiView::Timeline => " F5 Timeline — Up/Down select · Enter scrub (frozen preview) · r /rewind <tick> (disk) · f /fork · Esc back ",
                     TuiView::Chat => unreachable!(),
                 };
                 let mut lines = Vec::new();
@@ -1802,7 +2062,10 @@ impl TuiInner {
                             " [{mode_label}{queue_tag}] Goal / Command (/ cmds · @ files · Alt+↑/↓ history · Tab Plan/Build · F2 Agents) "
                         ),
                         lines,
-                        if queued_count > 0 {
+                        // `SDD-07` Fase 3: input caja en ámbar bajo TimeFreeze.
+                        if time_frozen_render {
+                            Color::Yellow
+                        } else if queued_count > 0 {
                             Color::Cyan
                         } else {
                             Color::White
@@ -1874,15 +2137,38 @@ impl TuiInner {
             f.render_widget(header_text, header_cols[2]);
 
             if view == TuiView::Chat {
+                // `SDD-07` Fase 3: banner ámbar negrita **arriba** de la traza
+                // (línea sola sin bloque: `Length(1)` no deja sitio para borde).
+                let (chat_area, banner_area) =
+                    if let Some(banner) = &time_banner {
+                        let vsplit = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Length(1), Constraint::Min(4)])
+                            .split(chunks[1]);
+                        (vsplit[1], Some((vsplit[0], banner.clone())))
+                    } else {
+                        (chunks[1], None)
+                    };
+                if let Some((area, text)) = banner_area {
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            text,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ))),
+                        area,
+                    );
+                }
                 let has_side_panel = plan_snapshot.is_some() || services_snapshot.is_some();
                 let (trace_area, side_area) = if has_side_panel && f.area().width >= 100 {
                 let hsplit = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                    .split(chunks[1]);
+                    .split(chat_area);
                 (hsplit[0], Some(hsplit[1]))
             } else {
-                (chunks[1], None)
+                (chat_area, None)
             };
 
             let viewport_height = trace_area.height.saturating_sub(2) as usize;
@@ -1905,7 +2191,17 @@ impl TuiInner {
             let body = Paragraph::new(log_lines)
                 .scroll((u16::try_from(scroll_top).unwrap_or(u16::MAX), 0))
                 .wrap(Wrap { trim: false })
-                .block(Block::default().title(trace_title).borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .title(trace_title)
+                        .borders(Borders::ALL)
+                        // `SDD-07` Fase 3: borde ámbar mientras hay TimeFreeze.
+                        .border_style(if time_frozen_render {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        }),
+                );
             f.render_widget(body, trace_area);
 
             if let Some(right_area) = side_area {
@@ -1993,8 +2289,8 @@ impl TuiInner {
                         );
                     }
                     TuiView::Timeline => {
-                        if let Some((entries, sel, latest)) = &timeline_view_data {
-                            render_timeline_view(f, chunks[1], entries, *sel, *latest);
+                        if let Some((rows, cursor, present, sel)) = &timeline_view_data {
+                            render_timeline_view(f, chunks[1], rows, *cursor, *present, *sel);
                         }
                     }
                     TuiView::Chat => unreachable!(),
@@ -3085,5 +3381,306 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("+new"), "{rendered}");
+    }
+
+    // ============================================================
+    // `SDD-07` Fase 3 — TEST-07.6: TimeFreeze en el TUI, determinista
+    // sobre `ratatui::backend::TestBackend` (sin terminal real).
+    // ============================================================
+
+    fn tf_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("openonyx-tui-time-{prefix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Contexto TEST-07.6: grafo con 1 efecto registrado (tick 4), ring con
+    /// ticks `0..=5` (`present = 5`) y `TimeDebugState` opcionalmente scrubeado
+    /// a `scrub_to` (si `Some`, queda congelado mirando el pasado).
+    fn tf_ctx(
+        scrub_to: Option<u64>,
+    ) -> (
+        TuiDriver,
+        onyx_soul_agents::AgentGraph,
+        crate::time_debug::TimeDebugState,
+    ) {
+        use onyx_soul_agents::{AttrRegistry, Graph as _};
+        let mut graph = onyx_soul_agents::AgentGraph::new();
+        let vocab = Vocab::resolve(&mut graph);
+        let ws_vocab = onyx_workspace::WorkspaceVocab::resolve_with(|name| graph.attr(name));
+        // Un efecto registrado tras el cursor (tick 4 > 3): es lo que se
+        // revertiría al confirmar la bifurcación (`revert on branch: N file(s)`).
+        let eff = graph.create();
+        graph.set(eff, ws_vocab.effect_tick, onyx_soul_agents::Value::Int(4));
+        graph.set(
+            eff,
+            ws_vocab.effect_tool,
+            onyx_soul_agents::Value::Text("fs_write".into()),
+        );
+        graph.set(
+            eff,
+            ws_vocab.effect_target,
+            onyx_soul_agents::Value::Text("out.txt".into()),
+        );
+        let td = crate::time_debug::TimeDebugState::new(None);
+        for t in 0..6u64 {
+            td.record_tick(t, &graph.export());
+        }
+        if let Some(tick) = scrub_to {
+            td.scrub_to(tick).unwrap();
+        }
+        let driver = TuiDriver::new(vocab)
+            .unwrap()
+            .with_workspace_vocab(ws_vocab)
+            .with_time_debug(td.clone());
+        (driver, graph, td)
+    }
+
+    /// TEST-07.6: escribe un comando en el input y lo envía con `Enter`;
+    /// si el popup de autocompletado slash quedó abierto, el primer `Enter`
+    /// acepta el completado y el segundo envía (comportamiento estándar).
+    fn tf_type_command(inner: &mut TuiInner, cmd: &str) {
+        inner.input.clear();
+        for c in cmd.chars() {
+            inner.dispatch_key(CtKeyCode::Char(c), KeyModifiers::NONE);
+        }
+        if inner.popup.is_open() {
+            inner.dispatch_key(CtKeyCode::Enter, KeyModifiers::NONE);
+        }
+        inner.dispatch_key(CtKeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    fn tf_rendered(inner: &TuiInner) -> String {
+        inner
+            .terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// TEST-07.6: escribe `prefix` en el input, sincroniza el popup y
+    /// devuelve las labels visibles (helper aparte: el `RefMut` del test no
+    /// permite dividir borrows de campos de `TuiInner`).
+    fn tf_slash_labels(inner: &mut TuiInner, prefix: &str) -> Vec<String> {
+        inner.input.set_text(prefix);
+        let input_snapshot = inner.input.clone();
+        inner
+            .popup
+            .sync_from_buffer(&input_snapshot, &mut inner.file_index, None, None);
+        let labels: Vec<String> = inner.popup.items.iter().map(|i| i.label.clone()).collect();
+        inner.popup.close();
+        labels
+    }
+
+    #[test]
+    fn time_freeze_banner_and_input_lock_in_test_backend() {
+        let (driver, graph, _td) = tf_ctx(Some(3));
+        let mut inner = driver.inner.borrow_mut();
+
+        // (1a) Banner ámbar + `tick 3 / present 5` + aviso de ficheros a
+        // revertir (solo RAM, `effects_after_tick`).
+        inner.render(&graph);
+        let rendered = tf_rendered(&inner);
+        assert!(rendered.contains("TIME FROZEN"), "{rendered}");
+        assert!(rendered.contains("tick 3 / present 5"), "{rendered}");
+        assert!(
+            rendered.contains("revert on branch: 1 file(s)"),
+            "{rendered}"
+        );
+
+        // (1b) Prompt normal bloqueado: no entra a `queued`, vuelve al input
+        // y avisa en `status_hint`.
+        for c in "hola".chars() {
+            inner.dispatch_key(CtKeyCode::Char(c), KeyModifiers::NONE);
+        }
+        inner.dispatch_key(CtKeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(inner.input.as_str(), "hola");
+        assert!(
+            inner.queued.is_empty(),
+            "frozen: el prompt normal no entra a queued"
+        );
+        assert!(
+            inner
+                .status_hint
+                .as_deref()
+                .is_some_and(|h| h.starts_with("Paused in TIME FROZEN")),
+            "status_hint: {:?}",
+            inner.status_hint
+        );
+
+        // (1c) `/…` y `!…` sí se encolan bajo freeze (vías de escape del
+        // depurador).
+        tf_type_command(&mut inner, "/go");
+        tf_type_command(&mut inner, "/step 1");
+        tf_type_command(&mut inner, "/graph inspect mem");
+        tf_type_command(&mut inner, "!echo hi");
+        let cmds: Vec<String> = inner
+            .queued
+            .iter()
+            .filter_map(|ev| match ev {
+                OnyxEvent::Ingress(IngressEvent::Command(c)) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cmds,
+            vec![
+                "/go".to_string(),
+                "/step 1".to_string(),
+                "/graph inspect mem".to_string(),
+                "!echo hi".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn time_freeze_keys_scrub_ctrl_t_and_safe_esc() {
+        let (driver, _graph, td) = tf_ctx(None);
+        let mut inner = driver.inner.borrow_mut();
+        // En vivo: cursor == present == 5, sin congelación.
+        assert!(!td.is_frozen());
+        assert_eq!(td.cursor(), 5);
+        assert_eq!(td.present(), 5);
+
+        // Escribir "hola" y `Alt+Left`: texto intacto, el cursor retrocedió
+        // y el scrub a pasado auto-congeló.
+        for c in "hola".chars() {
+            inner.dispatch_key(CtKeyCode::Char(c), KeyModifiers::NONE);
+        }
+        inner.dispatch_key(CtKeyCode::Left, KeyModifiers::ALT);
+        assert_eq!(inner.input.as_str(), "hola", "Alt+← no toca el InputBuffer");
+        assert!(td.is_frozen(), "scrub a pasado auto-congela");
+        assert_eq!(td.cursor(), 4);
+        assert_eq!(td.present(), 5);
+
+        // `Ctrl+T` alterna: descongela (vuelve al presente) y congela de nuevo.
+        inner.dispatch_key(CtKeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!td.is_frozen());
+        assert_eq!(td.cursor(), 5);
+        inner.dispatch_key(CtKeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(td.is_frozen());
+
+        // `Esc` congelado → `return_to_present` **sin cerrar** la app.
+        inner.dispatch_key(CtKeyCode::Esc, KeyModifiers::NONE);
+        assert!(!td.is_frozen());
+        assert_eq!(td.cursor(), 5);
+        assert!(
+            !inner.quit.load(Ordering::Relaxed),
+            "Esc congelado no cierra la aplicación"
+        );
+
+        // Segundo `Esc` ya en vivo → cierra.
+        inner.dispatch_key(CtKeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            inner.quit.load(Ordering::Relaxed),
+            "Esc en vivo cierra la aplicación"
+        );
+    }
+
+    #[test]
+    fn timeline_f5_lists_ram_pack_and_present_with_cursor() {
+        use onyx_soul_agents::Graph as _;
+        let dir = tf_temp_dir("timeline");
+        let store = SharedPackStore::new(&dir, None);
+        let mut graph = onyx_soul_agents::AgentGraph::new();
+        let vocab = Vocab::resolve(&mut graph);
+        let td = crate::time_debug::TimeDebugState::new(Some(store.clone()));
+        for t in 0..6u64 {
+            td.record_tick(t, &graph.export());
+        }
+        // Hito en disco en tick 2 (también en el anillo → etiqueta [pack:*]).
+        store
+            .save_milestone(2, "cmd:/step", &graph.export())
+            .unwrap();
+        td.scrub_to(3).unwrap();
+
+        let driver = TuiDriver::new(vocab)
+            .unwrap()
+            .with_session_storage(None, Some(store.clone()))
+            .with_time_debug(td.clone());
+        let mut inner = driver.inner.borrow_mut();
+        inner.switch_view(TuiView::Timeline);
+        inner.render(&graph);
+        let rendered = tf_rendered(&inner);
+        assert!(rendered.contains("[pack:cmd:/step]"), "{rendered}");
+        assert!(rendered.contains("[ram]"), "{rendered}");
+        assert!(rendered.contains("(present)"), "{rendered}");
+        assert!(rendered.contains("▶ cursor"), "{rendered}");
+
+        // Down → tick 1; Enter → `scrub_to` + `F1 Chat` con preview congelado
+        // (0 disco: el pack sigue con su único hito).
+        inner.dispatch_key(CtKeyCode::Down, KeyModifiers::NONE);
+        inner.dispatch_key(CtKeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(td.cursor(), 1);
+        assert!(td.is_frozen());
+        assert_eq!(inner.view, TuiView::Chat);
+        assert!(
+            inner
+                .status_hint
+                .as_deref()
+                .is_some_and(|h| h.starts_with("Scrubbed to tick 1")),
+            "status_hint: {:?}",
+            inner.status_hint
+        );
+        assert_eq!(store.entries().len(), 1, "0 disco hasta confirmar");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn palette_time_group_and_slash_autocomplete_sdd07() {
+        let (driver, _graph, _td) = tf_ctx(None);
+        let mut inner = driver.inner.borrow_mut();
+
+        // (4a) Grupo "Time" en la paleta `Ctrl+K` con los comandos exactos.
+        inner.open_palette();
+        let time_items: Vec<&crate::tui_palette::PaletteItem> = inner
+            .palette
+            .visible_items()
+            .iter()
+            .filter(|i| i.group == "Time")
+            .copied()
+            .collect();
+        assert_eq!(time_items.len(), 5, "grupo Time con 5 ítems");
+        let cmds: std::collections::BTreeMap<String, String> = time_items
+            .iter()
+            .map(|i| match i.action() {
+                PaletteAction::Command(c) => (i.label.clone(), c.clone()),
+                other => panic!("ítem Time no es Command: {:?} {other:?}", i.label),
+            })
+            .collect();
+        assert_eq!(
+            cmds.get("time toggle freeze (pause here)"),
+            Some(&"/time".to_string())
+        );
+        assert_eq!(cmds.get("time step 1"), Some(&"/step 1".to_string()));
+        assert_eq!(cmds.get("time step-llm"), Some(&"/step-llm".to_string()));
+        assert_eq!(cmds.get("time go (resume)"), Some(&"/go".to_string()));
+        assert_eq!(
+            cmds.get("graph inspect mem"),
+            Some(&"/graph inspect mem".to_string())
+        );
+        inner.palette.close();
+
+        // (4b) Autocompletado `/` de los 7 slash del depurador.
+        for (prefix, expected) in [
+            ("/go", "/go"),
+            ("/graph", "/graph"),
+            ("/in", "/inject"),
+            ("/rea", "/read"),
+            ("/step", "/step"),
+            ("/step-", "/step-llm"),
+            ("/time", "/time"),
+        ] {
+            let labels = tf_slash_labels(&mut inner, prefix);
+            assert!(
+                labels.contains(&expected.to_string()),
+                "{prefix} → esperaba {expected} en {labels:?}"
+            );
+        }
     }
 }

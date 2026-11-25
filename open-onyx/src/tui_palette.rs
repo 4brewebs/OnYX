@@ -23,6 +23,7 @@ use ratatui::{
 };
 
 use crate::llm_profile::LlmProfilesPublicState;
+use crate::time_debug::TimeDebugState;
 use crate::tui::AgentRow;
 use crate::tui_views::TuiView;
 
@@ -132,6 +133,13 @@ impl PaletteItem {
             format!("focus [{tag}]"),
             PaletteAction::Agent(id),
         )
+    }
+
+    /// `SDD-07` Fase 3: ítem del grupo **Time** (depurador temporal). El
+    /// label de `toggle freeze` es **dinámico** según el estado actual
+    /// (congelado → "resume", en vivo → "freeze").
+    pub fn time(label: impl Into<String>, hint: impl Into<String>, cmd: &str) -> Self {
+        Self::new("Time", label, hint, PaletteAction::Command(cmd.to_string()))
     }
 
     pub fn action(&self) -> &PaletteAction {
@@ -252,13 +260,48 @@ impl PaletteState {
     }
 }
 
-/// Construye el catálogo de la paleta: 5 vistas + LLM (perfiles/providers/
-/// esfuerzos, solo si hay handle) + agentes del último render.
+/// Construye el catálogo de la paleta: 5 vistas + **Time** (depurador
+/// temporal, solo si hay `TimeDebugState`) + LLM (perfiles/providers/esfuerzos,
+/// solo si hay handle) + agentes del último render.
 pub fn build_palette_items(
     profiles: Option<&LlmProfilesPublicState>,
     agent_rows: &[AgentRow],
+    time_debug: Option<&TimeDebugState>,
 ) -> Vec<PaletteItem> {
     let mut items: Vec<PaletteItem> = TuiView::ALL.iter().map(|v| PaletteItem::view(*v)).collect();
+    if let Some(td) = time_debug {
+        // Label dinámico: congelado → "resume", en vivo → "freeze".
+        let toggle_label = if td.is_frozen() {
+            "time toggle freeze → resume (go to present)"
+        } else {
+            "time toggle freeze (pause here)"
+        };
+        items.push(PaletteItem::time(
+            toggle_label,
+            "toggle TimeFreeze",
+            "/time",
+        ));
+        items.push(PaletteItem::time(
+            "time step 1",
+            "advance 1 tick (frozen)",
+            "/step 1",
+        ));
+        items.push(PaletteItem::time(
+            "time step-llm",
+            "allow 1 LLM turn (frozen)",
+            "/step-llm",
+        ));
+        items.push(PaletteItem::time(
+            "time go (resume)",
+            "return to present + live",
+            "/go",
+        ));
+        items.push(PaletteItem::time(
+            "graph inspect mem",
+            "preview memory graph at cursor",
+            "/graph inspect mem",
+        ));
+    }
     if let Some(snapshot) = profiles {
         for entry in &snapshot.profiles {
             items.push(PaletteItem::llm_profile(
@@ -442,7 +485,7 @@ mod tests {
     fn palette_filters_and_selects_llm_items() {
         let profiles = sample_profiles();
         let agents = sample_agents();
-        let items = build_palette_items(Some(&profiles), &agents);
+        let items = build_palette_items(Some(&profiles), &agents, None);
         let mut state = PaletteState::closed();
         state.open_with(items);
 
@@ -481,7 +524,7 @@ mod tests {
     #[test]
     fn palette_items_emit_correct_slash_commands() {
         let profiles = sample_profiles();
-        let items = build_palette_items(Some(&profiles), &sample_agents());
+        let items = build_palette_items(Some(&profiles), &sample_agents(), None);
 
         let view = items.iter().find(|i| i.label == "F2 Agents").unwrap();
         assert_eq!(view.action(), &PaletteAction::View(TuiView::Agents));
@@ -510,7 +553,7 @@ mod tests {
 
     #[test]
     fn palette_without_handle_has_no_llm_items() {
-        let items = build_palette_items(None, &sample_agents());
+        let items = build_palette_items(None, &sample_agents(), None);
         assert!(items.iter().all(|i| i.group != "LLM"));
         assert_eq!(items.len(), 5 + 2);
     }
@@ -542,7 +585,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let profiles = sample_profiles();
-        let items = build_palette_items(Some(&profiles), &sample_agents());
+        let items = build_palette_items(Some(&profiles), &sample_agents(), None);
         let mut state = PaletteState::closed();
         state.open_with(items);
         state.move_down();

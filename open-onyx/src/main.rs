@@ -1376,7 +1376,10 @@ fn launch_interactive_chat(
         .with_model_info(llm.model.clone(), llm.effort)
         .with_llm_profile(profile_handle.clone())
         .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
-        .with_subagents(sub_handle.clone());
+        .with_subagents(sub_handle.clone())
+        // `SDD-07` Fase 3: el TUI comparte el motor del depurador temporal
+        // (banner ámbar, Alt+←/→, Ctrl+T, Esc seguro, bloqueo de prompt).
+        .with_time_debug(time_debug.clone());
     let tui_handle = tui.handle();
     let quit = tui.quit_flag();
     let action_ctx = SessionActionContext {
@@ -5193,14 +5196,15 @@ ready_log = "READY_BUS"
     // `SDD-07` Fase 2: primitivas 0-tokens, cirugía `/graph` y sellados
     // =======================================================================
 
-    /// Contexto de sesión mínimo para `apply_session_action` (BUILD, sin store
-    /// ni subagentes; `time_debug` opcional).
+    /// Contexto de sesión mínimo para `apply_session_action` (BUILD, sin
+    /// subagentes; `time_debug` y store de snapshots opcionales).
     fn det_session_ctx(
         workspace_root: &Path,
         config: &AgentConfig,
         ws_vocab: &onyx_workspace::WorkspaceVocab,
         tools: &WorkspaceTools,
         time_debug: Option<TimeDebugState>,
+        snapshot_store: Option<SharedPackStore>,
     ) -> SessionActionContext {
         SessionActionContext {
             workspace_root: workspace_root.to_path_buf(),
@@ -5208,7 +5212,7 @@ ready_log = "READY_BUS"
             ws_vocab: *ws_vocab,
             mode_handle: WorkspaceModeHandle::new(WorkspaceMode::Build),
             tools: tools.clone(),
-            snapshot_store: None,
+            snapshot_store,
             subagents: None,
             pending_action: PendingSessionAction::new(),
             pending_notes: PendingSystemNotes::new(),
@@ -5281,7 +5285,7 @@ ready_log = "READY_BUS"
         // TimeFreeze en el presente (último tick completado = 2).
         td.set_present(host.ticks() - 1);
         td.freeze();
-        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()));
+        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()), None);
 
         // `! echo hola` → sandbox + sellado + reinyección por la cadena de
         // drivers (queda grabado en el transcript del driver de grabación).
@@ -5317,10 +5321,13 @@ ready_log = "READY_BUS"
             view.memory
         );
 
-        // El usuario sigue la frontera (scrub al presente + re-congelación):
-        // sin esto la siguiente mutación bifurcaría desde el cursor antiguo.
-        td.scrub_to(td.present()).unwrap();
-        td.freeze();
+        // Fix de auditoría Fase 2 (A1): congelado EN el presente,
+        // `record_tick` ya avanzó el cursor al presente (sin bifurcación ni
+        // descongelación): la siguiente mutación no necesita scrub manual.
+        assert!(
+            td.is_frozen() && td.cursor() == td.present(),
+            "congelado en el presente: el cursor sigue al presente (frozen intacto)"
+        );
 
         // `/read secret.txt` → lectura verificada, scrub + cap 8 KiB + sellado.
         let sealed_read = session::apply_session_action(
@@ -5445,16 +5452,19 @@ ready_log = "READY_BUS"
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `SDD-07` Fase 2 (TEST-07.4): cirugía `/graph` in-tick —
-    /// `drop-mem`/`edit-mem`/`set-goal` con efecto EAV exacto; `mem_seq`
-    /// estrictamente monótono (sin reutilización de ids tras `drop-mem`);
-    /// hito `cmd:/graph-mutate` en el pack (y ninguno para `inspect`);
+    /// `SDD-07` Fase 2 + fix de auditoría (TEST-07.4): cirugía `/graph`
+    /// **sellada** — el slash crudo solo **solicita** la mutación;
+    /// `apply_session_action` (gate + bifurcación) devuelve el sellado
+    /// `/__onyx_det_graph` que el spawner reejecuta in-tick (bit-a-bit en
+    /// `openonyx replay`, 0 I/O); `mem_seq` estrictamente monótono (sin
+    /// reutilización de ids tras `drop-mem`); hito `cmd:/graph-mutate` en el
+    /// pack **en el tick que muta de verdad** (y ninguno para `inspect`);
     /// atributos reservados del framework intactos; `clear_seen_reads()`
     /// invocado (la deduplicación de `fs_read` se resetea); y reversibilidad:
     /// el preview 1 tick antes del drop aún muestra la memoria eliminada
     /// (solo RAM, 0 I/O; el rewind de rama es mecánica de SDD-05).
     #[test]
-    fn graph_surgery_monotonic_milestones_and_preview() {
+    fn graph_surgery_sealed_monotonic_milestones_and_preview() {
         use onyx_soul_agents::{AgentGraph, Graph, GraphView, Value, Vocab};
 
         let dir =
@@ -5478,7 +5488,7 @@ ready_log = "READY_BUS"
         let spawner = CommandSpawnerSystem::new(false)
             .with_max_steps(8)
             .with_tools(tools.clone());
-        let (mut host, _ws_vocab) =
+        let (mut host, ws_vocab) =
             build_host_with_options(1, cfg.clone(), &opts, Some(Box::new(spawner)), None).unwrap();
         let v = host.vocab();
 
@@ -5495,7 +5505,11 @@ ready_log = "READY_BUS"
             td.record_tick(host.ticks() - 1, &host.graph().export());
         }
 
-        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+        // Cadena de drivers real (el sellado viaja por `queue_ingress` →
+        // `driver.poll` → grabado, como en `run_session`).
+        let headless = HeadlessDriver::new();
+        let handle = headless.handle();
+        let mut driver = RecordingBridge::new(v, |req: &AgentView| {
             let r = match req.request {
                 1 => "ok",
                 2 => "more-done",
@@ -5503,7 +5517,8 @@ ready_log = "READY_BUS"
                 _ => return None,
             };
             Some(Reply::done(req.agent, req.request, r))
-        });
+        })
+        .wrapping(headless);
 
         // Turno 1 (ticks 0..2) + turno 2 (ticks 3..5): root `Done`
         // "more-done". Al reactivar en el turno 2, `continue_agent` vuelca el
@@ -5531,6 +5546,13 @@ ready_log = "READY_BUS"
             "memoria inicial del root (volcado `say` + `user`): {mems:?}"
         );
 
+        // TimeFreeze en el presente (último tick completado = 5): congelado
+        // EN el presente, el cursor sigue al presente (fix A1) y ninguna
+        // mutación bifurca.
+        td.set_present(5);
+        td.freeze();
+        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()), None);
+
         // Deduplicación de `fs_read`: 2ª lectura idéntica → stub `@TOON`.
         fs::write(dir.join("doc.txt"), "one\ntwo\nthree\n").unwrap();
         let read_args = r#"{"path":"doc.txt"}"#;
@@ -5542,13 +5564,30 @@ ready_log = "READY_BUS"
             "2ª lectura dentro de la ventana: stub @TOON: {r2}"
         );
 
-        // `/graph drop-mem 1..2` (tick 6): elimina `say` (1) y `user` (2);
-        // la nota `system` vuelca el `result` pendiente como `say` (seq 3) y
-        // añade la propia nota (seq 4). Llama a `clear_seen_reads()`.
-        host.push(OnyxEvent::Ingress(IngressEvent::Command(
-            "/graph drop-mem 1..2".into(),
-        )));
+        // `/graph drop-mem 1..2` (fix de auditoría): el slash crudo solo
+        // **solicita** la mutación; `apply_session_action` (gate +
+        // bifurcación) devuelve el sellado `/__onyx_det_graph` que el
+        // spawner reejecuta in-tick en el tick 6: elimina `say` (1) y
+        // `user` (2); la nota `system` vuelca el `result` pendiente como
+        // `say` (seq 3) y añade la propia nota (seq 4). Llama a
+        // `clear_seen_reads()`.
+        let sealed_drop = session::apply_session_action(
+            &mut host,
+            command::SessionAction::GraphDropMem { start: 1, end: 2 },
+            &ctx,
+            0,
+        )
+        .expect("drop-mem asentado debe devolver el comando sellado");
+        assert!(
+            sealed_drop.starts_with(time_debug::DET_GRAPH_CMD_PREFIX),
+            "sellado con prefijo reservado: {sealed_drop}"
+        );
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed_drop)));
         step_rec(&td, &mut host, &mut driver); // tick 6
+        assert!(
+            td.is_frozen() && td.cursor() == td.present(),
+            "congelado en el presente: el cursor sigue al presente (0 bifurcaciones)"
+        );
 
         let view = host.view(root);
         assert!(
@@ -5588,11 +5627,19 @@ ready_log = "READY_BUS"
         let r3 = tools.execute("fs_read", read_args).unwrap();
         assert_eq!(r3, r1, "tras drop-mem la dedup de fs_read se resetea");
 
-        // `/graph edit-mem 3 <text>` (tick 7): reescribe el texto del seq 3
-        // (el volcado `say`) sin tocar nada más.
-        host.push(OnyxEvent::Ingress(IngressEvent::Command(
-            "/graph edit-mem 3 rewrote-by-test".into(),
-        )));
+        // `/graph edit-mem 3 <text>` (tick 7): mismo patrón sellado;
+        // reescribe el texto del seq 3 (el volcado `say`) sin tocar nada más.
+        let sealed_edit = session::apply_session_action(
+            &mut host,
+            command::SessionAction::GraphEditMem {
+                seq: 3,
+                text: "rewrote-by-test".into(),
+            },
+            &ctx,
+            0,
+        )
+        .expect("edit-mem asentado debe devolver el comando sellado");
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed_edit)));
         step_rec(&td, &mut host, &mut driver); // tick 7
         let edited = host
             .graph()
@@ -5615,11 +5662,18 @@ ready_log = "READY_BUS"
             host.view(root).memory
         );
 
-        // `/graph set-goal <text>` (1 tick): reescribe el goal del root.
-        host.push(OnyxEvent::Ingress(IngressEvent::Command(
-            "/graph set-goal brand new goal".into(),
-        )));
-        step_rec(&td, &mut host, &mut driver); // tick 7
+        // `/graph set-goal <text>` (tick 8): reescribe el goal del root.
+        let sealed_goal = session::apply_session_action(
+            &mut host,
+            command::SessionAction::GraphSetGoal {
+                text: "brand new goal".into(),
+            },
+            &ctx,
+            0,
+        )
+        .expect("set-goal asentado debe devolver el comando sellado");
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed_goal)));
+        step_rec(&td, &mut host, &mut driver); // tick 8
         assert_eq!(host.view(root).goal, "brand new goal");
         assert!(
             host.view(root)
@@ -5653,8 +5707,9 @@ ready_log = "READY_BUS"
             "`pending` no se toca"
         );
 
-        // Hitos: `cmd:/graph-mutate` en los ticks de las 3 mutaciones y
-        // ninguno para `inspect` (read-only).
+        // Hitos: `cmd:/graph-mutate` en los ticks en que el **sellado** muta
+        // de verdad (los slash crudos solo solicitaban) y ninguno para
+        // `inspect` (read-only).
         let mutate_ticks = |dir: &Path| -> Vec<u64> {
             pack::PackSnapshotStore::new(dir)
                 .entries()
@@ -5738,6 +5793,244 @@ ready_log = "READY_BUS"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `SDD-07` fix de auditoría (TEST-07.4b, spec §10): flujo E2E de
+    /// bifurcación — `scrub_to(tick_pasado)` (auto-congela) → `/graph
+    /// drop-mem` → `apply_session_action` **confirma automáticamente** la
+    /// bifurcación en `tick_pasado` (fork del pack + restore ring-first); el
+    /// drop se aplica sobre **ese estado** (no sobre el futuro) y el cursor
+    /// sigue al nuevo presente congelado.
+    #[test]
+    fn graph_surgery_branches_from_past_cursor_e2e() {
+        use onyx_soul_agents::{GraphView, Value};
+
+        let dir =
+            std::env::temp_dir().join(format!("openonyx-graph-branch-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AgentConfig {
+            default_max_steps: 8,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy);
+        let snap_dir = dir.join("snaps");
+        let shared = SharedPackStore::new(&snap_dir, None);
+        // Hitos en cada tick (`periodic`) para que el pack tenga futuro
+        // bifurcable más allá del tick pasado.
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_step_snapshots: true,
+            snapshot_every: Some(1),
+            ..SessionOptions::default()
+        };
+        let spawner = CommandSpawnerSystem::new(false)
+            .with_max_steps(8)
+            .with_tools(tools.clone());
+        // Mismo host que la sesión real: el store es ring-RAM-first
+        // (`TimeDebugSnapshotStore`) sobre el pack compartido (restore sin I/O).
+        let td = TimeDebugState::new(None);
+        let td_store = TimeDebugSnapshotStore::new(Some(shared.clone()), td.ring_arc());
+        let (mut host, ws_vocab) = build_host_with_shared_store(
+            1,
+            cfg.clone(),
+            &opts,
+            Some(Box::new(spawner)),
+            None,
+            Some(shared.clone()),
+            Some(td_store),
+        )
+        .unwrap();
+        let v = host.vocab();
+
+        let headless = HeadlessDriver::new();
+        let handle = headless.handle();
+        let mut driver = RecordingBridge::new(v, |req: &AgentView| {
+            let r = match req.request {
+                1 => "ok",
+                2 => "more-done",
+                3 => "again-done",
+                _ => return None,
+            };
+            Some(Reply::done(req.agent, req.request, r))
+        })
+        .wrapping(headless);
+        fn step_rec<R: Responder>(
+            td: &TimeDebugState,
+            host: &mut AgentHost,
+            driver: &mut RecordingBridge<R>,
+        ) {
+            use onyx_soul_agents::Graph as _;
+            host.step(driver);
+            td.record_tick(host.ticks() - 1, &host.graph().export());
+        }
+
+        // Turno 1 (ticks 0..2), turno 2 (3..5), turno 3 (6..8): root `Done`
+        // "again-done". En el tick 5 la memoria es `["say:ok","user:more"]`;
+        // el futuro (tick 8) añade además "user:again".
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("hola".into())));
+        for _ in 0..3 {
+            step_rec(&td, &mut host, &mut driver);
+        }
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("more".into())));
+        for _ in 0..3 {
+            step_rec(&td, &mut host, &mut driver);
+        }
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("again".into())));
+        for _ in 0..3 {
+            step_rec(&td, &mut host, &mut driver);
+        }
+        let root = host.agents()[0];
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        assert_eq!(host.ticks(), 9, "3 turnos = 9 ticks");
+
+        let mut orig_entries_before: Vec<(u64, String)> = PackSnapshotStore::new(&snap_dir)
+            .entries()
+            .iter()
+            .map(|m| (m.tick, m.tag.clone()))
+            .collect();
+        orig_entries_before.sort_unstable();
+        assert!(
+            orig_entries_before.iter().any(|(t, _)| *t == 8),
+            "el pack debe tener futuro (tick 8) para bifurcar: {orig_entries_before:?}"
+        );
+
+        // Scrub al pasado (fin del turno 2) → auto-congelación.
+        td.scrub_to(5).unwrap();
+        assert!(td.is_frozen());
+        assert!(td.cursor() < td.present());
+
+        let ctx = det_session_ctx(
+            &dir,
+            &cfg,
+            &ws_vocab,
+            &tools,
+            Some(td.clone()),
+            Some(shared.clone()),
+        );
+
+        // `/graph drop-mem 2` (drop de "user:more") **sobre el pasado**: la
+        // bifurcación se confirma automáticamente en el tick 5.
+        let sealed = session::apply_session_action(
+            &mut host,
+            command::SessionAction::GraphDropMem { start: 2, end: 2 },
+            &ctx,
+            0,
+        )
+        .expect("la mutación debe devolver el comando sellado");
+        assert!(
+            sealed.starts_with(time_debug::DET_GRAPH_CMD_PREFIX),
+            "{sealed}"
+        );
+        let notes = ctx.pending_notes.drain();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("[time-branch] Branched from tick 5")),
+            "bifurcación confirmada automáticamente en el tick pasado: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("Branched snapshots into")),
+            "fork del pack de snapshots: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("Applied (sealed, 0 LLM tokens)")),
+            "la mutación quedó sellada: {notes:?}"
+        );
+
+        // El host restaurado al estado del tick 5: la memoria del turno 3
+        // ("user:again") ya no existe (el futuro quedó preservado, no vivo).
+        assert_eq!(host.ticks(), 6, "el reloj vuelve a cursor+1");
+        let view = host.view(root);
+        assert!(
+            !view.memory.iter().any(|(_, t)| t == "again"),
+            "el estado restaurado no incluye el futuro (turno 3): {:?}",
+            view.memory
+        );
+        assert!(
+            view.memory.iter().any(|(_, t)| t == "more"),
+            "el estado del tick 5 SÍ tiene `user:more` (pendiente de drop): {:?}",
+            view.memory
+        );
+
+        // El sellado se reinyecta: el drop se aplica sobre **ese** estado,
+        // no sobre el futuro.
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed)));
+        step_rec(&td, &mut host, &mut driver); // nuevo tick 6 (línea bifurcada)
+        let view = host.view(root);
+        assert!(
+            !view.memory.iter().any(|(_, t)| t == "more"),
+            "`user:more` fue droppeado: {:?}",
+            view.memory
+        );
+        assert!(
+            view.memory.iter().any(|(k, t)| k == "say" && t == "ok"),
+            "`say:ok` (del tick 5) permanece: {:?}",
+            view.memory
+        );
+        assert!(
+            !view.memory.iter().any(|(_, t)| t == "again"),
+            "el drop se aplicó en el estado del tick 5, no en el futuro: {:?}",
+            view.memory
+        );
+        assert!(
+            view.memory.iter().any(|(k, t)| k == "system"
+                && t.contains("Dropped 1 memory node(s) with mem_seq in [2..=2]")),
+            "nota exacta del drop: {:?}",
+            view.memory
+        );
+        assert_eq!(
+            host.graph().get(root, v.mem_count),
+            Some(Value::Int(4)),
+            "mem_count del estado tick 5 (2) + volcado `say` (3) + nota (4)"
+        );
+
+        // El cursor sigue al nuevo presente, sin descongelar.
+        assert!(td.is_frozen(), "sigue congelado (0 descongelaciones)");
+        assert_eq!(td.present(), 6, "presente de la nueva línea");
+        assert_eq!(td.cursor(), 6, "el cursor sigue al nuevo presente");
+
+        // El pack bifurcó: la línea activa es el fork (con la nueva
+        // mutación en el tick 6) y la línea original queda intacta.
+        // (No re-computar `default_fork_dir` aquí: la heurística anti-
+        // colisión vería el fork recién creado.)
+        let fork_dir = shared.current_dir();
+        assert_ne!(
+            fork_dir, snap_dir,
+            "la línea activa no es la línea original"
+        );
+        assert!(
+            fork_dir.to_string_lossy().contains("snaps.fork-t5"),
+            "el directorio del fork es determinista: {fork_dir:?}"
+        );
+        let mut orig_entries_after: Vec<(u64, String)> = PackSnapshotStore::new(&snap_dir)
+            .entries()
+            .iter()
+            .map(|m| (m.tick, m.tag.clone()))
+            .collect();
+        orig_entries_after.sort_unstable();
+        assert_eq!(
+            orig_entries_after, orig_entries_before,
+            "la línea original se preserva intacta (el futuro no se toca)"
+        );
+        let fork_mut = PackSnapshotStore::new(&fork_dir)
+            .entries()
+            .iter()
+            .filter(|m| m.tag == "cmd:/graph-mutate")
+            .map(|m| m.tick)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fork_mut,
+            vec![6],
+            "hito de la mutación en la línea bifurcada"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `SDD-07` Fase 2 (TEST-07.5): primitivas 0-tokens —
     /// `/step [n]` avanza `n` ticks deterministas **sin** invocar al LLM
     /// (clamp 1..=64, exige frozen y no descongela); `/step-llm` reactiva el
@@ -5797,12 +6090,12 @@ ready_log = "READY_BUS"
 
         td.set_present(host.ticks() - 1);
         td.freeze();
-        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()));
+        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()), None);
 
         // Sin congelación: `/step` se rechaza con nota accionable.
         let td_unfrozen = TimeDebugState::new(None);
         td_unfrozen.set_present(host.ticks() - 1);
-        let ctx_unfrozen = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td_unfrozen));
+        let ctx_unfrozen = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td_unfrozen), None);
         let r = session::apply_session_action(
             &mut host,
             command::SessionAction::Step(1),
@@ -5933,7 +6226,7 @@ ready_log = "READY_BUS"
         let td_c = TimeDebugState::new(None);
         td_c.set_present(host_c.ticks() - 1);
         td_c.freeze();
-        let ctx_c = det_session_ctx(&dir, &cfg, &_ws_c, &tools, Some(td_c));
+        let ctx_c = det_session_ctx(&dir, &cfg, &_ws_c, &tools, Some(td_c), None);
 
         // Settled (0 en vuelo, 0 tools, 0 aprobaciones) → mutación permitida.
         let sealed_c = session::apply_session_action(
