@@ -129,10 +129,14 @@ pub struct ServeGuard {
     pub addr: SocketAddr,
     pub api_key: String,
     pub ws: TempWorkspace,
+    /// Banner impreso por `serve` al arrancar (stdout hasta la línea de la clave).
+    pub banner: String,
 }
 
 #[derive(Default)]
 pub struct ServeOpts<'a> {
+    /// Dirección de `--bind` (por defecto `127.0.0.1:0`).
+    pub bind: Option<&'a str>,
     pub api_key: Option<&'a str>,
     pub cors_origin: Option<&'a str>,
     pub prepare: Option<&'a dyn Fn(&Path)>,
@@ -152,7 +156,7 @@ impl ServeGuard {
         cmd.current_dir(&ws.ws).args([
             "serve",
             "--bind",
-            "127.0.0.1:0",
+            opts.bind.unwrap_or("127.0.0.1:0"),
             "--workspace",
             ws.ws.to_str().unwrap(),
             "--provider",
@@ -199,7 +203,13 @@ impl ServeGuard {
                     if let Some(rest) = line.trim().strip_prefix("URL:") {
                         let url = rest.trim();
                         let hostport = url.trim_start_matches("http://").trim_end_matches('/');
-                        addr = hostport.parse().ok();
+                        // Bind público (`0.0.0.0`/`[::]`): el cliente entra por loopback.
+                        addr = hostport.parse::<SocketAddr>().ok().map(|mut a| {
+                            if a.ip().is_unspecified() {
+                                a.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+                            }
+                            a
+                        });
                     }
                     if let Some(rest) = line.trim().strip_prefix("API Key:") {
                         if let Some(tok) = rest.split_whitespace().next() {
@@ -229,6 +239,7 @@ impl ServeGuard {
             addr,
             api_key,
             ws,
+            banner: seen.join("\n"),
         };
         guard.wait_listening();
         guard
