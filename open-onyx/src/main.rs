@@ -587,7 +587,7 @@ fn help_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let usage_str = usage();
     let body = r#"SUBCOMMANDS:
-  chat                     Launch interactive TUI with SSE streaming, diff approvals, F1..F5 views + Ctrl+K palette, Plan/Build toggle, and Live Plan
+  chat                     Launch interactive TUI with SSE streaming, diff approvals, F1..F5 views + Ctrl+K palette, Plan/Build toggle, Live Plan, and the TimeFreeze time debugger (Alt+←/→, Ctrl+T, /time, /go, /step, /step-llm, /read, /inject, /graph, !cmd)
   run <goal>               Run a single headless turn toward <goal> and print the final result
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
@@ -595,7 +595,7 @@ fn help_text() -> String {
   bench                    Multi-model benchmark from an identical snapshot (disposable worktrees + rewind + `--verify`; live `provider:model` or offline `replay:<label>=<file.tr>` candidates; unattended runs use `--auto-approve` — every candidate runs in a throwaway worktree, the root is never touched)
   doctor                   Verify workspace git repository, sandbox, Workspace Trust, MCP servers (`[mcp.servers.*]`), snapshot packs, and transcripts
   trust                    Approve, check, list, or revoke Workspace Trust hashes (`~/.onyx/trusted_workspaces.toml`)
-  serve                    Serve embedded mobile-first PWA + JSON/SSE API (`/api/v1/...`) over HTTP/1.1 (0 tokio)
+  serve                    Serve embedded mobile-first PWA + JSON/SSE API (`/api/v1/...`) over HTTP/1.1 (0 tokio). TimeFreeze parity: `#tick-pill` opens the amber Time Debugger bar (ephemeral `POST /api/v1/time/scrub`, `409 Conflict` for plain prompts under freeze); non-goal: Sprout/MCP effects are not rewound
 
 OPTIONS:
   -w, --workspace <dir>    Target workspace directory (default: current working directory)
@@ -649,6 +649,8 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   Tab                      Toggle [PLAN] (read-only) and [BUILD] (edits enabled)
   F1..F5                   Switch ephemeral views: F1 Chat · F2 Agents · F3 Sprout · F4 Plan & Diff · F5 Timeline
   Ctrl+K                   Command palette: filter views, LLM slash commands, and agents (Up/Down + Enter)
+  Alt+Left / Alt+Right     TimeFreeze: scrub the cursor −1/+1 over available ticks (auto-freezes when looking at the past; amber banner appears)
+  Ctrl+T                   TimeFreeze: toggle freeze at the cursor / return to present (ephemeral: RAM only, 0 disk)
   /view <chat|agents|sprout|plan|timeline>
                            Switch views from the prompt (ephemeral: no bus event, no tick, no graph write)
   Ctrl+Tab                 Quick-cycle focused agent (terminal-dependent alias; `F2`/`/agent` work everywhere)
@@ -664,6 +666,16 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /undo                    Revert the latest reversible git checkpoint (also removes newly created untracked `fs_write` files)
   /rewind [tick]           List milestones or rewind in-place to `<tick>` (forks snapshots safely + restores git tree)
   /fork [name]             Branch snapshots up to the current tick into a sibling directory without mutating the original
+  /time                    TimeFreeze: toggle freeze at the current cursor (pause here; ephemeral, 0 disk)
+  /go                      TimeFreeze: branch from the cursor if needed and resume at present (`/unfreeze` alias)
+  /step [n]                TimeFreeze: advance `n` deterministic ticks with 0 LLM calls (default 1; works frozen)
+  /step-llm                TimeFreeze: exactly one LLM turn (gate + branch + re-freeze when it answers)
+  /read <path> [a..b]      Read a workspace file (or line range) into memory, 0 tokens, frozen-safe
+  /inject <text>           Stage a sealed `user` memory into the timeline, 0 tokens, frozen-safe
+  /graph <inspect|drop-mem|edit-mem|set-goal>
+                           Inspect or surgically edit the frozen graph (memories by seq, goal) without advancing time; read-only `inspect [agent|mem|ws]`
+  ! <cmd>                  Run a deterministic shell command in the sandbox and seal its result (frozen-safe)
+                           TimeFreeze non-goal: Sprout/MCP side effects are not rewound
   /compact [focus]         Compact older turns into a verified session summary (creating a `cmd:/compact` milestone)
   /services                Show @TOON v1 status of local processes & containers from `sprout.toml`
   /service <start|stop|logs> <id|all> [tail]
@@ -678,7 +690,7 @@ TUI CONTROLS & SLASH COMMANDS (chat):
   /effort [auto|low|medium|high]
                           Change the reasoning/thinking effort of the active target
   /new [goal]              Start a fresh agent conversation (optionally passing an immediate <goal>)
-  Esc                      Close popup/palette; from F2..F5 back to F1 Chat; in F1 Chat quit cleanly
+  Esc                      Close popup/palette; while TIME FROZEN return to present (without quitting); from F2..F5 back to F1 Chat; in F1 Chat quit cleanly
   Ctrl+C                   Quit cleanly (flushing exit snapshot & transcript if configured)
 
 PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
