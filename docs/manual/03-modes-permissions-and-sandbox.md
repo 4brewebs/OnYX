@@ -86,6 +86,17 @@ enabled = true
 max_hops = 2          # clamped 1..=4
 ask_heat_bp = 2500    # threshold for public scope:src symbols (basis points 0..=10000)
 hard_ask_bp = 8000    # hard threshold for any high-fanout symbol
+
+[verify]
+# Verify-on-Edit: after each successful fs_edit/fs_write, run the rules whose glob
+# matches the edited file (section 2.9). Off by default.
+on_edit = true
+max_secs = 20         # default per-rule timeout (clamped 1..=120)
+
+[[verify.rules]]
+glob = "**/*.rs"
+command = "cargo test --workspace"
+# max_secs = 60       # per-rule timeout override (optional)
 ```
 
 > **Monotonicity of *Scent-Heated Approval*:** `[impact]` can only **escalate** `Allow → Ask` and display `# impact: N callers, H hops, scope:src(pub) [heat Xbp]` above the diff in TUI/CLI. It never overrides `deny`, never relaxes `ask` to `allow`, and degrades gracefully to static rules when unindexed or `enabled = false`.
@@ -180,6 +191,36 @@ url = "https://mcp.example.com/sse"
 - **Sanitized output:** `tools/call` results and discovery errors pass through `truncate_utf8` + `scrub_secrets` before reaching the LLM or the transcript.
 - **`openonyx doctor`:** audits each declared server with a **5 s-capped** handshake (`min(timeout_secs, 5)`): `Connected`/`Disabled` → `[CHECK]`, failure → actionable `[ERR]` (already scrubbed message), untrusted workspace → `[WARN]` without workspace discovery.
 - **0-I/O `replay`:** replaying an `ONYXTR2` transcript never contacts a server: the `mcp__*` tools are reconstructed from the transcript itself (`extract_mcp_tools_from_transcript`), without `load_mcp_registry`.
+
+---
+
+## 2.9. Verify-on-Edit (`[verify]` / `[[verify.rules]]`)
+
+*Verify-on-Edit* closes the edit → verify loop **inside the agent's turn**: after each **successful** `fs_edit`/`fs_write`, `openonyx` runs the commands whose rules match the edited file and appends the outcome to the tool's observation, so the model can fix the error before the turn ends.
+
+```toml
+[verify]
+on_edit = true        # default false: explicit opt-in, 0 overhead when unset
+max_secs = 20         # default per-rule timeout (clamped 1..=120)
+
+[[verify.rules]]
+glob = "**/*.rs"      # relative-path glob (compile_glob_regex)
+command = "cargo test --workspace"
+# max_secs = 60       # per-rule timeout override (optional)
+
+[[verify.rules]]
+glob = "src/**"
+command = "pnpm test"
+```
+
+- **Rule scope:** a rule fires when its `glob` matches the edited file **or** (when a Scent index exists) a `scope:test` file reachable by AST impact within **≤ 2 hops**; in an unindexed workspace only the edited path is matched.
+- **Execution:** every `command` goes through the **same sandbox pipeline as `shell_exec`** (`prepare_sandboxed_shell_command` + `configure_process_isolation` + `ProcessJob` RAII + `env_clear()` + timeout cancellation + `scrub_secrets`), with captured diagnostics capped at **4 KiB**.
+- **Outputs injected into the tool observation:**
+  - `\n[verify: PASS] <N> rule(s) succeeded (<cmds>)` — plus `impacted_tests: [...]` when the Scent index identifies reachable `scope:test` files;
+  - `\n[verify: FAIL] <cmd> (exit <code> | timed out after <N>s)\n<diagnostics>\n(Fix the error before finishing the turn.)`;
+  - `\n[verify: BLOCKED] <cmd> (denied by [permissions])` — the rule is not executed.
+- **`[permissions].deny` governance:** each `command` is evaluated as `shell_exec` **before** running; a `deny` blocks the rule (`[verify: BLOCKED]`) and stops the verification loop for that edit.
+- **Workspace Trust Gate:** merge precedence is `global (~/.onyx/config.toml) < workspace (<workspace>/.onyx/config.toml, trusted)`; an **untrusted** workspace ignores its `[verify]`/`[[verify.rules]]` entirely (with an actionable warning in `policy.trust_warnings`), while the global config still applies. Trusted workspace rules **replace** the global set.
 
 ---
 

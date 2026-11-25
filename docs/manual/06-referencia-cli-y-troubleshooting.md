@@ -14,6 +14,7 @@ openonyx run <goal> [OPCIONES]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
 openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--dry-run] [OPCIONES]
+openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [OPCIONES]
 openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
 openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]
 openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [OPCIONES]
@@ -58,7 +59,36 @@ openonyx [--help | -h | --version | -V]
 | `--json` | `inspect` | Emite salida estructurada en JSON. |
 | `--transcript <file>` | `rewind`, `doctor` | Reproduce transcripción desde el punto de rewind o valida su cabecera en `doctor`. |
 | `--dry-run` | `rewind` | Previsualiza efectos huérfanos y plan de rollback sin modificar disco. |
+| `--models <list>` | `bench` | Lista de candidatos separada por comas: `<provider>:<model>` (LLM vivo, p. ej. `gemini:gemini-2.5-pro,openai:gpt-4o`) y/o `replay:<label>=<file.tr>` / `replay:<file.tr>` (transcripción `ONYXTR2` offline, determinista). |
+| `--verify <cmd>` | `bench` | Comando de verificación ejecutado **sandboxed dentro del worktree** del candidato tras asentarse (misma tubería de `shell_exec`); su `exit 0` decide `passed_verify`. Sin `--verify`, `passed_verify` = el agente terminó `Done` y la sesión se asentó. |
+| `--out <file.json>` | `bench` | Escribe el informe JSON completo (metadata + resultados) en pretty-print. |
+| `--goal <text>` | `bench` | Objetivo del agente raíz si en el `--tick` no hay agente activo (obligatorio en ese caso). |
 | `-h, --help` / `-V, --version` | Global | Muestra ayuda o versión y sale con código `0`. |
+
+### `openonyx bench` — referencia completa
+
+Benchmark multi-modelo desde un **snapshot idéntico**: cada candidato se ejecuta en un **worktree desechable** (`bench-<pid>-<idx>-<label>`) con rewind a `--tick` (`reconcile_rewind_effects_report`), un host de sesión fresco (`request_restore` + 1 step) y, al terminar, la raíz y `HEAD` quedan **100 % intactos** y el worktree se elimina (guard RAII; también en error o pánico).
+
+```sh
+# Comparativa en vivo + replay offline, con verificación y informe JSON
+openonyx bench \
+  --snapshot-dir .onyx/vault/20261125-100000_gpt-4o \
+  --tick 12 \
+  --models "gemini:gemini-2.5-pro,openai:gpt-4o,replay:baseline=run_baseline.tr" \
+  --goal "fix the failing test in src/app.rs" \
+  --verify "cargo test --workspace" \
+  --out bench_report.json \
+  --auto-approve \
+  --sandbox workspace-write \
+  --sandbox-net offline
+```
+
+- **Candidatos (`--models`):** `<provider>:<model>` con `provider ∈ gemini|openai|anthropic` (credenciales vía las variables habituales `GEMINI_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` o `--api-base`); `replay:<label>=<path.tr>` fija el label; `replay:<path.tr>` usa el *file stem* como label. El parse divide primero por `:` y luego por `=`, de modo que las rutas con letra de unidad Windows (`replay:C:\runs\a.tr`) se conservan intactas.
+- **Ejecución por candidato (secuencial):** rewind del worktree al tick → host fresco restaurado → si no hay agente activo en el tick, se spawnea un agente raíz con `--goal` → se ejecuta hasta asentarse (tope interno de 256 ticks) con telemetría real (tokens/coste) en candidatos vivos (replay: tokens/coste `0`).
+- **`--auto-approve`:** para ejecución **desatendida** en worktrees desechables: cada candidato corre solo en su worktree, la raíz nunca se toca; `[permissions].deny` sigue aplicando.
+- **Salida:** tabla Markdown de 9 columnas en `stdout` — `| model | passed_verify | ticks | tool_calls | input_tokens | cached_tokens | output_tokens | estimated_cost_usd | wall_time_ms |` — y, con `--out`, el informe JSON (`metadata` con snapshot/tick/models/verify + `results` por candidato con todas las columnas).
+- **Flags reutilizados:** `--workspace <dir>`, `--sandbox <off|workspace-write|strict-container>`, `--sandbox-net <offline|localhost|unrestricted>`, `--shell-timeout <secs>`, `--trust-workspace`, `--api-base <url>`, `--allow-custom-auth-host`, `--effort <low|medium|high>`, `--thinking-budget <n>` (el candidato vivo determina su propio `provider:model`).
+- **Validación accionable:** sin `--snapshot-dir`/`--tick`/`--models` el error indica la flag que falta; proveedor desconocido → `unsupported provider ... (expected `gemini`, `openai` or `anthropic`)`; snapshot ausente → aviso de suelo (floor), no error.
 
 ---
 

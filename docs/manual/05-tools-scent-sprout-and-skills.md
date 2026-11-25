@@ -2,11 +2,11 @@
 
 > 🇪🇸 **[Ver este capítulo en Español](05-herramientas-scent-sprout-y-skills.md)**
 
-This chapter catalogs all **23 tools** exposed to the agent in `openonyx` (19 base + `spawn_agent` + 4 async subagent tools in isolated Git worktrees), explains AST navigation (`onyx-scent`), covers local service & container orchestration (`sprout.toml`), shows how to customize behavior with `ONYX.md` / skills, and outlines headless automation (`openonyx run`).
+This chapter catalogs all **24 tools** exposed to the agent in `openonyx` (19 base + `spawn_agent` + 4 async subagent tools in isolated Git worktrees), explains multi-language AST navigation (`onyx-scent` 2.0), covers local service & container orchestration (`sprout.toml`), shows how to customize behavior with `ONYX.md` / skills, and outlines headless automation (`openonyx run`) and multi-model benchmarking (`openonyx bench`).
 
 ---
 
-## 1. Complete 23-Tool Catalog
+## 1. Complete 24-Tool Catalog
 
 ### Read-Only & Coordination Tools (No Approval Required)
 
@@ -16,15 +16,16 @@ This chapter catalogs all **23 tools** exposed to the agent in `openonyx` (19 ba
 | `fs_list` | List workspace directory tree up to `max_depth` (default `3`). | Skips external symlinks, `.git`, `target`, `node_modules`, `.onyx/vault/`, `*.tr`, `*.onyxpack`. |
 | `glob_files` | Find workspace paths matching glob patterns (`*`, `**`, `?`, `[...]`, `{a,b}`). | Deterministic lexicographical order (or `sort_by_mtime`). Rejects path traversal. |
 | `code_search` | Literal or `regex` text search across the workspace. | Supports `case_insensitive`, `include_glob`, `exclude_glob`, and `context_lines` (`0..=5`) with `scrub_secrets`. |
-| `scent_outline` | Paginated `@TOON v1` AST map of symbols, visibility, and line ranges. | Supports `Rust`, `Python`, and `Java`; incremental `blake3` cache + per-session `seen_outlines` dedup invalidated on edits/shell/`/undo`; filters `public_only`, `exclude_tests`, `cursor`, `max_rows` (`1..=500`). |
+| `scent_outline` | Paginated `@TOON v1` AST map of symbols, visibility, and line ranges. | Supports `Rust`, `Python`, `Java`, `TypeScript` (`.ts/.tsx/.mts/.cts`), `JavaScript` (`.js/.jsx/.mjs/.cjs`), `Go`, and `C/C++` (`.c/.h/.cc/.cpp/.cxx/.hh/.hpp`); incremental `blake3` cache + persistent binary `.onyx/scent.idx` cache + per-session `seen_outlines` dedup invalidated on edits/shell/`/undo`; filters `public_only`, `exclude_tests`, `cursor`, `max_rows` (`1..=500`). |
 | `scent_impact` | Semantic call-impact graph (integer thermal diffusion `0..=10_000` bp, `1..=6` hops). | Reveals callers/dependents before refactoring shared symbols. |
+| `scent_references` | Resolves the exact AST definition of a symbol and its direct cross-references (callers, callees, implementors, type users) as `@TOON v1` tuples. | `target` (symbol name, `Type::method`, or `file::symbol`); optional `public_only`, `exclude_tests`, pagination `cursor`/`max_rows` (`1..=500`). |
 | `git_status` | Read-only `git status --short --branch`. | Preferred over `shell_exec` for Git inspection. |
 | `git_diff` | Read-only `git diff --no-color` with optional `path`, `staged`, and `context_lines`. | Passes `path` strictly after `--`. |
 | `load_skill` | On-demand Markdown protocol/guide loader. | Searches `.onyx/skills/`, `skills/`, `~/.onyx/skills/`, plus built-in `scent` and `rust` guides. |
 | `plan_update` | Updates structured checklist (`pending`, `in_progress`, `completed`). | Persisted to `ws.plan.text` and rendered in the right-hand `Live Plan` panel. |
 | `service_status` | Returns `@TOON v1` status of all `sprout.toml` services. | Also projected into the `Services (Sprout)` side panel. |
 | `service_logs` | Reads recent lines from a Sprout service ring-buffer (up to 2,000 lines). | Lossy UTF-8 decoding + `scrub_secrets` filtering. |
-| `spawn_agent` | Delegates an independent subtask to a child subagent (`WaitingChildren`). | Default `32`-step cap (overridable via `max_steps` JSON arg). |
+| `spawn_agent` | Delegates an independent subtask to a child subagent (`WaitingChildren`). | Default `32`-step cap (overridable via `max_steps` JSON arg). With `isolated: true` the child works in its own **isolated Git worktree** (`onyx/sub/agent-*`) and the root is untouched until the 3-way is applied (section 1.1). |
 
 ### Mutating Tools (Require Approval in `BUILD`; Blocked in `PLAN`/`EXPLORE`)
 
@@ -52,6 +53,15 @@ Besides `spawn_agent` (synchronous, same workspace), the agent can launch **asyn
 
 > **External drivers:** with `driver = "opencode"` (or any declared `[[external_drivers]]`), the job is delegated to an external CLI harness working in the same isolated worktree; process isolation, the Trust gate, and the network policy are documented in chapter 03 (section 2.7).
 
+### 1.1. `spawn_agent(isolated: true)` — synchronous children in isolated worktrees
+
+Beyond the async jobs above, `spawn_agent` accepts the `isolated: true` argument: the **synchronous** child (the parent goes `WaitingChildren`) works in its own **isolated Git worktree**, so parallel edits by several children **never touch the root working tree** until merged.
+
+- **Creation:** when a pending `spawn_agent(isolated: true)` is detected, the bridge lazily creates the `onyx/sub/agent-<parent>-<child>-<seq>` worktree via `WorktreeManager` (SDD-09) with `WorkspacePolicy::for_worktree` and `NativeOffline` networking; creation uses a `commit-tree` checkpoint of the current working tree, **without moving the root `HEAD` or index**. If the workspace is not a Git repo (or Git < 2.38), the parent receives a sticky, actionable error (root untouched).
+- **Finalization:** when the child terminates (`Done`/`Failed`) or vanishes from the graph, the bridge finalizes it unconditionally: it captures the ephemeral commit of the child's final working tree, evaluates the **3-way** (`git merge-tree`, root intact), and records an `IsolatedWorktreeResult` (`Pending`/`Applied`/`Discarded`/`Transferred`).
+- **Resolution:** with a clean 3-way the result is applied to the root (or discarded) **sequentially**; with **conflicts**, the worktree is transferred to `SubagentManager` and the work flows through the normal **`subagent_status` / `subagent_merge` / `subagent_discard`** path (same approval and governance as `spawn_subagent` jobs). Result notifications follow the async-job semantics (`last_completed_proposals` and, with `proactive_notifications`, an `IngressEvent::Command`).
+- **Cleanup:** the worktree is removed on apply/discard, on the bridge `Drop`, and by the orphaned-worktree pruning in `openonyx doctor`; the temp branch `onyx/sub/<job_id>` is always deleted.
+
 ### Dynamic MCP Tools (`mcp__<server>__<tool>`)
 
 On top of the fixed catalog above, every MCP server declared in `[mcp.servers.<name>]` (chapter 03, section 2.8) injects its tools **dynamically** into the LLM under the name `mcp__<server>__<tool>`:
@@ -65,13 +75,20 @@ On top of the fixed catalog above, every MCP server declared in `[mcp.servers.<n
 
 ---
 
-## 2. Semantic AST Navigation with `onyx-scent`
+## 2. Semantic AST Navigation with `onyx-scent` (Scent 2.0)
 
 Instead of burning tokens reading entire multi-thousand-line files, `openonyx` encourages a two-step workflow:
-1. **`scent_outline`**: fetches symbol signatures, visibility, and exact line ranges in compact `@TOON v1` format (paginated via `cursor` / `next_cursor`). Repeated calls on unchanged files hit the per-session `seen_outlines` cache, which invalidates automatically after `fs_edit`, `fs_write`, `shell_exec`, or `/undo`.
-2. **`scent_impact`** + **`fs_read(start_line, end_line)`**: checks the blast radius before editing public symbols, then reads only the exact lines required.
+1. **`scent_outline`**: fetches function, struct, trait, class, method, *type alias* and *component* signatures, visibility, and exact line ranges in compact `@TOON v1` format (paginated via `cursor` / `next_cursor`). Repeated calls on unchanged files hit the per-session `seen_outlines` cache, which invalidates automatically after `fs_edit`, `fs_write`, `shell_exec`, or `/undo`.
+2. **`scent_impact`** / **`scent_references`** + **`fs_read(start_line, end_line)`**: checks the blast radius (or resolves a symbol's exact definition and direct cross-references) before editing public symbols, then reads only the exact lines required.
 
-> **Currently supported languages in `onyx-scent`:** Rust (`.rs`), Python (`.py`), and Java (`.java`). For other languages, the agent uses `glob_files` + `code_search` v2 + `fs_read`.
+> **Languages supported by `onyx-scent` (Scent 2.0):** **7 languages** — Rust (`.rs`), Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`, `.mts`, `.cts`), JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`), Go (`.go`), and C/C++ (`.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`). In JS/TS it also extracts *type aliases* (`EntityKind::TypeAlias`) and **components** (`EntityKind::Component`: PascalCase functions with JSX in `.tsx`/`.jsx`), and `is_callable` includes both. For other languages, the agent uses `glob_files` + `code_search` v2 + `fs_read`.
+
+### Incremental binary cache `.onyx/scent.idx`
+
+- **`ONYXSCI1`**: the workspace AST index is persisted to **`.onyx/scent.idx`** (machinery `ONYXSCI1`: magic + version + entries sorted by `rel_path` + final `blake3` checksum) alongside a hygiene `.onyx/.gitignore` that ignores `scent.idx` and `scent.idx.tmp*`; any anomaly (truncated file, wrong magic/version, invalid checksum) is silently ignored and the index is rebuilt clean.
+- **Incremental reload**: each refresh only re-parses files whose mtime/content changed (hash-verified), so repos with thousands of files update in tens of milliseconds; the file is written atomically (temp file + rename).
+- **Excluded from Git artifacts**: subagent ephemeral checkpoints (`commit-tree`) and worktree impact evaluation **exclude** `.onyx/scent.idx*` and its `.gitignore`, so a child's work is never polluted by OnYX's own operational artifacts.
+- **`scent` CLI**: the `onyx-scent` crate (`cli` feature) exposes the **`scent`** binary with `outline`, `impact`, and **`references`** subcommands (same `@TOON v1` output as the agent tools, for direct use in scripts/CI).
 
 ---
 

@@ -590,7 +590,7 @@ fn help_text() -> String {
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
   rewind <dir> <tick>      Restore git checkpoints to <tick> (or prior milestone) and replay/continue
-  bench                    Multi-model benchmark from an identical snapshot (disposable worktrees + rewind + `--verify`; live `provider:model` or offline `replay:<label>=<file.tr>` candidates)
+  bench                    Multi-model benchmark from an identical snapshot (disposable worktrees + rewind + `--verify`; live `provider:model` or offline `replay:<label>=<file.tr>` candidates; unattended runs use `--auto-approve` — every candidate runs in a throwaway worktree, the root is never touched)
   doctor                   Verify workspace git repository, sandbox, Workspace Trust, MCP servers (`[mcp.servers.*]`), snapshot packs, and transcripts
   trust                    Approve, check, list, or revoke Workspace Trust hashes (`~/.onyx/trusted_workspaces.toml`)
   serve                    Serve embedded mobile-first PWA + JSON/SSE API (`/api/v1/...`) over HTTP/1.1 (0 tokio)
@@ -684,6 +684,8 @@ PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
   .onyx/skills/<name>/SKILL.md (also skills/, ~/.onyx/skills/)
                            Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
   [mcp.servers.<name>]     MCP servers from `config.toml` (global `~/.onyx/config.toml` and, if trusted, workspace): `transport = "stdio"` (`command`/`args`/`env`) or `"http"` (`url`/`headers`), `timeout_secs`, `enabled`. Their tools appear as `mcp__<server>__<tool>`, always approval-gated, `Deny` in PLAN/EXPLORE, audited by `openonyx doctor`
+  [verify] / [[verify.rules]]
+                           Verify-on-Edit: after each successful `fs_edit`/`fs_write`, run the rules whose `glob` matches the edited file (plus Scent-impacted `scope:test` files) in the `shell_exec` sandbox; `[verify]` keys: `on_edit = true` (opt-in), `max_secs` (1..=120, default 20), each `[[verify.rules]]` takes `glob`, `command`, optional `max_secs`. Output is appended as `[verify: PASS|FAIL|BLOCKED]`; workspace rules are subject to Workspace Trust and to `[permissions].deny`
   Live Plan & Services     Right-hand panels (`plan_update` + `sprout.toml`) shown automatically when width >= 100 columns
   User Manual              Full guide available in `docs/manual/index.md`
   Session Vault            `.onyx/vault/<session>/` stores snapshots + `.tr` together (`.onyx/vault/unassigned/` for standalone `.tr`; auto-ignored by Git)
