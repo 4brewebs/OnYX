@@ -28,6 +28,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --release --locked
+      - run: cargo clippy -p onyx-scent --features cli --all-targets --locked -- -D warnings
+      - run: cargo test -p onyx-scent --features cli --locked
       - name: Comprobar documentación
         run: cargo doc --workspace --no-deps --locked
         env:
