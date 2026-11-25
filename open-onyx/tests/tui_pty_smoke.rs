@@ -337,3 +337,29 @@ mod pty {
         assert_restored(&run);
     }
 }
+
+/// Mismo origen que el hallazgo de `cli_blackbox`: `main` imprime el `io::Error` con
+/// `Debug` (`Error: Os { code: 6, kind: Uncategorized, message: "No such device or
+/// address" }`) y el usuario no sabe que falta un terminal interactivo.
+#[test]
+#[ignore = "BUG: chat sin TTY imprime `Os { code: 6, .. }` en vez de pedir un terminal interactivo"]
+fn chat_without_a_tty_explains_that_a_terminal_is_required() {
+    let ws = TempWorkspace::new("tui_notty_msg");
+    let mut cmd = hermetic_command(&ws.home);
+    cmd.current_dir(&ws.ws).args([
+        "chat",
+        "--workspace",
+        ws.ws.to_str().unwrap(),
+        "--provider",
+        "openai",
+        "--api-base",
+        "http://127.0.0.1:9/v1",
+    ]);
+    let out = run_with_timeout(cmd, Duration::from_secs(20)).expect("chat sin TTY se colgó");
+    let lower = out.stderr.to_ascii_lowercase();
+    assert!(
+        lower.contains("tty") || lower.contains("terminal"),
+        "el error debería decir que hace falta un terminal: {}",
+        out.stderr
+    );
+}
