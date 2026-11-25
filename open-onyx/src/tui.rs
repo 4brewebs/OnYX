@@ -887,8 +887,13 @@ impl TuiInner {
                 })
                 .unwrap_or_default();
         };
+        // `SDD-07` Fase 4A: el store del depurador temporal es la fuente
+        // única de verdad de la timeline (TUI y Web); el store de sesión es
+        // solo fallback (tests / sesiones sin `--snapshot-dir` en el hub).
         let mut pack_tags = std::collections::BTreeMap::new();
-        if let Some(s) = &self.snapshot_store {
+        let store: Option<&crate::pack::SharedPackStore> =
+            td.pack_store().or(self.snapshot_store.as_ref());
+        if let Some(s) = store {
             for m in s.entries() {
                 pack_tags.insert(m.tick, m.tag.clone());
             }
@@ -1962,11 +1967,20 @@ impl TuiInner {
                     td.present()
                 );
                 if td.cursor() < td.present() {
-                    let files = self
-                        .ws_vocab
-                        .as_ref()
-                        .map(|wv| td.pending_revert_files(graph, wv).len())
-                        .unwrap_or(0);
+                    // `SDD-07` Fase 4A (fix de auditoría Fase 3): la cuenta
+                    // sale de `live_effects` (grafo vivo) cuando el borde de
+                    // sesión lo ha sincronizado — el `graph` recibido puede
+                    // ser el `preview_graph(cursor)`, que no contiene
+                    // efectos `> cursor`. Fallback (tests sin `run_session`):
+                    // el grafo recibido.
+                    let files = if td.live_effects_synced() {
+                        td.pending_revert_file_names().len()
+                    } else {
+                        self.ws_vocab
+                            .as_ref()
+                            .map(|wv| td.pending_revert_files(graph, wv).len())
+                            .unwrap_or(0)
+                    };
                     banner.push_str(&format!(" · revert on branch: {files} file(s)"));
                 }
                 banner

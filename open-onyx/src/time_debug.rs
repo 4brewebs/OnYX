@@ -36,7 +36,7 @@ use onyx_soul_agents::{
     pending_approvals, pending_tool_calls,
 };
 use onyx_workspace::{
-    RecordedEffect, WorkspaceTools, WorkspaceVocab, effects_after_tick,
+    RecordedEffect, WorkspaceTools, WorkspaceVocab, all_recorded_effects, effects_after_tick,
     restore_git_tree_checkpoint_for_targets,
 };
 
@@ -266,6 +266,16 @@ pub struct TimeDebugState {
     ring: Arc<Mutex<InMemoryTickRing>>,
     preview_cache: Arc<Mutex<PreviewGraphCache>>,
     pack: Option<SharedPackStore>,
+    /// `SDD-07` Fase 4A (fix de auditoría Fase 3): efectos del **grafo vivo**
+    /// capturados en el borde de sesión (`sync_live_effects`). El grafo que
+    /// `SessionView::current` entrega a la UI (TUI o Web) es el
+    /// `preview_graph(cursor)` cuando el cursor mira el pasado — sobre él
+    /// `effects_after_tick` devuelve siempre 0; `live_effects` es la fuente
+    /// de verdad para `pending_revert_file_names` (0 I/O, RAM).
+    live_effects: Arc<Mutex<Vec<RecordedEffect>>>,
+    /// `live_effects` ha recibido al menos una `sync_live_effects` (el
+    /// fallback del banner TUI solo se usa en tests sin `run_session`).
+    live_effects_synced: Arc<AtomicBool>,
 }
 
 impl TimeDebugState {
@@ -278,7 +288,54 @@ impl TimeDebugState {
             ring: Arc::new(Mutex::new(InMemoryTickRing::new())),
             preview_cache: Arc::new(Mutex::new(PreviewGraphCache::new())),
             pack,
+            live_effects: Arc::new(Mutex::new(Vec::new())),
+            live_effects_synced: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Store de snapshots compartido (hito en disco + `fork_pack_until_tick`).
+    /// Fuente única de verdad de la timeline (TUI F5 y Web, `SDD-07` Fase 4A).
+    pub fn pack_store(&self) -> Option<&SharedPackStore> {
+        self.pack.as_ref()
+    }
+
+    /// `SDD-07` Fase 4A: captura los efectos del **grafo vivo** (0 I/O).
+    /// Llamado en cada `record_tick` del borde de sesión, tras `--resume`,
+    /// tras `/rewind` y al final de `confirm_branch_from_cursor`: así
+    /// `pending_revert_file_names` sigue siendo exacto aunque la UI reciba el
+    /// `preview_graph(cursor)` (que no contiene efectos `> cursor`).
+    pub fn sync_live_effects<G: GraphView + ?Sized>(&self, live_graph: &G, ws: &WorkspaceVocab) {
+        let effects = all_recorded_effects(live_graph, ws);
+        if let Ok(mut guard) = self.live_effects.lock() {
+            *guard = effects;
+        }
+        self.live_effects_synced.store(true, Ordering::Release);
+    }
+
+    /// `SDD-07` Fase 4A: rutas únicas (ordenadas) de los efectos del grafo
+    /// vivo con `tick > cursor`: lo que se revertiría al confirmar la
+    /// bifurcación. Vacío si `cursor >= present`.
+    pub fn pending_revert_file_names(&self) -> Vec<String> {
+        let cursor = self.cursor();
+        if cursor >= self.present() {
+            return Vec::new();
+        }
+        let mut names = BTreeSet::new();
+        if let Ok(guard) = self.live_effects.lock() {
+            for e in guard.iter().filter(|e| e.tick > cursor) {
+                if !e.target.is_empty() {
+                    names.insert(e.target.clone());
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// ¿`live_effects` ya se ha sincronizado alguna vez? (El banner TUI usa
+    /// el fallback sobre el grafo recibido cuando no, p. ej. tests sin
+    /// `run_session`.)
+    pub fn live_effects_synced(&self) -> bool {
+        self.live_effects_synced.load(Ordering::Acquire)
     }
 
     /// Límites de ring personalizados (tests).
@@ -753,6 +810,10 @@ pub fn confirm_branch_from_cursor(
     state.clear_preview_cache();
     state.set_present(cursor);
     tools.clear_seen_reads();
+    // `SDD-07` Fase 4A: el grafo vivo acaba de restaurarse (1 step
+    // determinista) → refrescar la captura de efectos para
+    // `pending_revert_file_names`.
+    state.sync_live_effects(host.graph(), ws_vocab);
 
     let mut summary = format!(
         "[time-branch] Branched from tick {cursor} (present {present}); clock at tick {}.",

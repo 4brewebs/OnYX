@@ -1730,3 +1730,187 @@ dialog::backdrop {
     flex: 1 1 auto;
   }
 }
+
+/* `SDD-07` Fase 4A: Time Debugger (TimeFreeze) — barra ámbar + pill congelada */
+
+#tick-pill.is-frozen {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-color: color-mix(in oklab, var(--amber) 45%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--amber) 16%, transparent);
+}
+
+.time-debug-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.6rem 0.9rem;
+  border-block-end: 1px solid color-mix(in oklab, var(--amber) 45%, transparent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--amber) 13%, var(--bg-surface)),
+    color-mix(in oklab, var(--amber) 7%, var(--bg-surface))
+  );
+}
+
+.tdb-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.tdb-status {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--ink-primary);
+}
+
+.tdb-status.is-frozen {
+  color: var(--amber);
+}
+
+.tdb-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.tdb-btn {
+  padding: 0.32rem 0.62rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in oklab, var(--amber) 45%, transparent);
+  background: var(--bg-elevated);
+  color: var(--ink-primary);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease, transform 100ms ease;
+}
+
+.tdb-btn:hover {
+  border-color: var(--amber);
+}
+
+.tdb-btn:active {
+  transform: translateY(1px);
+}
+
+.tdb-freeze {
+  color: var(--amber);
+}
+
+.tdb-resume {
+  color: var(--emerald);
+  border-color: color-mix(in oklab, var(--emerald) 45%, transparent);
+}
+
+.tdb-resume:hover {
+  border-color: var(--emerald);
+}
+
+#tdb-slider {
+  inline-size: clamp(9rem, 26vw, 16rem);
+  accent-color: var(--amber);
+  cursor: pointer;
+}
+
+#tdb-slider:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.tdb-revert-warn {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--amber);
+}
+
+.tdb-error {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--crimson);
+}
+
+.tdb-bench {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.tdb-bench-hint {
+  flex: 1 1 20rem;
+  padding: 0.42rem 0.6rem;
+  border-radius: var(--radius-sm);
+  border: 1px dashed color-mix(in oklab, var(--amber) 45%, transparent);
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--ink-secondary);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.tdb-nongoal {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--ink-muted);
+  cursor: help;
+}
+
+/* Botones ✎/× de memoria (solo root + TIME FROZEN + seq >= 0) */
+.mem-wrap {
+  position: relative;
+}
+
+.mem-actions {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  display: flex;
+  gap: 0.3rem;
+  z-index: 3;
+}
+
+.mem-btn {
+  inline-size: 1.7rem;
+  block-size: 1.7rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid color-mix(in oklab, var(--amber) 55%, transparent);
+  background: var(--bg-elevated);
+  color: var(--amber);
+  font-size: 0.85rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-card);
+  transition: border-color 140ms ease, background-color 140ms ease, transform 100ms ease;
+}
+
+.mem-btn:hover {
+  border-color: var(--amber);
+}
+
+.mem-btn:active {
+  transform: translateY(1px);
+}
+
+.mem-btn-drop {
+  color: var(--crimson);
+  border-color: color-mix(in oklab, var(--crimson) 55%, transparent);
+}
+
+.mem-btn-drop:hover {
+  border-color: var(--crimson);
+}

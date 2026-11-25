@@ -1352,6 +1352,10 @@ fn launch_interactive_chat(
         // (el step de restore ejecutó `target_tick`), alineado con el
         // `MilestoneSnapshotSystem`.
         time_debug.set_present(host.ticks().saturating_sub(1));
+        // `SDD-07` Fase 4A: `--resume` restauró el grafo vivo → capturar
+        // `live_effects` antes del primer render (fuente de
+        // `pending_revert_file_names` de TUI/Web).
+        time_debug.sync_live_effects(host.graph(), &ws_vocab);
         if let Some(src) = &plan.branched_from {
             pending_notes.push(format!(
                 "[resume] Restored milestone tick {} into branch `{}` (source `{}` preserved).",
@@ -1608,6 +1612,10 @@ fn launch_web_serve(
         // (el step de restore ejecutó `target_tick`), alineado con el
         // `MilestoneSnapshotSystem`.
         time_debug.set_present(host.ticks().saturating_sub(1));
+        // `SDD-07` Fase 4A: `--resume` restauró el grafo vivo → capturar
+        // `live_effects` antes del primer render (fuente de
+        // `pending_revert_file_names` de la Web).
+        time_debug.sync_live_effects(host.graph(), &ws_vocab);
     }
 
     let stream_preview = StreamPreviewHandle::new();
@@ -1627,6 +1635,9 @@ fn launch_web_serve(
     .with_model_info(llm.model.clone(), llm.effort)
     .with_llm_profile(profile_handle.clone())
     .with_session_storage(resolved_storage.session_label.clone(), shared_store.clone())
+    // `SDD-07` Fase 4A: paridad TimeFreeze en Web — el mismo estado del
+    // bucle de sesión (scrub/preview/`live_effects`, 0 reconstrucción en JS).
+    .with_time_debug(time_debug.clone())
     .with_subagents(sub_handle.clone());
 
     let bound = web_driver.local_addr();

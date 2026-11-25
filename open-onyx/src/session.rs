@@ -282,9 +282,13 @@ pub fn run_session<D: SessionDriver>(
                     // el agente en el grafo (por `AgentSpawner`).
                     needs_follow_up_tick = ui_queued;
                     // `SDD-07`: captura la frontera de tick en el anillo RAM.
+                    // `SDD-07` Fase 4A: refresca `live_effects` (grafo vivo)
+                    // para que `pending_revert_file_names` sea exacto aunque
+                    // la UI reciba el `preview_graph(cursor)`.
                     if let Some(td) = &time_debug {
                         if host.ticks() > 0 {
                             td.record_tick(host.ticks() - 1, &host.graph().export());
+                            td.sync_live_effects(host.graph(), &ws_vocab);
                         }
                     }
 
@@ -749,6 +753,9 @@ pub fn apply_session_action(
                 host.step(&mut HeadlessDriver::new());
                 td.record_tick(host.ticks() - 1, &host.graph().export());
             }
+            // `SDD-07` Fase 4A: los ticks deterministas acabados de dar
+            // pueden portar efectos → refrescar la captura del grafo vivo.
+            td.sync_live_effects(host.graph(), &ctx.ws_vocab);
             let mut msg = format!(
                 "[step] Advanced {n} deterministic tick(s) with 0 LLM; clock at tick {} (frozen).",
                 host.ticks()
@@ -960,6 +967,9 @@ pub fn apply_session_action(
                 }
                 td.clear_preview_cache();
                 td.set_present(target_tick);
+                // `SDD-07` Fase 4A: el grafo vivo quedó restaurado a la nueva
+                // línea temporal → refrescar `live_effects` (0 I/O).
+                td.sync_live_effects(host.graph(), &ctx.ws_vocab);
             }
 
             let mut summary = if target_tick != requested_tick {
