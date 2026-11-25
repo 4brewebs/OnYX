@@ -99,9 +99,9 @@ pub fn parse_candidate_spec(raw: &str) -> Result<BenchCandidateSpec, String> {
             let label = label.trim();
             let path = path.trim();
             if label.is_empty() || path.is_empty() {
-                return Err(
-                    "malformed replay candidate (need `<label>=<path.tr>`): `{entry}`".to_string(),
-                );
+                return Err(format!(
+                    "malformed replay candidate (need `<label>=<path.tr>`): `{entry}`"
+                ));
             }
             Ok(BenchCandidateSpec::Replay {
                 label: label.to_string(),
@@ -1032,6 +1032,14 @@ mod tests {
         assert!(e.contains("malformed live candidate"), "{e}");
         let e = parse_candidates("replay:").unwrap_err();
         assert!(e.contains("replay candidate needs"), "{e}");
+        // `replay:=foo.tr` (label vacío) y `replay:lbl=` (path vacío): el mensaje
+        // interpola el candidato tal y como se escribió (sin literal `{entry}`).
+        let e = parse_candidates("replay:=foo.tr").unwrap_err();
+        assert!(e.contains("malformed replay candidate"), "{e}");
+        assert!(e.contains("replay:=foo.tr"), "{e}");
+        let e = parse_candidates("replay:lbl=").unwrap_err();
+        assert!(e.contains("malformed replay candidate"), "{e}");
+        assert!(e.contains("replay:lbl="), "{e}");
     }
 
     #[test]
