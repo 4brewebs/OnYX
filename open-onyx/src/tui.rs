@@ -1115,7 +1115,8 @@ impl TuiInner {
                             self.pending_focus_switch =
                                 Some(FocusSwitch::Target(target.to_string()));
                         }
-                    } else if self.root_busy && !is_immediate_slash_cmd(&cmd) {
+                    } else if self.root_busy && !crate::command::is_immediate_session_command(&cmd)
+                    {
                         self.pending_prompts.push(cmd);
                     } else {
                         let lower = cmd.trim().to_ascii_lowercase();
@@ -2402,39 +2403,6 @@ pub(crate) fn build_approval_lines(
     lines
 }
 
-/// Returns `true` for slash commands that should execute immediately instead of waiting in the
-/// follow-up prompt queue while the root agent is busy.
-fn is_immediate_slash_cmd(cmd: &str) -> bool {
-    let lower = cmd.trim().to_ascii_lowercase();
-    lower == "/mode"
-        || lower.starts_with("/mode ")
-        || lower == "/profile"
-        || lower.starts_with("/profile ")
-        || lower == "/provider"
-        || lower.starts_with("/provider ")
-        || lower == "/model"
-        || lower.starts_with("/model ")
-        || lower == "/effort"
-        || lower.starts_with("/effort ")
-        || lower == "/services"
-        || lower.starts_with("/services ")
-        || lower == "/service"
-        || lower.starts_with("/service ")
-        || lower == "/subagents"
-        || lower == "/subagent"
-        || lower == "/spawn"
-        || lower.starts_with("/spawn ")
-        || lower.starts_with("/merge ")
-        || lower.starts_with("/discard ")
-        || lower == "/trust"
-        || lower.starts_with("/trust ")
-        || lower == "/undo"
-        || lower == "/cancel"
-        || lower.starts_with("/cancel ")
-        || lower == "/stop"
-        || lower.starts_with("/stop ")
-}
-
 fn cached_sandbox_driver() -> onyx_workspace::SandboxDriverKind {
     use std::sync::OnceLock;
     static DRIVER: OnceLock<onyx_workspace::SandboxDriverKind> = OnceLock::new();
@@ -3696,5 +3664,48 @@ mod tests {
                 "{prefix} → esperaba {expected} en {labels:?}"
             );
         }
+    }
+
+    /// `SDD-07` Fase 4B (fix de auditoría — regresión del deadlock): con el
+    /// agente raíz ocupado (`root_busy == true`, Thinking) **y** TimeFreeze
+    /// activo (el breakpoint principal pre-LLM), las vías de escape deben ir
+    /// al bus inmediato (`queued`), NO a `pending_prompts` (allí esperarían
+    /// un idle que nunca llega mientras el tiempo sigue congelado → el
+    /// usuario no puede salir del freeze con su propia UI).
+    #[test]
+    fn time_freeze_escape_commands_immediate_while_root_busy() {
+        let (driver, _graph, td) = tf_ctx(Some(3));
+        let mut inner = driver.inner.borrow_mut();
+        assert!(td.is_frozen(), "tf_ctx(Some(3)) deja el tiempo congelado");
+
+        // Escenario crítico: el agente está pausado en Thinking y congelado.
+        inner.root_busy = true;
+
+        for cmd in ["/go", "/step-llm", "/graph drop-mem 1", "!echo hi"] {
+            tf_type_command(&mut inner, cmd);
+        }
+
+        let cmds: Vec<String> = inner
+            .queued
+            .iter()
+            .filter_map(|ev| match ev {
+                OnyxEvent::Ingress(IngressEvent::Command(c)) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cmds,
+            vec![
+                "/go".to_string(),
+                "/step-llm".to_string(),
+                "/graph drop-mem 1".to_string(),
+                "!echo hi".to_string(),
+            ],
+            "las vías de escape van al bus inmediato"
+        );
+        assert!(
+            inner.pending_prompts.is_empty(),
+            "nada queda en pending_prompts (deadlock: idle que nunca llega)"
+        );
     }
 }

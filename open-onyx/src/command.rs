@@ -96,6 +96,65 @@ pub enum SessionAction {
     },
 }
 
+/// `SDD-07` Fase 4B (fix de auditoría): comandos de sesión que deben ejecutarse
+/// **inmediatamente** aunque el agente raíz esté ocupado (`root_busy == true`).
+///
+/// Sin esta lista, bajo `TimeFreeze` en el breakpoint principal (pre-LLM:
+/// `root_busy` + `frozen`) las vías de escape (`/go`, `/step-llm`,
+/// `/graph drop-mem`, `!cmd`…) se encolarían en los prompts pendientes
+/// esperando un idle que nunca llega mientras el tiempo sigue congelado →
+/// deadlock (el usuario no puede salir del freeze con su propia UI).
+///
+/// Función única compartida por TUI y Web para que las dos superficies no
+/// diverjan: antes eran dos copias idénticas byte a byte
+/// (`is_immediate_slash_cmd` en `tui.rs` y `is_immediate_web_slash` en
+/// `web.rs`).
+pub(crate) fn is_immediate_session_command(cmd: &str) -> bool {
+    let lower = cmd.trim().to_ascii_lowercase();
+    lower == "/mode"
+        || lower.starts_with("/mode ")
+        || lower == "/profile"
+        || lower.starts_with("/profile ")
+        || lower == "/provider"
+        || lower.starts_with("/provider ")
+        || lower == "/model"
+        || lower.starts_with("/model ")
+        || lower == "/effort"
+        || lower.starts_with("/effort ")
+        || lower == "/services"
+        || lower.starts_with("/services ")
+        || lower == "/service"
+        || lower.starts_with("/service ")
+        || lower == "/subagents"
+        || lower == "/subagent"
+        || lower == "/spawn"
+        || lower.starts_with("/spawn ")
+        || lower.starts_with("/merge ")
+        || lower.starts_with("/discard ")
+        || lower == "/trust"
+        || lower.starts_with("/trust ")
+        || lower == "/undo"
+        || lower == "/cancel"
+        || lower.starts_with("/cancel ")
+        || lower == "/stop"
+        || lower.starts_with("/stop ")
+        // `SDD-07` Fase 4B: vías de escape del TimeFreeze y primitivas
+        // 0-tokens (deben llegar al bus incluso con `root_busy` + `frozen`).
+        || lower == "/time"
+        || lower == "/go"
+        || lower == "/unfreeze"
+        || lower == "/step"
+        || lower.starts_with("/step ")
+        || lower == "/step-llm"
+        || lower == "/graph"
+        || lower.starts_with("/graph ")
+        || lower == "/inject"
+        || lower.starts_with("/inject ")
+        || lower == "/read"
+        || lower.starts_with("/read ")
+        || lower.starts_with('!')
+}
+
 #[derive(Clone, Default)]
 pub struct PendingSessionAction(Arc<Mutex<Option<SessionAction>>>);
 

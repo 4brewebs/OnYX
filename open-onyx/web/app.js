@@ -188,7 +188,7 @@
     }
   }
 
-  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog, dom.llmModal]) {
+  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog, dom.llmModal, dom.editMemDialog]) {
     dlg.addEventListener('close', () => { dlg.returnValue = ''; });
   }
 
@@ -438,7 +438,10 @@
     dom.tdbSlider.min = String(min);
     dom.tdbSlider.max = String(max);
     dom.tdbSlider.value = String(Math.min(cursor, max));
-    dom.tdbSlider.disabled = cursor >= present;
+    // `SDD-07` Fase 4B (fix de auditoría): deshabilitado solo si no hay
+    // ticks disponibles — en el presente con anillo poblado el slider debe
+    // poder arrastrarse hacia el pasado sin pulsar ◀ antes.
+    dom.tdbSlider.disabled = tdbAvailable.length <= 1;
 
     // `Freeze` / `Present` según estado (auto-congela si el cursor ya ancla).
     const anchored = frozen || cursor < present;
@@ -1451,8 +1454,13 @@
     const td = (state && state.time_debug) || null;
     const memFrozen = Boolean(td && td.frozen);
     const canEditMem = Boolean(focused && focused.is_root && memFrozen);
+    // `SDD-07` Fase 4B (pulido): `cursor_tick` + longitud total del texto de
+    // la memoria en la key — re-render garantizado al cambiar de tick en
+    // preview o al editar una memoria antigua in-place con ✎ (misma
+    // longitud, distinto contenido).
+    const memTextTotal = memory.reduce((acc, m) => acc + (m.text || '').length, 0);
     const historyKey = focused
-      ? `${focused.id}|${focused.goal}|${memory.length}|${lastEntry ? lastEntry.seq : 0}|${lastEntry ? (lastEntry.text || '').length : 0}|${traceMode}|${memFrozen ? 'F' : 'L'}`
+      ? `${focused.id}|${focused.goal}|${memory.length}|${lastEntry ? lastEntry.seq : 0}|${lastEntry ? (lastEntry.text || '').length : 0}|${memTextTotal}|${td ? td.cursor_tick : 0}|${traceMode}|${memFrozen ? 'F' : 'L'}`
       : 'empty';
 
     if (historyKey !== lastHistoryKey) {

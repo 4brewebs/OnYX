@@ -632,7 +632,7 @@ impl WebHub {
             .state
             .lock()
             .map_err(|_| WebCommandRejection::BadRequest("web hub lock poisoned".to_string()))?;
-        if guard.root_busy && !is_immediate_web_slash(cmd) {
+        if guard.root_busy && !crate::command::is_immediate_session_command(cmd) {
             guard.queued_prompts.push_back(cmd.to_string());
             guard.state_dirty = true;
         } else {
@@ -810,37 +810,6 @@ impl WebHub {
         matches.sort();
         matches
     }
-}
-
-fn is_immediate_web_slash(cmd: &str) -> bool {
-    let lower = cmd.trim().to_ascii_lowercase();
-    lower == "/mode"
-        || lower.starts_with("/mode ")
-        || lower == "/profile"
-        || lower.starts_with("/profile ")
-        || lower == "/provider"
-        || lower.starts_with("/provider ")
-        || lower == "/model"
-        || lower.starts_with("/model ")
-        || lower == "/effort"
-        || lower.starts_with("/effort ")
-        || lower == "/services"
-        || lower.starts_with("/services ")
-        || lower == "/service"
-        || lower.starts_with("/service ")
-        || lower == "/subagents"
-        || lower == "/subagent"
-        || lower == "/spawn"
-        || lower.starts_with("/spawn ")
-        || lower.starts_with("/merge ")
-        || lower.starts_with("/discard ")
-        || lower == "/trust"
-        || lower.starts_with("/trust ")
-        || lower == "/undo"
-        || lower == "/cancel"
-        || lower.starts_with("/cancel ")
-        || lower == "/stop"
-        || lower.starts_with("/stop ")
 }
 
 // ---------------------------------------------------------------------------
@@ -3292,6 +3261,39 @@ mod tests {
         assert_eq!(
             queued, 3,
             "/go + /graph + !echo encolan; el 409 y el 400 no"
+        );
+    }
+
+    /// `SDD-07` Fase 4B (fix de auditoría — regresión del deadlock): con el
+    /// agente raíz ocupado (`root_busy`, Thinking) **y** TIME FROZEN (el
+    /// breakpoint principal pre-LLM de SDD-07), las vías de escape deben
+    /// llegar al bus inmediato (`incoming_events`), NO a la cola de prompts
+    /// pendientes (donde esperarían un idle que nunca llega mientras el
+    /// tiempo sigue congelado → el usuario queda atrapado en el freeze).
+    #[test]
+    fn test_07_7_5_escape_commands_immediate_while_root_busy_frozen() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // frozen + cursor < present (breakpoint pre-LLM)
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td);
+        // Escenario crítico: el agente está pausado en Thinking y congelado.
+        hub.state.lock().unwrap().root_busy = true;
+
+        for cmd in ["/go", "/step-llm", "/graph drop-mem 1", "!echo hi"] {
+            let resp = td_cmd(&hub, cmd);
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{cmd} → {resp}");
+        }
+
+        let guard = hub.state.lock().unwrap();
+        assert_eq!(
+            guard.incoming_events.len(),
+            4,
+            "las 4 vías de escape entran al bus inmediato"
+        );
+        assert!(
+            guard.queued_prompts.is_empty(),
+            "nada se encola en queued_prompts (deadlock: idle que nunca llega)"
         );
     }
 
