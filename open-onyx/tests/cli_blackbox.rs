@@ -274,3 +274,23 @@ fn serve_without_any_provider_key_fails_with_actionable_message() {
     let out = run(&ws, &args);
     assert_clean_failure(&out, &args, &["GEMINI_API_KEY"]);
 }
+
+/// BUG: los errores de E/S se imprimen con `Debug` (`Error: Os { code: 2, kind: NotFound,
+/// message: "No such file or directory" }`) sin decir qué ruta falló.
+#[test]
+#[ignore = "BUG: replay/doctor con ruta inexistente imprimen `Os { code: 2, .. }` sin la ruta"]
+fn missing_paths_are_named_in_the_error_message() {
+    let ws = TempWorkspace::new("cli_missing");
+    let missing = ws.ws.join("forja-missing.tr");
+    let ms = missing.to_str().unwrap();
+    let wsd = ws.ws.to_str().unwrap();
+    let missing_ws = ws.ws.join("forja-missing-ws");
+    let mws = missing_ws.to_str().unwrap();
+    for args in [
+        vec!["replay", ms, "--workspace", wsd],
+        vec!["doctor", "--workspace", mws],
+    ] {
+        let out = run(&ws, &args);
+        assert_clean_failure(&out, &args, &["forja-missing"]);
+    }
+}
