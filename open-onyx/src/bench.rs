@@ -77,6 +77,20 @@ impl BenchCandidateSpec {
     }
 }
 
+/// File stem portable (Windows+Linux) para el label de un replay sin etiqueta: separa el
+/// último componente por `/` **y** `\` (en Linux `Path::file_stem()` no trata `\` como
+/// separador, así que `C:\tmp\myrun.tr` daría el label `C:\tmp\myrun`), y corta la última
+/// extensión. `snaps/myrun.tr` y `C:\tmp\myrun.tr` → `myrun` en cualquier plataforma.
+fn bare_replay_label(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    if stem.is_empty() {
+        "replay".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
 /// Parsea una entrada de `--models`.
 ///
 /// Orden de separación crítico (portable Windows+Linux): primero `split_once(':')` para
@@ -108,13 +122,10 @@ pub fn parse_candidate_spec(raw: &str) -> Result<BenchCandidateSpec, String> {
                 path: std::path::PathBuf::from(path),
             })
         } else {
-            // Sin `=`: el label es el file stem del `.tr`.
+            // Sin `=`: el label es el file stem del `.tr` (portable Windows+Linux:
+            // `Path::file_stem()` no separa `\` en Linux, ver `bare_replay_label`).
             let path = std::path::PathBuf::from(rest);
-            let label = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| "replay".to_string());
+            let label = bare_replay_label(rest);
             Ok(BenchCandidateSpec::Replay { label, path })
         }
     } else {
@@ -1013,6 +1024,18 @@ mod tests {
 
     #[test]
     fn parse_candidates_replay_bare_path_uses_file_stem_label() {
+        // Forma portable con `/`: el label es el file stem del `.tr`.
+        let v = parse_candidates("replay:snaps/myrun.tr").unwrap();
+        match &v[0] {
+            BenchCandidateSpec::Replay { label, path } => {
+                assert_eq!(label, "myrun");
+                assert_eq!(path, &std::path::PathBuf::from("snaps/myrun.tr"));
+            }
+            other => panic!("expected Replay, got {other:?}"),
+        }
+        // Ruta con letra de unidad Windows: el `:` no rompe el parse y el stem es
+        // idéntico en Windows y Linux (sin depender de `Path::file_stem`, que en
+        // Linux no separa `\` — ver `bare_replay_label`).
         let v = parse_candidates(r"replay:C:\tmp\myrun.tr").unwrap();
         match &v[0] {
             BenchCandidateSpec::Replay { label, path } => {
