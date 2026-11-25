@@ -131,20 +131,11 @@ pub struct ServeGuard {
     pub ws: TempWorkspace,
 }
 
+#[derive(Default)]
 pub struct ServeOpts<'a> {
     pub api_key: Option<&'a str>,
     pub cors_origin: Option<&'a str>,
     pub prepare: Option<&'a dyn Fn(&Path)>,
-}
-
-impl Default for ServeOpts<'_> {
-    fn default() -> Self {
-        Self {
-            api_key: None,
-            cors_origin: None,
-            prepare: None,
-        }
-    }
 }
 
 impl ServeGuard {

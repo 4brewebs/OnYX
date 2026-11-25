@@ -191,7 +191,7 @@ fn every_api_path_used_by_app_js_is_routed() {
         let mut rest = js.as_str();
         while let Some(i) = rest.find(&needle) {
             let after = &rest[i + 1..];
-            let end = after.find(|c| c == quote || c == '?' || c == '$').unwrap();
+            let end = after.find([quote, '?', '$']).unwrap();
             paths.push(after[..end].to_string());
             rest = &after[end..];
         }
