@@ -4359,6 +4359,7 @@ mod tests {
             subagents: Some(handle.clone()),
             pending_action: PendingSessionAction::new(),
             pending_notes: PendingSystemNotes::new(),
+            time_debug: None,
         };
 
         // Gate: fuera de BUILD el `/spawn` se bloquea y no crea job.

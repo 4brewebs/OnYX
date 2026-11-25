@@ -37,6 +37,7 @@ use crate::openai::{
     DEFAULT_OPENAI_API_BASE, OpenAiSharedState, OpenAiStreamTarget, build_openai_request_body,
     execute_openai_stream_http,
 };
+use crate::time_debug::TimeDebugState;
 
 /// Driver asíncrono con streaming SSE y **objetivo LLM dinámico** (hot-swap en
 /// caliente, `SDD-03` Fase 2). Envuelve al driver de subagentes (`wrapping`),
@@ -51,6 +52,9 @@ pub struct DynamicLlmDriver {
     in_flight_count: Arc<AtomicUsize>,
     has_ready: Arc<AtomicBool>,
     stream_preview: Option<StreamPreviewHandle>,
+    /// `SDD-07`: gate de congelación — con `frozen` y sin presupuesto de
+    /// `/step-llm`, `present()` no despacha (ni marca `dispatched`).
+    time_debug: Option<TimeDebugState>,
     rx: mpsc::Receiver<Reply>,
     tx: mpsc::Sender<Reply>,
     inner: Option<Box<dyn PlatformDriver>>,
@@ -88,6 +92,7 @@ impl DynamicLlmDriver {
             in_flight_count,
             has_ready,
             stream_preview: None,
+            time_debug: None,
             rx,
             tx,
             inner: None,
@@ -126,6 +131,12 @@ impl DynamicLlmDriver {
         self.anthropic_shared.mcp_schemas = mcp_schemas;
         self
     }
+
+    /// `SDD-07` Fase 1: gate `frozen`/`step_llm_budget` en `present()`.
+    pub fn with_time_debug(mut self, time_debug: TimeDebugState) -> Self {
+        self.time_debug = Some(time_debug);
+        self
+    }
 }
 
 impl PlatformDriver for DynamicLlmDriver {
@@ -148,6 +159,14 @@ impl PlatformDriver for DynamicLlmDriver {
         }
         let preview = self.stream_preview.clone();
         for req in pending_requests(graph, &self.vocab) {
+            // `SDD-07`: congelado sin presupuesto de `/step-llm` → no se
+            // despacha **ni** se marca `dispatched`: al descongelar, el request
+            // pendiente sale al siguiente `present()` sin reintento ni pérdida.
+            if let Some(td) = &self.time_debug {
+                if !td.try_acquire_llm_turn() {
+                    continue;
+                }
+            }
             let key = (req.agent.0, req.request);
             if !self.dispatched.insert(key) {
                 continue;

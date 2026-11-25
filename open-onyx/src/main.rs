@@ -11,6 +11,7 @@ mod ops;
 mod pack;
 mod session;
 mod subagent;
+mod time_debug;
 mod tui;
 mod tui_input;
 mod tui_palette;
@@ -60,6 +61,7 @@ use subagent::{
     ResponderFactory, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, SubagentManager,
     SubagentManagerDriver,
 };
+use time_debug::{TimeDebugSnapshotStore, TimeDebugState};
 use tui::TuiDriver;
 use vault::{
     auto_save_from_env, ensure_vault_gitignore, resolve_fork_dir, resolve_read_snapshot_dir,
@@ -1283,6 +1285,10 @@ fn launch_interactive_chat(
         .snapshot_dir
         .as_ref()
         .map(|d| SharedPackStore::new(d, effective_opts.max_snapshots));
+    // `SDD-07` Fase 1: motor del depurador temporal (ring RAM + gate `frozen`),
+    // compartido por el bucle de sesión y el `DynamicLlmDriver`.
+    let time_debug = TimeDebugState::new(shared_store.clone());
+    let time_debug_store = TimeDebugSnapshotStore::new(shared_store.clone(), time_debug.ring_arc());
     let pending_action = PendingSessionAction::new();
     let pending_notes = PendingSystemNotes::new();
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
@@ -1332,6 +1338,7 @@ fn launch_interactive_chat(
         Some(Box::new(spawner)),
         Some(checkpoints.clone()),
         shared_store.clone(),
+        Some(time_debug_store),
     )?;
 
     if let Some(plan) = &resume_plan {
@@ -1341,6 +1348,7 @@ fn launch_interactive_chat(
         if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ws_vocab) {
             mode_handle.set(restored_mode);
         }
+        time_debug.set_present(host.ticks());
         if let Some(src) = &plan.branched_from {
             pending_notes.push(format!(
                 "[resume] Restored milestone tick {} into branch `{}` (source `{}` preserved).",
@@ -1378,6 +1386,7 @@ fn launch_interactive_chat(
         pending_action,
         pending_notes,
         subagents: Some(sub_handle.clone()),
+        time_debug: Some(time_debug.clone()),
     };
     let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
         .with_mode_handle(mode_handle.clone())
@@ -1408,6 +1417,7 @@ fn launch_interactive_chat(
         )
         .with_stream_preview(stream_preview)
         .with_telemetry(telemetry)
+        .with_time_debug(time_debug.clone())
         .with_external_driver_ids(driver_ids.to_vec())
         .with_mcp_schemas(Arc::clone(mcp_schemas))
         .wrapping(sub_driver),
@@ -1529,6 +1539,10 @@ fn launch_web_serve(
         .snapshot_dir
         .as_ref()
         .map(|d| SharedPackStore::new(d, effective_opts.max_snapshots));
+    // `SDD-07` Fase 1: motor del depurador temporal (ring RAM + gate `frozen`),
+    // compartido por el bucle de sesión y el `DynamicLlmDriver`.
+    let time_debug = TimeDebugState::new(shared_store.clone());
+    let time_debug_store = TimeDebugSnapshotStore::new(shared_store.clone(), time_debug.ring_arc());
     let pending_action = PendingSessionAction::new();
     let pending_notes = PendingSystemNotes::new();
     let mode_handle = WorkspaceModeHandle::new(WorkspaceMode::Build);
@@ -1574,6 +1588,7 @@ fn launch_web_serve(
         Some(Box::new(spawner)),
         Some(checkpoints.clone()),
         shared_store.clone(),
+        Some(time_debug_store),
     )?;
 
     if let Some(plan) = &resume_plan {
@@ -1583,6 +1598,7 @@ fn launch_web_serve(
         if let Some(restored_mode) = graph_workspace_mode(host.graph(), &ws_vocab) {
             mode_handle.set(restored_mode);
         }
+        time_debug.set_present(host.ticks());
     }
 
     let stream_preview = StreamPreviewHandle::new();
@@ -1647,6 +1663,7 @@ fn launch_web_serve(
         pending_action,
         pending_notes,
         subagents: Some(sub_handle.clone()),
+        time_debug: Some(time_debug.clone()),
     };
     let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
         .with_mode_handle(mode_handle.clone())
@@ -1675,6 +1692,7 @@ fn launch_web_serve(
         )
         .with_stream_preview(stream_preview)
         .with_telemetry(telemetry)
+        .with_time_debug(time_debug.clone())
         .with_external_driver_ids(driver_ids.to_vec())
         .with_mcp_schemas(Arc::clone(mcp_schemas))
         .wrapping(sub_driver),
@@ -2950,6 +2968,7 @@ mod tests {
             Some(Box::new(spawner)),
             None,
             Some(shared_store.clone()),
+            None,
         )
         .unwrap();
         let mut driver = HeadlessDriver::new();
@@ -2984,6 +3003,7 @@ mod tests {
             pending_action: PendingSessionAction::new(),
             pending_notes: PendingSystemNotes::new(),
             subagents: None,
+            time_debug: None,
         };
         let msg = session::apply_session_action(
             &mut host,
@@ -4169,6 +4189,7 @@ ready_log = "READY_BUS"
             Some(Box::new(spawner)),
             Some(checkpoints.clone()),
             Some(shared_store.clone()),
+            None,
         )
         .unwrap();
 
@@ -4287,6 +4308,7 @@ ready_log = "READY_BUS"
             pending_action,
             pending_notes,
             subagents: None,
+            time_debug: None,
         };
         let fork_msg = session::apply_session_action(
             &mut host,

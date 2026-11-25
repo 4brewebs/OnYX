@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onyx_soul_agents::{
-    AgentConfig, AgentHost, AgentSpec, AgentState, ConceptId, EventBus, Graph, GraphView,
-    HeadlessDriver, OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply, Responder,
-    SubagentSystem, SurfaceBinding, SurfaceId, Vocab, pending_approvals,
+    AgentConfig, AgentGraph, AgentHost, AgentSpec, AgentState, ConceptId, EventBus, Graph,
+    GraphView, HeadlessDriver, OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply,
+    Responder, SnapshotStore, SubagentSystem, SurfaceBinding, SurfaceId, Vocab, pending_approvals,
 };
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
@@ -26,6 +26,7 @@ use crate::pack::{
     fork_pack_until_tick,
 };
 use crate::subagent::{MergePreviewState, SubagentHandle, effective_merge_decision};
+use crate::time_debug::{TimeDebugSnapshotStore, TimeDebugState};
 
 /// Interfaz mínima de bombeo UI compartida entre `TuiHandle` (`openonyx chat`) y
 /// `WebHandle` (`openonyx serve`) para que ambos corran sobre el mismo bucle determinista
@@ -34,6 +35,36 @@ pub trait UiIdlePump {
     fn render(&self, graph: &dyn GraphView);
     fn has_queued_events(&self) -> bool;
     fn pump_idle(&self, graph: &dyn GraphView);
+}
+
+/// `SDD-07`: vista que ve la UI en cada iteración del bucle — el grafo vivo, o
+/// el **preview efímero** del `cursor_tick` cuando el depurador está congelado
+/// mirando al pasado (read-only; no toca el `AgentHost`, Git ni `.onyxpack`).
+enum SessionView<'a> {
+    Live(&'a AgentGraph),
+    Preview(Arc<AgentGraph>),
+}
+
+impl<'a> SessionView<'a> {
+    fn current(host: &'a AgentHost, time_debug: &Option<TimeDebugState>) -> Self {
+        if let Some(td) = time_debug
+            .as_ref()
+            .filter(|td| td.is_frozen() && td.cursor() < td.present())
+        {
+            if let Ok(preview) = td.preview_graph(td.cursor()) {
+                return Self::Preview(preview);
+            }
+            // Preview no disponible (purgado y sin hito): se degrada al vivo.
+        }
+        Self::Live(host.graph())
+    }
+
+    fn view(&self) -> &dyn GraphView {
+        match self {
+            Self::Live(graph) => *graph,
+            Self::Preview(graph) => graph.as_ref(),
+        }
+    }
 }
 
 pub const SURFACE_STATUS: SurfaceId = SurfaceId(1);
@@ -139,6 +170,8 @@ pub struct SessionActionContext {
     pub subagents: Option<SubagentHandle>,
     pub pending_action: PendingSessionAction,
     pub pending_notes: PendingSystemNotes,
+    /// `SDD-07` Fase 1: motor del depurador temporal (ring RAM + gate `frozen`).
+    pub time_debug: Option<TimeDebugState>,
 }
 
 pub enum StopPolicy {
@@ -201,7 +234,8 @@ pub fn run_session<D: SessionDriver>(
             bridge_ready,
             action_ctx,
         } => {
-            ui.render(host.graph());
+            let time_debug = action_ctx.as_ref().and_then(|c| c.time_debug.clone());
+            ui.render(SessionView::current(host, &time_debug).view());
             let mut needs_follow_up_tick = false;
             let mut stepped_in_session = false;
             let shared_store = action_ctx.as_ref().and_then(|c| c.snapshot_store.clone());
@@ -216,8 +250,18 @@ pub fn run_session<D: SessionDriver>(
                     &host.vocab(),
                     llm_in_flight.load(Ordering::Acquire),
                 );
-                let can_advance = !host.is_settled() && !all_blocked;
-                if can_advance || ui_queued || ready || needs_follow_up_tick {
+                // `SDD-07`: congelado → 0 ticks autónomos; solo se avanza si hay
+                // trabajo real pendiente (comando colado, respuesta LLM/tool).
+                let frozen = time_debug.as_ref().is_some_and(|t| t.is_frozen());
+                let can_advance = if frozen {
+                    ui_queued || ready || needs_follow_up_tick
+                } else {
+                    (!host.is_settled() && !all_blocked)
+                        || ui_queued
+                        || ready
+                        || needs_follow_up_tick
+                };
+                if can_advance {
                     let was_settled = host.is_settled();
                     let surfaces = active_surfaces(host.graph(), &host.vocab(), &ws_vocab);
                     host.step_with(driver, &surfaces);
@@ -226,6 +270,12 @@ pub fn run_session<D: SessionDriver>(
                     // `spawn_event` (por `CommandSpawnerSystem`) y otro en crear
                     // el agente en el grafo (por `AgentSpawner`).
                     needs_follow_up_tick = ui_queued;
+                    // `SDD-07`: captura la frontera de tick en el anillo RAM.
+                    if let Some(td) = &time_debug {
+                        if host.ticks() > 0 {
+                            td.record_tick(host.ticks() - 1, &host.graph().export());
+                        }
+                    }
 
                     if let Some(ctx) = &action_ctx {
                         if let Some(action) = ctx.pending_action.take() {
@@ -241,7 +291,7 @@ pub fn run_session<D: SessionDriver>(
                                 let _ = apply_session_action(host, action, ctx);
                                 needs_follow_up_tick = false;
                             }
-                            ui.render(host.graph());
+                            ui.render(SessionView::current(host, &time_debug).view());
                         }
                     }
 
@@ -250,7 +300,7 @@ pub fn run_session<D: SessionDriver>(
                         let _ = save_transcript_if_configured(opts, driver);
                     }
                 } else {
-                    ui.pump_idle(host.graph());
+                    ui.pump_idle(SessionView::current(host, &time_debug).view());
                 }
             }
             if stepped_in_session {
@@ -790,9 +840,10 @@ pub fn build_host_with_options(
     extra_system: Option<Box<dyn OnyxSystem>>,
     checkpoints: Option<PendingCheckpoints>,
 ) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
-    build_host_with_shared_store(seed, config, opts, extra_system, checkpoints, None)
+    build_host_with_shared_store(seed, config, opts, extra_system, checkpoints, None, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_host_with_shared_store(
     seed: u64,
     config: AgentConfig,
@@ -800,6 +851,9 @@ pub fn build_host_with_shared_store(
     extra_system: Option<Box<dyn OnyxSystem>>,
     checkpoints: Option<PendingCheckpoints>,
     shared_store: Option<SharedPackStore>,
+    // `SDD-07` Fase 1: si está presente, es el store del `AgentHost`
+    // (`load` ring RAM → pack; `save` solo pack).
+    time_debug_store: Option<TimeDebugSnapshotStore>,
 ) -> Result<(AgentHost, WorkspaceVocab), Box<dyn std::error::Error>> {
     let mut ledger = WorkspaceLedgerSystem::new();
     if let Some(cp) = checkpoints {
@@ -815,11 +869,16 @@ pub fn build_host_with_shared_store(
     if let Some(sys) = extra_system {
         builder = builder.system(sys);
     }
-    if let Some(store) = shared_store {
+    let store: Option<Box<dyn SnapshotStore>> = match (time_debug_store, shared_store) {
+        (Some(td), _) => Some(Box::new(td)),
+        (None, Some(shared)) => Some(Box::new(shared)),
+        (None, None) => None,
+    };
+    if let Some(store) = store {
         if opts.save_step_snapshots {
             builder = builder.system(Box::new(MilestoneSnapshotSystem::new(opts.snapshot_every)));
         }
-        builder = builder.store(Box::new(store));
+        builder = builder.store(store);
     } else if let Some(dir) = &opts.snapshot_dir {
         if opts.save_step_snapshots {
             builder = builder.system(Box::new(MilestoneSnapshotSystem::new(opts.snapshot_every)));
