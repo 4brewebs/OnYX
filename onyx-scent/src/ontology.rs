@@ -44,10 +44,10 @@ impl SupportedLang {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
             "java" => Some(Self::Java),
-            "ts" | "tsx" => Some(Self::TypeScript),
-            "js" | "jsx" | "mjs" => Some(Self::JavaScript),
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             "go" => Some(Self::Go),
-            "c" | "h" | "cpp" | "hpp" => Some(Self::Cpp),
+            "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hh" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -61,6 +61,23 @@ impl SupportedLang {
             Self::JavaScript => "javascript",
             Self::Go => "go",
             Self::Cpp => "cpp",
+        }
+    }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Rust),
+            1 => Some(Self::Python),
+            2 => Some(Self::Java),
+            3 => Some(Self::TypeScript),
+            4 => Some(Self::JavaScript),
+            5 => Some(Self::Go),
+            6 => Some(Self::Cpp),
+            _ => None,
         }
     }
 }
@@ -97,6 +114,25 @@ impl EntityKind {
     pub fn is_callable(self) -> bool {
         matches!(self, Self::Function | Self::Method | Self::Component)
     }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Function),
+            1 => Some(Self::Method),
+            2 => Some(Self::Struct),
+            3 => Some(Self::Enum),
+            4 => Some(Self::Trait),
+            5 => Some(Self::Class),
+            6 => Some(Self::Interface),
+            7 => Some(Self::TypeAlias),
+            8 => Some(Self::Component),
+            _ => None,
+        }
+    }
 }
 
 /// Semantic dependency relation between two symbols.
@@ -128,6 +164,21 @@ impl RelationKind {
             Self::Implements => "implements",
             Self::UsesType => "uses_type",
             Self::UsedByType => "used_by",
+        }
+    }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Calls),
+            1 => Some(Self::CalledBy),
+            2 => Some(Self::Implements),
+            3 => Some(Self::UsesType),
+            4 => Some(Self::UsedByType),
+            _ => None,
         }
     }
 }

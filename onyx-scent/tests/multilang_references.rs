@@ -44,6 +44,14 @@ fn supported_lang_extension_mapping_covers_sdd05_languages() {
         Some(SupportedLang::TypeScript)
     );
     assert_eq!(
+        SupportedLang::from_extension("mts"),
+        Some(SupportedLang::TypeScript)
+    );
+    assert_eq!(
+        SupportedLang::from_extension("cts"),
+        Some(SupportedLang::TypeScript)
+    );
+    assert_eq!(
         SupportedLang::from_extension("js"),
         Some(SupportedLang::JavaScript)
     );
@@ -53,6 +61,10 @@ fn supported_lang_extension_mapping_covers_sdd05_languages() {
     );
     assert_eq!(
         SupportedLang::from_extension("mjs"),
+        Some(SupportedLang::JavaScript)
+    );
+    assert_eq!(
+        SupportedLang::from_extension("cjs"),
         Some(SupportedLang::JavaScript)
     );
     assert_eq!(SupportedLang::from_extension("go"), Some(SupportedLang::Go));
@@ -65,6 +77,143 @@ fn supported_lang_extension_mapping_covers_sdd05_languages() {
     assert_eq!(
         SupportedLang::from_extension("hpp"),
         Some(SupportedLang::Cpp)
+    );
+    assert_eq!(
+        SupportedLang::from_extension("cc"),
+        Some(SupportedLang::Cpp)
+    );
+    assert_eq!(
+        SupportedLang::from_extension("cxx"),
+        Some(SupportedLang::Cpp)
+    );
+    assert_eq!(
+        SupportedLang::from_extension("hh"),
+        Some(SupportedLang::Cpp)
+    );
+}
+
+#[test]
+fn ignored_dirs_exclude_onyx_agents_and_tooling_directories() {
+    let ws = TempWorkspace::new("ignored_dirs");
+    fs::create_dir_all(ws.0.join("src")).unwrap();
+    fs::create_dir_all(ws.0.join(".onyx/worktrees/wt-1")).unwrap();
+    fs::create_dir_all(ws.0.join(".agents/skills/demo")).unwrap();
+    fs::create_dir_all(ws.0.join(".venv/lib/site")).unwrap();
+    fs::create_dir_all(ws.0.join(".next/cache")).unwrap();
+    fs::write(ws.0.join("src/lib.rs"), "pub fn visible() -> i32 { 1 }\n").unwrap();
+    // Copias que NUNCA deben indexarse (worktrees de subagentes, guías, deps, build).
+    fs::write(
+        ws.0.join(".onyx/worktrees/wt-1/lib.rs"),
+        "pub fn shadow() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.0.join(".agents/skills/demo/skill.rs"),
+        "pub fn guide() -> i32 { 3 }\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.0.join(".venv/lib/site/dep.rs"),
+        "pub fn dep() -> i32 { 4 }\n",
+    )
+    .unwrap();
+    fs::write(ws.0.join(".next/cache/page.js"), "export const page = 5;\n").unwrap();
+
+    let mut idx = WorkspaceIndex::new();
+    let stats = idx.index_workspace(&ws.0).unwrap();
+    assert_eq!(stats.total_files, 1, "only src/lib.rs may be indexed");
+
+    let outline = idx.outline_toon(ToonPageOptions::default());
+    assert!(outline.contains("src/lib.rs::visible"), "{outline}");
+    for forbidden in ["shadow", "guide", "dep", "page"] {
+        assert!(!outline.contains(forbidden), "{outline}");
+    }
+}
+
+#[test]
+fn go_test_prefix_is_not_test_outside_test_files() {
+    let ws = TempWorkspace::new("go_test_prefix");
+    fs::create_dir_all(ws.0.join("health")).unwrap();
+    fs::write(
+        ws.0.join("health/health.go"),
+        r#"
+package health
+
+// TestConnection es un health check de producción, no un test.
+func TestConnection() error {
+    return ping()
+}
+
+func ping() error {
+    return nil
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        ws.0.join("health/ping_test.go"),
+        r#"
+package health
+
+func helperForTest() int {
+    return pingCount
+}
+
+var pingCount = 1
+"#,
+    )
+    .unwrap();
+
+    let mut idx = WorkspaceIndex::new();
+    idx.index_workspace(&ws.0).unwrap();
+    let outline = idx.outline_toon(ToonPageOptions::default());
+    let conn_row = outline
+        .lines()
+        .find(|l| l.starts_with("health/health.go::TestConnection |"))
+        .unwrap_or("");
+    assert!(
+        conn_row.contains("| fn | func TestConnection() error |") && conn_row.contains("scope:src"),
+        "{outline}"
+    );
+    let test_row = outline
+        .lines()
+        .find(|l| l.starts_with("health/ping_test.go::helperForTest"))
+        .unwrap_or("");
+    assert!(test_row.contains("scope:test"), "{outline}");
+}
+
+#[test]
+fn ts_js_multi_declarator_signatures_are_per_declarator() {
+    let ws = TempWorkspace::new("multi_declarator");
+    fs::create_dir_all(ws.0.join("src")).unwrap();
+    fs::write(
+        ws.0.join("src/multi.ts"),
+        r#"
+export const alpha = (x: number): number => x,
+  beta = (y: number): number => y + 1;
+"#,
+    )
+    .unwrap();
+
+    let mut idx = WorkspaceIndex::new();
+    idx.index_workspace(&ws.0).unwrap();
+    let outline = idx.outline_toon(ToonPageOptions::default());
+    let beta_row = outline
+        .lines()
+        .find(|l| l.starts_with("src/multi.ts::beta |"))
+        .unwrap_or("");
+    assert!(beta_row.contains("beta = (y: number): number"), "{outline}");
+    assert!(
+        !beta_row.contains("alpha"),
+        "beta's signature must not leak alpha's declarator: {outline}"
+    );
+    let alpha_row = outline
+        .lines()
+        .find(|l| l.starts_with("src/multi.ts::alpha |"))
+        .unwrap_or("");
+    assert!(
+        alpha_row.contains("alpha = (x: number): number"),
+        "{outline}"
     );
 }
 

@@ -1659,7 +1659,7 @@ impl WorkspaceTools {
             .scent_index
             .lock()
             .map_err(|_| "scent index lock poisoned".to_string())?;
-        idx.index_target(&self.policy.root, Some(&resolved))
+        idx.index_target_with_cache(&self.policy.root, Some(&resolved))
             .map_err(|e| e.to_string())?;
         let out = truncate_utf8(&idx.outline_toon(opts), self.policy.max_output_bytes);
         if let Ok(mut guard) = self.seen_outlines.lock() {
@@ -1674,7 +1674,7 @@ impl WorkspaceTools {
             .scent_index
             .lock()
             .map_err(|_| "scent index lock poisoned".to_string())?;
-        idx.index_workspace(&self.policy.root)
+        idx.index_workspace_with_cache(&self.policy.root)
             .map_err(|e| e.to_string())?;
         let hops = args.max_hops.unwrap_or(3).clamp(1, 6);
         let opts = onyx_scent::ToonPageOptions {
@@ -1706,7 +1706,7 @@ impl WorkspaceTools {
             .scent_index
             .lock()
             .map_err(|_| "scent index lock poisoned".to_string())?;
-        idx.index_workspace(&self.policy.root)
+        idx.index_workspace_with_cache(&self.policy.root)
             .map_err(|e| e.to_string())?;
         let opts = onyx_scent::ToonPageOptions {
             cursor: args.cursor.unwrap_or(0),

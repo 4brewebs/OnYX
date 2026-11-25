@@ -25,6 +25,9 @@ enum Commands {
         max_rows: usize,
         #[arg(long)]
         public_only: bool,
+        /// Disables the persistent `.onyx/scent.idx` cache (in-memory only)
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Emit ranked @TOON v1 thermal impact neighbors around a symbol
     Impact {
@@ -38,6 +41,9 @@ enum Commands {
         cursor: usize,
         #[arg(long, default_value_t = 250)]
         max_rows: usize,
+        /// Disables the persistent `.onyx/scent.idx` cache (in-memory only)
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Emit @TOON v1 definitions and direct cross-references for a symbol
     References {
@@ -53,6 +59,9 @@ enum Commands {
         public_only: bool,
         #[arg(long)]
         exclude_tests: bool,
+        /// Disables the persistent `.onyx/scent.idx` cache (in-memory only)
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -67,14 +76,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cursor,
             max_rows,
             public_only,
+            no_cache,
         } => {
-            index.index_target(&root, path.as_deref())?;
-            let out = index.outline_toon(ToonPageOptions {
+            let opts = ToonPageOptions {
                 cursor,
                 max_rows,
                 public_only,
                 ..ToonPageOptions::default()
-            });
+            };
+            let out = if no_cache {
+                index.index_target(&root, path.as_deref())?;
+                index.outline_toon(opts)
+            } else {
+                index.index_target_with_cache(&root, path.as_deref())?;
+                index.outline_toon(opts)
+            };
             print!("{out}");
         }
         Commands::Impact {
@@ -83,19 +99,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_hops,
             cursor,
             max_rows,
+            no_cache,
         } => {
-            index.index_workspace(&root)?;
+            let opts = ToonPageOptions {
+                cursor,
+                max_rows,
+                ..ToonPageOptions::default()
+            };
+            if no_cache {
+                index.index_workspace(&root)?;
+            } else {
+                index.index_workspace_with_cache(&root)?;
+            }
             let out = index.impact_toon(
                 &target,
                 &DistillerConfig {
                     iterations: max_hops,
                     ..DistillerConfig::default()
                 },
-                ToonPageOptions {
-                    cursor,
-                    max_rows,
-                    ..ToonPageOptions::default()
-                },
+                opts,
             )?;
             print!("{out}");
         }
@@ -106,8 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_rows,
             public_only,
             exclude_tests,
+            no_cache,
         } => {
-            index.index_workspace(&root)?;
+            if no_cache {
+                index.index_workspace(&root)?;
+            } else {
+                index.index_workspace_with_cache(&root)?;
+            }
             let out = index.references_toon(
                 &target,
                 ToonPageOptions {

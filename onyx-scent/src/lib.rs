@@ -4,6 +4,8 @@ pub mod lang;
 pub mod ontology;
 pub mod toon;
 
+mod cache;
+
 pub use distiller::{DistillerConfig, ImpactHit, MAX_TEMPERATURE_BP, distill_heat};
 pub use index::{IndexStats, RangeImpactSummary, WorkspaceIndex};
 pub use ontology::{

@@ -445,8 +445,9 @@ pub fn evaluate_mutation_impact(
     }
 
     let mut guard = scent_index.lock().ok()?;
-    // Refresco incremental por blake3 (solo reparsea archivos modificados; < 20ms en caché caliente).
-    let _ = guard.index_workspace(&policy.root);
+    // Refresco incremental con caché persistente `.onyx/scent.idx` (solo reparsea archivos
+    // modificados; fast-path stat anti-racy < 20 ms en caché caliente).
+    let _ = guard.index_workspace_with_cache(&policy.root);
 
     let cfg = onyx_scent::DistillerConfig {
         iterations: u8::try_from(policy.impact.max_hops.clamp(1, 4)).unwrap_or(2),
@@ -505,7 +506,7 @@ pub fn evaluate_unified_diff_impact(
     }
 
     let mut guard = scent_index.lock().ok()?;
-    let _ = guard.index_workspace(&policy.root);
+    let _ = guard.index_workspace_with_cache(&policy.root);
 
     let cfg = onyx_scent::DistillerConfig {
         iterations: u8::try_from(policy.impact.max_hops.clamp(1, 4)).unwrap_or(2),

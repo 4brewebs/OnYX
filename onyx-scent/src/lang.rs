@@ -40,6 +40,12 @@ pub struct RawTypeRef {
 pub struct ParsedFile {
     pub lang: SupportedLang,
     pub blake3_hash: [u8; 32],
+    /// File size in bytes at the moment the entry was (re)validated (racy-clean stat fast path).
+    pub file_len: u64,
+    /// File `mtime` in seconds since the Unix epoch at the moment the entry was validated.
+    pub mtime_secs: u64,
+    /// File `mtime` nanosecond remainder at the moment the entry was validated.
+    pub mtime_nanos: u32,
     pub entities: Vec<ParsedEntity>,
     pub raw_calls: Vec<RawCall>,
     pub raw_type_refs: Vec<RawTypeRef>,
@@ -133,6 +139,9 @@ pub fn parse_source(
     Ok(ParsedFile {
         lang,
         blake3_hash,
+        file_len: 0,
+        mtime_secs: 0,
+        mtime_nanos: 0,
         entities: ctx.entities,
         raw_calls: ctx.raw_calls,
         raw_type_refs: ctx.raw_type_refs,
@@ -859,7 +868,9 @@ impl<'a> WalkCtx<'a> {
                     let body_start = body
                         .map(|b| b.start_byte())
                         .unwrap_or_else(|| value_node.end_byte());
-                    let sig = compact_ws(&self.source[node.start_byte()..body_start])
+                    // Firma por declarador (no por la declaración completa): con varios
+                    // declaradores (`const a = ..., b = ...`) cada firma es autónoma.
+                    let sig = compact_ws(&self.source[child.start_byte()..body_start])
                         .trim_end_matches("=>")
                         .trim()
                         .to_string();
@@ -1071,9 +1082,10 @@ impl<'a> WalkCtx<'a> {
                         .unwrap_or_else(|| node.end_byte());
                     let sig = compact_ws(&self.source[node.start_byte()..body_start]);
                     let is_pub = starts_ascii_upper(&name);
-                    let is_test = self.in_test_depth > 0
-                        || name.starts_with("Test")
-                        || name.starts_with("Benchmark");
+                    // `scope:test` solo por ubicación de fichero (`*_test.go`): el prefijo
+                    // `Test`/`Benchmark` es habitual en código de producción (p. ej.
+                    // `TestConnection()` en health checks) y no debe contaminar el grafo.
+                    let is_test = self.in_test_depth > 0;
                     let idx = self.push_entity(
                         node,
                         EntityDraft {
