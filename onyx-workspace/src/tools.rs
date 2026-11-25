@@ -129,6 +129,24 @@ pub fn spawn_subagent_driver_from_args(args_json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Indica si `spawn_agent` (`SDD-05` REQ-05.5) debe ejecutarse en un *worktree* Git
+/// aislado: solo `true` si el campo `isolated` es exactamente el booleano JSON `true`.
+/// Argumentos vacíos o JSON inválido → `false` (comportamiento clásico, sin *worktree*).
+pub fn spawn_agent_is_isolated(args_json: &str) -> bool {
+    let raw = if args_json.trim().is_empty() {
+        "{}"
+    } else {
+        args_json
+    };
+    match serde_json::from_str::<JsonValue>(raw) {
+        Ok(value) => value
+            .get("isolated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
         let sprout = SproutSupervisor::new(policy.clone());
@@ -175,6 +193,12 @@ impl WorkspaceTools {
     pub fn with_cancel_flag(mut self, cancel_flag: Arc<AtomicBool>) -> Self {
         self.cancel_flag = Some(cancel_flag);
         self
+    }
+
+    /// Bandera de cancelación compartida (p. ej. para propagarla a *worktrees* aislados
+    /// de hijos de `spawn_agent(isolated: true)`); `None` si no hay cancelación activa.
+    pub fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel_flag.clone()
     }
 
     fn is_cancelled(&self) -> bool {
@@ -392,7 +416,8 @@ impl WorkspaceTools {
                 "type": "OBJECT",
                 "properties": {
                     "name": { "type": "STRING", "description": "Optional short label for the subagent." },
-                    "goal": { "type": "STRING", "description": "Clear, bounded goal for the child subagent." }
+                    "goal": { "type": "STRING", "description": "Clear, bounded goal for the child subagent." },
+                    "isolated": { "type": "BOOLEAN", "description": "When true, run the child subagent inside an isolated Git worktree so parallel edits never touch the root working tree until merged (default false)." }
                 },
                 "required": ["goal"]
             }),
@@ -2553,4 +2578,41 @@ fn redact_bearer_tokens(input: &str) -> String {
     }
     out.push_str(&input[idx..]);
     out
+}
+
+#[cfg(test)]
+mod isolated_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_agent_schema_declares_isolated_boolean() {
+        let schema = WorkspaceTools::subagent_schema();
+        let props = &schema.parameters["properties"];
+        assert!(props.get("isolated").is_some(), "missing `isolated`");
+        assert_eq!(props["isolated"]["type"], "BOOLEAN");
+        assert!(
+            props["isolated"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("isolated Git worktree")
+        );
+        // `isolated` no es requerido: sigue siendo `goal` el único campo obligatorio.
+        let required = schema.parameters["required"].as_array().unwrap();
+        assert_eq!(required, &vec![json!("goal")]);
+    }
+
+    #[test]
+    fn spawn_agent_is_isolated_parses() {
+        assert!(!spawn_agent_is_isolated(""));
+        assert!(!spawn_agent_is_isolated("{}"));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"x"}"#));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"x","isolated":false}"#));
+        assert!(spawn_agent_is_isolated(r#"{"goal":"x","isolated":true}"#));
+        assert!(!spawn_agent_is_isolated(
+            r#"{"goal":"x","isolated":"true"}"#
+        ));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"x","isolated":1}"#));
+        assert!(!spawn_agent_is_isolated("not json"));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"#));
+    }
 }

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::policy::is_control_plane_rel_path;
 use crate::sandbox::NetworkPolicy;
-use crate::state::capture_git_tree_checkpoint;
+use crate::state::{capture_git_tree_checkpoint, capture_git_tree_checkpoint_excluding};
 
 /// Variable de entorno opcional para sobreescribir el directorio base de *worktrees* temporales.
 pub const ONYX_WT_DIR_ENV: &str = "ONYX_WT_DIR";
@@ -329,14 +329,23 @@ impl WorktreeManager {
 
     /// Captura el estado final del *working tree* del subagente en un commit efímero descendiente
     /// de `handle.base_commit`, listo para reconciliación 3-way.
+    ///
+    /// Excluye los artefactos operativos que OnYX mismo crea en el *worktree* (caché scent
+    /// `.onyx/scent.idx*` y su `.gitignore` de higiene, al evaluar el impacto de una mutación
+    /// con la feature `scent`): no son trabajo del hijo. El pathspec `scent*` es glob (no una
+    /// ruta explícita): `git add` rechaza pathspecs que nombran rutas ya ignoradas por
+    /// `.gitignore` (el propio `.onyx/.gitignore` ignora `scent.idx`). El resto de `.onyx/`
+    /// **no** se excluye: p. ej. un `config.toml` tocado directamente en el *worktree* sigue
+    /// capturándose y bloqueándose en `apply` por Control Plane.
     pub fn capture_subagent_commit(
         &self,
         handle: &WorktreeHandle,
     ) -> Result<(String, String), String> {
-        create_ephemeral_commit(
+        create_ephemeral_commit_excluding(
             &handle.worktree_path,
             Some(&handle.base_commit),
             &format!("onyx-wt-sub:{}", handle.job_id),
+            &[":(exclude).onyx/scent*", ":(exclude).onyx/.gitignore"],
         )
     }
 
@@ -689,12 +698,22 @@ fn create_ephemeral_commit(
     explicit_parent: Option<&str>,
     message: &str,
 ) -> Result<(String, String), String> {
-    let (head_sha, tree_sha) = capture_git_tree_checkpoint(repo_dir).ok_or_else(|| {
-        format!(
-            "failed to capture git tree checkpoint for `{}`",
-            repo_dir.display()
-        )
-    })?;
+    create_ephemeral_commit_excluding(repo_dir, explicit_parent, message, &[])
+}
+
+fn create_ephemeral_commit_excluding(
+    repo_dir: &Path,
+    explicit_parent: Option<&str>,
+    message: &str,
+    extra_excludes: &[&str],
+) -> Result<(String, String), String> {
+    let (head_sha, tree_sha) = capture_git_tree_checkpoint_excluding(repo_dir, extra_excludes)
+        .ok_or_else(|| {
+            format!(
+                "failed to capture git tree checkpoint for `{}`",
+                repo_dir.display()
+            )
+        })?;
 
     let mut cmd = Command::new("git");
     cmd.arg("commit-tree").arg(&tree_sha);
@@ -1138,6 +1157,69 @@ mod tests {
             handle.branch_name
         );
 
+        let _ = fs::remove_dir_all(&wt_base);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn capture_subagent_commit_excludes_onyx_operational_artifacts() {
+        let repo = init_temp_git_repo("sub_exc");
+        let wt_base = repo
+            .parent()
+            .unwrap()
+            .join(format!("onyx_wt_base_subexc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt_base);
+
+        let mgr = WorktreeManager::with_base_dir_override(&repo, Some(&wt_base)).unwrap();
+        let handle = mgr.create_worktree("job-2", 5).unwrap();
+
+        // Trabajo real del hijo + artefactos operativos que OnYX mismo crea en el
+        // *worktree* (caché scent + su `.gitignore` de higiene, p. ej. al evaluar el
+        // impacto de una mutación con la feature `scent`).
+        fs::write(handle.worktree_path.join("b.txt"), "subagent-updated-b\n").unwrap();
+        fs::create_dir_all(handle.worktree_path.join(".onyx")).unwrap();
+        fs::write(
+            handle.worktree_path.join(".onyx/.gitignore"),
+            "scent.idx\nscent.idx.tmp*\n",
+        )
+        .unwrap();
+        fs::write(handle.worktree_path.join(".onyx/scent.idx"), b"ONYXSCI1").unwrap();
+        fs::write(
+            handle.worktree_path.join(".onyx/scent.idx.tmp.1.2"),
+            b"partial",
+        )
+        .unwrap();
+        // Un `.onyx/` que NO es artefacto de la caché sigue siendo trabajo del hijo
+        // (y p. ej. `config.toml` se bloquea aparte por Control Plane).
+        fs::write(handle.worktree_path.join(".onyx/notes.txt"), "child note\n").unwrap();
+
+        let (sub_commit, _) = mgr.capture_subagent_commit(&handle).unwrap();
+        let changed = mgr
+            .changed_files_between(&handle.base_commit, &sub_commit)
+            .unwrap();
+        assert_eq!(
+            changed,
+            vec![".onyx/notes.txt".to_string(), "b.txt".to_string(),],
+            "{changed:?}"
+        );
+
+        // Si lo único "cambiado" son artefactos operativos, el preview debe ser
+        // `NoOp` (no hay trabajo que aplicar) y el *worktree* se retira sin más.
+        let only_artifacts = mgr.create_worktree("job-3", 6).unwrap();
+        fs::create_dir_all(only_artifacts.worktree_path.join(".onyx")).unwrap();
+        fs::write(
+            only_artifacts.worktree_path.join(".onyx/scent.idx"),
+            b"ONYXSCI1",
+        )
+        .unwrap();
+        let (sub_only, _) = mgr.capture_subagent_commit(&only_artifacts).unwrap();
+        let outcome = mgr
+            .preview_three_way_merge(&only_artifacts, &sub_only)
+            .unwrap();
+        assert!(matches!(outcome, WorktreeMergeOutcome::NoOp), "{outcome:?}");
+
+        mgr.remove_worktree(&handle).unwrap();
+        mgr.remove_worktree(&only_artifacts).unwrap();
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&repo);
     }

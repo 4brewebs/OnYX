@@ -1342,7 +1342,7 @@ fn launch_interactive_chat(
         .with_mode_handle(mode_handle)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_proactive_notifications(true)
-        .wrapping(ws_bridge);
+        .with_workspace_bridge(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
@@ -1611,7 +1611,7 @@ fn launch_web_serve(
         .with_mode_handle(mode_handle)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_proactive_notifications(true)
-        .wrapping(ws_bridge);
+        .with_workspace_bridge(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
@@ -1958,7 +1958,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
                 .with_policy(policy.clone())
                 .with_proactive_notifications(false)
-                .wrapping(ws_bridge);
+                .with_workspace_bridge(ws_bridge);
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),

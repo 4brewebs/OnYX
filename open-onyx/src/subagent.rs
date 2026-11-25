@@ -471,6 +471,41 @@ impl SubagentManager {
         self
     }
 
+    /// Registra el *worktree* ya finalizado de un subagente hijo de
+    /// `spawn_agent(isolated: true)` (`SDD-05` REQ-05.5): el ciclo aislado corrió dentro de
+    /// `WorkspaceToolBridge` (captura + 3-way en la finalización); aquí el job entra en
+    /// `Done`/`Failed` con su `proposal` para que `subagent_status`/`subagent_merge`
+    /// (`Scent-Heated Approval` + Control Plane)/`subagent_discard` funcionen sin cambios
+    /// sobre `ManagedJob` (el *worktree* queda poseído por este gestor: `Drop` lo retira).
+    pub fn register_completed_worktree(
+        &mut self,
+        handle: WorktreeHandle,
+        proposal: SubagentProposal,
+    ) -> Result<(), String> {
+        let job_id = proposal.job_id.clone();
+        if self.jobs.contains_key(&job_id) {
+            return Err(format!("subagent job_id `{job_id}` already registered"));
+        }
+        let job = ManagedJob {
+            job_id: job_id.clone(),
+            driver: proposal.driver.clone(),
+            name: job_id.clone(),
+            goal: proposal.summary.clone(),
+            spawn_tick: proposal.spawn_tick,
+            handle,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            state: if proposal.ok {
+                SubagentJobState::Done(proposal.clone())
+            } else {
+                SubagentJobState::Failed(proposal.clone())
+            },
+            worktree_removed: false,
+        };
+        self.jobs.insert(job_id, job);
+        Ok(())
+    }
+
     /// Pinnea el objetivo LLM por job lanzado (`SDD-03` Fase 2): la fábrica se
     /// invoca **síncrono en [`Self::spawn_job`]** (congela el objetivo activo en el
     /// hilo principal) y devuelve la fábrica interna que el worker thread usa para
@@ -1152,6 +1187,19 @@ impl SubagentHandle {
             .unwrap_or_default()
     }
 
+    /// Forwarder de [`SubagentManager::register_completed_worktree`] (`SDD-05` REQ-05.5).
+    pub fn register_completed_worktree(
+        &self,
+        handle: WorktreeHandle,
+        proposal: SubagentProposal,
+    ) -> Result<(), String> {
+        let mut mgr = self
+            .0
+            .lock()
+            .map_err(|_| "subagent manager lock poisoned".to_string())?;
+        mgr.register_completed_worktree(handle, proposal)
+    }
+
     /// Vista previa 3-way para la solicitud de aprobación `(agent_id, request_id)`:
     /// reutiliza el [`MergePreviewTicket`] sellado para esa misma solicitud sin relanzar
     /// `git write-tree`/`merge-tree` en cada redibujado (`SDD-10` Paso 0).
@@ -1532,6 +1580,10 @@ pub struct SubagentManagerDriver {
     vocab: Vocab,
     handle: SubagentHandle,
     inner: Option<Box<dyn PlatformDriver>>,
+    /// Puente de workspace tipo concreto (`SDD-05` REQ-05.5): se invoca antes que `inner`
+    /// (misma invariante que con `wrapping`) y sus *worktrees* aislados finalizados se
+    /// drenan a [`SubagentManager::register_completed_worktree`] en cada `present`.
+    isolated_bridge: Option<WorkspaceToolBridge>,
     dispatched: BTreeSet<(u64, u64)>,
     handled_approvals: BTreeSet<(u64, u64)>,
     queued: Vec<Reply>,
@@ -1549,6 +1601,7 @@ impl SubagentManagerDriver {
             vocab,
             handle: manager.into(),
             inner: None,
+            isolated_bridge: None,
             dispatched: BTreeSet::new(),
             handled_approvals: BTreeSet::new(),
             queued: Vec::new(),
@@ -1559,6 +1612,14 @@ impl SubagentManagerDriver {
             current_poll: 0,
             last_completed_proposals: Vec::new(),
         }
+    }
+
+    /// Sustituye a `wrapping` para el `WorkspaceToolBridge` (`SDD-05` REQ-05.5): el puente
+    /// se conserva tipo concreto para poder drenar en `present` los *worktrees* aislados
+    /// finalizados vía [`SubagentManager::register_completed_worktree`].
+    pub fn with_workspace_bridge(mut self, bridge: WorkspaceToolBridge) -> Self {
+        self.isolated_bridge = Some(bridge);
+        self
     }
 
     pub fn with_ready_flag(mut self, ready_flag: Arc<AtomicBool>) -> Self {
@@ -1583,6 +1644,11 @@ impl SubagentManagerDriver {
         self
     }
 
+    /// Envuelve otro `PlatformDriver` genérico. En producción el `WorkspaceToolBridge`
+    /// entra por [`Self::with_workspace_bridge`] (tipo concreto para drenar *worktrees*
+    /// aislados, `SDD-05` REQ-05.5); `wrapping` sigue disponible para tests que envuelven
+    /// drivers auxiliares (p. ej. `AutoApproveSpawns`).
+    #[allow(dead_code)]
     pub fn wrapping(mut self, inner: impl PlatformDriver + 'static) -> Self {
         self.inner = Some(Box::new(inner));
         self
@@ -1710,8 +1776,12 @@ impl SubagentManagerDriver {
 
 impl PlatformDriver for SubagentManagerDriver {
     fn poll(&mut self, bus: &mut dyn EventBus) {
-        // Primero `inner.poll(bus)` (donde `WorkspaceToolBridge` limpia `ready_flag` antes de que
-        // nosotros drenemos `mpsc`), manteniendo invariante libre de carreras con los workers.
+        // Primero el puente de workspace (`SDD-05` REQ-05.5): `WorkspaceToolBridge` limpia
+        // `ready_flag` antes de que nosotros drenemos `mpsc`, manteniendo la invariante
+        // libre de carreras con los workers.
+        if let Some(bridge) = self.isolated_bridge.as_mut() {
+            bridge.poll(bus);
+        }
         if let Some(inner) = self.inner.as_mut() {
             inner.poll(bus);
         }
@@ -1816,6 +1886,14 @@ impl PlatformDriver for SubagentManagerDriver {
             }
         }
 
+        if let Some(bridge) = self.isolated_bridge.as_mut() {
+            bridge.present(graph, surfaces);
+            // Drenado (`SDD-05` REQ-05.5): *worktrees* aislados finalizados → jobs
+            // `Done`/`Failed` del manager, visibles en `subagent_status`/`merge`/`discard`.
+            for (wt_handle, proposal) in bridge.take_completed_isolated_worktrees() {
+                let _ = self.handle.register_completed_worktree(wt_handle, proposal);
+            }
+        }
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }

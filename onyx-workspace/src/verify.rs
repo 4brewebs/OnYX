@@ -158,6 +158,13 @@ impl VerifyConfig {
                 continue;
             }
 
+            // Contenido de secciones ajenas (arrays multilínea de `[permissions]`,
+            // tablas de `[mcp.servers.*]`, `[[external_drivers]]`, …) nunca rompe
+            // `[verify]`: se ignora en bloque.
+            if current_rule.is_none() && !in_verify {
+                continue;
+            }
+
             let Some((raw_key, raw_val)) = stripped.split_once('=') else {
                 return Err(format!(
                     "config.toml line {line_no}: expected `key = value` inside [verify]"
@@ -207,9 +214,8 @@ impl VerifyConfig {
                 continue;
             }
 
-            if !in_verify {
-                continue;
-            }
+            // Aquí `in_verify == true` (asegurado por el skip de secciones ajenas
+            // al inicio del loop) y no hay regla abierta.
             // Claves de `[verify]`.
             match key {
                 "on_edit" => {
@@ -296,16 +302,28 @@ impl VerifyConfig {
     }
 }
 
-/// Extrae una string literal TOML (dobles comillas, escapes mínimos `\"` `\\` `\n` `\t`)
-/// o devuelve error descriptivo.
+/// Extrae una string TOML (basic `"..."` con escapes mínimos `\"` `\\` `\n` `\t`, o
+/// literal `'...'` sin escapes) o devuelve error descriptivo.
 fn parse_toml_string(value: &str, key: &str, line_no: usize) -> Result<String, String> {
+    // String literal TOML: `'...'` sin escapes; no puede contener `'`.
+    if let Some(stripped) = value.strip_prefix('\'') {
+        let inner = stripped.strip_suffix('\'').ok_or_else(|| {
+            format!("config.toml line {line_no}: `{key}` must be a quoted string, got `{value}`")
+        })?;
+        if inner.contains('\'') {
+            return Err(format!(
+                "config.toml line {line_no}: `{key}`: single-quoted strings cannot contain `'`"
+            ));
+        }
+        return Ok(inner.to_string());
+    }
     let inner = value
         .strip_prefix('"')
         .filter(|_| value.ends_with('"'))
         .and_then(|v| v.strip_suffix('"'))
         .ok_or_else(|| {
             format!(
-                "config.toml line {line_no}: `{key}` must be a double-quoted string, got `{value}`"
+                "config.toml line {line_no}: `{key}` must be a quoted string (single or double), got `{value}`"
             )
         })?;
     let mut out = String::with_capacity(inner.len());
@@ -431,6 +449,17 @@ pub fn run_verify_on_edit(
     }
 
     // 3) Ejecución fail-fast con gobernanza `[permissions].deny`.
+    // Sufijo determinista `impacted_tests` (mismo en PASS y FAIL, si no está vacío).
+    let impacted_suffix = if impacted_tests.is_empty() {
+        String::new()
+    } else {
+        let tests = impacted_tests
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" impacted_tests: [{tests}]")
+    };
     let mut succeeded: Vec<&str> = Vec::new();
     for rule in &matched {
         let args_json = format!(
@@ -448,25 +477,25 @@ pub fn run_verify_on_edit(
             Ok(()) => succeeded.push(rule.command.as_str()),
             Err(VerifyRunError::Exit(code, diag)) => {
                 return Some(format!(
-                    "\n[verify: FAIL] `{}` (exit {code})\n{diag}\n(Fix the error before finishing the turn.)",
+                    "\n[verify: FAIL] `{}` (exit {code})\n{diag}\n(Fix the error before finishing the turn.){impacted_suffix}",
                     rule.command
                 ));
             }
             Err(VerifyRunError::Timeout(secs, diag)) => {
                 return Some(format!(
-                    "\n[verify: FAIL] `{}` (timed out after {secs}s)\n{diag}\n(Fix the error before finishing the turn.)",
+                    "\n[verify: FAIL] `{}` (timed out after {secs}s)\n{diag}\n(Fix the error before finishing the turn.){impacted_suffix}",
                     rule.command
                 ));
             }
             Err(VerifyRunError::Spawn(msg)) => {
                 return Some(format!(
-                    "\n[verify: FAIL] `{}` (spawn failed: {msg})\n(Fix the error before finishing the turn.)",
+                    "\n[verify: FAIL] `{}` (spawn failed: {msg})\n(Fix the error before finishing the turn.){impacted_suffix}",
                     rule.command
                 ));
             }
             Err(VerifyRunError::Cancelled) => {
                 return Some(format!(
-                    "\n[verify: FAIL] `{}` (cancelled by user)\n(Fix the error before finishing the turn.)",
+                    "\n[verify: FAIL] `{}` (cancelled by user)\n(Fix the error before finishing the turn.){impacted_suffix}",
                     rule.command
                 ));
             }
@@ -479,16 +508,7 @@ pub fn run_verify_on_edit(
         "\n[verify: PASS] {} rule(s) succeeded ({cmds})",
         succeeded.len()
     );
-    if impacted_tests.is_empty() {
-        Some(base)
-    } else {
-        let tests = impacted_tests
-            .iter()
-            .map(|t| format!("\"{t}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("{base} impacted_tests: [{tests}]"))
-    }
+    Some(format!("{base}{impacted_suffix}"))
 }
 
 /// Ejecuta `command` con la tubería aislada de `shell_exec` y un `timeout` propio.
@@ -699,6 +719,82 @@ deny = ["shell_exec(*)"]
         .unwrap();
         assert_eq!(patch.on_edit, Some(true));
         assert!(patch.rules.is_none());
+    }
+
+    #[test]
+    fn verify_parse_ignores_foreign_sections_with_multiline_arrays_and_bare_lines() {
+        // Arrays multilínea de `[permissions]`, tablas `[mcp.servers.*]` y
+        // `[[external_drivers]]` (líneas sin `=`) antes de `[verify]` no rompen el parseo.
+        let patch = VerifyConfig::parse_toml(
+            r#"
+[permissions]
+deny = [
+  "shell_exec(rm*)",
+  "shell_exec(sudo*)",
+]
+
+[mcp.servers.local]
+command = "node"
+args = [
+  "/srv/mcp.js",
+]
+
+[[external_drivers]]
+id = "opencode"
+args = [
+  "run",
+  "--quiet",
+]
+
+[verify]
+on_edit = true
+max_secs = 30
+
+[[verify.rules]]
+glob = "**/*.rs"
+command = "cargo check --message-format=short"
+"#,
+        )
+        .unwrap();
+        assert_eq!(patch.on_edit, Some(true));
+        assert_eq!(patch.max_secs, Some(30));
+        let rules = patch.rules.expect("rules must parse");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].glob, "**/*.rs");
+        assert_eq!(rules[0].command, "cargo check --message-format=short");
+    }
+
+    #[test]
+    fn verify_parse_accepts_single_quoted_literal_strings() {
+        let patch = VerifyConfig::parse_toml(
+            r#"
+[[verify.rules]]
+glob = '**/*.rs'
+command = 'cargo check --message-format=short'
+"#,
+        )
+        .unwrap();
+        let rule = &patch.rules.as_ref().expect("rules")[0];
+        assert_eq!(rule.glob, "**/*.rs");
+        assert_eq!(rule.command, "cargo check --message-format=short");
+
+        // Literal sin comilla de cierre → error.
+        assert!(
+            VerifyConfig::parse_toml("[[verify.rules]]\nglob = '*\ncommand = \"x\"\n").is_err()
+        );
+        // `"` dentro de un literal es válido tal cual (sin escapes).
+        let patch = VerifyConfig::parse_toml(
+            r#"
+[[verify.rules]]
+glob = '*.rs'
+command = 'echo "a literal quote"'
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            patch.rules.as_ref().unwrap()[0].command,
+            "echo \"a literal quote\""
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub mod trust;
 pub mod verify;
 pub mod worktree;
 
-pub use bridge::WorkspaceToolBridge;
+pub use bridge::{IsolatedWorktreeResult, IsolatedWorktreeState, WorkspaceToolBridge};
 pub use external_driver::{
     builtin_external_driver_presets, load_external_drivers, merge_external_drivers,
     parse_external_drivers_toml,
@@ -63,7 +63,7 @@ pub use state::{
 pub use tools::{
     FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,
     format_plan_steps, is_async_subagent_tool, preview_tool_diff, scrub_secrets,
-    spawn_subagent_driver_from_args,
+    spawn_agent_is_isolated, spawn_subagent_driver_from_args,
 };
 pub use trust::{
     ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,
