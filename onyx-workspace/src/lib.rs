@@ -12,9 +12,10 @@ pub mod sprout;
 pub mod state;
 pub mod tools;
 pub mod trust;
+pub mod verify;
 pub mod worktree;
 
-pub use bridge::WorkspaceToolBridge;
+pub use bridge::{IsolatedWorktreeResult, IsolatedWorktreeState, WorkspaceToolBridge};
 pub use external_driver::{
     builtin_external_driver_presets, load_external_drivers, merge_external_drivers,
     parse_external_drivers_toml,
@@ -62,12 +63,16 @@ pub use state::{
 pub use tools::{
     FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,
     format_plan_steps, is_async_subagent_tool, preview_tool_diff, scrub_secrets,
-    spawn_subagent_driver_from_args,
+    spawn_agent_is_isolated, spawn_subagent_driver_from_args,
 };
 pub use trust::{
     ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,
     default_trust_store_path, evaluate_workspace_trust, hash_file_blake3, list_trusted_workspaces,
     normalize_workspace_key, revoke_workspace_trust, trust_workspace,
+};
+pub use verify::{
+    IMPACTED_TEST_MAX_HOPS, VERIFY_DIAGNOSTIC_CAP_BYTES, VERIFY_MAX_SECS_DEFAULT, VerifyConfig,
+    VerifyPatch, VerifyRule, run_verify_on_edit,
 };
 pub use worktree::{
     ExternalDriverConfig, GitVersion, MIN_GIT_VERSION, ONYX_WT_DIR_ENV, PromptTransport,

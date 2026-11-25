@@ -7,11 +7,12 @@ use onyx_soul_agents::{
 };
 use onyx_workspace::{
     NetworkPolicy, PendingCheckpoints, PermissionDecision, PermissionRules, ProcessJob,
-    ProcessLimits, SandboxConfig, SandboxMode, ServiceKind, SproutConfig, WorkspaceLedgerSystem,
-    WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy, WorkspaceToolBridge, WorkspaceTools,
-    WorkspaceVocab, capture_git_tree_checkpoint, detect_sandbox_capabilities,
-    discover_skills_summary, effects_after_tick, graph_workspace_plan, graph_workspace_services,
-    is_file_read, latest_undoable_effect, preview_tool_diff, restore_git_tree_checkpoint,
+    ProcessLimits, SandboxConfig, SandboxMode, ServiceKind, SproutConfig, VerifyConfig, VerifyRule,
+    WorkspaceLedgerSystem, WorkspaceMode, WorkspaceModeHandle, WorkspacePolicy,
+    WorkspaceToolBridge, WorkspaceTools, WorkspaceVocab, capture_git_tree_checkpoint,
+    detect_sandbox_capabilities, discover_skills_summary, effects_after_tick, graph_workspace_plan,
+    graph_workspace_services, is_file_read, latest_undoable_effect, preview_tool_diff,
+    restore_git_tree_checkpoint,
 };
 
 struct TempDir(PathBuf);
@@ -483,8 +484,10 @@ fn scent_tools_emit_toon_outline_and_impact_respecting_policy() {
 
     assert!(WorkspaceTools::all_tool_names().contains(&"scent_outline"));
     assert!(WorkspaceTools::all_tool_names().contains(&"scent_impact"));
+    assert!(WorkspaceTools::all_tool_names().contains(&"scent_references"));
     assert!(!WorkspaceTools::approval_required_names().contains(&"scent_outline"));
     assert!(!WorkspaceTools::approval_required_names().contains(&"scent_impact"));
+    assert!(!WorkspaceTools::approval_required_names().contains(&"scent_references"));
 
     let outline = tools.execute("scent_outline", r#"{"path":"src"}"#).unwrap();
     assert!(outline.starts_with("@TOON v1"), "{outline}");
@@ -495,6 +498,37 @@ fn scent_tools_emit_toon_outline_and_impact_respecting_policy() {
         .unwrap();
     assert!(impact.starts_with("@TOON v1"), "{impact}");
     assert!(impact.contains("src/lib.rs::entry"), "{impact}");
+
+    // `SDD-05` REQ-05.3: `scent_references` resuelve definición + referencias directas.
+    let references = tools
+        .execute("scent_references", r#"{"target":"leaf"}"#)
+        .unwrap();
+    assert!(references.starts_with("@TOON v1"), "{references}");
+    assert!(
+        references.contains("src/lib.rs::leaf | defined_at"),
+        "{references}"
+    );
+    assert!(
+        references.contains("src/lib.rs::leaf | called_by | src/lib.rs::entry"),
+        "{references}"
+    );
+
+    // En el lado inverso: `entry` emite `calls` hacia `leaf`.
+    let entry_refs = tools
+        .execute("scent_references", r#"{"target":"entry"}"#)
+        .unwrap();
+    assert!(
+        entry_refs.contains("src/lib.rs::entry | calls | src/lib.rs::leaf"),
+        "{entry_refs}"
+    );
+
+    let unknown_err = tools
+        .execute("scent_references", r#"{"target":"does_not_exist"}"#)
+        .unwrap_err();
+    assert!(
+        unknown_err.contains("not found") || unknown_err.contains("does_not_exist"),
+        "{unknown_err}"
+    );
 
     let traversal_err = tools
         .execute("scent_outline", r#"{"path":"../outside"}"#)
@@ -2916,4 +2950,1002 @@ fn for_worktree_derives_non_offline_network_for_external_harness_allowlist() {
         )
         .unwrap();
     assert_eq!(derived.sandbox.network, NetworkPolicy::LocalhostOnly);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `SDD-05` REQ-05.4 / TEST-05.3 — Verify-on-Edit E2E (portable Windows + Linux).
+//
+// El sandbox se fija a `SandboxMode::Off` para que el comando de verificación use
+// `plain_shell_command` (shell nativo del SO: `pwsh`/`sh`) sin capas adicionales,
+// manteniendo la E2E determinista y portable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Policy con `[verify]` explícito y sandbox `Off` (comando de verificación vía shell nativo).
+fn verify_policy(dir: &std::path::Path, verify: VerifyConfig) -> WorkspacePolicy {
+    WorkspacePolicy::new(dir)
+        .unwrap()
+        .with_sandbox(SandboxConfig {
+            mode: SandboxMode::Off,
+            ..Default::default()
+        })
+        .with_verify(verify)
+}
+
+/// Comando de verificación portable que sale `0` si `src/lib.rs` contiene `MARKER_OK`,
+/// o emite `verify-fail: MARKER_OK missing` a stdout y sale `1` en caso contrario.
+fn verify_content_check_cmd() -> String {
+    if cfg!(windows) {
+        "if (Select-String -Path 'src/lib.rs' -Pattern 'MARKER_OK' -Quiet) { echo verify-ok } else { echo 'verify-fail: MARKER_OK missing'; exit 1 }"
+            .to_string()
+    } else {
+        "if grep -q MARKER_OK src/lib.rs; then echo verify-ok; else echo 'verify-fail: MARKER_OK missing'; exit 1; fi"
+            .to_string()
+    }
+}
+
+#[test]
+fn verify_on_edit_fails_on_introduced_break_then_passes_after_fix() {
+    let dir = TempDir::new("verify_failpass");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::write(
+        dir.0.join("src/lib.rs"),
+        "pub fn compute() -> i32 { MARKER_OK }\n",
+    )
+    .unwrap();
+
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: verify_content_check_cmd(),
+            max_secs: None,
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    // 1) Introducir un fallo: `MARKER_OK` -> `MARKER_BAD` → regla falla (exit 1).
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"MARKER_OK","new_text":"MARKER_BAD"}"#,
+        )
+        .unwrap();
+    assert!(obs.contains("[verify: FAIL]"), "{obs}");
+    assert!(obs.contains("(exit 1)"), "{obs}");
+    assert!(obs.contains("verify-fail: MARKER_OK missing"), "{obs}");
+    assert!(
+        obs.contains("(Fix the error before finishing the turn.)"),
+        "{obs}"
+    );
+
+    // 2) Corregir: `MARKER_BAD` -> `MARKER_OK` → regla pasa.
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"MARKER_BAD","new_text":"MARKER_OK"}"#,
+        )
+        .unwrap();
+    assert!(obs.contains("[verify: PASS]"), "{obs}");
+    assert!(obs.contains("rule(s) succeeded"), "{obs}");
+}
+
+#[test]
+fn verify_on_edit_emits_no_block_when_path_outside_glob() {
+    let dir = TempDir::new("verify_outside");
+    fs::write(dir.0.join("notes.txt"), "hello\n").unwrap();
+
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: "echo should-never-run".to_string(),
+            max_secs: None,
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    // Editar un `.txt` fuera de la glob `**/*.rs` → sin bloque `[verify: ...]`.
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"notes.txt","old_text":"hello","new_text":"bye"}"#,
+        )
+        .unwrap();
+    assert!(!obs.contains("[verify:"), "{obs}");
+    assert!(obs.starts_with("edited"), "{obs}");
+}
+
+#[test]
+fn verify_on_edit_slow_rule_is_killed_and_reports_timeout() {
+    let dir = TempDir::new("verify_timeout");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::write(dir.0.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+
+    let slow_cmd = if cfg!(windows) {
+        "Start-Sleep -Seconds 5"
+    } else {
+        "sleep 5"
+    };
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: slow_cmd.to_string(),
+            max_secs: Some(1),
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    let start = std::time::Instant::now();
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"{ 1 }","new_text":"{ 2 }"}"#,
+        )
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(obs.contains("[verify: FAIL]"), "{obs}");
+    assert!(obs.contains("timed out after 1s"), "{obs}");
+    // El `ProcessJob` mata el proceso a los ~1 s: mucho antes del sleep de 5 s.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "took {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "scent")]
+#[test]
+fn verify_on_edit_reports_impacted_tests_in_pass_summary() {
+    let dir = TempDir::new("verify_impacted");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    fs::create_dir_all(dir.0.join("tests")).unwrap();
+    fs::write(
+        dir.0.join("src/lib.rs"),
+        "pub fn target_fn() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("tests/target_test.rs"),
+        "#[test]\nfn test_target() {\n    let _ = target_fn();\n}\n",
+    )
+    .unwrap();
+
+    let cfg = VerifyConfig {
+        on_edit: true,
+        max_secs: 20,
+        rules: vec![VerifyRule {
+            glob: "**/*.rs".to_string(),
+            command: "echo verify-ok".to_string(),
+            max_secs: None,
+        }],
+    };
+    let tools = WorkspaceTools::new(verify_policy(&dir.0, cfg));
+
+    // Editar `target_fn` (llamado por `test_target` a 1 hop) → resumen PASS con
+    // `impacted_tests` que incluye el test alcanzable.
+    let obs = tools
+        .execute(
+            "fs_edit",
+            r#"{"path":"src/lib.rs","old_text":"{ 1 }","new_text":"{ 2 }"}"#,
+        )
+        .unwrap();
+    assert!(obs.contains("[verify: PASS]"), "{obs}");
+    assert!(obs.contains("impacted_tests:"), "{obs}");
+    assert!(obs.contains("test_target"), "{obs}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `SDD-05` REQ-05.5 / TEST-05.4: `spawn_agent(isolated: true)` en *worktrees* Git
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
+
+use onyx_soul_agents::{
+    AgentConfig, AgentState, EventBus, GraphView, PlatformDriver, SPAWN_AGENT_TOOL, SubagentSystem,
+    SurfaceBinding, Vocab, pending_requests,
+};
+use onyx_workspace::{IsolatedWorktreeResult, IsolatedWorktreeState};
+
+/// Responde scripteado para [`IsolatedTestDriver`] (alias para evitar `type_complexity`).
+type IsolatedResponder = dyn Fn(&AgentView) -> Option<Reply>;
+
+/// Driver minimal que ejecuta las decisiones scripteadas (mismo patrón que
+/// `RecordingBridge`) conservando el `WorkspaceToolBridge` tipo concreto — igual que
+/// `SubagentManagerDriver::with_workspace_bridge` en producción — y expone la API de
+/// *worktrees* aislados al test.
+struct IsolatedTestDriver {
+    vocab: Vocab,
+    bridge: WorkspaceToolBridge,
+    responder: Box<IsolatedResponder>,
+    queued: Vec<Reply>,
+    dispatched: BTreeSet<(u64, u64)>,
+}
+
+impl IsolatedTestDriver {
+    fn new(
+        vocab: Vocab,
+        bridge: WorkspaceToolBridge,
+        responder: impl Fn(&AgentView) -> Option<Reply> + 'static,
+    ) -> Self {
+        Self {
+            vocab,
+            bridge,
+            responder: Box::new(responder),
+            queued: Vec::new(),
+            dispatched: BTreeSet::new(),
+        }
+    }
+
+    fn results(&self) -> Vec<IsolatedWorktreeResult> {
+        self.bridge.isolated_results()
+    }
+
+    fn errors(&self) -> Vec<(u64, String)> {
+        self.bridge.isolated_errors()
+    }
+
+    fn apply(&mut self, child_id: u64) -> Result<Vec<String>, String> {
+        self.bridge.apply_isolated_worktree(child_id)
+    }
+
+    fn discard(&mut self, child_id: u64) -> Result<(), String> {
+        self.bridge.discard_isolated_worktree(child_id)
+    }
+}
+
+impl PlatformDriver for IsolatedTestDriver {
+    fn poll(&mut self, bus: &mut dyn EventBus) {
+        self.bridge.poll(bus);
+        for reply in self.queued.drain(..) {
+            bus.push(reply.to_event());
+        }
+    }
+
+    fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        // Primero el puente (ejecuta las llamadas a herramienta de los hijos), luego las
+        // decisiones scripteadas del test.
+        self.bridge.present(graph, surfaces);
+        for request in pending_requests(graph, &self.vocab) {
+            if self.dispatched.insert((request.agent.0, request.request)) {
+                if let Some(reply) = (self.responder)(&request) {
+                    self.queued.push(reply);
+                }
+            }
+        }
+    }
+}
+
+fn run_git_in(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@local")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@local")
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn init_git_repo(dir: &Path) {
+    run_git_in(dir, &["init", "-q"]);
+}
+
+fn git_commit_all(dir: &Path, msg: &str) {
+    run_git_in(dir, &["add", "-A"]);
+    run_git_in(dir, &["commit", "-q", "-m", msg]);
+}
+
+fn git_head_sha(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn git_branch_exists(dir: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn onyx_subagent_worktree_count(dir: &Path) -> usize {
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.starts_with("branch ") && line.contains("onyx/sub/"))
+        .count()
+}
+
+/// TEST-05.4 (1): dos hijos `isolated: true` en paralelo (a.rs / b.rs); la raíz queda
+/// intacta mientras corren; `apply_isolated_worktree` secuencial → ambos merges 3-way
+/// limpios, `HEAD` no se mueve y *worktrees* + ramas `onyx/sub/*` se eliminan.
+#[test]
+fn isolated_spawn_agent_children_merge_cleanly_without_moving_head() {
+    let dir = TempDir::new("iso-parallel");
+    init_git_repo(&dir.0);
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+    fs::write(dir.0.join("b.rs"), "B1\n").unwrap();
+    git_commit_all(&dir.0, "initial");
+    let head_before = git_head_sha(&dir.0);
+
+    let wt_base = TempDir::new("iso-parallel-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 48,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(7)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    let spec = AgentSpec::new("parent", "delegate two isolated edits")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_write", "fs_read"])
+        .with_timeout_ticks(48);
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| {
+        if req.name == "worker-a" {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "a done"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"a.rs","content":"A2 isolated\n"}"#,
+                ))
+            }
+        } else if req.name == "worker-b" {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "b done"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"b.rs","content":"B2 isolated\n"}"#,
+                ))
+            }
+        } else {
+            // Padre: lanza worker-a y luego worker-b (ambos `isolated: true`), y termina.
+            let obs = req.memory.iter().filter(|(k, _)| k == "observe").count();
+            if obs >= 2 {
+                Some(Reply::done(
+                    req.agent,
+                    req.request,
+                    "both isolated edits merged",
+                ))
+            } else if obs == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-b","goal":"edit b.rs","isolated":true}"#,
+                ))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-a","goal":"edit a.rs","isolated":true}"#,
+                ))
+            }
+        }
+    });
+
+    assert!(host.run_until_settled(&mut driver, 64));
+    let agents = host.agents();
+    assert_eq!(agents.len(), 3, "parent + 2 isolated children");
+    let (parent_id, child_a, child_b) = (agents[0], agents[1], agents[2]);
+    assert_eq!(host.agent_state(parent_id), Some(AgentState::Done));
+    assert_eq!(host.agent_state(child_a), Some(AgentState::Done));
+    assert_eq!(host.agent_state(child_b), Some(AgentState::Done));
+
+    // Raíz intacta mientras los hijos corrieron (antes de aplicar nada).
+    assert_eq!(fs::read_to_string(dir.0.join("a.rs")).unwrap(), "A1\n");
+    assert_eq!(fs::read_to_string(dir.0.join("b.rs")).unwrap(), "B1\n");
+
+    // Dos resultados `Pending` con commit capturado, summary del hijo y rama `onyx/sub/*`.
+    let results = driver.results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    let res_a = results.iter().find(|r| r.child_id == child_a.0).unwrap();
+    let res_b = results.iter().find(|r| r.child_id == child_b.0).unwrap();
+    for r in [res_a, res_b] {
+        assert_eq!(r.state, IsolatedWorktreeState::Pending);
+        assert!(!r.sub_commit.is_empty());
+        assert!(r.ok, "child must be Done");
+        assert!(r.handle.worktree_path.exists());
+        assert!(r.job_id.starts_with("agent-"), "{:?}", r.job_id);
+        assert_eq!(r.handle.branch_name, format!("onyx/sub/{}", r.job_id));
+    }
+    assert_eq!(res_a.summary, "a done");
+    assert_eq!(res_a.changed_files, vec!["a.rs".to_string()]);
+
+    // Aplicar el primero: 3-way limpio sobre el estado actual de root.
+    let applied_a = driver.apply(child_a.0).unwrap();
+    assert_eq!(applied_a, vec!["a.rs".to_string()]);
+    assert_eq!(
+        fs::read_to_string(dir.0.join("a.rs")).unwrap(),
+        "A2 isolated\n"
+    );
+    // El segundo sigue `Pending` con su worktree en disco.
+    assert!(res_b.handle.worktree_path.exists());
+
+    // Aplicar el segundo: 3-way fresco y limpio (merge secuencial sin colisión).
+    let applied_b = driver.apply(child_b.0).unwrap();
+    assert_eq!(applied_b, vec!["b.rs".to_string()]);
+    assert_eq!(
+        fs::read_to_string(dir.0.join("b.rs")).unwrap(),
+        "B2 isolated\n"
+    );
+
+    // `HEAD` no se ha movido; worktrees y ramas temporales eliminados.
+    assert_eq!(git_head_sha(&dir.0), head_before);
+    assert!(!res_a.handle.worktree_path.exists());
+    assert!(!res_b.handle.worktree_path.exists());
+    assert!(!git_branch_exists(&dir.0, &res_a.handle.branch_name));
+    assert!(!git_branch_exists(&dir.0, &res_b.handle.branch_name));
+    assert_eq!(onyx_subagent_worktree_count(&dir.0), 0);
+    assert!(
+        driver
+            .results()
+            .iter()
+            .all(|r| { matches!(r.state, IsolatedWorktreeState::Applied) })
+    );
+}
+
+/// TEST-05.5 (A3): dos padres independientes en el mismo `AgentHost` lanzan `worker-a`
+/// (`a.rs`) y `worker-b` (`b.rs`) **en paralelo, mismo tick**; los dos *worktrees*
+/// aislados coexisten en disco a la vez (`onyx_subagent_worktree_count == 2`) antes de
+/// finalizar, la raíz queda intacta en vuelo y ambos se aplican limpios vía 3-way.
+#[test]
+fn isolated_two_parents_parallel_children_have_two_live_worktrees() {
+    let dir = TempDir::new("iso-two-parents");
+    init_git_repo(&dir.0);
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+    fs::write(dir.0.join("b.rs"), "B1\n").unwrap();
+    git_commit_all(&dir.0, "initial");
+    let head_before = git_head_sha(&dir.0);
+
+    let wt_base = TempDir::new("iso-two-parents-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 48,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(11)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    // El hijo hereda las herramientas del padre: sin `fs_write` en el spec, las llamadas
+    // del hijo serían `denied` (igual que en TEST-05.4 (1)).
+    let spec_a = AgentSpec::new("parent-1", "delegate a.rs edit")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_read", "fs_write"])
+        .with_timeout_ticks(48);
+    let spec_b = AgentSpec::new("parent-2", "delegate b.rs edit")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_read", "fs_write"])
+        .with_timeout_ticks(48);
+    // Dos spawns en el mismo host antes del primer tick: los dos hijos nacen en paralelo.
+    host.spawn(&spec_a);
+    host.spawn(&spec_b);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| match req
+        .name
+        .as_str()
+    {
+        "worker-a" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"a.rs","content":"A2 isolated\n"}"#,
+            ))
+        }
+        "worker-b" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                "fs_write",
+                r#"{"path":"b.rs","content":"B2 isolated\n"}"#,
+            ))
+        }
+        "worker-a" | "worker-b" => Some(Reply::done(req.agent, req.request, "done")),
+        "parent-1" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                SPAWN_AGENT_TOOL,
+                r#"{"name":"worker-a","goal":"edit a.rs","isolated":true}"#,
+            ))
+        }
+        "parent-2" if !req.memory.iter().any(|(k, _)| k == "observe") => {
+            Some(Reply::call_structured(
+                req.agent,
+                req.request,
+                SPAWN_AGENT_TOOL,
+                r#"{"name":"worker-b","goal":"edit b.rs","isolated":true}"#,
+            ))
+        }
+        _ => Some(Reply::done(req.agent, req.request, "delegated")),
+    });
+
+    // Tick a tick hasta que ambos *worktrees* coexisten en disco (los dos hijos corren en
+    // paralelo): en ese instante la raíz debe quedar intacta. (Los padres pueden terminar
+    // antes que sus hijos: la señal de paralelismo son los dos worktrees vivos.)
+    let mut in_flight = false;
+    for _ in 0..32 {
+        host.step(&mut driver);
+        if onyx_subagent_worktree_count(&dir.0) == 2 {
+            assert_eq!(
+                fs::read_to_string(dir.0.join("a.rs")).unwrap(),
+                "A1\n",
+                "la raíz debe quedar intacta mientras corren los hijos"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.0.join("b.rs")).unwrap(),
+                "B1\n",
+                "la raíz debe quedar intacta mientras corren los hijos"
+            );
+            in_flight = true;
+            break;
+        }
+    }
+    assert!(
+        in_flight,
+        "los dos worktrees aislados nunca coexistieron en disco"
+    );
+
+    assert!(host.run_until_settled(&mut driver, 64));
+    let agents = host.agents();
+    assert_eq!(agents.len(), 4, "2 padres + 2 hijos aislados");
+    assert!(
+        agents
+            .iter()
+            .all(|a| host.agent_state(*a) == Some(AgentState::Done)),
+        "todos los agentes deben terminar en Done"
+    );
+
+    // Dos resultados `Pending`; aplicar cada uno: 3-way limpio y secuencial.
+    let results = driver.results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    for r in &results {
+        assert_eq!(r.state, IsolatedWorktreeState::Pending);
+        assert!(!r.sub_commit.is_empty());
+        assert!(r.ok, "child must be Done");
+        assert_eq!(r.changed_files.len(), 1, "{r:?}");
+        assert_eq!(driver.apply(r.child_id).unwrap(), r.changed_files);
+    }
+    assert_eq!(
+        fs::read_to_string(dir.0.join("a.rs")).unwrap(),
+        "A2 isolated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.0.join("b.rs")).unwrap(),
+        "B2 isolated\n"
+    );
+
+    // `HEAD` no se ha movido; 0 *worktrees* y 0 ramas `onyx/sub/*` residuales.
+    assert_eq!(git_head_sha(&dir.0), head_before);
+    assert_eq!(onyx_subagent_worktree_count(&dir.0), 0);
+    for r in &results {
+        assert!(!git_branch_exists(&dir.0, &r.handle.branch_name));
+    }
+    assert!(
+        driver
+            .results()
+            .iter()
+            .all(|r| matches!(r.state, IsolatedWorktreeState::Applied))
+    );
+}
+
+/// TEST-05.4 (1b): `discard_isolated_worktree` elimina *worktree* + rama `onyx/sub/*`
+/// sin tocar `root` ni mover `HEAD`; el resultado queda `Discarded`.
+#[test]
+fn isolated_spawn_agent_child_can_be_discarded_without_touching_root() {
+    let dir = TempDir::new("iso-discard");
+    init_git_repo(&dir.0);
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+    git_commit_all(&dir.0, "initial");
+    let head_before = git_head_sha(&dir.0);
+
+    let wt_base = TempDir::new("iso-discard-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 48,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(7)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    let spec = AgentSpec::new("parent", "delegate an isolated edit")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_write", "fs_read"])
+        .with_timeout_ticks(48);
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| {
+        if req.name == "worker-a" {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "a done"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"a.rs","content":"A2 isolated\n"}"#,
+                ))
+            }
+        } else {
+            // Padre: lanza el hijo aislado y termina al recibir su resultado.
+            let obs = req.memory.iter().filter(|(k, _)| k == "observe").count();
+            if obs >= 1 {
+                Some(Reply::done(req.agent, req.request, "child finished"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-a","goal":"edit a.rs","isolated":true}"#,
+                ))
+            }
+        }
+    });
+
+    assert!(host.run_until_settled(&mut driver, 64));
+    let agents = host.agents();
+    assert_eq!(agents.len(), 2);
+    assert_eq!(host.agent_state(agents[1]), Some(AgentState::Done));
+
+    let results = driver.results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    let res = &results[0];
+    assert_eq!(res.state, IsolatedWorktreeState::Pending);
+    assert!(!res.sub_commit.is_empty());
+    assert_eq!(res.changed_files, vec!["a.rs".to_string()]);
+    let wt_path = res.handle.worktree_path.clone();
+    let branch = res.handle.branch_name.clone();
+    assert!(wt_path.exists());
+    assert!(git_branch_exists(&dir.0, &branch));
+
+    // Descartar: *worktree* + rama eliminados sin aplicar nada sobre `root`.
+    driver.discard(agents[1].0).unwrap();
+    assert!(!wt_path.exists());
+    assert!(!git_branch_exists(&dir.0, &branch));
+    assert_eq!(git_head_sha(&dir.0), head_before);
+    assert_eq!(fs::read_to_string(dir.0.join("a.rs")).unwrap(), "A1\n");
+    assert_eq!(onyx_subagent_worktree_count(&dir.0), 0);
+    assert!(
+        driver
+            .results()
+            .iter()
+            .all(|r| { matches!(r.state, IsolatedWorktreeState::Discarded) })
+    );
+}
+
+/// TEST-05.4 (3a): `isolated` ausente o `false` → comportamiento clásico sin *worktree*:
+/// el hijo escribe directamente en `root` y no queda rastro en el directorio base.
+#[test]
+fn spawn_agent_without_isolated_flag_does_not_create_worktree() {
+    let dir = TempDir::new("iso-off");
+    init_git_repo(&dir.0);
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+    fs::write(dir.0.join("b.rs"), "B1\n").unwrap();
+    git_commit_all(&dir.0, "initial");
+
+    let wt_base = TempDir::new("iso-off-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 48,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(7)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    let spec = AgentSpec::new("parent", "delegate two direct edits")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_write", "fs_read"])
+        .with_timeout_ticks(48);
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| {
+        if req.name == "worker-a" {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "a done"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"a.rs","content":"A2 direct\n"}"#,
+                ))
+            }
+        } else if req.name == "worker-b" {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "b done"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"b.rs","content":"B2 direct\n"}"#,
+                ))
+            }
+        } else {
+            // Padre: worker-a sin `isolated` (ausente) y worker-b con `isolated:false`.
+            let obs = req.memory.iter().filter(|(k, _)| k == "observe").count();
+            if obs >= 2 {
+                Some(Reply::done(
+                    req.agent,
+                    req.request,
+                    "both direct edits done",
+                ))
+            } else if obs == 1 {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-b","goal":"edit b.rs","isolated":false}"#,
+                ))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-a","goal":"edit a.rs"}"#,
+                ))
+            }
+        }
+    });
+
+    assert!(host.run_until_settled(&mut driver, 64));
+    let agents = host.agents();
+    assert_eq!(agents.len(), 3);
+
+    // Comportamiento clásico: los hijos escriben directamente en `root`.
+    assert_eq!(
+        fs::read_to_string(dir.0.join("a.rs")).unwrap(),
+        "A2 direct\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.0.join("b.rs")).unwrap(),
+        "B2 direct\n"
+    );
+    // Sin *worktrees* aislados: ni resultados, ni errores pegajosos, ni rastro en disco.
+    assert!(driver.results().is_empty(), "{:?}", driver.results());
+    assert!(driver.errors().is_empty(), "{:?}", driver.errors());
+    assert_eq!(onyx_subagent_worktree_count(&dir.0), 0);
+    assert_eq!(fs::read_dir(&wt_base.0).unwrap().count(), 0);
+}
+
+/// TEST-05.4 (3b): `isolated: true` en un workspace **sin Git** → error accionable
+/// pegajoso en el slot del hijo; `root` no se muta y no se crea ningún *worktree*.
+#[test]
+fn isolated_spawn_agent_in_non_git_repo_yields_actionable_error() {
+    let dir = TempDir::new("iso-nogit");
+    // Sin `git init`: no es un repositorio.
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+
+    let wt_base = TempDir::new("iso-nogit-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 48,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(7)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    let spec = AgentSpec::new("parent", "delegate an isolated edit")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_write", "fs_read"])
+        .with_timeout_ticks(48);
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| {
+        if req.name == "worker-a" {
+            if req
+                .memory
+                .iter()
+                .any(|(k, _)| k == "observe" || k == "tool_error")
+            {
+                Some(Reply::done(req.agent, req.request, "a gave up"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"a.rs","content":"A2 isolated\n"}"#,
+                ))
+            }
+        } else {
+            let obs = req
+                .memory
+                .iter()
+                .filter(|(k, _)| k == "observe" || k == "tool_error")
+                .count();
+            if obs >= 1 {
+                Some(Reply::done(
+                    req.agent,
+                    req.request,
+                    "spawn reported failure",
+                ))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-a","goal":"edit a.rs","isolated":true}"#,
+                ))
+            }
+        }
+    });
+
+    assert!(host.run_until_settled(&mut driver, 64));
+    let agents = host.agents();
+    assert_eq!(agents.len(), 2);
+
+    // Error accionable pegajoso con el motivo exacto (no-repo-Git).
+    let errors = driver.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0, agents[1].0);
+    assert!(
+        errors[0].1.contains("not inside a Git work tree"),
+        "{:?}",
+        errors[0].1
+    );
+
+    // `root` no se mutó y no se creó ningún *worktree*.
+    assert_eq!(fs::read_to_string(dir.0.join("a.rs")).unwrap(), "A1\n");
+    assert!(driver.results().is_empty(), "{:?}", driver.results());
+    assert_eq!(fs::read_dir(&wt_base.0).unwrap().count(), 0);
+
+    // El padre recibió el reporte de fallo del hijo (ciclo cerrado de `spawn_agent`).
+    let parent_result = host.result(agents[0]).unwrap();
+    assert!(parent_result.contains("failure"), "{parent_result}");
+}
+
+/// TEST-05.4 (3c): `Drop` del puente retira en best-effort los *worktrees* aún poseídos
+/// (hijo finalizado sin aplicar) y sus ramas `onyx/sub/*`.
+#[test]
+fn bridge_drop_removes_unapplied_isolated_worktrees() {
+    let dir = TempDir::new("iso-drop");
+    init_git_repo(&dir.0);
+    fs::write(dir.0.join("a.rs"), "A1\n").unwrap();
+    git_commit_all(&dir.0, "initial");
+
+    let wt_base = TempDir::new("iso-drop-wt");
+    let policy = WorkspacePolicy::new(&dir.0).unwrap();
+    let tools = WorkspaceTools::new(policy);
+
+    let config = AgentConfig {
+        default_max_steps: 16,
+        default_timeout_ticks: 64,
+        ..AgentConfig::default()
+    };
+    let mut host = AgentHost::builder(7)
+        .config(config.clone())
+        .system(Box::new(SubagentSystem::new(config)))
+        .build()
+        .unwrap();
+    let spec = AgentSpec::new("parent", "delegate and never finish")
+        .with_tools([SPAWN_AGENT_TOOL, "fs_write", "fs_read"])
+        .with_timeout_ticks(64);
+    host.spawn(&spec);
+
+    let ws_bridge = WorkspaceToolBridge::new(host.vocab(), tools)
+        .with_worktree_base_dir(Some(wt_base.0.clone()));
+    let mut driver = IsolatedTestDriver::new(host.vocab(), ws_bridge, |req: &AgentView| {
+        if req.name == "worker-a" {
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::done(req.agent, req.request, "a done"))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"a.rs","content":"A2 isolated\n"}"#,
+                ))
+            }
+        } else {
+            // Padre: lanza al hijo aislado y luego se queda ocupado para siempre
+            // (nunca termina) → el resultado aislado queda `Pending` al `drop`.
+            if req.memory.iter().any(|(k, _)| k == "observe") {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_read",
+                    r#"{"path":"a.rs"}"#,
+                ))
+            } else {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    SPAWN_AGENT_TOOL,
+                    r#"{"name":"worker-a","goal":"edit a.rs","isolated":true}"#,
+                ))
+            }
+        }
+    });
+
+    // Ticks suficientes para que el hijo termine y quede un resultado `Pending`.
+    for _ in 0..32 {
+        host.step(&mut driver);
+    }
+    let results = driver.results();
+    assert_eq!(results.len(), 1, "{:?}", driver.results());
+    let res = &results[0];
+    assert_eq!(res.state, IsolatedWorktreeState::Pending);
+    let wt_path = res.handle.worktree_path.clone();
+    let branch = res.handle.branch_name.clone();
+    assert!(wt_path.exists(), "worktree must exist before drop");
+    assert!(git_branch_exists(&dir.0, &branch));
+
+    // `Drop` del driver → `Drop` del puente → limpieza best-effort.
+    drop(driver);
+    assert!(!wt_path.exists(), "Drop must remove the unapplied worktree");
+    assert!(
+        !git_branch_exists(&dir.0, &branch),
+        "Drop must delete the branch"
+    );
+    assert_eq!(onyx_subagent_worktree_count(&dir.0), 0);
+    // `root` sigue intacto (nada se aplicó).
+    assert_eq!(fs::read_to_string(dir.0.join("a.rs")).unwrap(), "A1\n");
 }

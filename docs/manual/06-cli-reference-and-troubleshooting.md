@@ -14,6 +14,7 @@ openonyx run <goal> [OPTIONS]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
 openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]
 openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--dry-run] [OPTIONS]
+openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [OPTIONS]
 openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
 openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]
 openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [OPTIONS]
@@ -58,7 +59,36 @@ openonyx [--help | -h | --version | -V]
 | `--json` | `inspect` | Emit machine-readable JSON output. |
 | `--transcript <file>` | `rewind`, `doctor` | Replay transcript from rewind tick (`rewind`) or validate transcript (`doctor`). |
 | `--dry-run` | `rewind` | Preview orphaned effects and Git rollback plan without modifying disk. |
+| `--models <list>` | `bench` | Comma-separated candidate list: `<provider>:<model>` (live LLM, e.g. `gemini:gemini-2.5-pro,openai:gpt-4o`) and/or `replay:<label>=<file.tr>` / `replay:<file.tr>` (offline `ONYXTR2` transcript, deterministic). |
+| `--verify <cmd>` | `bench` | Verification command executed **sandboxed inside the candidate's worktree** after it settles (same pipeline as `shell_exec`); its `exit 0` decides `passed_verify`. Without `--verify`, `passed_verify` = agent finished `Done` and the session settled. |
+| `--out <file.json>` | `bench` | Write the full pretty-printed JSON report (metadata + results). |
+| `--goal <text>` | `bench` | Root agent goal when no agent is active at `--tick` (required in that case). |
 | `-h, --help` / `-V, --version` | Global | Print help or version and exit `0`. |
+
+### `openonyx bench` — full reference
+
+Multi-model benchmark from an **identical snapshot**: every candidate runs in a **throwaway worktree** (`bench-<pid>-<idx>-<label>`) rewound to `--tick` (`reconcile_rewind_effects_report`), with a fresh session host (`request_restore` + 1 step); afterwards the root and `HEAD` remain **100 % intact** and the worktree is removed (RAII guard; also on error or panic).
+
+```sh
+# Live + offline replay comparison, with verification and a JSON report
+openonyx bench \
+  --snapshot-dir .onyx/vault/20261125-100000_gpt-4o \
+  --tick 12 \
+  --models "gemini:gemini-2.5-pro,openai:gpt-4o,replay:baseline=run_baseline.tr" \
+  --goal "fix the failing test in src/app.rs" \
+  --verify "cargo test --workspace" \
+  --out bench_report.json \
+  --auto-approve \
+  --sandbox workspace-write \
+  --sandbox-net offline
+```
+
+- **Candidates (`--models`):** `<provider>:<model>` with `provider ∈ gemini|openai|anthropic` (credentials via the usual `GEMINI_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` variables or `--api-base`); `replay:<label>=<path.tr>` sets the label explicitly; `replay:<path.tr>` uses the file stem as the label. Parsing splits on `:` first, then `=`, so Windows drive-letter paths (`replay:C:\runs\a.tr`) survive intact.
+- **Per candidate (sequential):** rewind the worktree to the tick → fresh restored host → if no agent is active at the tick, spawn a root agent from `--goal` → run until settled (internal 256-tick cap) with real telemetry (tokens/cost) for live candidates (replay: tokens/cost `0`).
+- **`--auto-approve`:** for **unattended** runs on disposable worktrees: each candidate runs only inside its own worktree and the root is never touched; `[permissions].deny` still applies.
+- **Output:** a 9-column Markdown table on `stdout` — `| model | passed_verify | ticks | tool_calls | input_tokens | cached_tokens | output_tokens | estimated_cost_usd | wall_time_ms |` — plus, with `--out`, the JSON report (`metadata` with snapshot/tick/models/verify + per-candidate `results` with every column).
+- **Reused flags:** `--workspace <dir>`, `--sandbox <off|workspace-write|strict-container>`, `--sandbox-net <offline|localhost|unrestricted>`, `--shell-timeout <secs>`, `--trust-workspace`, `--api-base <url>`, `--allow-custom-auth-host`, `--effort <low|medium|high>`, `--thinking-budget <n>` (a live candidate determines its own `provider:model`).
+- **Actionable validation:** missing `--snapshot-dir`/`--tick`/`--models` produces an error naming the missing flag; unknown provider → `unsupported provider ... (expected `gemini`, `openai` or `anthropic`)`; a missing snapshot store → floor warning, not an error.
 
 ---
 

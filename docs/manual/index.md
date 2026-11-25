@@ -8,7 +8,9 @@ A diferencia de otros asistentes de terminal que mezclan estado en memoria volá
 
 - **Snapshots comprimidos por hitos** (`snapshots.onyxpack`) con verificación FNV-1a y tolerancia a cortes.
 - **Time-travel y bifurcación segura** (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`).
-- **Subagentes asíncronos en worktrees Git aislados** (`spawn_subagent` / `/spawn`, fusión 3-way con *Scent-Heated Merge*, `--max-subagents`, y harnesses CLI externos como drivers opcionales `[[external_drivers]]`).
+- **Subagentes asíncronos en worktrees Git aislados** (`spawn_subagent` / `/spawn`, fusión 3-way con *Scent-Heated Merge*, `--max-subagents`, y harnesses CLI externos como drivers opcionales `[[external_drivers]]`), y **`spawn_agent(isolated: true)`**: hijos síncronos en worktrees aislados `onyx/sub/agent-*` con reconciliación 3-way que **nunca toca `HEAD` ni la raíz** hasta el merge.
+- **Benchmark multi-modelo** (`openonyx bench`): mismos snapshot/tick, worktrees desechables por candidato (rewind + RAII), candidatos LLM vivos `provider:model` o replays offline `replay:<label>=<file.tr>`, `--verify` sandboxed, tabla Markdown de 9 columnas + informe JSON `--out`; la raíz queda 100 % intacta.
+- **Verify-on-Edit** (`[verify]` / `[[verify.rules]]` en `.onyx/config.toml`): tras cada `fs_edit`/`fs_write` exitoso, ejecuta las reglas cuya `glob` empareja el archivo editado (y tests `scope:test` impactados por Scent) en sandbox y inyecta `[verify: PASS|FAIL|BLOCKED]` a la observación del tool, sujeto a Workspace Trust y `[permissions].deny`.
 - **Objetivo LLM conmutable en caliente** (`[[llm_profiles]]`, `/profile` / `/provider` / `/model` / `/effort`, cabecera `provider/model` viva y selector Web sin credenciales) con **proveedor nativo Anthropic** (Messages API, prompt caching `ephemeral` y *extended thinking* acotado con `--thinking-budget`).
 - **Herramientas dinámicas MCP** (`[mcp.servers.<name>]` con transportes `stdio` y `http`): cada tool se expone como `mcp__<server>__<tool>`, siempre con aprobación explícita, `Deny` en `PLAN`/`EXPLORE`, con gate de Workspace Trust, aislamiento de fallos por servidor y auditoría en `openonyx doctor`.
 - **TUI modular `F1..F5`** (Chat, Agents, Sprout, Plan & Diff, Timeline) con paleta de comandos `Ctrl+K` y `/view`.
@@ -16,7 +18,7 @@ A diferencia de otros asistentes de terminal que mezclan estado en memoria volá
 - **Grabación y reproducción 100% offline** (`ONYXTR2`, 0 llamadas de red, 0 escrituras en disco).
 - **Seguridad por capas**: **Workspace Trust con `blake3`** (`openonyx trust` / `/trust`), modos `PLAN` / `BUILD` / `EXPLORE`, reglas `.onyx/config.toml` (`deny > ask > allow`), *Scent-Heated Approvals*, sandbox OS con `env_clear()`, protección RO del Control Plane y `ProcessJob` RAII.
 - **Interfaz Web / PWA embebida (`openonyx serve`)**: servidor HTTP/1.1 + SSE puro en `std::net` (0 `tokio`), pensado para navegador local, móvil Android/iOS o despliegue detrás de proxy HTTPS, con autenticación constante por `blake3` (Cookie `HttpOnly` / `Bearer`) y `--cors-origin` para clientes externos.
-- **Navegación semántica AST** (`onyx-scent`: `scent_outline` + `scent_impact`) y **orquestación local de servicios/contenedores** (`sprout.toml`).
+- **Navegación semántica AST Scent 2.0** (`onyx-scent`: `scent_outline` + `scent_impact` + `scent_references`): **7 lenguajes** (Rust, Python, Java, TypeScript, JavaScript, Go, C/C++), tipos `EntityKind::{TypeAlias, Component}`, caché binaria incremental `.onyx/scent.idx` (`ONYXSCI1`, recarga < 20 ms) y CLI `scent outline|impact|references`; más **orquestación local de servicios/contenedores** (`sprout.toml`).
 
 ---
 

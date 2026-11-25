@@ -298,7 +298,7 @@ pub fn summarize_tool_output_tier1(tool_name: &str, call_args: &str, output: &st
                 format!("[summary fs_read {path} ({lines} lines, {bytes}B, sha:{sha})]")
             }
         }
-        "scent_outline" | "scent_impact" => {
+        "scent_outline" | "scent_impact" | "scent_references" => {
             let target = extract_call_str_arg(call_args, "path")
                 .or_else(|| extract_call_str_arg(call_args, "target"))
                 .unwrap_or_else(|| ".".to_string());

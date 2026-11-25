@@ -1200,6 +1200,15 @@ mod tests {
             "expected pruned worktree check: {:?}",
             report.checks
         );
+        // Sin warnings de *worktrees* residuales tras el prune (`SDD-05` TEST-05.4 (2)).
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("leftover onyx subagent worktree")),
+            "no leftover worktree warning expected: {:?}",
+            report.warnings
+        );
 
         let _ = fs::remove_dir_all(&wt_base);
         let _ = fs::remove_dir_all(&dir);

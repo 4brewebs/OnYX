@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
+
 use crate::distiller::{DistillerConfig, distill_heat};
 use crate::index::WorkspaceIndex;
-use crate::ontology::ScentError;
+use crate::ontology::{RelationKind, ScentError};
 
 pub const TOON_HEADER: &str = "@TOON v1";
 pub const DEFAULT_MAX_ROWS: usize = 250;
@@ -207,6 +209,130 @@ impl WorkspaceIndex {
                 })
             })
             .collect();
+
+        Ok(render_toon(&rows, opts))
+    }
+
+    /// Resolves definitions and direct cross-references (callers, callees, implementors,
+    /// and type users) for `target` from `ScentArena` and encodes them as `@TOON v1` tuples.
+    pub fn references_toon(
+        &self,
+        target: &str,
+        opts: ToonPageOptions,
+    ) -> Result<String, ScentError> {
+        let targets = self.resolve_targets(target);
+        if targets.is_empty() {
+            return Err(ScentError::TargetNotFound {
+                target: target.to_string(),
+            });
+        }
+
+        let impl_pairs: BTreeSet<(usize, usize)> = self
+            .arena
+            .edges
+            .iter()
+            .filter(|e| e.kind == RelationKind::Implements)
+            .map(|e| (e.source_id, e.target_id))
+            .collect();
+
+        let mut rows: Vec<ToonRow> = Vec::new();
+        let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+        for &tid in &targets {
+            let Some(node) = self.arena.nodes.get(tid) else {
+                continue;
+            };
+            let key = (
+                node.qualified_name.clone(),
+                "defined_at".to_string(),
+                node.signature.clone(),
+            );
+            if seen.insert(key) {
+                rows.push(ToonRow {
+                    subject: node.qualified_name.clone(),
+                    predicate: "defined_at".to_string(),
+                    object: node.signature.clone(),
+                    meta: format!(
+                        "kind:{},lang:{},lines:{}-{},vis:{},scope:{}",
+                        node.kind.as_str(),
+                        node.lang.as_str(),
+                        node.start_line,
+                        node.end_line,
+                        if node.is_public { "pub" } else { "priv" },
+                        if node.is_test { "test" } else { "src" }
+                    ),
+                });
+            }
+        }
+
+        let mut ref_entries: Vec<(u8, String, String, String, String)> = Vec::new();
+        for &tid in &targets {
+            let Some(src_node) = self.arena.nodes.get(tid) else {
+                continue;
+            };
+            for edge in &self.arena.edges {
+                if edge.source_id != tid {
+                    continue;
+                }
+                let Some(neighbor) = self.arena.nodes.get(edge.target_id) else {
+                    continue;
+                };
+                if opts.public_only && !neighbor.is_public {
+                    continue;
+                }
+                if opts.exclude_tests && neighbor.is_test {
+                    continue;
+                }
+                let (rank, predicate) = match edge.kind {
+                    RelationKind::CalledBy => (1u8, RelationKind::CalledBy.as_str()),
+                    RelationKind::Implements => (2u8, RelationKind::Implements.as_str()),
+                    RelationKind::UsedByType => {
+                        if impl_pairs.contains(&(edge.target_id, tid)) {
+                            (2u8, "implemented_by")
+                        } else {
+                            (3u8, RelationKind::UsedByType.as_str())
+                        }
+                    }
+                    RelationKind::Calls => (4u8, RelationKind::Calls.as_str()),
+                    RelationKind::UsesType => (5u8, RelationKind::UsesType.as_str()),
+                };
+                let meta = format!(
+                    "kind:{},lang:{},lines:{}-{},vis:{},scope:{},sig:{}",
+                    neighbor.kind.as_str(),
+                    neighbor.lang.as_str(),
+                    neighbor.start_line,
+                    neighbor.end_line,
+                    if neighbor.is_public { "pub" } else { "priv" },
+                    if neighbor.is_test { "test" } else { "src" },
+                    neighbor.signature
+                );
+                ref_entries.push((
+                    rank,
+                    src_node.qualified_name.clone(),
+                    predicate.to_string(),
+                    neighbor.qualified_name.clone(),
+                    meta,
+                ));
+            }
+        }
+
+        ref_entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        for (_, subject, predicate, object, meta) in ref_entries {
+            if seen.insert((subject.clone(), predicate.clone(), object.clone())) {
+                rows.push(ToonRow {
+                    subject,
+                    predicate,
+                    object,
+                    meta,
+                });
+            }
+        }
 
         Ok(render_toon(&rows, opts))
     }

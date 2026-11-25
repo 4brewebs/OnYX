@@ -1,4 +1,5 @@
 mod anthropic;
+mod bench;
 mod command;
 mod context;
 mod external_driver;
@@ -66,6 +67,7 @@ use vault::{
 };
 use web::{DEFAULT_WEB_BIND, WebDriver, WebServerConfig};
 
+#[derive(Clone)]
 struct CliArgs {
     mode: Mode,
     workspace: PathBuf,
@@ -96,6 +98,14 @@ struct CliArgs {
     interactive: bool,
     snapshot_every: Option<u64>,
     max_snapshots: Option<usize>,
+    /// `--models <list>` (bench, `SDD-05` REQ-05.6).
+    bench_models: Option<String>,
+    /// `--verify <cmd>` (bench, `SDD-05` REQ-05.6).
+    bench_verify: Option<String>,
+    /// `--out <file.json>` (bench, `SDD-05` REQ-05.6).
+    bench_out: Option<PathBuf>,
+    /// `--goal <text>` (bench: agente raíz si no hay agente activo en el tick).
+    bench_goal: Option<String>,
 }
 
 impl CliArgs {
@@ -128,10 +138,15 @@ impl CliArgs {
             interactive: false,
             snapshot_every: None,
             max_snapshots: None,
+            bench_models: None,
+            bench_verify: None,
+            bench_out: None,
+            bench_goal: None,
         }
     }
 }
 
+#[derive(Clone)]
 enum Mode {
     Help,
     Version,
@@ -162,6 +177,11 @@ enum Mode {
         bind: String,
         api_key: Option<String>,
         cors_origin: Option<String>,
+    },
+    /// Benchmarking reproducible multi-modelo (`SDD-05` REQ-05.6).
+    Bench {
+        /// `--tick <n>` (snapshot a rebobinar; `None` → error accionable en dispatch).
+        tick: Option<u64>,
     },
 }
 
@@ -203,6 +223,10 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut interactive = false;
     let mut snapshot_every: Option<u64> = None;
     let mut max_snapshots: Option<usize> = None;
+    let mut bench_models: Option<String> = None;
+    let mut bench_verify: Option<String> = None;
+    let mut bench_out: Option<PathBuf> = None;
+    let mut bench_goal: Option<String> = None;
     let mut tick_opt: Option<u64> = None;
     let mut transcript_opt: Option<PathBuf> = None;
     let mut list = false;
@@ -387,6 +411,24 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                 let t = args.next().ok_or("--tick requires a number")?;
                 tick_opt = Some(t.parse::<u64>().map_err(|_| "--tick must be a u64")?);
             }
+            "--models" => {
+                let m = args
+                    .next()
+                    .ok_or("--models requires a comma-separated candidate list")?;
+                bench_models = Some(m);
+            }
+            "--verify" => {
+                let v = args.next().ok_or("--verify requires a command")?;
+                bench_verify = Some(v);
+            }
+            "--out" => {
+                let p = args.next().ok_or("--out requires a path")?;
+                bench_out = Some(PathBuf::from(p));
+            }
+            "--goal" => {
+                let g = args.next().ok_or("--goal requires text")?;
+                bench_goal = Some(g);
+            }
             "--transcript" => {
                 let p = args.next().ok_or("--transcript requires a path")?;
                 transcript_opt = Some(PathBuf::from(p));
@@ -487,6 +529,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     .filter(|s| !s.trim().is_empty())
             }),
         },
+        "bench" => Mode::Bench { tick: tick_opt },
         _ => return Err(usage()),
     };
 
@@ -527,11 +570,15 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         interactive,
         snapshot_every,
         max_snapshots,
+        bench_models,
+        bench_verify,
+        bench_out,
+        bench_goal,
     })
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [--workspace <dir>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--shell-timeout <secs>] [--auto-approve] [--trust-workspace] [--api-base <url>] [--allow-custom-auth-host] [--effort <low|medium|high>] [--thinking-budget <tokens>]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -543,6 +590,7 @@ fn help_text() -> String {
   replay <transcript>      Replay a recorded ONYXTR2 transcript offline (0 network calls, 0 disk mutations)
   inspect <snapshot_dir>   Inspect milestone snapshots (snapshots.onyxpack or legacy tick-*.bin) and graph state
   rewind <dir> <tick>      Restore git checkpoints to <tick> (or prior milestone) and replay/continue
+  bench                    Multi-model benchmark from an identical snapshot (disposable worktrees + rewind + `--verify`; live `provider:model` or offline `replay:<label>=<file.tr>` candidates; unattended runs use `--auto-approve` — every candidate runs in a throwaway worktree, the root is never touched)
   doctor                   Verify workspace git repository, sandbox, Workspace Trust, MCP servers (`[mcp.servers.*]`), snapshot packs, and transcripts
   trust                    Approve, check, list, or revoke Workspace Trust hashes (`~/.onyx/trusted_workspaces.toml`)
   serve                    Serve embedded mobile-first PWA + JSON/SSE API (`/api/v1/...`) over HTTP/1.1 (0 tokio)
@@ -636,6 +684,8 @@ PROJECT INSTRUCTIONS, SKILLS & SIDE PANELS:
   .onyx/skills/<name>/SKILL.md (also skills/, ~/.onyx/skills/)
                            Discovered as a compact catalog and loaded on demand via `load_skill` (includes `scent` & `rust`)
   [mcp.servers.<name>]     MCP servers from `config.toml` (global `~/.onyx/config.toml` and, if trusted, workspace): `transport = "stdio"` (`command`/`args`/`env`) or `"http"` (`url`/`headers`), `timeout_secs`, `enabled`. Their tools appear as `mcp__<server>__<tool>`, always approval-gated, `Deny` in PLAN/EXPLORE, audited by `openonyx doctor`
+  [verify] / [[verify.rules]]
+                           Verify-on-Edit: after each successful `fs_edit`/`fs_write`, run the rules whose `glob` matches the edited file (plus Scent-impacted `scope:test` files) in the `shell_exec` sandbox; `[verify]` keys: `on_edit = true` (opt-in), `max_secs` (1..=120, default 20), each `[[verify.rules]]` takes `glob`, `command`, optional `max_secs`. Output is appended as `[verify: PASS|FAIL|BLOCKED]`; workspace rules are subject to Workspace Trust and to `[permissions].deny`
   Live Plan & Services     Right-hand panels (`plan_update` + `sprout.toml`) shown automatically when width >= 100 columns
   User Manual              Full guide available in `docs/manual/index.md`
   Session Vault            `.onyx/vault/<session>/` stores snapshots + `.tr` together (`.onyx/vault/unassigned/` for standalone `.tr`; auto-ignored by Git)
@@ -1342,7 +1392,7 @@ fn launch_interactive_chat(
         .with_mode_handle(mode_handle)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_proactive_notifications(true)
-        .wrapping(ws_bridge);
+        .with_workspace_bridge(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
@@ -1611,7 +1661,7 @@ fn launch_web_serve(
         .with_mode_handle(mode_handle)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_proactive_notifications(true)
-        .wrapping(ws_bridge);
+        .with_workspace_bridge(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
     let rec_bridge = RecordingBridge::new(host.vocab(), |_: &AgentView| None);
@@ -1853,7 +1903,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--dry-run` no hace I/O: en ambos casos los tools `mcp__*` salen del
     // transcript (ver `extract_mcp_tools_from_transcript`), no del registro.
     let mcp_registry: Option<Arc<McpRegistry>> = match &cli.mode {
-        Mode::Doctor { .. } | Mode::Replay(_) | Mode::Inspect { .. } => None,
+        Mode::Doctor { .. } | Mode::Replay(_) | Mode::Inspect { .. } | Mode::Bench { .. } => None,
         Mode::Rewind {
             transcript: Some(_),
             ..
@@ -1903,6 +1953,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match &cli.mode {
+        // `SDD-05` REQ-05.6: benchmarking reproducible multi-modelo desde un
+        // snapshot/commit idéntico (worktrees desechables + rewind + verify).
+        Mode::Bench { tick } => {
+            let args = bench::BenchArgs {
+                cli: &cli,
+                workspace: cli.workspace.clone(),
+                policy: policy.clone(),
+                snapshot_dir: cli.snapshot_dir.clone(),
+                tick: *tick,
+                models: cli.bench_models.clone(),
+                verify: cli.bench_verify.clone(),
+                out: cli.bench_out.clone(),
+                goal: cli.bench_goal.clone(),
+                max_steps: cli.max_steps,
+                auto_approve: cli.auto_approve,
+                shell_timeout_secs: cli.shell_timeout_secs,
+                wt_base: None,
+            };
+            if let Err(e) = bench::run_bench(&args) {
+                eprintln!("[bench] {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Mode::Run(goal) => {
             let llm = resolve_llm_config(&cli, &cli.workspace)?;
             let auto_save = cli.auto_save || auto_save_from_env();
@@ -1958,7 +2032,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
                 .with_policy(policy.clone())
                 .with_proactive_notifications(false)
-                .wrapping(ws_bridge);
+                .with_workspace_bridge(ws_bridge);
             let telemetry = SessionTelemetryHandle::new(&llm.model, llm.api_base.is_some());
             let mut driver = RecordingBridge::new(
                 host.vocab(),

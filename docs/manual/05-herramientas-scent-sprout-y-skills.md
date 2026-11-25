@@ -2,7 +2,7 @@
 
 > 🇬🇧 **[Read this chapter in English](05-tools-scent-sprout-and-skills.md)**
 
-Este capítulo recoge el catálogo completo de las **23 herramientas** disponibles para el agente dentro de `openonyx` (19 base + `spawn_agent` + 4 asíncronas de subagentes en worktrees Git aislados), cómo aprovechar la navegación AST (`onyx-scent`), cómo orquestar procesos y contenedores locales con `sprout.toml`, cómo personalizar el comportamiento mediante `ONYX.md` / skills y cómo ejecutar tareas en modo headless (`openonyx run`).
+Este capítulo recoge el catálogo completo de las **24 herramientas** disponibles para el agente dentro de `openonyx` (19 base + `spawn_agent` + 4 asíncronas de subagentes en worktrees Git aislados), cómo aprovechar la navegación AST multilenguaje (`onyx-scent` 2.0), cómo orquestar procesos y contenedores locales con `sprout.toml`, cómo personalizar el comportamiento mediante `ONYX.md` / skills y cómo ejecutar tareas en modo headless (`openonyx run`) o en benchmark multi-modelo (`openonyx bench`).
 
 ---
 
@@ -16,15 +16,16 @@ Este capítulo recoge el catálogo completo de las **23 herramientas** disponibl
 | `fs_list` | Listar árbol de directorio hasta `max_depth` (default `3`). | Omite symlinks fuera de raíz, `.git`, `target`, `node_modules`, `*.tr`, `*.onyxpack`. |
 | `glob_files` | Localizar rutas por patrón glob (`*`, `**`, `?`, `[...]`, `{a,b}`). | Orden lexicográfico determinista (o `sort_by_mtime`). Rechaza *path traversal*. |
 | `code_search` | Búsqueda de texto literal o `regex` en el workspace. | Soporta `case_insensitive`, `include_glob`, `exclude_glob` y `context_lines` (`0..=5`) con `scrub_secrets`. |
-| `scent_outline` | Mapa AST paginado (`@TOON v1`) de símbolos, visibilidad y rangos de líneas. | Soporta `Rust`, `Python` y `Java`; caché incremental `blake3` + caché de sesión `seen_outlines` invalidada automáticamente tras ediciones/shell/`/undo`; filtros `public_only`, `exclude_tests`, `cursor`, `max_rows` (`1..=500`). |
+| `scent_outline` | Mapa AST paginado (`@TOON v1`) de símbolos, visibilidad y rangos de líneas. | Soporta `Rust`, `Python`, `Java`, `TypeScript` (`.ts/.tsx/.mts/.cts`), `JavaScript` (`.js/.jsx/.mjs/.cjs`), `Go` y `C/C++` (`.c/.h/.cc/.cpp/.cxx/.hh/.hpp`); caché incremental `blake3` + caché binaria persistente `.onyx/scent.idx` + caché de sesión `seen_outlines` invalidada automáticamente tras ediciones/shell/`/undo`; filtros `public_only`, `exclude_tests`, `cursor`, `max_rows` (`1..=500`). |
 | `scent_impact` | Grafo de impacto semántico (difusión térmica entera `0..=10_000` bp, `1..=6` hops). | Indica qué símbolos y archivos se ven afectados antes de refactorizar un símbolo compartido. |
+| `scent_references` | Resuelve la definición exacta de un símbolo y sus referencias cruzadas directas (callers, callees, implementers, usuarios del tipo) como tuplas `@TOON v1`. | `target` (nombre de símbolo, `Type::method` o `file::symbol`); filtros opcionales `public_only`, `exclude_tests`, paginación `cursor`/`max_rows` (`1..=500`). |
 | `git_status` | Ejecuta `git status --short --branch` de solo lectura. | Úsala en lugar de `shell_exec` para comprobar cambios locales. |
 | `git_diff` | Ejecuta `git diff --no-color` con `path`, `staged` y `context_lines` opcionales. | Pasa `path` estrictamente tras `--`. |
 | `load_skill` | Carga bajo demanda una guía Markdown/skill por nombre. | Busca en `.onyx/skills/`, `skills/`, `~/.onyx/skills/` y las integradas `scent` y `rust`. |
 | `plan_update` | Actualiza el checklist estructurado de progreso (`pending`, `in_progress`, `completed`). | Se persiste en `ws.plan.text` y se renderiza en el panel derecho `Live Plan`. |
 | `service_status` | Consulta el estado `@TOON v1` de todos los servicios de `sprout.toml`. | Reflejado también en el panel derecho `Services (Sprout)`. |
 | `service_logs` | Lee las últimas líneas del ring-buffer (hasta 2.000 líneas) de un servicio Sprout. | Filtrado con `scrub_secrets` y decodificación UTF-8 lossy. |
-| `spawn_agent` | Delega una subtarea independiente a un subagente hijo (`WaitingChildren`). | Techo por defecto de `32` pasos (ajustable mediante `max_steps` en los argumentos JSON). |
+| `spawn_agent` | Delega una subtarea independiente a un subagente hijo (`WaitingChildren`). | Techo por defecto de `32` pasos (ajustable mediante `max_steps` en los argumentos JSON). Con `isolated: true` el hijo trabaja en un **worktree Git aislado** (`onyx/sub/agent-*`) y la raíz no se toca hasta aplicar el 3-way (ver sección 1.1). |
 
 ### Herramientas mutantes (requieren aprobación en `BUILD`; bloqueadas en `PLAN`/`EXPLORE`)
 
@@ -52,6 +53,15 @@ Además de `spawn_agent` (síncrono, misma workspace), el agente puede lanzar jo
 
 > **Drivers externos:** con `driver = "opencode"` (o cualquier `[[external_drivers]]` declarado), el job se delega a un harness CLI externo que trabaja en el mismo worktree aislado; el aislamiento de proceso, el gate de Trust y la política de red se documentan en el capítulo 03 (sección 2.7).
 
+### 1.1. `spawn_agent(isolated: true)` — hijos sincronos en worktrees aislados
+
+Además de los jobs asíncronos anteriores, `spawn_agent` admite el argumento `isolated: true`: el **hijo síncrono** (el padre queda `WaitingChildren`) trabaja en su propio **worktree Git aislado**, de modo que ediciones paralelas de varios hijos **nunca tocan el working tree raíz** hasta el merge.
+
+- **Creación:** al detectar un `spawn_agent(isolated: true)` pendiente, el bridge crea perezosamente el worktree `onyx/sub/agent-<parent>-<child>-<seq>` vía `WorktreeManager` (SDD-09) con `WorkspacePolicy::for_worktree` y red `NativeOffline`; la creación usa un checkpoint `commit-tree` del working tree actual, **sin mover `HEAD` ni el índice** de la raíz. Si el workspace no es un repo Git (o Git < 2.38), el padre recibe un error accionable pegajoso (sin tocar `root`).
+- **Finalización:** cuando el hijo termina (`Done`/`Failed`) o desaparece del grafo, el bridge lo finaliza de forma incondicional: captura el commit efímero del working tree final del hijo, evalúa el **3-way** (`git merge-tree`, raíz intacta) y registra un `IsolatedWorktreeResult` (`Pending`/`Applied`/`Discarded`/`Transferred`).
+- **Resolución:** con 3-way limpio, el resultado se aplica a la raíz (o se descarta) **secuencialmente**; con **conflictos**, el worktree queda transferido a `SubagentManager` y el trabajo pasa al flujo normal de **`subagent_status` / `subagent_merge` / `subagent_discard`** (misma aprobación y gobernanza que los jobs `spawn_subagent`). La notificación del resultado sigue la semántica de los jobs asíncronos (`last_completed_proposals` y, con `proactive_notifications`, un `IngressEvent::Command`).
+- **Limpieza:** el worktree se elimina al aplicarlo/descartarlo, en `Drop` del bridge y por la poda de worktrees huérfanos en `openonyx doctor`; la rama temporal `onyx/sub/<job_id>` se borra siempre.
+
 ### Herramientas dinámicas MCP (`mcp__<server>__<tool>`)
 
 Además del catálogo fijo anterior, cada servidor MCP declarado en `[mcp.servers.<name>]` (capítulo 03, sección 2.8) inyecta sus tools **dinámicamente** al LLM con el nombre `mcp__<server>__<tool>`:
@@ -65,13 +75,20 @@ Además del catálogo fijo anterior, cada servidor MCP declarado en `[mcp.server
 
 ---
 
-## 2. Navegación AST con `onyx-scent`
+## 2. Navegación AST con `onyx-scent` (Scent 2.0)
 
 En lugar de leer archivos de miles de líneas completos, `openonyx` anima al agente a trabajar en dos fases:
-1. **`scent_outline`**: obtiene en pocos tokens todas las funciones, structs, traits, clases y métodos con sus números de línea exactos en formato compacto `@TOON v1` (paginado con `cursor` y `next_cursor`). Si el agente intenta repetir exactamente el mismo outline sobre un archivo que no ha cambiado, la caché `seen_outlines` devuelve una respuesta compacta ahorrando tokens y evitando bucles; en cuanto `fs_edit`, `fs_write`, `shell_exec` o `/undo` modifican el workspace, la caché se invalida automáticamente.
-2. **`scent_impact`** + **`fs_read(start_line, end_line)`**: calcula el radio de impacto antes de tocar una firma pública y lee únicamente el bloque exacto necesario.
+1. **`scent_outline`**: obtiene en pocos tokens todas las funciones, structs, traits, clases, métodos, *type aliases* y *componentes* con sus números de línea exactos en formato compacto `@TOON v1` (paginado con `cursor` y `next_cursor`). Si el agente intenta repetir exactamente el mismo outline sobre un archivo que no ha cambiado, la caché `seen_outlines` devuelve una respuesta compacta ahorrando tokens y evitando bucles; en cuanto `fs_edit`, `fs_write`, `shell_exec` o `/undo` modifican el workspace, la caché se invalida automáticamente.
+2. **`scent_impact`** / **`scent_references`** + **`fs_read(start_line, end_line)`**: calcula el radio de impacto (o resuelve la definición exacta y las referencias cruzadas directas de un símbolo) antes de tocar una firma pública, y lee únicamente el bloque exacto necesario.
 
-> **Lenguajes soportados actualmente por `onyx-scent`:** Rust (`.rs`), Python (`.py`) y Java (`.java`). En otros lenguajes el agente utiliza `glob_files` + `code_search` v2 + `fs_read`.
+> **Lenguajes soportados por `onyx-scent` (Scent 2.0):** **7 lenguajes** — Rust (`.rs`), Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`, `.mts`, `.cts`), JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`), Go (`.go`) y C/C++ (`.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`). En JS/TS se extraen además *type aliases* (`EntityKind::TypeAlias`) y **componentes** (`EntityKind::Component`: funciones PascalCase con JSX en `.tsx`/`.jsx`), y `is_callable` incluye ambos. En otros lenguajes el agente utiliza `glob_files` + `code_search` v2 + `fs_read`.
+
+### Caché incremental binaria `.onyx/scent.idx`
+
+- **`ONYXSCI1`**: el índice AST del workspace se persiste en **`.onyx/scent.idx`** (máquina `ONYXSCI1`: magic + versión + entradas ordenadas por `rel_path` + checksum `blake3` final) junto con un `.onyx/.gitignore` de higiene que ignora `scent.idx` y `scent.idx.tmp*`; cualquier anomalía (truncado, magic/versión distinta, checksum inválido) se ignora silenciosamente y el índice se reconstruye limpio.
+- **Excluido de los artefactos Git**: los checkpoints efímeros de subagentes (`commit-tree`) y la evaluación de impacto de un *worktree* **excluyen** `.onyx/scent.idx*` y su `.gitignore`, para que el trabajo del hijo no se contamine con artefactos operativos de OnYX.
+- **Recarga incremental**: en cada refresco se re-analizan únicamente los archivos cuyo mtime/contenido cambiaron (verificación por hash), de modo que repos de miles de archivos se actualizan en decenas de milisegundos; el archivo se escribe atómicamente (`scent.idx.tmp.*` → rename).
+- **CLI `scent`**: el crate `onyx-scent` (feature `cli`) expone el binario **`scent`** con los subcomandos `outline`, `impact` y **`references`** (misma salida `@TOON v1` que las tools del agente, para uso directo en scripts/CI).
 
 ---
 

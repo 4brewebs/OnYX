@@ -86,6 +86,17 @@ enabled = true
 max_hops = 2          # acotado 1..=4
 ask_heat_bp = 2500    # umbral para símbolos pub scope:src (basis points 0..=10000)
 hard_ask_bp = 8000    # umbral duro para cualquier símbolo con alto fan-out
+
+[verify]
+# Verify-on-Edit: tras cada fs_edit/fs_write exitoso ejecuta las reglas cuya glob
+# empareja el archivo editado (sección 2.9). Desactivado por defecto.
+on_edit = true
+max_secs = 20         # timeout por defecto por regla (acotado 1..=120)
+
+[[verify.rules]]
+glob = "**/*.rs"
+command = "cargo test --workspace"
+# max_secs = 60       # timeout propio de la regla (opcional)
 ```
 
 > **Monotonía de *Scent-Heated Approval*:** `[impact]` solo puede **subir** una decisión `Allow → Ask` y mostrar la línea `# impact: N callers, H hops, scope:src(pub) [heat Xbp]` sobre el diff en TUI/CLI. Nunca anula un `deny`, nunca baja un `ask` a `allow`, y degrada limpiamente a política estática si el archivo no está indexado o `enabled = false`.
@@ -180,6 +191,36 @@ url = "https://mcp.ejemplo.com/sse"
 - **Salidas saneadas:** los resultados de `tools/call` y los errores de descubrimiento pasan por `truncate_utf8` + `scrub_secrets` antes de llegar al LLM o a la transcripción.
 - **`openonyx doctor`:** audita cada servidor declarado con un handshake **acotado a 5 s** (`min(timeout_secs, 5)`): `Connected`/`Disabled` → `[CHECK]`, fallo → `[ERR]` accionable (mensaje ya scrubbeado), workspace no confiado → `[WARN]` sin descubrimiento de workspace.
 - **`replay` 0-I/O:** al reproducir una transcripción `ONYXTR2` no se contacta con ningún servidor: los tools `mcp__*` se reconstruyen desde la propia transcripción (`extract_mcp_tools_from_transcript`), sin `load_mcp_registry`.
+
+---
+
+## 2.9. Verify-on-Edit (`[verify]` / `[[verify.rules]]`)
+
+El *Verify-on-Edit* cierra el bucle edit → verificar **dentro del turno del agente**: tras cada `fs_edit`/`fs_write` **exitoso**, `openonyx` ejecuta los comandos cuyas reglas emparejan el archivo editado e inyecta el resultado al final de la observación del tool, para que el modelo corrija el error antes de terminar el turno.
+
+```toml
+[verify]
+on_edit = true        # default false: opt-in explícito, 0 overhead sin configurar
+max_secs = 20         # timeout por defecto por regla (acotado 1..=120)
+
+[[verify.rules]]
+glob = "**/*.rs"      # glob de ruta relativa (compile_glob_regex)
+command = "cargo test --workspace"
+# max_secs = 60       # timeout propio de la regla (opcional)
+
+[[verify.rules]]
+glob = "src/**"
+command = "pnpm test"
+```
+
+- **Alcance de cada regla:** la regla se dispara si la `glob` empareja el archivo editado **o** (cuando hay índice Scent) un archivo `scope:test` alcanzable por impacto AST en **≤ 2 hops**; si el workspace no está indexado, solo empareja la ruta editada.
+- **Ejecución:** cada `command` pasa por la **misma tubería de sandbox de `shell_exec`** (`prepare_sandboxed_shell_command` + `configure_process_isolation` + `ProcessJob` RAII + `env_clear()` + cancelación por timeout + `scrub_secrets`), con diagnóstico capturado acotado a **4 KiB**.
+- **Salidas inyectadas en la observación del tool:**
+  - `\n[verify: PASS] <N> rule(s) succeeded (<cmds>)` — más `impacted_tests: [...]` cuando el índice Scent identifica tests `scope:test` alcanzables;
+  - `\n[verify: FAIL] <cmd> (exit <code> | timed out after <N>s)\n<diagnóstico>\n(Fix the error before finishing the turn.)`;
+  - `\n[verify: BLOCKED] <cmd> (denied by [permissions])` — la regla no se ejecuta.
+- **Gobernanza `[permissions].deny`:** cada `command` se evalúa como `shell_exec` **antes** de ejecutarse; un `deny` bloquea la regla (`[verify: BLOCKED]`) y detiene el bucle de verificación de esa edición.
+- **Workspace Trust Gate:** la fusión es `global (~/.onyx/config.toml) < workspace (<workspace>/.onyx/config.toml, confiado)`; un workspace **no confiado** ignora por completo sus `[verify]`/`[[verify.rules]]` (con advertencia accionable en `policy.trust_warnings`), mientras que la configuración global sí aplica. Las reglas de workspace **reemplazan** al conjunto global cuando el workspace está confiado.
 
 ---
 

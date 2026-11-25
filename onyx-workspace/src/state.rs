@@ -229,6 +229,17 @@ pub type PendingCheckpoints = Arc<Mutex<HashMap<(u64, String, String), (String, 
 /// Funciona incluso antes del primer commit (`head_sha` vacío).
 /// Devuelve `None` si `root` no es un repositorio Git válido.
 pub fn capture_git_tree_checkpoint(root: &Path) -> Option<(String, String)> {
+    capture_git_tree_checkpoint_excluding(root, &[])
+}
+
+/// Igual que [`capture_git_tree_checkpoint`], pero con pathspecs de exclusión
+/// adicionales: el commit efímero de un subagente aislado (`SDD-05` REQ-05.5) debe
+/// capturar solo el trabajo del hijo, no los artefactos operativos que OnYX mismo
+/// crea en el workspace (p. ej. `.onyx/scent.idx` + su `.gitignore` de higiene).
+pub(crate) fn capture_git_tree_checkpoint_excluding(
+    root: &Path,
+    extra_excludes: &[&str],
+) -> Option<(String, String)> {
     static CKPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let in_repo = Command::new("git")
@@ -258,18 +269,20 @@ pub fn capture_git_tree_checkpoint(root: &Path) -> Option<(String, String)> {
     let temp_index =
         std::env::temp_dir().join(format!("onyx_git_idx_{}_{nanos}_{seq}", std::process::id()));
 
+    let mut add_args: Vec<&str> = vec![
+        "add",
+        "-A",
+        "--",
+        ".",
+        ":(exclude)*.onyxpack",
+        ":(exclude)*.onyxpack.tmp",
+        ":(exclude)tick-*.bin",
+        ":(exclude)*/tick-*.bin",
+        ":(exclude)*.tr",
+    ];
+    add_args.extend_from_slice(extra_excludes);
     let add_ok = Command::new("git")
-        .args([
-            "add",
-            "-A",
-            "--",
-            ".",
-            ":(exclude)*.onyxpack",
-            ":(exclude)*.onyxpack.tmp",
-            ":(exclude)tick-*.bin",
-            ":(exclude)*/tick-*.bin",
-            ":(exclude)*.tr",
-        ])
+        .args(&add_args)
         .env("GIT_INDEX_FILE", &temp_index)
         .current_dir(root)
         .output()

@@ -129,6 +129,24 @@ pub fn spawn_subagent_driver_from_args(args_json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Indica si `spawn_agent` (`SDD-05` REQ-05.5) debe ejecutarse en un *worktree* Git
+/// aislado: solo `true` si el campo `isolated` es exactamente el booleano JSON `true`.
+/// Argumentos vacíos o JSON inválido → `false` (comportamiento clásico, sin *worktree*).
+pub fn spawn_agent_is_isolated(args_json: &str) -> bool {
+    let raw = if args_json.trim().is_empty() {
+        "{}"
+    } else {
+        args_json
+    };
+    match serde_json::from_str::<JsonValue>(raw) {
+        Ok(value) => value
+            .get("isolated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
         let sprout = SproutSupervisor::new(policy.clone());
@@ -175,6 +193,12 @@ impl WorkspaceTools {
     pub fn with_cancel_flag(mut self, cancel_flag: Arc<AtomicBool>) -> Self {
         self.cancel_flag = Some(cancel_flag);
         self
+    }
+
+    /// Bandera de cancelación compartida (p. ej. para propagarla a *worktrees* aislados
+    /// de hijos de `spawn_agent(isolated: true)`); `None` si no hay cancelación activa.
+    pub fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel_flag.clone()
     }
 
     fn is_cancelled(&self) -> bool {
@@ -279,6 +303,7 @@ impl WorkspaceTools {
                 "service_exec",
                 "scent_outline",
                 "scent_impact",
+                "scent_references",
             ]
         }
         #[cfg(not(feature = "scent"))]
@@ -326,6 +351,7 @@ impl WorkspaceTools {
                 "service_exec",
                 "scent_outline",
                 "scent_impact",
+                "scent_references",
                 "spawn_agent",
                 "spawn_subagent",
                 "subagent_status",
@@ -390,7 +416,8 @@ impl WorkspaceTools {
                 "type": "OBJECT",
                 "properties": {
                     "name": { "type": "STRING", "description": "Optional short label for the subagent." },
-                    "goal": { "type": "STRING", "description": "Clear, bounded goal for the child subagent." }
+                    "goal": { "type": "STRING", "description": "Clear, bounded goal for the child subagent." },
+                    "isolated": { "type": "BOOLEAN", "description": "When true, run the child subagent inside an isolated Git worktree so parallel edits never touch the root working tree until merged (default false)." }
                 },
                 "required": ["goal"]
             }),
@@ -725,7 +752,7 @@ impl WorkspaceTools {
         {
             out.push(ToolSchema {
                 name: "scent_outline".into(),
-                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, or Java files.".into(),
+                description: "Return compact @TOON v1 AST outlines (public signatures and 1-based line ranges) for Rust, Python, Java, TypeScript, JavaScript, Go, or C/C++ files.".into(),
                 parameters: json!({
                     "type": "OBJECT",
                     "properties": {
@@ -748,6 +775,22 @@ impl WorkspaceTools {
                         "max_hops": { "type": "INTEGER", "description": "Optional diffusion hop radius (1..=6, default 3)." },
                         "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public neighbor symbols." },
                         "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test neighbors (scope:test)." },
+                        "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
+                        "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (1..=500, default 250)." }
+                    },
+                    "required": ["target"]
+                }),
+                requires_approval: false,
+            });
+            out.push(ToolSchema {
+                name: "scent_references".into(),
+                description: "Resolve exact AST definitions and direct cross-references (callers, callees, implementors, type users) for a symbol as @TOON v1 tuples.".into(),
+                parameters: json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "target": { "type": "STRING", "description": "Symbol name, Type::method, or file::symbol to resolve." },
+                        "public_only": { "type": "BOOLEAN", "description": "Optional filter to emit only public referencing symbols." },
+                        "exclude_tests": { "type": "BOOLEAN", "description": "Optional filter to omit test references (scope:test)." },
                         "cursor": { "type": "INTEGER", "description": "Optional 0-based row cursor for pagination." },
                         "max_rows": { "type": "INTEGER", "description": "Optional maximum TOON rows per page (1..=500, default 250)." }
                     },
@@ -871,6 +914,12 @@ impl WorkspaceTools {
                 let args: ScentImpactArgs = serde_json::from_str(raw)
                     .map_err(|e| format!("invalid scent_impact args: {e}"))?;
                 self.scent_impact(args)
+            }
+            #[cfg(feature = "scent")]
+            "scent_references" => {
+                let args: ScentReferencesArgs = serde_json::from_str(raw)
+                    .map_err(|e| format!("invalid scent_references args: {e}"))?;
+                self.scent_references(args)
             }
             // `SDD-04 REQ-04.3`: herramientas MCP (`mcp__<server>__<tool>`), despachadas
             // antes del comodín `unknown tool`; la salida ya pasó por `truncate_utf8` +
@@ -1092,11 +1141,12 @@ impl WorkspaceTools {
         fs::write(&path, args.content.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
         self.invalidate_seen_file(&path);
-        Ok(format!(
-            "wrote {} bytes to {}",
-            args.content.len(),
-            args.path
-        ))
+        let mut obs = format!("wrote {} bytes to {}", args.content.len(), args.path);
+        // `SDD-05` REQ-05.4: solo tras escritura exitosa (nunca si falló arriba).
+        if let Some(block) = self.verify_after_edit(&path, None) {
+            obs.push_str(&block);
+        }
+        Ok(obs)
     }
 
     fn fs_edit(&self, args: FsEditArgs) -> Result<String, String> {
@@ -1105,6 +1155,13 @@ impl WorkspaceTools {
         let path = self.policy.resolve_existing(&args.path)?;
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read `{}`: {e}", args.path))?;
+
+        // `SDD-05` REQ-05.4: rangos 1-based inclusivos de cada hunk sobre el contenido
+        // original (radio de impacto AST del Verify-on-Edit).
+        let edited_ranges: Vec<(usize, usize)> = hunks
+            .iter()
+            .filter_map(|h| snippet_line_range(&content, &h.old_text))
+            .collect();
 
         let mut working = content;
         let mut trimmed_count = 0usize;
@@ -1128,20 +1185,68 @@ impl WorkspaceTools {
         fs::write(&path, working.as_bytes())
             .map_err(|e| format!("failed to write `{}`: {e}", args.path))?;
         self.invalidate_seen_file(&path);
-        if trimmed_count > 0 {
-            Ok(format!(
+        let mut obs = if trimmed_count > 0 {
+            format!(
                 "edited `{}` ({} replacement(s), {} line-trimmed)",
                 args.path,
                 hunks.len(),
                 trimmed_count
-            ))
+            )
         } else {
-            Ok(format!(
-                "edited `{}` ({} replacement(s))",
-                args.path,
-                hunks.len()
-            ))
+            format!("edited `{}` ({} replacement(s))", args.path, hunks.len())
+        };
+        // `SDD-05` REQ-05.4: solo tras edición exitosa (nunca si falló arriba).
+        if let Some(block) = self.verify_after_edit(&path, Some(&edited_ranges)) {
+            obs.push_str(&block);
         }
+        Ok(obs)
+    }
+
+    /// Bucle Verify-on-Edit tras una mutación exitosa (`SDD-05` REQ-05.4). Devuelve el
+    /// bloque `[verify: ...]` a adjuntar a la observación, o `None` si `[verify]` está
+    /// apagado, no hay reglas o ninguna empareja (la salida del tool queda intacta).
+    fn verify_after_edit(
+        &self,
+        abs_path: &std::path::Path,
+        #[cfg_attr(not(feature = "scent"), allow(unused_variables))] line_ranges: Option<
+            &[(usize, usize)],
+        >,
+    ) -> Option<String> {
+        if !self.policy.verify.on_edit || self.policy.verify.rules.is_empty() {
+            return None;
+        }
+        let rel_path = abs_path
+            .strip_prefix(&self.policy.root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if rel_path.is_empty() {
+            return None;
+        }
+
+        // Radio de impacto AST: símbolos `scope:test` alcanzables en ≤ 2 hops desde el
+        // archivo/líneas editados. Sin feature `scent` (o índice no disponible) se
+        // degrada limpiamente a matching solo por el rel_path editado.
+        let impacted_tests: Vec<String> = {
+            #[cfg(feature = "scent")]
+            {
+                let mut guard = self.scent_index.lock().ok()?;
+                let _ = guard.index_workspace_with_cache(&self.policy.root);
+                guard.impacted_tests_for_path(
+                    &rel_path,
+                    line_ranges,
+                    crate::verify::IMPACTED_TEST_MAX_HOPS,
+                )
+            }
+            #[cfg(not(feature = "scent"))]
+            {
+                Vec::new()
+            }
+        };
+
+        crate::verify::run_verify_on_edit(&self.policy, &rel_path, &impacted_tests, || {
+            self.is_cancelled()
+        })
     }
 
     fn load_skill(&self, args: LoadSkillArgs) -> Result<String, String> {
@@ -1635,7 +1740,7 @@ impl WorkspaceTools {
             .scent_index
             .lock()
             .map_err(|_| "scent index lock poisoned".to_string())?;
-        idx.index_target(&self.policy.root, Some(&resolved))
+        idx.index_target_with_cache(&self.policy.root, Some(&resolved))
             .map_err(|e| e.to_string())?;
         let out = truncate_utf8(&idx.outline_toon(opts), self.policy.max_output_bytes);
         if let Ok(mut guard) = self.seen_outlines.lock() {
@@ -1650,7 +1755,7 @@ impl WorkspaceTools {
             .scent_index
             .lock()
             .map_err(|_| "scent index lock poisoned".to_string())?;
-        idx.index_workspace(&self.policy.root)
+        idx.index_workspace_with_cache(&self.policy.root)
             .map_err(|e| e.to_string())?;
         let hops = args.max_hops.unwrap_or(3).clamp(1, 6);
         let opts = onyx_scent::ToonPageOptions {
@@ -1675,9 +1780,33 @@ impl WorkspaceTools {
             .map_err(|e| e.to_string())?;
         Ok(truncate_utf8(&toon, self.policy.max_output_bytes))
     }
+
+    #[cfg(feature = "scent")]
+    fn scent_references(&self, args: ScentReferencesArgs) -> Result<String, String> {
+        let mut idx = self
+            .scent_index
+            .lock()
+            .map_err(|_| "scent index lock poisoned".to_string())?;
+        idx.index_workspace_with_cache(&self.policy.root)
+            .map_err(|e| e.to_string())?;
+        let opts = onyx_scent::ToonPageOptions {
+            cursor: args.cursor.unwrap_or(0),
+            max_rows: args
+                .max_rows
+                .unwrap_or(onyx_scent::DEFAULT_MAX_ROWS)
+                .clamp(1, 500),
+            public_only: args.public_only.unwrap_or(false),
+            exclude_tests: args.exclude_tests.unwrap_or(false),
+            ..onyx_scent::ToonPageOptions::default()
+        };
+        let toon = idx
+            .references_toon(&args.target, opts)
+            .map_err(|e| e.to_string())?;
+        Ok(truncate_utf8(&toon, self.policy.max_output_bytes))
+    }
 }
 
-fn read_pipe_capped<R: Read + Send + 'static>(
+pub(crate) fn read_pipe_capped<R: Read + Send + 'static>(
     pipe: Option<R>,
     cap: usize,
 ) -> thread::JoinHandle<String> {
@@ -1882,6 +2011,16 @@ struct ScentImpactArgs {
     max_rows: Option<usize>,
 }
 
+#[cfg(feature = "scent")]
+#[derive(Deserialize)]
+struct ScentReferencesArgs {
+    target: String,
+    public_only: Option<bool>,
+    exclude_tests: Option<bool>,
+    cursor: Option<usize>,
+    max_rows: Option<usize>,
+}
+
 fn extract_edit_hunks(args: &FsEditArgs) -> Result<Vec<FsEditHunk>, String> {
     let mut hunks = Vec::new();
     match (&args.old_text, &args.new_text) {
@@ -1906,6 +2045,22 @@ fn extract_edit_hunks(args: &FsEditArgs) -> Result<Vec<FsEditHunk>, String> {
         );
     }
     Ok(hunks)
+}
+
+/// Rango de líneas 1-based inclusivo `(start_line, end_line)` del primer `needle` dentro de
+/// `content` (`None` si no aparece). `SDD-05` REQ-05.4: alimenta el radio de impacto AST
+/// del Verify-on-Edit con las líneas realmente tocadas por un hunk de `fs_edit`.
+fn snippet_line_range(content: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let byte_start = content.find(needle)?;
+    let start_line = content[..byte_start].matches('\n').count() + 1;
+    let end_line = start_line
+        + content[byte_start..byte_start + needle.len()]
+            .matches('\n')
+            .count();
+    Some((start_line, end_line))
 }
 
 fn apply_single_edit_in_memory(
@@ -2423,4 +2578,41 @@ fn redact_bearer_tokens(input: &str) -> String {
     }
     out.push_str(&input[idx..]);
     out
+}
+
+#[cfg(test)]
+mod isolated_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_agent_schema_declares_isolated_boolean() {
+        let schema = WorkspaceTools::subagent_schema();
+        let props = &schema.parameters["properties"];
+        assert!(props.get("isolated").is_some(), "missing `isolated`");
+        assert_eq!(props["isolated"]["type"], "BOOLEAN");
+        assert!(
+            props["isolated"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("isolated Git worktree")
+        );
+        // `isolated` no es requerido: sigue siendo `goal` el único campo obligatorio.
+        let required = schema.parameters["required"].as_array().unwrap();
+        assert_eq!(required, &vec![json!("goal")]);
+    }
+
+    #[test]
+    fn spawn_agent_is_isolated_parses() {
+        assert!(!spawn_agent_is_isolated(""));
+        assert!(!spawn_agent_is_isolated("{}"));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"x"}"#));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"x","isolated":false}"#));
+        assert!(spawn_agent_is_isolated(r#"{"goal":"x","isolated":true}"#));
+        assert!(!spawn_agent_is_isolated(
+            r#"{"goal":"x","isolated":"true"}"#
+        ));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"x","isolated":1}"#));
+        assert!(!spawn_agent_is_isolated("not json"));
+        assert!(!spawn_agent_is_isolated(r#"{"goal":"#));
+    }
 }

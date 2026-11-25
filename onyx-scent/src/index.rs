@@ -1,15 +1,35 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::cache;
 use crate::distiller::{DistillerConfig, MAX_TEMPERATURE_BP, distill_heat};
 use crate::lang::{ParsedFile, RawCall, RawTypeRef, parse_source};
 use crate::ontology::{
     Edge, Entity, RelationKind, ScentArena, ScentError, SupportedLang, compute_signature_hash,
 };
 
-const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".onyx",
+    ".agents",
+    ".venv",
+    "__pycache__",
+    ".next",
+];
 const MAX_MULTI_TARGET_MATCHES: usize = 6;
+/// Fast-path anti-racy: solo se puede saltar `fs::read` + `blake3` (stat-only hit) cuando el
+/// `mtime` es idéntico al validado Y el archivo tiene ≥ 2 s de antigüedad (las ediciones
+/// recientes, incluso de igual tamaño, siempre verifican el hash).
+const STAT_ONLY_MIN_MTIME_AGE: Duration = Duration::from_secs(2);
+const CACHE_FALLBACK_NAME: &str = "scent.idx";
+/// Secuencia global de temp files de caché: sin colisiones si varios hilos del mismo
+/// proceso llaman a `save_cache` a la vez (tests en paralelo, subagentes).
+static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Summary metrics for an incremental workspace indexing pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,6 +64,7 @@ pub struct RangeImpactSummary {
 pub struct WorkspaceIndex {
     cache: BTreeMap<String, ParsedFile>,
     pub arena: ScentArena,
+    dirty: bool,
 }
 
 impl WorkspaceIndex {
@@ -55,6 +76,98 @@ impl WorkspaceIndex {
     /// reusing cached AST subgraphs whenever a file's `blake3` hash matches.
     pub fn index_workspace(&mut self, root: &Path) -> Result<IndexStats, ScentError> {
         self.index_target(root, None)
+    }
+
+    /// Indexes the whole workspace under `root`, persisting the incremental cache at
+    /// `<root>/.onyx/scent.idx` (best-effort: a missing/corrupt file or a read-only
+    /// workspace degrades silently to in-memory operation).
+    pub fn index_workspace_with_cache(&mut self, root: &Path) -> Result<IndexStats, ScentError> {
+        self.index_target_with_cache(root, None)
+    }
+
+    /// Scoped variant of [`Self::index_workspace_with_cache`] (one file/directory under `root`).
+    pub fn index_target_with_cache(
+        &mut self,
+        root: &Path,
+        scope: Option<&Path>,
+    ) -> Result<IndexStats, ScentError> {
+        let canon_root = root.canonicalize().map_err(|e| ScentError::Io {
+            path: root.display().to_string(),
+            message: e.to_string(),
+        })?;
+        let idx_path = cache::cache_path_for(&canon_root);
+        if self.cache.is_empty() {
+            let _ = self.load_cache(&idx_path);
+        }
+        let stats = self.index_target(&canon_root, scope)?;
+        if self.dirty && self.save_cache(&idx_path).is_ok() {
+            self.dirty = false;
+        }
+        Ok(stats)
+    }
+
+    /// Loads the persistent cache at `path` into memory (replacing the in-memory cache).
+    /// Returns `true` on success; a missing, truncated or invalid file returns `false`
+    /// and leaves the index clean.
+    pub fn load_cache(&mut self, path: &Path) -> bool {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        match cache::deserialize_cache(&bytes) {
+            Ok(entries) => {
+                self.cache = entries;
+                self.dirty = false;
+                true
+            }
+            Err(_) => {
+                self.cache.clear();
+                false
+            }
+        }
+    }
+
+    /// Atomically saves the in-memory cache to `path` (temp file + rename) and ensures
+    /// `.gitignore` hygiene in the cache directory.
+    pub fn save_cache(&self, path: &Path) -> Result<(), ScentError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ScentError::Io {
+                path: parent.display().to_string(),
+                message: e.to_string(),
+            })?;
+            cache::ensure_scent_gitignore(parent);
+        }
+        let payload = cache::serialize_cache(&self.cache);
+        let stem = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| CACHE_FALLBACK_NAME.to_string());
+        let seq = CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp = path.with_file_name(format!("{stem}.tmp.{pid}.{seq}"));
+        fs::write(&tmp, &payload).map_err(|e| ScentError::Io {
+            path: tmp.display().to_string(),
+            message: e.to_string(),
+        })?;
+        match fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                // Windows: si el destino ya existe y el rename no lo reemplaza,
+                // eliminarlo y reintentar el rename limpio.
+                let _ = fs::remove_file(path);
+                let result = fs::rename(&tmp, path).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    ScentError::Io {
+                        path: path.display().to_string(),
+                        message: format!("rename failed ({first}); retry after remove failed: {e}"),
+                    }
+                });
+                if result.is_err() {
+                    let _ = fs::remove_file(&tmp);
+                }
+                result
+            }
+        }
     }
 
     /// Indexes either the whole workspace (`scope = None`) or a specific file/directory under `root`.
@@ -112,11 +225,42 @@ impl WorkspaceIndex {
         // Prune removed files only during full-workspace scans so scoped calls keep full cache warm.
         if scope.is_none() {
             let live_paths: BTreeSet<&str> = discovered.iter().map(|(p, _)| p.as_str()).collect();
+            let before = self.cache.len();
             self.cache.retain(|k, _| live_paths.contains(k.as_str()));
+            if self.cache.len() != before {
+                self.dirty = true;
+            }
         }
 
+        let now = SystemTime::now();
         for (rel_path, lang) in &discovered {
             let abs_path = canon_root.join(rel_path);
+            let meta = fs::metadata(&abs_path).map_err(|e| ScentError::Io {
+                path: rel_path.clone(),
+                message: e.to_string(),
+            })?;
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let mtime_since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+            let mtime_secs = mtime_since_epoch.as_secs();
+            let mtime_nanos = mtime_since_epoch.subsec_nanos();
+            let file_len = meta.len();
+
+            // Stat-only fast path (anti-racy): stat idéntico al validado Y mtime ≥ 2 s
+            // antiguo → sin `fs::read` ni `blake3`. Ediciones recientes siempre hash.
+            let stat_matches_cache = self.cache.get(rel_path).is_some_and(|cached| {
+                cached.lang == *lang
+                    && cached.file_len == file_len
+                    && cached.mtime_secs == mtime_secs
+                    && cached.mtime_nanos == mtime_nanos
+            });
+            let mtime_old_enough = now
+                .duration_since(mtime)
+                .is_ok_and(|age| age >= STAT_ONLY_MIN_MTIME_AGE);
+            if stat_matches_cache && mtime_old_enough {
+                stats.cache_hits += 1;
+                continue;
+            }
+
             let bytes = fs::read(&abs_path).map_err(|e| ScentError::Io {
                 path: rel_path.clone(),
                 message: e.to_string(),
@@ -128,14 +272,31 @@ impl WorkspaceIndex {
                 .is_some_and(|cached| cached.blake3_hash == hash && cached.lang == *lang);
 
             if cache_hit {
+                if let Some(cached) = self.cache.get_mut(rel_path) {
+                    let stat_changed = cached.file_len != file_len
+                        || cached.mtime_secs != mtime_secs
+                        || cached.mtime_nanos != mtime_nanos;
+                    cached.file_len = file_len;
+                    cached.mtime_secs = mtime_secs;
+                    cached.mtime_nanos = mtime_nanos;
+                    // Reescritura solo si el stat validado cambió de verdad (evita
+                    // persistir `.onyx/scent.idx` en reloads íntegros de hash).
+                    if stat_changed {
+                        self.dirty = true;
+                    }
+                }
                 stats.cache_hits += 1;
             } else {
                 let source = String::from_utf8(bytes).map_err(|e| ScentError::Parse {
                     path: rel_path.clone(),
                     message: format!("non-UTF-8 source file: {e}"),
                 })?;
-                let parsed = parse_source(rel_path, *lang, &source, hash)?;
+                let mut parsed = parse_source(rel_path, *lang, &source, hash)?;
+                parsed.file_len = file_len;
+                parsed.mtime_secs = mtime_secs;
+                parsed.mtime_nanos = mtime_nanos;
                 self.cache.insert(rel_path.clone(), parsed);
+                self.dirty = true;
                 stats.reparsed_files += 1;
             }
         }
@@ -552,6 +713,93 @@ impl WorkspaceIndex {
         }
 
         stale.into_iter().collect()
+    }
+
+    /// `SDD-05` REQ-05.4: `scope:test` entities reachable via reverse edges
+    /// (`CalledBy`, `UsedByType`, `Implements`) in up to `max_hops` hops from the entities
+    /// inside `rel_path`. When `line_ranges` (1-based inclusive) is provided and non-empty,
+    /// the seed narrows to the entities intersecting those ranges (otherwise every entity
+    /// of the file). Test epicenters themselves are included (editing inside a test file).
+    /// Returns sorted unique `qualified_name`s (`rel_path::Symbol`).
+    pub fn impacted_tests_for_path(
+        &self,
+        rel_path: &str,
+        line_ranges: Option<&[(usize, usize)]>,
+        max_hops: usize,
+    ) -> Vec<String> {
+        if self.arena.nodes.is_empty() {
+            return Vec::new();
+        }
+        let norm = rel_path
+            .trim()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+        if norm.is_empty() {
+            return Vec::new();
+        }
+        let ranges: Vec<(usize, usize)> = match line_ranges {
+            Some(ranges) => ranges.iter().map(|&(s, e)| (s.min(e), s.max(e))).collect(),
+            None => Vec::new(),
+        };
+
+        let mut seeds: BTreeSet<usize> = BTreeSet::new();
+        for node in &self.arena.nodes {
+            if node.file != norm {
+                continue;
+            }
+            if !ranges.is_empty()
+                && !ranges
+                    .iter()
+                    .any(|(s, e)| node.start_line <= *e && node.end_line >= *s)
+            {
+                continue;
+            }
+            seeds.insert(node.id);
+        }
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+
+        let max_h = max_hops.clamp(1, 6);
+        let mut visited: BTreeSet<usize> = seeds.clone();
+        let mut queue: VecDeque<(usize, usize)> = seeds.iter().map(|&id| (id, 0)).collect();
+        let mut tests: BTreeSet<String> = BTreeSet::new();
+        for id in &seeds {
+            if let Some(node) = self.arena.nodes.get(*id) {
+                if node.is_test {
+                    tests.insert(node.qualified_name.clone());
+                }
+            }
+        }
+
+        while let Some((cur, depth)) = queue.pop_front() {
+            if depth >= max_h {
+                continue;
+            }
+            for edge in &self.arena.edges {
+                if edge.source_id != cur {
+                    continue;
+                }
+                if !matches!(
+                    edge.kind,
+                    RelationKind::CalledBy | RelationKind::UsedByType | RelationKind::Implements
+                ) {
+                    continue;
+                }
+                if visited.insert(edge.target_id) {
+                    if let Some(node) = self.arena.nodes.get(edge.target_id) {
+                        if node.is_test {
+                            tests.insert(node.qualified_name.clone());
+                        }
+                    }
+                    queue.push_back((edge.target_id, depth + 1));
+                }
+            }
+        }
+
+        tests.into_iter().collect()
     }
 }
 
