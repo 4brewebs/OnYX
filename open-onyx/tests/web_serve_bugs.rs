@@ -37,3 +37,25 @@ fn header_limit_is_enforced_while_reading_not_after() {
         );
     }
 }
+
+/// El token de sesión se deriva una sola vez al arrancar (`WebHub::new`) y logout solo
+/// pide al navegador que borre la cookie: una cookie copiada antes del logout sigue
+/// autenticando hasta reiniciar `serve`. Logout debería revocar la sesión en el servidor.
+#[test]
+#[ignore = "BUG: logout no revoca la sesión; el token de cookie es fijo durante toda la vida del proceso"]
+fn session_cookie_stops_working_after_logout() {
+    let srv = ServeGuard::start("bug_logout");
+    let cookie = srv.login_cookie();
+    assert_eq!(srv.get("/api/v1/state", &[("Cookie", &cookie)]).status, 200);
+    let r = srv.post(
+        "/api/v1/auth/logout",
+        &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
+        "",
+    );
+    assert_eq!(r.status, 200);
+    let after = srv.get("/api/v1/state", &[("Cookie", &cookie)]);
+    assert_eq!(
+        after.status, 401,
+        "la cookie anterior al logout sigue siendo válida"
+    );
+}
