@@ -1,3 +1,10 @@
+//! `openonyx serve` expuesto como en un VPS: bind no-loopback (`0.0.0.0:0`) con
+//! `--api-key` explícita, atacado desde fuera **sin autenticar**.
+//!
+//! Cada test corre bajo [`hard_timeout`] para no colgar nunca el CI. Las mediciones de
+//! memoria, hilos y descriptores leen `/proc/<pid>` y solo se hacen en Linux. Lo que
+//! falla hoy está en `#[ignore = "BUG: ..."]` (ejecutar con `-- --ignored`).
+
 mod common;
 
 use common::{ServeGuard, ServeOpts, build_request};
@@ -92,6 +99,85 @@ fn vps_bind_requires_the_explicit_key_and_never_prints_it() {
 }
 
 // ---------------------------------------------------------------- 1. cabeceras gigantes
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "BUG: read_line sin tope (web.rs:2046/2068); 4 conexiones con líneas de 64 MiB inflan el RSS cientos de MiB"]
+fn unauthenticated_giant_header_lines_do_not_grow_memory() {
+    hard_timeout(Duration::from_secs(120), || {
+        let srv = vps("vps_rss");
+        let pid = srv.pid();
+        let before = proc_field_kib(pid, "VmRSS:");
+        let addr = srv.addr;
+        let workers: Vec<_> = (0..4)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let mut s = TcpStream::connect(addr).unwrap();
+                    s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let prefix: &[u8] = if i % 2 == 0 {
+                        b"GET /"
+                    } else {
+                        b"GET / HTTP/1.1\r\nX: "
+                    };
+                    let _ = s.write_all(prefix);
+                    let chunk = vec![b'A'; 1 << 20];
+                    for _ in 0..64 {
+                        if s.write_all(&chunk).is_err() {
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        let after = proc_field_kib(pid, "VmRSS:");
+        let grown_mib = after.saturating_sub(before) / 1024;
+        assert!(
+            grown_mib < 64,
+            "RSS creció {grown_mib} MiB ({before} KiB → {after} KiB) con cabeceras sin autenticar"
+        );
+    });
+}
+
+#[test]
+#[ignore = "BUG: al superar 16 KiB de cabecera o 64 KiB de cuerpo el servidor cierra en silencio en vez de responder 431/413"]
+fn oversized_requests_get_a_4xx_answer() {
+    hard_timeout(Duration::from_secs(60), || {
+        let srv = vps("vps_4xx");
+        let big_header = format!(
+            "GET / HTTP/1.1\r\nHost: x\r\nX-Big: {}\r\n\r\n",
+            "a".repeat(20 * 1024)
+        );
+        let r = srv
+            .try_request(&big_header)
+            .unwrap_or_else(|_| common::Response::parse(b""));
+        assert!(
+            (400..500).contains(&r.status),
+            "cabecera > 16 KiB ⇒ {}",
+            r.status
+        );
+        let big_line = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(20 * 1024));
+        let r = srv
+            .try_request(&big_line)
+            .unwrap_or_else(|_| common::Response::parse(b""));
+        assert!(
+            (400..500).contains(&r.status),
+            "request line > 16 KiB ⇒ {}",
+            r.status
+        );
+        let r = srv
+            .try_request("POST /api/v1/auth/login HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n")
+            .unwrap_or_else(|_| common::Response::parse(b""));
+        assert!(
+            (400..500).contains(&r.status),
+            "Content-Length enorme ⇒ {}",
+            r.status
+        );
+    });
+}
 
 // ------------------------------------------------------------ 2. Content-Length enorme o falso
 
@@ -188,6 +274,33 @@ fn slowloris_does_not_block_a_legitimate_client() {
     });
 }
 
+#[test]
+#[ignore = "BUG: no hay plazo total por petición; un byte cada <10 s mantiene la conexión y su hilo indefinidamente"]
+fn slowloris_connections_are_cut_by_a_total_request_deadline() {
+    hard_timeout(Duration::from_secs(90), || {
+        let srv = vps("vps_slowloris_deadline");
+        let mut s = connect_raw(&srv);
+        s.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        // 30 s goteando un byte cada 3 s (por debajo del timeout de lectura de 10 s).
+        let start = Instant::now();
+        let mut cut = false;
+        while start.elapsed() < Duration::from_secs(30) {
+            if s.write_all(b"X").is_err() {
+                cut = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        if !cut {
+            s.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut b = [0u8; 1];
+            cut = matches!(s.read(&mut b), Ok(0));
+        }
+        assert!(cut, "la conexión lenta sigue viva tras 30 s de goteo");
+    });
+}
+
 // --------------------------------------------------- 4. muchas conexiones sin autenticar
 
 #[cfg(target_os = "linux")]
@@ -228,6 +341,26 @@ fn idle_unauthenticated_connections_release_threads_and_fds_after_close() {
     });
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "BUG: sin tope de conexiones concurrentes; accept_loop crea un hilo por conexión (300 conexiones ociosas ⇒ ~300 hilos)"]
+fn concurrent_unauthenticated_connections_are_capped() {
+    hard_timeout(Duration::from_secs(60), || {
+        let srv = vps("vps_conn_cap");
+        let pid = srv.pid();
+        std::thread::sleep(Duration::from_millis(300));
+        let threads0 = proc_field_kib(pid, "Threads:");
+        let _conns: Vec<TcpStream> = (0..300).map(|_| connect_raw(&srv)).collect();
+        std::thread::sleep(Duration::from_millis(800));
+        let threads1 = proc_field_kib(pid, "Threads:");
+        assert!(
+            threads1 < threads0 + 128,
+            "300 conexiones sin autenticar crearon {} hilos",
+            threads1 - threads0
+        );
+    });
+}
+
 // ----------------------------------------------------------------- 5. fuerza bruta
 
 #[test]
@@ -259,7 +392,54 @@ fn brute_force_never_locks_out_the_real_key() {
     });
 }
 
+#[test]
+#[ignore = "BUG: login sin rate limit ni retardo; 200 intentos fallidos seguidos responden 401 al instante"]
+fn login_brute_force_is_rate_limited() {
+    hard_timeout(Duration::from_secs(120), || {
+        let srv = vps("vps_ratelimit");
+        let t = Instant::now();
+        let mut limited = false;
+        for i in 0..200 {
+            let body = format!(r#"{{"api_key":"forja-guess-{i:04}"}}"#);
+            let r = srv.post(
+                "/api/v1/auth/login",
+                &[("Sec-Fetch-Site", "same-origin")],
+                &body,
+            );
+            if r.status == 429 {
+                limited = true;
+                break;
+            }
+        }
+        let elapsed = t.elapsed();
+        assert!(
+            limited || elapsed > Duration::from_secs(20),
+            "200 intentos fallidos en {elapsed:?} sin 429 ni retardo"
+        );
+    });
+}
+
 // --------------------------------------------------------------- 6. logout (ver web_serve_bugs)
+
+#[test]
+#[ignore = "BUG: logout no revoca la sesión (token fijo desde WebHub::new, web.rs:505-507); también en bind público"]
+fn vps_session_cookie_stops_working_after_logout() {
+    hard_timeout(Duration::from_secs(60), || {
+        let srv = vps("vps_logout");
+        let cookie = srv.login_cookie();
+        let r = srv.post(
+            "/api/v1/auth/logout",
+            &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(srv.get("/api/v1/state", &[("Cookie", &cookie)]).status, 401);
+        assert_eq!(
+            srv.get("/api/v1/events", &[("Cookie", &cookie)]).status,
+            401
+        );
+    });
+}
 
 // ----------------------------------------------------------------------- 7. SSE
 
@@ -400,5 +580,24 @@ fn cross_site_fetch_metadata_blocks_every_post_on_a_public_bind() {
             );
             assert_eq!(r.status, 403, "{path}");
         }
+    });
+}
+
+#[test]
+#[ignore = "BUG: sin Sec-Fetch-Site el guard CSRF no mira Origin; POST con cookie y Origin ajeno se acepta (mitigado por SameSite=Lax)"]
+fn foreign_origin_without_fetch_metadata_is_rejected() {
+    hard_timeout(Duration::from_secs(60), || {
+        let srv = vps("vps_origin");
+        let cookie = srv.login_cookie();
+        let r = srv.post(
+            "/api/v1/queue/clear",
+            &[("Cookie", &cookie), ("Origin", "https://evil.example")],
+            "{}",
+        );
+        assert_eq!(
+            r.status, 403,
+            "POST con Origin ajeno y sin Sec-Fetch-Site ⇒ {}",
+            r.status
+        );
     });
 }
