@@ -89,7 +89,7 @@ fn three_turns_without_rewind_reach_the_provider() {
 
 /// Rewind en vivo al milestone del turno 1 y nuevo turno: debe despacharse al proveedor.
 #[test]
-#[ignore = "BUG: DynamicLlmDriver::dispatched no se limpia tras /rewind; el turno nuevo reutiliza (agent, request) y nunca se envía al proveedor (open-onyx/src/llm_driver.rs:152)"]
+#[ignore = "BUG: FIX-01 DynamicLlmDriver::dispatched no se limpia tras /rewind; el turno nuevo reutiliza (agent, request) y nunca se envía al proveedor (open-onyx/src/llm_driver.rs:152)"]
 fn new_turn_after_live_rewind_is_dispatched_to_the_provider() {
     let fake = FakeOpenAi::start(vec![text("uno"), text("dos"), text("tres")]);
     let snaps = TempDir::new("snaps_rewind");

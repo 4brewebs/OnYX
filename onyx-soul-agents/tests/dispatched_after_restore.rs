@@ -120,7 +120,7 @@ fn restore_with_fresh_bridge_redispatches_restored_request() {
 /// Rewind en vivo: mismo host, mismo `RecordingBridge`. La petición `(agent, 1)` vuelve a
 /// estar pendiente tras el restore y debe despacharse otra vez.
 #[test]
-#[ignore = "BUG: RecordingBridge::dispatched no se limpia tras restore; la petición restaurada (agent, request) se salta y el agente queda colgado (onyx-soul-agents/src/bridge.rs:356)"]
+#[ignore = "BUG: FIX-31 RecordingBridge::dispatched no se limpia tras restore; la petición restaurada (agent, request) se salta y el agente queda colgado (onyx-soul-agents/src/bridge.rs:356)"]
 fn restore_with_same_bridge_redispatches_restored_request() {
     let store = Store::default();
     let calls: Calls = Rc::default();

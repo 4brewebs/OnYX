@@ -50,7 +50,7 @@ fn stream_cut_in_the_middle_of_an_event_fails() {
 
 /// Stream truncado: deltas de texto sin `finish_reason` ni `[DONE]` y cierre TCP limpio.
 #[test]
-#[ignore = "BUG: EOF limpio sin [DONE] ni finish_reason se acepta como finish_reason=stop y el texto truncado queda como respuesta final (open-onyx/src/openai.rs:468-470)"]
+#[ignore = "BUG: FIX-03 EOF limpio sin [DONE] ni finish_reason se acepta como finish_reason=stop y el texto truncado queda como respuesta final (open-onyx/src/openai.rs:468-470)"]
 fn stream_closed_cleanly_without_done_marker_is_not_a_stop() {
     let fake = FakeOpenAi::start(vec![Step::Sse {
         events: vec![delta("Hola "), delta("mun")],
