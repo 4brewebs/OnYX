@@ -80,12 +80,14 @@ openonyx chat --effort high
 export ONYX_EFFORT=medium
 ```
 
+> **Para `anthropic`:** el esfuerzo se traduce en un presupuesto de *extended thinking* (`thinking.budget_tokens`: `low` 2048 / `medium` 8192 / `high` 16384 tokens) cuando no se fija uno explícito. Puedes acotarlo con `--thinking-budget <n>` (o `ANTHROPIC_THINKING_BUDGET`; `0` = off, rango `1024..=60000`), que además eleva `max_tokens` por encima del presupuesto. El proveedor soporta además *prompt caching* (`cache_control: ephemeral` en el sistema y la última definición de tool) y reintentos automáticos ante `429`/`529` (capítulo 06).
+
 ### 2.1 Objetivo LLM en caliente (`/profile`, `/provider`, `/model`, `/effort`)
 
 Más allá del esfuerzo, el objetivo LLM completo (proveedor, modelo, `api_base` y esfuerzo) es **conmutable en caliente** sin reiniciar la sesión:
 
-- **Perfiles**: bloques `[[llm_profiles]]` en `.onyx/config.toml` (workspace confiado) con `id`, `provider` (`gemini` | `openai`), `model`, `effort`, `api_base` opcional y `api_key_env` opcional. **Nunca** se admiten claves literales en el archivo (detalles en el capítulo 03).
-- **Comandos slash**: `/profile [id]` lista o aplica un perfil, `/provider <gemini|openai>`, `/model <name>` y `/effort <auto|low|medium|high>`. El cambio se aplica en la siguiente frontera de tick y queda sellado en la transcripción `ONYXTR2` (replay determinista).
+- **Perfiles**: bloques `[[llm_profiles]]` en `.onyx/config.toml` (workspace confiado) con `id`, `provider` (`gemini` | `openai` | `anthropic`), `model`, `effort`, `api_base` opcional y `api_key_env` opcional. **Nunca** se admiten claves literales en el archivo (detalles en el capítulo 03).
+- **Comandos slash**: `/profile [id]` lista o aplica un perfil, `/provider <gemini|openai|anthropic>`, `/model <name>` y `/effort <auto|low|medium|high>`. El cambio se aplica en la siguiente frontera de tick y queda sellado en la transcripción `ONYXTR2` (replay determinista).
 - **Cabecera viva**: la fila de título pasa a mostrar `provider/model (effort:...)` del objetivo actual en lugar del de arranque.
 - **Paleta `Ctrl+K`**: alternativa sin teclear — filtras perfiles, proveedores y esfuerzos y ejecutas con `Enter` (las acciones LLM pasan por el bus determinista, igual que si las tecleas; un perfil sin credenciales se muestra como `unavailable` con su motivo y no es seleccionable).
 - **Web UI (`openonyx serve`)**: el botón *LLM target* (subtítulo de la marca) abre un diálogo modal con perfil/modelo/esfuerzo y botones Apply/Cancel, sin exponer credenciales al navegador.

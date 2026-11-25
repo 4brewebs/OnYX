@@ -16,6 +16,8 @@ The active mode (`ws.mode`) lives inside the EAV graph and is recorded in `ONYXT
 | **`PLAN`** | Allowed | **Unconditionally blocked** (even with `allow` rules or `--auto-approve`). | Architecture analysis, design planning, PR reviews. |
 | **`EXPLORE`** | Allowed | **Unconditionally blocked**. | Safe read-only exploration of unfamiliar repositories. |
 
+> **Dynamic MCP tools:** even though an `mcp__<server>__<tool>` call may not mutate the local filesystem, a remote MCP server can execute processes or network traffic outside `openonyx`'s control, so it is treated like a mutation and is **`Deny` in `PLAN`/`EXPLORE`** (section 2.8).
+
 ### Switching Modes in `chat`
 - Press **`Tab`** to toggle `[BUILD]` ↔ `[PLAN]` in place.
 - Or run `/mode plan`, `/mode build`, `/mode explore` (or `/mode` with no argument to toggle `PLAN` ↔ `BUILD`).
@@ -116,7 +118,7 @@ api_base = "http://localhost:11434/v1"
 # api_key_env = "OLLAMA_API_KEY"
 ```
 
-- **Fields:** `id` (unique), `provider` (`gemini` | `openai`), `model`, `effort` (`auto` | `low` | `medium` | `high`), optional `api_base`, and optional `api_key_env`. Unknown or duplicate keys are an actionable parse error.
+- **Fields:** `id` (unique), `provider` (`gemini` | `openai` | `anthropic`), `model`, `effort` (`auto` | `low` | `medium` | `high`), optional `api_base`, and optional `api_key_env`. Unknown or duplicate keys are an actionable parse error.
 - **Never literal keys:** a literal `api_key` in the block is **rejected** by the parser with an error pointing to `api_key_env` (and the message never echoes the key value). Credentials are always resolved from environment variables (`api_key_env` → the provider's standard variable → `ONYX_API_KEY`).
 - **`api_base` validated at registration:** same policy as `--api-base` (`http://` only on loopback; remote hosts require `https://`; non-official hosts require `--allow-custom-auth-host`).
 - **Trust gate:** an **untrusted** workspace ignores its `[[llm_profiles]]` blocks and shows the warning `ignored N [[llm_profiles]] block(s); run openonyx trust or /trust to approve`. With a trusted workspace, precedence is global (`~/.onyx/config.toml`) < project (merge *replace-by-id*).
@@ -147,6 +149,37 @@ allowed_env = []
 - **Process isolation:** the prompt is delivered without shell injection (stdin / single argv / temp file); the child environment goes through `env_clear()` + `allowed_env`; the process is bound to a `ProcessJob` at `spawn` (if `timeout_secs` elapses or the job is cancelled, the whole tree dies; on Windows there is a `taskkill /F /T /PID` fallback); and the full log is sealed in `.onyx/vault/subagent-logs/<job_id>.log` after passing through `scrub_secrets`.
 - **Declarative network (`network_allowlist`):** this is **declarative** governance: it is enforced in-container only under `--sandbox strict-container`; under the other profiles it is advisory (`doctor` tells you so). An empty allowlist means `LocalhostOnly`; with an allowlist, the sandbox does **not** inject `*_OFFLINE` variables (the harness must reach its API).
 - **Merge forced to `Ask`:** even if your permissions would auto-approve, `subagent_merge` for a job with an external driver requires explicit approval (`ExternalDriverApprovalPolicy`).
+
+---
+
+## 2.8. MCP Servers (`[mcp.servers.<name>]`)
+
+`openonyx` can connect **Model Context Protocol (MCP) servers** declared in `config.toml` (global `~/.onyx/config.toml` and, with a trusted workspace, `<workspace>/.onyx/config.toml`):
+
+```toml
+[mcp.servers.github]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+# env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }   # ${VAR} refs expanded at spawn time
+timeout_secs = 20            # default 20
+# enabled = true             # default true
+
+[mcp.servers.docs]
+transport = "http"
+url = "https://mcp.example.com/sse"
+# headers = { Authorization = "Bearer ${MCP_DOCS_TOKEN}" }
+```
+
+- **Fields:** `transport` (`"stdio"` with `command`/`args`/`env`, or `"http"` with `url`/`headers`), `timeout_secs` (default `20` s per JSON-RPC call), and `enabled` (default `true`). Server names cannot contain `__` (reserved for the `mcp__<server>__<tool>` prefix). `${ENV_VAR}` references are expanded **only** when the process/request launches (never logged or persisted), and `Authorization`/`X-Api-Key` in `headers` **require** `${VAR}`.
+- **Merge & Trust gate:** *replace-by-name* merge with precedence `global < workspace`; an **untrusted** workspace ignores its `[mcp.servers.*]` with the warning `MCP config in ... ignored: workspace is not trusted (use --trust-workspace or openonyx trust)`, while the global config always applies.
+- **Naming & approval:** every discovered tool (`tools/list`) is exposed to the LLM as **`mcp__<server>__<tool>`** with `requires_approval = true`: it **always** asks for interactive approval in `BUILD` unless a more specific `allow` rule says otherwise (e.g. `allow = ["mcp__github__search_repos"]` or `allow = ["mcp__github__*"]`); `ask`/`deny` globs work too (`deny = ["mcp__*"]` blocks all MCP).
+- **`PLAN`/`EXPLORE` = `Deny`:** in those modes every `mcp__*` call is **unconditionally** blocked (a remote server executes processes/network outside the sandbox).
+- **Failure isolation:** a dead server never aborts the session: it is reported as `[openOnyx mcp] server \`<name>\` unavailable: ...` and the rest of the session continues; each server exposes its status for `openonyx doctor`.
+- **stdio session safety:** JSON-RPC 2.0 with a dedicated reader thread, a real per-call timeout (`mpsc::recv_timeout`), a 4 MiB `stdout` line cap, and `ProcessJob` process-tree teardown on failure (Windows and Unix).
+- **Sanitized output:** `tools/call` results and discovery errors pass through `truncate_utf8` + `scrub_secrets` before reaching the LLM or the transcript.
+- **`openonyx doctor`:** audits each declared server with a **5 s-capped** handshake (`min(timeout_secs, 5)`): `Connected`/`Disabled` → `[CHECK]`, failure → actionable `[ERR]` (already scrubbed message), untrusted workspace → `[WARN]` without workspace discovery.
+- **0-I/O `replay`:** replaying an `ONYXTR2` transcript never contacts a server: the `mcp__*` tools are reconstructed from the transcript itself (`extract_mcp_tools_from_transcript`), without `load_mcp_registry`.
 
 ---
 

@@ -5,7 +5,7 @@ description: Guía operativa completa para usar, configurar, depurar y automatiz
 
 # openOnyx (`openonyx`) — Guía Operativa
 
-`openonyx` es el harness CLI y TUI de OnYX (`onyx-soul-agents` + `onyx-workspace`). Conecta un proveedor LLM por HTTP/SSE (`gemini` o cualquier endpoint compatible con OpenAI `/v1/chat/completions`, con tolerancia a cortes SSE y reintentos transitorios) con un runtime determinista de grafo EAV (`AgentHost`), registro de transcripciones (`ONYXTR2`), snapshots comprimidos por hitos (`snapshots.onyxpack`), checkpoints Git reversibles (`/undo`), time-travel seguro con bifurcación (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`), sandbox OS, subagentes asíncronos en worktrees Git aislados con fusión 3-way (*Scent-Heated Merge*) y harnesses CLI externos como drivers (`/spawn`, `[[external_drivers]]`), vistas TUI modulares `F1..F5` con paleta `Ctrl+K`, objetivo LLM conmutado en caliente (`[[llm_profiles]]`, `/profile`/`/provider`/`/model`/`/effort`, cabecera `provider/model` viva y selector Web sin credenciales), y orquestación local de servicios (`sprout.toml`).
+`openonyx` es el harness CLI y TUI de OnYX (`onyx-soul-agents` + `onyx-workspace`). Conecta un proveedor LLM por HTTP/SSE (`gemini`, cualquier endpoint compatible con OpenAI `/v1/chat/completions` con tolerancia a cortes SSE y reintentos transitorios, o `anthropic` nativo con prompt caching `ephemeral` y *extended thinking* `--thinking-budget`) con herramientas dinámicas MCP (`[mcp.servers.<name>]` stdio/http → `mcp__<server>__<tool>`) y con un runtime determinista de grafo EAV (`AgentHost`), registro de transcripciones (`ONYXTR2`), snapshots comprimidos por hitos (`snapshots.onyxpack`), checkpoints Git reversibles (`/undo`), time-travel seguro con bifurcación (`/rewind`, `/fork`, `chat --resume --tick`, `rewind --interactive`), sandbox OS, subagentes asíncronos en worktrees Git aislados con fusión 3-way (*Scent-Heated Merge*) y harnesses CLI externos como drivers (`/spawn`, `[[external_drivers]]`), vistas TUI modulares `F1..F5` con paleta `Ctrl+K`, objetivo LLM conmutado en caliente (`[[llm_profiles]]`, `/profile`/`/provider`/`/model`/`/effort`, cabecera `provider/model` viva y selector Web sin credenciales), y orquestación local de servicios (`sprout.toml`).
 
 > **Manual de usuario completo:** consulta [`docs/manual/index.md`](../../../docs/manual/index.md) para tutoriales paso a paso, arquitectura de la TUI, configuración de permisos/sandbox, time-travel, catálogo completo de las 23 herramientas y resolución de problemas.
 
@@ -25,14 +25,18 @@ cargo run -p open-onyx -- <subcomando> [opciones]
 
 | Variable | Uso | Default / Notas |
 | --- | --- | --- |
-| `ONYX_PROVIDER` | Proveedor por defecto (`gemini` \| `openai`) | `gemini` (sobrescrito por `--provider`) |
+| `ONYX_PROVIDER` | Proveedor por defecto (`gemini` \| `openai` \| `anthropic`) | `gemini` (sobrescrito por `--provider`) |
 | `GEMINI_API_KEY` / `ONYX_API_KEY` | API key para `--provider gemini` | Requerida en `chat`, `run` y `rewind` vivo |
 | `ONYX_MODEL` / `ONYX_GEMINI_MODEL` | Modelo para Gemini | `gemini-4-hydrogen` (sobrescrito por `--model`) |
 | `GEMINI_API_BASE` | URL base personalizada de Gemini | Sobrescrito por `--api-base` |
 | `OPENAI_API_KEY` / `ONYX_API_KEY` | API key para `--provider openai` | Opcional si usas `--api-base` / `OPENAI_API_BASE` local |
 | `ONYX_MODEL` / `OPENAI_MODEL` | Modelo para backend OpenAI | `gpt-4o` (sobrescrito por `--model`) |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | Endpoint compatible OpenAI | `https://api.openai.com/v1` |
-| `ONYX_EFFORT` | Esfuerzo de razonamiento (`low` \| `medium` \| `high`) | Sobrescrito por `--effort`; fallbacks: `GEMINI_THINKING_LEVEL` (Gemini) y `OPENAI_REASONING_EFFORT` (OpenAI) |
+| `ANTHROPIC_API_KEY` / `ONYX_API_KEY` | API key para `--provider anthropic` | Requerida en `chat`, `run` y `rewind` vivo |
+| `ONYX_MODEL` / `ANTHROPIC_MODEL` | Modelo para Anthropic | `claude-sonnet-4-5` (sobrescrito por `--model`) |
+| `ANTHROPIC_API_BASE` | URL base de la API de Anthropic | `https://api.anthropic.com` (sobrescrito por `--api-base`) |
+| `ANTHROPIC_THINKING_BUDGET` | Presupuesto de *extended thinking* en tokens (`0` = off, `1024..=60000`) | Prioridad sobre el presupuesto derivado de `--effort` (2048/8192/16384) |
+| `ONYX_EFFORT` | Esfuerzo de razonamiento (`low` \| `medium` \| `high`) | Sobrescrito por `--effort`; fallbacks: `GEMINI_THINKING_LEVEL` (Gemini), `OPENAI_REASONING_EFFORT` (OpenAI); en Anthropic lo gobierna `ANTHROPIC_THINKING_BUDGET` |
 | `ONYX_AUTO_SAVE` | Activa `--auto-save` por defecto (`1` \| `true` \| `yes` \| `on`) | Guarda automáticamente snapshots + `.tr` en `.onyx/vault/<id>/` |
 
 > **Nota:** `replay`, `inspect`, `rewind --dry-run`, `rewind --transcript` y `doctor` funcionan sin API key ni llamadas de red.
@@ -49,6 +53,9 @@ openonyx chat --snapshot-dir mi-feat --record chat.tr
 # TUI con OpenAI / OpenRouter
 openonyx chat --provider openai --model gpt-4o --effort medium --auto-save
 
+# TUI con Anthropic nativo (thinking acotado)
+openonyx chat --provider anthropic --model claude-sonnet-4-5 --thinking-budget 8192 --auto-save
+
 # TUI con modelo local en Ollama / vLLM / LM Studio (sin API key requerida)
 openonyx chat --provider openai --api-base http://localhost:11434/v1 --model qwen2.5-coder:14b --effort low --auto-save
 
@@ -63,7 +70,7 @@ openonyx run "resume la arquitectura de crates" --auto-save
 ```toml
 [[llm_profiles]]
 id = "local-coder"            # [a-z0-9_-]; "custom" está reservado
-provider = "openai"           # "gemini" | "openai"
+provider = "openai"           # "gemini" | "openai" | "anthropic"
 model = "qwen2.5-coder:14b"   # no vacío
 effort = "medium"             # "low" | "medium" | "high" | ausente (auto)
 api_base = "http://localhost:11434/v1"
@@ -71,7 +78,7 @@ api_key_env = "OLLAMA_API_KEY"   # nombre de la variable de entorno — nunca el
 ```
 
 - Los perfiles del workspace solo se aplican en workspaces **confiados** (mismo gate de Workspace Trust que `[[external_drivers]]`; en `[UNTRUSTED]` se ignoran por completo). Las API keys solo se referencian por nombre de variable de entorno (`api_key_env`: la estructura no tiene campo de clave literal, de modo que ningún snapshot público puede exponerlas), y `api_base` se valida en el registro (`validate_api_base`: `http://` solo en loopback, remotos exigen `https://` + autorización explícita — bloquea exfiltración de credenciales).
-- **Hot-swap**: `/profile [<id>]`, `/provider <gemini|openai>`, `/model <name>` y `/effort <auto|low|medium|high>` (TUI y Web, case-insensitive) cambian el objetivo activo **en la frontera de tick** (`DynamicLlmDriver`): no interrumpen el turno en vuelo, los subagentes pinnan el objetivo del tick de spawn, cada conmutación queda sellada en `ONYXTR2` (el `replay` reproduce el hot-swap con 0 I/O vía `LlmProfileHandle::new_for_replay`) y la cabecera TUI/Web muestra el `provider/model · effort` **vivo** (fuente: `LlmProfileHandle::public_snapshot()`, con estado modal `ws.llm.*` restaurado en `/rewind` / `chat --resume --tick`).
+- **Hot-swap**: `/profile [<id>]`, `/provider <gemini|openai|anthropic>`, `/model <name>` y `/effort <auto|low|medium|high>` (TUI y Web, case-insensitive) cambian el objetivo activo **en la frontera de tick** (`DynamicLlmDriver`): no interrumpen el turno en vuelo, los subagentes pinnan el objetivo del tick de spawn, cada conmutación queda sellada en `ONYXTR2` (el `replay` reproduce el hot-swap con 0 I/O vía `LlmProfileHandle::new_for_replay`) y la cabecera TUI/Web muestra el `provider/model · effort` **vivo** (fuente: `LlmProfileHandle::public_snapshot()`, con estado modal `ws.llm.*` restaurado en `/rewind` / `chat --resume --tick`).
 - **Web UI**: la PWA expone un selector LLM sin credenciales (`#llm-config-btn` → `<dialog id="llm-modal">` nativo, 0 `innerHTML`) con los perfiles registrados (los no disponibles aparecen deshabilitados con motivo accionable), provider, modelo y esfuerzo; aplica **solo los campos modificados** como slash estándar por el endpoint autenticado existente `/api/v1/command` (0 endpoints nuevos) y los push SSE con el modal abierto nunca reescriben los campos en edición.
 
 ---
@@ -91,14 +98,14 @@ api_key_env = "OLLAMA_API_KEY"   # nombre de la variable de entorno — nunca el
    - `--dry-run`: previsualiza efectos huérfanos y plan de rollback sin tocar archivos.
    - `--transcript <file>`: reanuda determinísticamente desde una transcripción grabada.
    - `--interactive` / `--tui`: abre directamente la TUI en el tick restaurado creando un fork hermano seguro (`--fork-dir <dir>` opcional, o `--truncate-future` si se desea truncar in-place).
-6. **`doctor`**: Verifica salud del worktree Git, artefactos residuales, integridad de `snapshots.onyxpack` (checksums FNV-1a, payloads `ONYXAG`, colas truncadas tras crash), snapshots legacy, cabeceras de transcripción, objetos `tree_sha` del ledger, driver de sandbox OS disponible, estado de **Workspace Trust**, configuración/puertos de `sprout.toml` y **drivers externos** `[[external_drivers]]` (binario en `PATH`/`PATHEXT` con probe `--version` aislada de 3 s, y severidad por origen: `[WARN]` preset integrado ausente, `[ERR]` driver declarado ausente, `[CHECK]` binario que responde y allowlist enforzada solo con `strict-container` activo).
+6. **`doctor`**: Verifica salud del worktree Git, artefactos residuales, integridad de `snapshots.onyxpack` (checksums FNV-1a, payloads `ONYXAG`, colas truncadas tras crash), snapshots legacy, cabeceras de transcripción, objetos `tree_sha` del ledger, driver de sandbox OS disponible, estado de **Workspace Trust**, configuración/puertos de `sprout.toml`, **drivers externos** `[[external_drivers]]` (binario en `PATH`/`PATHEXT` con probe `--version` aislada de 3 s, y severidad por origen: `[WARN]` preset integrado ausente, `[ERR]` driver declarado ausente, `[CHECK]` binario que responde y allowlist enforzada solo con `strict-container` activo) y **servidores MCP** `[mcp.servers.*]` (handshake acotado a 5 s: `Connected`/`Disabled` → `[CHECK]`, fallo → `[ERR]` scrubbeado, workspace no confiado → `[WARN]` sin descubrimiento).
 7. **`trust [add|list|check|revoke]`**: Aprueba, lista, verifica o revoca los hashes `blake3` de `.onyx/config.toml` y `sprout.toml` en `~/.onyx/trusted_workspaces.toml`. En repositorios no confiados o modificados (`[UNTRUSTED]`), las reglas `allow` y relajaciones de `[sandbox]`/`[impact]` del proyecto se ignoran y `sprout.toml` bloquea la ejecución hasta confirmación explícita (también desde `/trust` en TUI).
 8. **`serve [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>]`**: Sirve la PWA mobile-first embebida (Vanilla HTML/CSS/JS, 0 Node, 0 `tokio`) — con selector LLM sin credenciales para `[[llm_profiles]]` — y la API `/api/v1/...` (JSON + SSE) lista para clientes externos (p. ej. Svelte) y despliegue en VPS detrás de HTTPS/Tailscale. Escucha en `127.0.0.1:8787` por defecto (generando clave aleatoria de 256 bits) y bloquea `--bind 0.0.0.0:...` sin `--api-key` / `ONYX_WEB_API_KEY` explícita (`>= 16` chars).
 
 ### Flags transversales principales
 
 - `-w, --workspace <dir>`: directorio del proyecto objetivo (default: CWD).
-- `--provider <gemini|openai>` / `--model <name>` / `--effort <low|medium|high>` / `--api-base <url>`: selección del backend LLM y nivel de razonamiento (`--api-base` solo permite `http://` en loopback `localhost`/`127.0.0.1`/`[::1]`, exige `https://` en hosts remotos, y pide `--allow-custom-auth-host` / `ONYX_ALLOW_CUSTOM_AUTH_HOST=1` para enviar API keys a hosts remotos no oficiales).
+- `--provider <gemini|openai|anthropic>` / `--model <name>` / `--effort <low|medium|high>` / `--thinking-budget <n>` / `--api-base <url>`: selección del backend LLM y nivel de razonamiento (`--thinking-budget` = presupuesto de *extended thinking* de Anthropic en tokens, `0` = off, `1024..=60000`) (`--api-base` solo permite `http://` en loopback `localhost`/`127.0.0.1`/`[::1]`, exige `https://` en hosts remotos, y pide `--allow-custom-auth-host` / `ONYX_ALLOW_CUSTOM_AUTH_HOST=1` para enviar API keys a hosts remotos no oficiales).
 - `--trust-workspace`: confía en memoria `.onyx/config.toml` y `sprout.toml` del workspace para esta ejecución.
 - `--auto-approve`: omite confirmación interactiva para herramientas mutantes (`fs_write`, `fs_edit`, `shell_exec`, `service_*`; las reglas `deny` de `.onyx/config.toml` siguen bloqueando y el sandbox se eleva automáticamente a `workspace-write` + `offline` salvo `--sandbox off`).
 - `--ignore-deny`: desactiva explícitamente las reglas `[permissions].deny` de `.onyx/config.toml`.
@@ -136,7 +143,7 @@ api_key_env = "OLLAMA_API_KEY"   # nombre de la variable de entorno — nunca el
 - **`/agent [id|name]`** (alias `/agents`): abre el selector de agentes o enfoca directamente a un agente por ID numérico o nombre (etiqueta de hito `cmd:/agent`).
 - **`/view <chat|agents|sprout|plan|timeline>`**: cambia la vista efímera (case-insensitive). Se intercepta a nivel TUI: no llega al bus de eventos, al historial de prompts ni a `ONYXTR2` (0 ticks, 0 mutaciones de grafo).
 - **`/profile [<id>]`**: sin argumentos lista los perfiles LLM registrados (`[[llm_profiles]]`); con `<id>` conmuta en caliente al perfil (frontera de tick, sellado en `ONYXTR2`, reproducido por `replay` con 0 I/O).
-- **`/provider <gemini|openai>`**, **`/model <name>`** y **`/effort <auto|low|medium|high>`**: cambian el proveedor, el modelo y el esfuerzo de razonamiento del objetivo LLM activo (misma semántica de hot-swap: no interrumpen el turno en vuelo, subagentes pinnan el tick de spawn, cabecera `provider/model` viva en TUI y Web). Todos los slash LLM son case-insensitive y también disponibles en la Web UI.
+- **`/provider <gemini|openai|anthropic>`**, **`/model <name>`** y **`/effort <auto|low|medium|high>`**: cambian el proveedor, el modelo y el esfuerzo de razonamiento del objetivo LLM activo (misma semántica de hot-swap: no interrumpen el turno en vuelo, subagentes pinnan el tick de spawn, cabecera `provider/model` viva en TUI y Web). Todos los slash LLM son case-insensitive y también disponibles en la Web UI.
 - **`/mode [plan|build|explore]`**: cambia al modo indicado o alterna `PLAN` ↔ `BUILD` si se omite el argumento.
   - `BUILD`: lectura y modificación controlada (`fs_edit` exige lectura previa del archivo).
   - `PLAN`: solo lectura y análisis; bloquea mutaciones.
@@ -151,6 +158,7 @@ api_key_env = "OLLAMA_API_KEY"   # nombre de la variable de entorno — nunca el
 - **`/merge <job_id>`**: fusiona la propuesta sellada del job con aprobación humana única (preview 3-way con banner `# impact:` de calor Scent; `Deny` para rutas del Control Plane y `Ask` obligatorio por gobernanza) y limpia el worktree.
 - **`/discard <job_id>`**: descarta el job sin fusionar (limpia el worktree y el estado `ws.subagent.*`).
 - **`/spawn [--driver <id>] <tarea>`**: lanza un subagente en segundo plano en un worktree aislado **sin gastar un turno de `root`** (válido incluso antes de tener un agente raíz activo). Comando y flag `--driver` case-insensitive y tolerantes a espacios múltiples; sin driver → motor nativo.
+- **Servidores MCP (`[mcp.servers.<name>]` en `config.toml`)**: `transport = "stdio"` (`command`/`args`/`env`) o `"http"` (`url`/`headers`), `timeout_secs` (default `20`), `enabled`; fusión `global < workspace (trusted)` (un workspace `[UNTRUSTED]` ignora los suyos con advertencia). Las tools descubiertas se exponen como `mcp__<server>__<tool>` con `requires_approval = true` (aprobación en `BUILD` salvo `allow` más específica, p. ej. `allow = ["mcp__github__*"]`; **`Deny` en `PLAN`/`EXPLORE`**), salidas por `truncate_utf8` + `scrub_secrets`, aislamiento de fallos por servidor y auditoría en `openonyx doctor` (handshake 5 s). `replay` reconstruye las tools `mcp__*` de la propia transcripción (0 I/O). Los subagentes no heredan el registro MCP.
 - **Harnesses CLI externos (`[[external_drivers]]` en `.onyx/config.toml`)**: declara drivers adicionales (`id`, `bin`, `args`, `prompt_transport = "stdin" | "arg" | "temp_file"`, `prompt_flag`, `timeout_secs`, `allowed_env`, `inherit_home`, `network_allowlist`); el preset `opencode` existe de serie y se sobreescribe por `id` (precedencia `preset < global < workspace`). Solo se aplican en workspaces **confiados** (en un workspace `[UNTRUSTED]` se ignoran por completo, también en el selector de la Web UI), `root` necesita aprobación explícita o regla `allow spawn_subagent(<driver>)` para delegar a un driver no-nativo, y el binario se audita en `openonyx doctor` (severidad por origen + probe `--version` aislada).
 - **Permisos granulares e impacto AST (`.onyx/config.toml`)**: `~/.onyx/config.toml` y `<workspace>/.onyx/config.toml` admiten `[permissions]` (`deny`, `allow`, `ask`, precedencia `deny > ask > allow`; `PLAN`/`EXPLORE` bloquean siempre mutaciones y `deny` aplica incluso con `--auto-approve` salvo `--ignore-deny`), `[sandbox]` e `[impact]` (*Scent-Heated Approval* monótono: escala `Allow → Ask` cuando `fs_edit`/`fs_write` toca símbolos con callers y muestra `# impact: ...` sobre el diff, guardando además `ws.effect.symbols` en el ledger).
 

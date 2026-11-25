@@ -80,12 +80,14 @@ openonyx chat --effort high --auto-save
 export ONYX_EFFORT=medium
 ```
 
+> **For `anthropic`:** the effort maps to an extended-thinking budget (`thinking.budget_tokens`: `low` 2048 / `medium` 8192 / `high` 16384 tokens) when no explicit budget is set. You can pin it with `--thinking-budget <n>` (or `ANTHROPIC_THINKING_BUDGET`; `0` = off, range `1024..=60000`), which also raises `max_tokens` above the budget. The provider also supports prompt caching (`cache_control: ephemeral` on the system block and the last tool definition) and automatic retries on `429`/`529` (chapter 06).
+
 ### 2.1 Hot-Swapping the LLM Target (`/profile`, `/provider`, `/model`, `/effort`)
 
 Beyond effort, the full LLM target (provider, model, `api_base`, and effort) is **hot-swappable** without restarting the session:
 
-- **Profiles**: `[[llm_profiles]]` blocks in `.onyx/config.toml` (trusted workspace) with `id`, `provider` (`gemini` | `openai`), `model`, `effort`, optional `api_base`, and optional `api_key_env`. **Never** literal keys in the file (details in chapter 03).
-- **Slash commands**: `/profile [id]` lists or applies a profile, `/provider <gemini|openai>`, `/model <name>`, and `/effort <auto|low|medium|high>`. Changes apply at the next tick boundary and are sealed in the `ONYXTR2` transcript (deterministic replay).
+- **Profiles**: `[[llm_profiles]]` blocks in `.onyx/config.toml` (trusted workspace) with `id`, `provider` (`gemini` | `openai` | `anthropic`), `model`, `effort`, optional `api_base`, and optional `api_key_env`. **Never** literal keys in the file (details in chapter 03).
+- **Slash commands**: `/profile [id]` lists or applies a profile, `/provider <gemini|openai|anthropic>`, `/model <name>`, and `/effort <auto|low|medium|high>`. Changes apply at the next tick boundary and are sealed in the `ONYXTR2` transcript (deterministic replay).
 - **Live header**: the title row switches to showing `provider/model (effort:...)` of the active target instead of the startup one.
 - **`Ctrl+K` palette**: a typing-free alternative — filter profiles, providers, and efforts, then run with `Enter` (LLM actions go through the deterministic bus exactly as if typed; a profile without credentials is shown as `unavailable` with its reason and is not selectable).
 - **Web UI (`openonyx serve`)**: the *LLM target* button (brand subtitle) opens a modal dialog with profile/model/effort and Apply/Cancel buttons, without exposing credentials to the browser.

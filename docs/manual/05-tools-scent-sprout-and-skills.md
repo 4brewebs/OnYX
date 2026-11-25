@@ -52,6 +52,17 @@ Besides `spawn_agent` (synchronous, same workspace), the agent can launch **asyn
 
 > **External drivers:** with `driver = "opencode"` (or any declared `[[external_drivers]]`), the job is delegated to an external CLI harness working in the same isolated worktree; process isolation, the Trust gate, and the network policy are documented in chapter 03 (section 2.7).
 
+### Dynamic MCP Tools (`mcp__<server>__<tool>`)
+
+On top of the fixed catalog above, every MCP server declared in `[mcp.servers.<name>]` (chapter 03, section 2.8) injects its tools **dynamically** into the LLM under the name `mcp__<server>__<tool>`:
+
+- **Discovery at startup:** the `initialize` → `tools/list` handshake (paginated, max 16 pages) retrieves each tool's name, description, and `inputSchema`; schemas are normalized before being declared to the provider (Gemini, OpenAI, and Anthropic).
+- **Always approval-gated:** `requires_approval = true` on every `mcp__*` tool: they ask for interactive approval in `BUILD` (unless a more specific `allow` rule) and are **`Deny` in `PLAN`/`EXPLORE`**, exactly like mutations.
+- **Isolation & sanitization:** a dead server never aborts the session, and results pass through `truncate_utf8` + `scrub_secrets`.
+- **0-I/O replay:** under `openonyx replay` the `mcp__*` tools are reconstructed from the transcript itself, without contacting any server.
+
+> **Subagents do not receive `mcp__*` tools:** only the session's root agent sees the MCP registry (worktree jobs do not inherit it).
+
 ---
 
 ## 2. Semantic AST Navigation with `onyx-scent`
