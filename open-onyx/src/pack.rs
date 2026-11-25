@@ -956,6 +956,22 @@ impl OnyxSystem for MilestoneSnapshotSystem {
                     || cmd.starts_with("/stop ")
                 {
                     cmd_tag = Some("cmd:/cancel".to_string());
+                } else if cmd.starts_with("/graph ") {
+                    // `SDD-07` Fase 2: solo los subcomandos mutantes emiten hito;
+                    // `inspect` es read-only (solo una nota `system`).
+                    let sub = cmd
+                        .strip_prefix("/graph ")
+                        .unwrap_or("")
+                        .trim()
+                        .split(char::is_whitespace)
+                        .next()
+                        .unwrap_or("");
+                    if matches!(
+                        sub.to_ascii_lowercase().as_str(),
+                        "drop-mem" | "edit-mem" | "set-goal"
+                    ) {
+                        cmd_tag = Some("cmd:/graph-mutate".to_string());
+                    }
                 }
             }
         }

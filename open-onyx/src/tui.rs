@@ -227,6 +227,12 @@ impl crate::session::UiIdlePump for TuiHandle {
     fn pump_idle(&self, graph: &dyn GraphView) {
         TuiHandle::pump_idle(self, graph);
     }
+
+    /// `SDD-07` Fase 2: encola el comando sellado; el próximo
+    /// `TuiDriver::poll` lo drena vía `bridge.push` (queda en `ONYXTR2`).
+    fn queue_ingress(&self, event: OnyxEvent) {
+        self.inner.borrow_mut().queued.push(event);
+    }
 }
 
 pub struct TuiDriver {

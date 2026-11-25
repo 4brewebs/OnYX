@@ -4371,10 +4371,16 @@ mod tests {
                 driver: None,
             },
             &ctx,
+            0,
         );
         assert!(
-            blocked.contains("Blocked in `PLAN` mode"),
-            "spawn must be blocked in PLAN mode, got: {blocked}"
+            blocked.is_none(),
+            "/spawn bloqueado no produce comando sellado: {blocked:?}"
+        );
+        let notes = ctx.pending_notes.drain();
+        assert!(
+            notes.iter().any(|n| n.contains("Blocked in `PLAN` mode")),
+            "spawn must be blocked in PLAN mode, got: {notes:?}"
         );
         assert!(
             handle.list_summaries().is_empty(),
@@ -4383,21 +4389,29 @@ mod tests {
 
         // BUILD: `/spawn --driver fake <tarea>` lanza sin gastar turno de root.
         ctx.mode_handle.set(WorkspaceMode::Build);
-        let msg = apply_session_action(
+        let sealed = apply_session_action(
             &mut host,
             SessionAction::SpawnSubagent {
                 goal: "Add from_slash.txt".to_string(),
                 driver: Some("fake".to_string()),
             },
             &ctx,
+            0,
         );
         assert!(
-            msg.contains("Launched background worktree job"),
-            "spawn should launch, got: {msg}"
+            sealed.is_none(),
+            "/spawn no produce comando sellado: {sealed:?}"
+        );
+        let notes = ctx.pending_notes.drain();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("Launched background worktree job")),
+            "spawn should launch, got: {notes:?}"
         );
         assert!(
-            msg.contains("on driver `fake`"),
-            "message must mention the external driver: {msg}"
+            notes.iter().any(|n| n.contains("on driver `fake`")),
+            "message must mention the external driver: {notes:?}"
         );
         assert_eq!(
             host.ticks(),

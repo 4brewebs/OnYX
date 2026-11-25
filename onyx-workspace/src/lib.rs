@@ -61,9 +61,9 @@ pub use state::{
     upsert_subagent_record,
 };
 pub use tools::{
-    FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools, discover_skills_summary,
-    format_plan_steps, is_async_subagent_tool, preview_tool_diff, scrub_secrets,
-    spawn_agent_is_isolated, spawn_subagent_driver_from_args,
+    DetShellExecResult, FsEditHunk, PlanStepItem, ToolSchema, WorkspaceTools,
+    discover_skills_summary, format_plan_steps, is_async_subagent_tool, preview_tool_diff,
+    scrub_secrets, spawn_agent_is_isolated, spawn_subagent_driver_from_args,
 };
 pub use trust::{
     ONYX_TRUST_FILE_ENV, WorkspaceTrustRecord, WorkspaceTrustReport, WorkspaceTrustStatus,

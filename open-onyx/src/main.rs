@@ -2999,6 +2999,7 @@ mod tests {
 
         // `/rewind 1` en vivo (host asentado, sin llamadas LLM en vuelo).
         let policy = WorkspacePolicy::new(&dir).unwrap();
+        let pending_notes = PendingSystemNotes::new();
         let action_ctx = SessionActionContext {
             workspace_root: dir.clone(),
             config: cfg,
@@ -3007,16 +3008,29 @@ mod tests {
             tools: WorkspaceTools::new(policy),
             snapshot_store: Some(shared_store.clone()),
             pending_action: PendingSessionAction::new(),
-            pending_notes: PendingSystemNotes::new(),
+            pending_notes: pending_notes.clone(),
             subagents: None,
             time_debug: None,
         };
-        let msg = session::apply_session_action(
+        let sealed = session::apply_session_action(
             &mut host,
             command::SessionAction::Rewind { requested_tick: 1 },
             &action_ctx,
+            0,
         );
-        assert!(msg.contains("Restored milestone tick 1"), "{msg}");
+        assert!(
+            sealed.is_none(),
+            "/rewind no produce comando sellado: {sealed:?}"
+        );
+        // Nota en `pending_notes` (este host no tiene root: el spawner del
+        // ctx no está cableado a la cola, así que la cola se conserva).
+        let notes = pending_notes.drain();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("Restored milestone tick 1")),
+            "{notes:?}"
+        );
         assert_eq!(host.ticks(), 2);
 
         // El grafo trae el `ws.llm.*` del milestone…
@@ -4316,28 +4330,49 @@ ready_log = "READY_BUS"
             subagents: None,
             time_debug: None,
         };
-        let fork_msg = session::apply_session_action(
+        let fork_sealed = session::apply_session_action(
             &mut host,
             command::SessionAction::Fork {
                 label: Some("exp-live".to_string()),
             },
             &action_ctx,
+            0,
         );
-        assert!(fork_msg.contains("[/fork] Created branch"), "{fork_msg}");
+        assert!(
+            fork_sealed.is_none(),
+            "/fork no produce comando sellado: {fork_sealed:?}"
+        );
+        // La nota viaja por `pending_notes` → memoria `system` del root
+        // (el step de `emit_session_note` drena la cola).
+        let root_mem = host.view(host.agents()[0]).memory;
+        assert!(
+            root_mem
+                .iter()
+                .any(|(k, t)| k == "system" && t.contains("[/fork] Created branch")),
+            "{root_mem:?}"
+        );
         let branched_dir = shared_store.current_dir();
         assert_ne!(branched_dir, snap_dir);
         assert!(branched_dir.join(pack::PACK_FILE_NAME).exists());
 
-        let rewind_msg = session::apply_session_action(
+        let rewind_sealed = session::apply_session_action(
             &mut host,
             command::SessionAction::Rewind {
                 requested_tick: pre_edit_tick,
             },
             &action_ctx,
+            0,
         );
         assert!(
-            rewind_msg.contains(&format!("Restored milestone tick {pre_edit_tick}")),
-            "{rewind_msg}"
+            rewind_sealed.is_none(),
+            "/rewind no produce comando sellado: {rewind_sealed:?}"
+        );
+        let root_mem = host.view(host.agents()[0]).memory;
+        assert!(
+            root_mem.iter().any(|(k, t)| {
+                k == "system" && t.contains(&format!("Restored milestone tick {pre_edit_tick}"))
+            }),
+            "{root_mem:?}"
         );
         assert_eq!(host.ticks(), pre_edit_tick + 1);
         assert_eq!(fs::read_to_string(dir.join("note.txt")).unwrap(), "v1\n");
@@ -5149,6 +5184,849 @@ ready_log = "READY_BUS"
             client.calls.load(Ordering::Acquire),
             1,
             "el replay no debe volver a llamar al cliente MCP"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =======================================================================
+    // `SDD-07` Fase 2: primitivas 0-tokens, cirugía `/graph` y sellados
+    // =======================================================================
+
+    /// Contexto de sesión mínimo para `apply_session_action` (BUILD, sin store
+    /// ni subagentes; `time_debug` opcional).
+    fn det_session_ctx(
+        workspace_root: &Path,
+        config: &AgentConfig,
+        ws_vocab: &onyx_workspace::WorkspaceVocab,
+        tools: &WorkspaceTools,
+        time_debug: Option<TimeDebugState>,
+    ) -> SessionActionContext {
+        SessionActionContext {
+            workspace_root: workspace_root.to_path_buf(),
+            config: config.clone(),
+            ws_vocab: *ws_vocab,
+            mode_handle: WorkspaceModeHandle::new(WorkspaceMode::Build),
+            tools: tools.clone(),
+            snapshot_store: None,
+            subagents: None,
+            pending_action: PendingSessionAction::new(),
+            pending_notes: PendingSystemNotes::new(),
+            time_debug,
+        }
+    }
+
+    /// `SDD-07` Fase 2 (TEST-07.3): `! echo hola` y `/read` bajo TimeFreeze se
+    /// ejecutan en el borde de sesión y quedan **sellados** en `ONYXTR2`
+    /// (`/__onyx_det_shell` / `/__onyx_det_read`, truncados al cap de 8 KiB y
+    /// `scrub_secrets`); el replay de la sesión es **bit-idéntico**
+    /// (mismo `graph().export()`) con **0 I/O**: el resultado sellado se
+    /// reinyecta como memoria y no se re-ejecuta ni se re-lee.
+    #[test]
+    fn det_sealed_shell_and_read_replay_bit_a_bit_zero_io() {
+        use onyx_soul_agents::Graph;
+
+        let dir =
+            std::env::temp_dir().join(format!("openonyx-det-sealed-replay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AgentConfig {
+            default_max_steps: 8,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy);
+
+        let (mut host, ws_vocab) = build_host(
+            1,
+            cfg.clone(),
+            None,
+            Some(Box::new(CommandSpawnerSystem::new(false).with_max_steps(8))),
+        )
+        .unwrap();
+
+        // Fichero >8 KiB para ejercitar el cap sellado, con un secreto
+        // sintético `sk-` en la primera línea (para `scrub_secrets`).
+        let secret_tail = "syntheticsecretkey0123456789";
+        let filler = "x".repeat(96);
+        let mut file_content = format!("api_key = sk-{secret_tail}\n");
+        for i in 0..120 {
+            file_content.push_str(&format!("{i:03} {filler} line\n"));
+        }
+        fs::write(dir.join("secret.txt"), &file_content).unwrap();
+
+        let headless = HeadlessDriver::new();
+        let handle = headless.handle();
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            (req.request == 1).then(|| Reply::done(req.agent, req.request, "ok"))
+        })
+        .wrapping(headless);
+
+        // El bucle de sesión captura cada frontera en el ring RAM (como
+        // `run_session`); sin ello el tick no sería scrubeable.
+        let td = TimeDebugState::new(None);
+        // Turno 1: root `Done` "ok" al finalizar el tick 2.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("hola".into())));
+        for _ in 0..3 {
+            host.step(&mut driver);
+            td.record_tick(host.ticks() - 1, &host.graph().export());
+        }
+        assert_eq!(host.ticks(), 3);
+        let root = host.agents()[0];
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        assert_eq!(host.result(root).as_deref(), Some("ok"));
+
+        // TimeFreeze en el presente (último tick completado = 2).
+        td.set_present(host.ticks() - 1);
+        td.freeze();
+        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()));
+
+        // `! echo hola` → sandbox + sellado + reinyección por la cadena de
+        // drivers (queda grabado en el transcript del driver de grabación).
+        let sealed = session::apply_session_action(
+            &mut host,
+            command::SessionAction::DetShell {
+                command: "echo hola".into(),
+            },
+            &ctx,
+            0,
+        )
+        .expect("DetShell asentado debe devolver el comando sellado");
+        assert!(
+            sealed.starts_with(time_debug::DET_SHELL_CMD_PREFIX),
+            "sellado con prefijo reservado: {sealed}"
+        );
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed)));
+        host.step(&mut driver);
+        td.record_tick(host.ticks() - 1, &host.graph().export());
+
+        let view = host.view(root);
+        let shell_mem = view
+            .memory
+            .iter()
+            .find(|(k, _)| k == "shell")
+            .unwrap_or_else(|| panic!("memoria `shell` del resultado sellado: {:?}", view.memory));
+        assert!(shell_mem.1.contains("exit_code: 0"), "{shell_mem:?}");
+        assert!(shell_mem.1.contains("hola"), "{shell_mem:?}");
+        // El volcado `say` del resultado `Done` precede a la memoria sellada.
+        assert!(
+            view.memory.iter().any(|(k, t)| k == "say" && t == "ok"),
+            "volcado `say` del resultado previo: {:?}",
+            view.memory
+        );
+
+        // El usuario sigue la frontera (scrub al presente + re-congelación):
+        // sin esto la siguiente mutación bifurcaría desde el cursor antiguo.
+        td.scrub_to(td.present()).unwrap();
+        td.freeze();
+
+        // `/read secret.txt` → lectura verificada, scrub + cap 8 KiB + sellado.
+        let sealed_read = session::apply_session_action(
+            &mut host,
+            command::SessionAction::DetRead {
+                path: "secret.txt".into(),
+                start_line: None,
+                end_line: None,
+            },
+            &ctx,
+            0,
+        )
+        .expect("DetRead asentado debe devolver el comando sellado");
+        assert!(
+            sealed_read.starts_with(time_debug::DET_READ_CMD_PREFIX),
+            "sellado con prefijo reservado: {sealed_read}"
+        );
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed_read)));
+        host.step(&mut driver);
+        td.record_tick(host.ticks() - 1, &host.graph().export());
+
+        let view = host.view(root);
+        let obs_mem = view
+            .memory
+            .iter()
+            .find(|(k, _)| k == "observe")
+            .unwrap_or_else(|| {
+                panic!("memoria `observe` de la lectura sellada: {:?}", view.memory)
+            });
+        assert!(
+            obs_mem.1.contains("[REDACTED]"),
+            "el secreto debe quedar scrubbed: {obs_mem:?}"
+        );
+        assert!(
+            !obs_mem.1.contains(secret_tail),
+            "el secreto crudo no puede aparecer: {obs_mem:?}"
+        );
+        let content = obs_mem
+            .1
+            .strip_prefix("[det-read] `secret.txt`\n")
+            .expect("prefijo del reporte det-read");
+        assert_eq!(
+            content.len(),
+            time_debug::DET_SEALED_OUTPUT_CAP_BYTES,
+            "el contenido debe truncarse al cap de 8 KiB (UTF-8 safe)"
+        );
+        let notes = ctx.pending_notes.drain();
+        assert!(
+            notes.iter().any(|n| n.contains("sealed, 0 LLM tokens")),
+            "nota accionable del borde de sesión: {notes:?}"
+        );
+
+        // 0 I/O: el contenido sellado es la única fuente; si el fichero
+        // cambia ahora, el replay no lo ve (no re-lee).
+        fs::write(dir.join("secret.txt"), "CHANGED-AFTER-SEAL\n").unwrap();
+
+        // El transcript `ONYXTR2` contiene los 2 sellados + 1 respuesta LLM.
+        let mut tr = driver.transcript().clone();
+        assert_eq!(
+            tr.commands.len(),
+            2,
+            "los 2 sellados deben estar en ONYXTR2"
+        );
+        assert_eq!(tr.entries.len(), 1, "1 respuesta LLM grabada");
+        // Round-trip del binario (la persistencia real de `--save-transcript`).
+        let decoded = Transcript::from_bytes(&tr.to_bytes()).expect("round-trip ONYXTR2");
+        assert_eq!(decoded.commands, tr.commands);
+        // El prompt inicial `hola` se push-eó con `host.push` (fuera del
+        // driver de grabación): se reconstruye a mano para el replay
+        // (patrón SDD-05).
+        tr.commands.insert(
+            0,
+            onyx_soul_agents::LoggedCommand {
+                poll: 0,
+                command: "hola".to_string(),
+            },
+        );
+
+        let (mut replay_host, _rws) = build_host(
+            1,
+            cfg.clone(),
+            None,
+            Some(Box::new(CommandSpawnerSystem::new(false).with_max_steps(8))),
+        )
+        .unwrap();
+        let mut replay_driver = ReplayBridge::new(tr).wrapping(HeadlessDriver::new());
+        run_session(
+            &mut replay_host,
+            &mut replay_driver,
+            &SessionOptions::default(),
+            StopPolicy::ReplayExhausted { max_ticks: 64 },
+        )
+        .unwrap();
+
+        // Bit-idéntico: mismo grafo EAV (ids de concepto, attrs, enlaces).
+        assert_eq!(
+            host.graph().export(),
+            replay_host.graph().export(),
+            "el replay debe ser bit-idéntico al live"
+        );
+        let rroot = replay_host.agents()[0];
+        assert_eq!(replay_host.agent_state(rroot), Some(AgentState::Done));
+        let rmem = replay_host.view(rroot).memory;
+        let r_obs = rmem
+            .iter()
+            .find(|(k, _)| k == "observe")
+            .expect("memoria `observe` en el replay");
+        assert!(r_obs.1.contains("[REDACTED]"), "{r_obs:?}");
+        assert!(
+            !r_obs.1.contains("CHANGED-AFTER-SEAL"),
+            "el replay no debe re-leer el fichero: {r_obs:?}"
+        );
+        let r_shell = rmem
+            .iter()
+            .find(|(k, _)| k == "shell")
+            .expect("memoria `shell` en el replay");
+        assert!(
+            r_shell.1.contains("exit_code: 0") && r_shell.1.contains("hola"),
+            "el replay no debe re-ejecutar el shell: {r_shell:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-07` Fase 2 (TEST-07.4): cirugía `/graph` in-tick —
+    /// `drop-mem`/`edit-mem`/`set-goal` con efecto EAV exacto; `mem_seq`
+    /// estrictamente monótono (sin reutilización de ids tras `drop-mem`);
+    /// hito `cmd:/graph-mutate` en el pack (y ninguno para `inspect`);
+    /// atributos reservados del framework intactos; `clear_seen_reads()`
+    /// invocado (la deduplicación de `fs_read` se resetea); y reversibilidad:
+    /// el preview 1 tick antes del drop aún muestra la memoria eliminada
+    /// (solo RAM, 0 I/O; el rewind de rama es mecánica de SDD-05).
+    #[test]
+    fn graph_surgery_monotonic_milestones_and_preview() {
+        use onyx_soul_agents::{AgentGraph, Graph, GraphView, Value, Vocab};
+
+        let dir =
+            std::env::temp_dir().join(format!("openonyx-graph-surgery-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AgentConfig {
+            default_max_steps: 8,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy);
+        let snap_dir = dir.join("snaps");
+        let opts = SessionOptions {
+            snapshot_dir: Some(snap_dir.clone()),
+            save_step_snapshots: true,
+            ..SessionOptions::default()
+        };
+        let spawner = CommandSpawnerSystem::new(false)
+            .with_max_steps(8)
+            .with_tools(tools.clone());
+        let (mut host, _ws_vocab) =
+            build_host_with_options(1, cfg.clone(), &opts, Some(Box::new(spawner)), None).unwrap();
+        let v = host.vocab();
+
+        // Ring RAM del depurador: captura la frontera de cada tick (como el
+        // bucle de sesión) para la reversibilidad por preview.
+        let td = TimeDebugState::new(None);
+        fn step_rec<R: Responder>(
+            td: &TimeDebugState,
+            host: &mut AgentHost,
+            driver: &mut RecordingBridge<R>,
+        ) {
+            use onyx_soul_agents::Graph as _;
+            host.step(driver);
+            td.record_tick(host.ticks() - 1, &host.graph().export());
+        }
+
+        let mut driver = RecordingBridge::new(host.vocab(), |req: &AgentView| {
+            let r = match req.request {
+                1 => "ok",
+                2 => "more-done",
+                3 => "again-done",
+                _ => return None,
+            };
+            Some(Reply::done(req.agent, req.request, r))
+        });
+
+        // Turno 1 (ticks 0..2) + turno 2 (ticks 3..5): root `Done`
+        // "more-done". Al reactivar en el turno 2, `continue_agent` vuelca el
+        // resultado previo como `say` (seq 1) y añade `user` (seq 2).
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("hola".into())));
+        for _ in 0..3 {
+            step_rec(&td, &mut host, &mut driver);
+        }
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("more".into())));
+        for _ in 0..3 {
+            step_rec(&td, &mut host, &mut driver);
+        }
+        let root = host.agents()[0];
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        assert_eq!(host.result(root).as_deref(), Some("more-done"));
+        let mems: Vec<String> = host
+            .view(root)
+            .memory
+            .iter()
+            .map(|(k, t)| format!("{k}:{t}"))
+            .collect();
+        assert_eq!(
+            mems,
+            vec!["say:ok", "user:more"],
+            "memoria inicial del root (volcado `say` + `user`): {mems:?}"
+        );
+
+        // Deduplicación de `fs_read`: 2ª lectura idéntica → stub `@TOON`.
+        fs::write(dir.join("doc.txt"), "one\ntwo\nthree\n").unwrap();
+        let read_args = r#"{"path":"doc.txt"}"#;
+        let r1 = tools.execute("fs_read", read_args).unwrap();
+        assert!(r1.contains("three"), "{r1}");
+        let r2 = tools.execute("fs_read", read_args).unwrap();
+        assert!(
+            r2.contains("unchanged_since_tick"),
+            "2ª lectura dentro de la ventana: stub @TOON: {r2}"
+        );
+
+        // `/graph drop-mem 1..2` (tick 6): elimina `say` (1) y `user` (2);
+        // la nota `system` vuelca el `result` pendiente como `say` (seq 3) y
+        // añade la propia nota (seq 4). Llama a `clear_seen_reads()`.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/graph drop-mem 1..2".into(),
+        )));
+        step_rec(&td, &mut host, &mut driver); // tick 6
+
+        let view = host.view(root);
+        assert!(
+            !view.memory.iter().any(|(_, t)| t == "more"),
+            "la memoria droppeada no debe quedar: {:?}",
+            view.memory
+        );
+        let drop_note = view
+            .memory
+            .iter()
+            .find(|(k, t)| k == "system" && t.contains("[/graph drop-mem]"))
+            .unwrap_or_else(|| panic!("nota `system` de drop-mem: {:?}", view.memory));
+        assert!(
+            drop_note
+                .1
+                .contains("Dropped 2 memory node(s) with mem_seq in [1..=2]"),
+            "{drop_note:?}"
+        );
+        assert!(
+            drop_note.1.contains("gaps are intentional"),
+            "{drop_note:?}"
+        );
+        // Volcado del `result` pendiente (`"more-done"`, seq 3) + nota (seq 4).
+        assert!(
+            view.memory
+                .iter()
+                .any(|(k, t)| k == "say" && t == "more-done"),
+            "el `result` pendiente se vuelca como `say`: {:?}",
+            view.memory
+        );
+        assert_eq!(
+            host.graph().get(root, v.mem_count),
+            Some(Value::Int(4)),
+            "`mem_count` monótono (los seqs 1..=2 no vuelven)"
+        );
+        // `clear_seen_reads()` invocado: la dedup se resetea.
+        let r3 = tools.execute("fs_read", read_args).unwrap();
+        assert_eq!(r3, r1, "tras drop-mem la dedup de fs_read se resetea");
+
+        // `/graph edit-mem 3 <text>` (tick 7): reescribe el texto del seq 3
+        // (el volcado `say`) sin tocar nada más.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/graph edit-mem 3 rewrote-by-test".into(),
+        )));
+        step_rec(&td, &mut host, &mut driver); // tick 7
+        let edited = host
+            .graph()
+            .related(root, v.rel_memory)
+            .iter()
+            .find(|m| matches!(host.graph().get(**m, v.mem_seq), Some(Value::Int(3))))
+            .copied()
+            .expect("memoria con mem_seq 3");
+        assert_eq!(
+            host.graph().get(edited, v.mem_text),
+            Some(Value::Text("rewrote-by-test".into())),
+            "edit-mem debe reescribir el texto del seq"
+        );
+        assert!(
+            host.view(root)
+                .memory
+                .iter()
+                .any(|(k, t)| k == "system" && t == "[/graph edit-mem] Rewrote mem_seq 3."),
+            "nota `system` de edit-mem: {:?}",
+            host.view(root).memory
+        );
+
+        // `/graph set-goal <text>` (1 tick): reescribe el goal del root.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/graph set-goal brand new goal".into(),
+        )));
+        step_rec(&td, &mut host, &mut driver); // tick 7
+        assert_eq!(host.view(root).goal, "brand new goal");
+        assert!(
+            host.view(root)
+                .memory
+                .iter()
+                .any(|(k, t)| k == "system"
+                    && t.starts_with("[/graph set-goal] Root goal rewritten.")),
+            "nota `system` de set-goal: {:?}",
+            host.view(root).memory
+        );
+
+        // Atributos reservados del framework intactos tras la cirugía.
+        assert_eq!(
+            host.agent_state(root),
+            Some(AgentState::Done),
+            "state no se toca"
+        );
+        assert_eq!(
+            host.graph().get(root, v.steps),
+            Some(Value::Int(2)),
+            "`steps` no se toca"
+        );
+        assert_eq!(
+            host.graph().get(root, v.max_steps),
+            Some(Value::Int(9)),
+            "`max_steps` no se toca"
+        );
+        assert_eq!(
+            host.graph().get(root, v.pending),
+            Some(Value::Int(0)),
+            "`pending` no se toca"
+        );
+
+        // Hitos: `cmd:/graph-mutate` en los ticks de las 3 mutaciones y
+        // ninguno para `inspect` (read-only).
+        let mutate_ticks = |dir: &Path| -> Vec<u64> {
+            pack::PackSnapshotStore::new(dir)
+                .entries()
+                .iter()
+                .filter(|m| m.tag == "cmd:/graph-mutate")
+                .map(|m| m.tick)
+                .collect()
+        };
+        assert_eq!(
+            mutate_ticks(&snap_dir),
+            vec![6, 7, 8],
+            "un hito por mutación"
+        );
+
+        host.push(OnyxEvent::Ingress(IngressEvent::Command(
+            "/graph inspect mem".into(),
+        )));
+        step_rec(&td, &mut host, &mut driver); // tick 9
+        assert!(
+            host.view(root)
+                .memory
+                .iter()
+                .any(|(k, t)| k == "system" && t.starts_with("[/graph inspect] root memories:")),
+            "inspect debe anotar el reporte: {:?}",
+            host.view(root).memory
+        );
+        assert_eq!(
+            mutate_ticks(&snap_dir),
+            vec![6, 7, 8],
+            "inspect no emite hito `cmd:/graph-mutate`"
+        );
+
+        // Turno 3: las siguientes memorias siguen secuencias > máximo histórico.
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("again".into())));
+        for _ in 0..3 {
+            step_rec(&td, &mut host, &mut driver); // ticks 10..12
+        }
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        let mut seqs: Vec<i64> = host
+            .graph()
+            .related(root, v.rel_memory)
+            .iter()
+            .filter_map(|m| match host.graph().get(*m, v.mem_seq) {
+                Some(Value::Int(s)) => Some(s),
+                _ => None,
+            })
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![3, 4, 5, 6, 7, 8],
+            "`mem_seq` estrictamente monótono (los droppeados 1..=2 no se reutilizan)"
+        );
+        assert_eq!(
+            host.graph().get(root, v.mem_count),
+            Some(Value::Int(8)),
+            "`mem_count` monótono tras drop-mem"
+        );
+
+        // Reversibilidad (0 I/O, solo RAM): 1 tick antes del drop, la memoria
+        // `user` ("more") aún está; en el tick del drop, no.
+        let before = td.preview_graph(5).expect("preview del tick 5 (pre-drop)");
+        let after = td.preview_graph(6).expect("preview del tick 6 (post-drop)");
+        let check_more = |bytes: &[u8]| -> bool {
+            let mut g = AgentGraph::new();
+            g.import(bytes).expect("import del preview");
+            let pv = Vocab::resolve(&mut g);
+            g.related(root, pv.rel_memory)
+                .iter()
+                .any(|m| matches!(g.get(*m, pv.mem_text), Some(Value::Text(t)) if t == "more"))
+        };
+        assert!(
+            check_more(&before.export()),
+            "el preview del tick 5 debe mostrar la memoria droppeada"
+        );
+        assert!(
+            !check_more(&after.export()),
+            "el preview del tick 6 ya no la muestra"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `SDD-07` Fase 2 (TEST-07.5): primitivas 0-tokens —
+    /// `/step [n]` avanza `n` ticks deterministas **sin** invocar al LLM
+    /// (clamp 1..=64, exige frozen y no descongela); `/step-llm` reactiva el
+    /// root `Done`→`Idle` sellado en-tick (0 I/O) y permite **exactamente 1
+    /// turno LLM** (el gate `try_acquire_llm_turn` re-congela al consumirlo);
+    /// gate de concurrencia: mutaciones bloqueadas con nota accionable si
+    /// hay LLM en vuelo, tool calls pendientes o aprobaciones; permitidas al
+    /// settling.
+    #[test]
+    fn det_step_step_llm_and_mutation_gate() {
+        use onyx_soul_agents::{Graph, GraphView, Value, pending_approvals, pending_tool_calls};
+
+        let dir = std::env::temp_dir().join(format!("openonyx-det-step-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = AgentConfig {
+            default_max_steps: 8,
+            default_timeout_ticks: 64,
+            ..AgentConfig::default()
+        };
+        let policy = WorkspacePolicy::new(&dir).unwrap();
+        let tools = WorkspaceTools::new(policy);
+
+        // --- Host A: `/step` (0 LLM) y `/step-llm` (1 turno exacto) -----------
+        let llm_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut host, ws_vocab) = build_host(
+            1,
+            cfg.clone(),
+            None,
+            Some(Box::new(CommandSpawnerSystem::new(false).with_max_steps(8))),
+        )
+        .unwrap();
+        let v = host.vocab();
+        let llm_ref = Arc::clone(&llm_calls);
+        let headless = HeadlessDriver::new();
+        let handle = headless.handle();
+        let mut driver = RecordingBridge::new(host.vocab(), move |req: &AgentView| {
+            let r = match req.request {
+                1 => "ok",
+                2 => "llm answer",
+                _ => return None,
+            };
+            llm_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Reply::done(req.agent, req.request, r))
+        })
+        .wrapping(headless);
+
+        let td = TimeDebugState::new(None);
+        host.push(OnyxEvent::Ingress(IngressEvent::Command("hola".into())));
+        for _ in 0..3 {
+            host.step(&mut driver);
+            td.record_tick(host.ticks() - 1, &host.graph().export());
+        }
+        let root = host.agents()[0];
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        assert_eq!(llm_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        td.set_present(host.ticks() - 1);
+        td.freeze();
+        let ctx = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td.clone()));
+
+        // Sin congelación: `/step` se rechaza con nota accionable.
+        let td_unfrozen = TimeDebugState::new(None);
+        td_unfrozen.set_present(host.ticks() - 1);
+        let ctx_unfrozen = det_session_ctx(&dir, &cfg, &ws_vocab, &tools, Some(td_unfrozen));
+        let r = session::apply_session_action(
+            &mut host,
+            command::SessionAction::Step(1),
+            &ctx_unfrozen,
+            0,
+        );
+        assert!(r.is_none(), "/step sin congelación no avanza: {r:?}");
+        let notes = ctx_unfrozen.pending_notes.drain();
+        assert!(notes.iter().any(|n| n.contains("Not frozen")), "{notes:?}");
+
+        // `/step 3`: +3 ticks exactos, 0 LLM, sigue congelado.
+        let t0 = host.ticks();
+        let r = session::apply_session_action(&mut host, command::SessionAction::Step(3), &ctx, 0);
+        assert!(r.is_none(), "/step no reinyecta nada: {r:?}");
+        assert_eq!(host.ticks(), t0 + 3, "Step(3) avanza exactamente 3 ticks");
+        assert_eq!(
+            llm_calls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "0 LLM en /step"
+        );
+        assert!(td.is_frozen(), "/step no descongela");
+        assert_eq!(
+            td.present(),
+            t0 + 3 - 1,
+            "present avanza con los ticks registrados"
+        );
+        let notes = ctx.pending_notes.drain();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("Advanced 3 deterministic tick(s)")),
+            "nota accionable de /step: {notes:?}"
+        );
+
+        // Clamps: Step(0) → 1 tick; Step(1000) → 64.
+        let t1 = host.ticks();
+        session::apply_session_action(&mut host, command::SessionAction::Step(0), &ctx, 0);
+        assert_eq!(host.ticks(), t1 + 1, "Step(0) se clampa a 1");
+        let t2 = host.ticks();
+        session::apply_session_action(&mut host, command::SessionAction::Step(1000), &ctx, 0);
+        assert_eq!(host.ticks(), t2 + 64, "Step(1000) se clampa a 64");
+        assert_eq!(
+            llm_calls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "0 LLM en los clamps"
+        );
+
+        // `/step-llm`: reactiva el root `Done`→`Idle` sellado (en-tick, 0 I/O).
+        // El usuario sigue la frontera (scrub al presente + re-congelación):
+        // sin esto la mutación bifurcaría desde el cursor antiguo.
+        td.scrub_to(td.present()).unwrap();
+        td.freeze();
+        let sealed =
+            session::apply_session_action(&mut host, command::SessionAction::StepLlm, &ctx, 0)
+                .expect("StepLlm debe devolver el comando sellado");
+        assert_eq!(sealed, time_debug::DET_STEP_LLM_CMD_PREFIX);
+        let notes = ctx.pending_notes.drain();
+        assert!(
+            notes.iter().any(|n| n.contains("Granted 1 LLM turn")),
+            "{notes:?}"
+        );
+
+        handle.push_event(OnyxEvent::Ingress(IngressEvent::Command(sealed)));
+        host.step(&mut driver); // intercept: Done → Idle, max_steps += max_steps_per_turn
+        assert_eq!(host.agent_state(root), Some(AgentState::Idle));
+        let steps_now = match host.graph().get(root, v.steps) {
+            Some(Value::Int(n)) => n,
+            other => panic!("steps = {other:?}"),
+        };
+        assert_eq!(
+            host.graph().get(root, v.max_steps),
+            Some(Value::Int(steps_now + 8)),
+            "max_steps += max_steps_per_turn (8) en la reactivación"
+        );
+        host.step(&mut driver); // Thinking → request 2 (el único despacho LLM)
+        host.step(&mut driver); // reply → Done "llm answer"
+        assert_eq!(host.agent_state(root), Some(AgentState::Done));
+        assert_eq!(host.result(root).as_deref(), Some("llm answer"));
+        assert_eq!(
+            llm_calls.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "exactamente 1 turno LLM tras /step-llm"
+        );
+        // El gate `try_acquire_llm_turn` (live: `DynamicLlmDriver::present`)
+        // permite el único turno concedido y re-congela al consumirlo.
+        assert!(
+            td.try_acquire_llm_turn(),
+            "el turno concedido debe despacharse"
+        );
+        assert!(
+            !td.try_acquire_llm_turn(),
+            "consumido → re-congelado (0 turnos más)"
+        );
+        assert!(td.is_frozen());
+
+        // --- Gate de concurrencia (host C: settling → permitido; luego cada
+        //     causa de bloqueo, con nota accionable) ---------------------------
+        let llm_c = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut host_c, _ws_c) = build_host(
+            1,
+            cfg.clone(),
+            None,
+            Some(Box::new(CommandSpawnerSystem::new(false).with_max_steps(8))),
+        )
+        .unwrap();
+        let v_c = host_c.vocab();
+        let llm_ref_c = Arc::clone(&llm_c);
+        let mut driver_c = RecordingBridge::new(host_c.vocab(), move |req: &AgentView| {
+            if req.name == "worker" || req.name == "approver" {
+                Some(Reply::call_structured(
+                    req.agent,
+                    req.request,
+                    "fs_write",
+                    r#"{"path":"x.txt","content":"x"}"#,
+                ))
+            } else {
+                llm_ref_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Reply::done(req.agent, req.request, "ok"))
+            }
+        });
+        host_c.push(OnyxEvent::Ingress(IngressEvent::Command("hola".into())));
+        for _ in 0..3 {
+            host_c.step(&mut driver_c);
+        }
+        let root_c = host_c.agents()[0];
+        assert_eq!(host_c.agent_state(root_c), Some(AgentState::Done));
+
+        let td_c = TimeDebugState::new(None);
+        td_c.set_present(host_c.ticks() - 1);
+        td_c.freeze();
+        let ctx_c = det_session_ctx(&dir, &cfg, &_ws_c, &tools, Some(td_c));
+
+        // Settled (0 en vuelo, 0 tools, 0 aprobaciones) → mutación permitida.
+        let sealed_c = session::apply_session_action(
+            &mut host_c,
+            command::SessionAction::DetShell {
+                command: "echo ok".into(),
+            },
+            &ctx_c,
+            0,
+        )
+        .expect("settled → DetShell permitido");
+        assert!(
+            sealed_c.starts_with(time_debug::DET_SHELL_CMD_PREFIX),
+            "{sealed_c}"
+        );
+
+        // LLM en vuelo → bloqueado con nota accionable.
+        let r = session::apply_session_action(
+            &mut host_c,
+            command::SessionAction::DetShell {
+                command: "echo x".into(),
+            },
+            &ctx_c,
+            1,
+        );
+        assert!(r.is_none(), "con LLM en vuelo no se muta: {r:?}");
+        let notes = ctx_c.pending_notes.drain();
+        assert!(
+            notes.iter().any(|n| n.contains("vuelo")),
+            "nota accionable con la causa: {notes:?}"
+        );
+
+        // Tool call pendiente (`Acting`) → bloqueado.
+        host_c.spawn(
+            &onyx_soul_agents::AgentSpec::new("worker", "run a tool")
+                .with_tools(["fs_write"].iter().copied()),
+        );
+        for _ in 0..4 {
+            if pending_tool_calls(host_c.graph(), &v_c).is_empty() {
+                host_c.step(&mut driver_c);
+            } else {
+                break;
+            }
+        }
+        assert!(
+            !pending_tool_calls(host_c.graph(), &v_c).is_empty(),
+            "el worker debe quedar con tool call pendiente"
+        );
+        let r = session::apply_session_action(
+            &mut host_c,
+            command::SessionAction::DetShell {
+                command: "echo x".into(),
+            },
+            &ctx_c,
+            0,
+        );
+        assert!(r.is_none(), "con tool call pendiente no se muta: {r:?}");
+        let notes = ctx_c.pending_notes.drain();
+        assert!(
+            notes.iter().any(|n| n.contains("tool")),
+            "nota accionable con la causa: {notes:?}"
+        );
+
+        // Aprobación pendiente (`WaitingApproval`) → bloqueado.
+        host_c.spawn(
+            &onyx_soul_agents::AgentSpec::new("approver", "needs approval")
+                .with_tools(["fs_write"].iter().copied())
+                .with_approval_tools(["fs_write"].iter().copied()),
+        );
+        for _ in 0..4 {
+            if pending_approvals(host_c.graph(), &v_c).is_empty() {
+                host_c.step(&mut driver_c);
+            } else {
+                break;
+            }
+        }
+        assert!(
+            !pending_approvals(host_c.graph(), &v_c).is_empty(),
+            "el approver debe quedar en WaitingApproval"
+        );
+        let r = session::apply_session_action(
+            &mut host_c,
+            command::SessionAction::DetShell {
+                command: "echo x".into(),
+            },
+            &ctx_c,
+            0,
+        );
+        assert!(r.is_none(), "con aprobación pendiente no se muta: {r:?}");
+        let notes = ctx_c.pending_notes.drain();
+        assert!(
+            notes.iter().any(|n| n.contains("aprobación")),
+            "nota accionable con la causa: {notes:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);

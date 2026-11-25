@@ -786,6 +786,16 @@ impl UiIdlePump for WebHandle {
             }
         }
     }
+
+    /// `SDD-07` Fase 2: encola el comando sellado; el próximo
+    /// `WebDriver::poll` drena `incoming_events` vía `bridge.push`
+    /// (queda grabado en `ONYXTR2`).
+    fn queue_ingress(&self, event: OnyxEvent) {
+        if let Ok(mut guard) = self.hub.state.lock() {
+            guard.incoming_events.push_back(event);
+            self.hub.input_cv.notify_all();
+        }
+    }
 }
 
 /// Driver determinista para `openonyx serve` que proyecta el grafo a clientes Web/SSE.

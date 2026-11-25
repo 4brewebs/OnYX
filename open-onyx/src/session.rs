@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onyx_soul_agents::{
     AgentConfig, AgentGraph, AgentHost, AgentSpec, AgentState, ConceptId, EventBus, Graph,
-    GraphView, HeadlessDriver, OnyxSystem, PlatformDriver, RecordingBridge, ReplayBridge, Reply,
-    Responder, SnapshotStore, SubagentSystem, SurfaceBinding, SurfaceId, Vocab, pending_approvals,
+    GraphView, HeadlessDriver, IngressEvent, OnyxEvent, OnyxSystem, PlatformDriver,
+    RecordingBridge, ReplayBridge, Reply, Responder, SnapshotStore, SubagentSystem, SurfaceBinding,
+    SurfaceId, Vocab, pending_approvals,
 };
 use onyx_workspace::{
     ImpactAssessment, PendingCheckpoints, PermissionDecision, WorkspaceLedgerSystem, WorkspaceMode,
     WorkspaceModeHandle, WorkspacePolicy, WorkspaceTools, WorkspaceVocab, graph_workspace_mode,
-    graph_workspace_services,
+    graph_workspace_services, scrub_secrets,
 };
 
 use crate::command::{PendingSessionAction, PendingSystemNotes, SessionAction};
@@ -26,7 +27,11 @@ use crate::pack::{
     fork_pack_until_tick,
 };
 use crate::subagent::{MergePreviewState, SubagentHandle, effective_merge_decision};
-use crate::time_debug::{TimeDebugSnapshotStore, TimeDebugState};
+use crate::time_debug::{
+    DET_SEALED_OUTPUT_CAP_BYTES, SealedReadResult, SealedShellResult, TimeDebugSnapshotStore,
+    TimeDebugState, check_mutation_gate, confirm_branch_from_cursor, encode_det_read_command,
+    encode_det_shell_command, truncate_utf8_safe,
+};
 
 /// Interfaz mínima de bombeo UI compartida entre `TuiHandle` (`openonyx chat`) y
 /// `WebHandle` (`openonyx serve`) para que ambos corran sobre el mismo bucle determinista
@@ -35,6 +40,11 @@ pub trait UiIdlePump {
     fn render(&self, graph: &dyn GraphView);
     fn has_queued_events(&self) -> bool;
     fn pump_idle(&self, graph: &dyn GraphView);
+    /// `SDD-07` Fase 2: encola un evento de ingress interno (comando sellado
+    /// `/__onyx_det_*`) para que el **siguiente tick** del driver lo procese a
+    /// través de la cadena normal (`bridge.push` → grabado `ONYXTR2`),
+    /// conservando el EAV bit-a-bit en replay. Default no-op (p. ej. `MockUi`).
+    fn queue_ingress(&self, _event: OnyxEvent) {}
 }
 
 /// `SDD-07`: vista que ve la UI en cada iteración del bucle — el grafo vivo, o
@@ -279,17 +289,29 @@ pub fn run_session<D: SessionDriver>(
 
                     if let Some(ctx) = &action_ctx {
                         if let Some(action) = ctx.pending_action.take() {
-                            if matches!(action, SessionAction::Rewind { .. })
-                                && llm_in_flight.load(Ordering::Acquire) > 0
-                            {
+                            let inflight = llm_in_flight.load(Ordering::Acquire);
+                            if matches!(action, SessionAction::Rewind { .. }) && inflight > 0 {
                                 emit_session_note(
                                     host,
                                     &ctx.pending_notes,
                                     "[/rewind] Cannot rewind while an LLM request is in flight; wait until settled.",
                                 );
                             } else {
-                                let _ = apply_session_action(host, action, ctx);
-                                needs_follow_up_tick = false;
+                                let result = apply_session_action(host, action, ctx, inflight);
+                                // `SDD-07` Fase 2: el comando sellado se reinyecta
+                                // por la cadena de drivers normal (`queue_ingress` →
+                                // próximo `driver.poll()` → `bridge.push` → grabado
+                                // en `ONYXTR2`); el spawner lo procesa en el siguiente
+                                // tick (EAV bit-a-bit en replay, 0 I/O).
+                                needs_follow_up_tick = match result {
+                                    Some(sealed) => {
+                                        ui.queue_ingress(OnyxEvent::Ingress(
+                                            IngressEvent::Command(sealed),
+                                        ));
+                                        true
+                                    }
+                                    None => false,
+                                };
                             }
                             ui.render(SessionView::current(host, &time_debug).view());
                         }
@@ -318,17 +340,50 @@ pub fn run_session<D: SessionDriver>(
 /// - Nunca muta ni sobrescribe el `snapshots.onyxpack` de la línea temporal anterior.
 /// - Reconcilia el working tree Git en silencio (sin `println!` sobre la TUI).
 /// - Resetea `seen_reads` y sincroniza `WorkspaceModeHandle` tras restaurar.
+fn running_subagents(ctx: &SessionActionContext) -> usize {
+    ctx.subagents.as_ref().map_or(0, |s| s.active_count())
+}
+
+/// `SDD-07` Fase 2: si el cursor está por debajo del presente (rama pendiente),
+/// confirma la bifurcación **antes** de mutar la realidad (gate incluido en
+/// [`confirm_branch_from_cursor`]). Devuelve la nota de bifurcación o `Err`.
+fn ensure_branch_from_cursor(
+    host: &mut AgentHost,
+    ctx: &SessionActionContext,
+    llm_in_flight: usize,
+) -> Result<Option<String>, String> {
+    let Some(td) = &ctx.time_debug else {
+        return Ok(None);
+    };
+    if td.cursor() >= td.present() {
+        return Ok(None);
+    }
+    let summary = confirm_branch_from_cursor(
+        host,
+        td,
+        &ctx.workspace_root,
+        &ctx.ws_vocab,
+        &ctx.tools,
+        ctx.snapshot_store.as_ref(),
+        llm_in_flight,
+        running_subagents(ctx),
+    )
+    .map_err(|e| e.0.clone())?;
+    Ok(Some(summary))
+}
+
 pub fn apply_session_action(
     host: &mut AgentHost,
     action: SessionAction,
     ctx: &SessionActionContext,
-) -> String {
+    llm_in_flight: usize,
+) -> Option<String> {
     match &action {
         SessionAction::MergeSubagent { job_id } => {
             let Some(ref sub) = ctx.subagents else {
                 let msg = "[/merge] Async subagents are unavailable in this session.".to_string();
                 emit_session_note(host, &ctx.pending_notes, &msg);
-                return msg;
+                return None;
             };
             let msg = match sub.merge_job(job_id) {
                 Ok(report) => {
@@ -356,13 +411,13 @@ pub fn apply_session_action(
                 Err(err) => format!("[/merge] ERROR: {err}"),
             };
             emit_session_note(host, &ctx.pending_notes, &msg);
-            return msg;
+            return None;
         }
         SessionAction::DiscardSubagent { job_id } => {
             let Some(ref sub) = ctx.subagents else {
                 let msg = "[/discard] Async subagents are unavailable in this session.".to_string();
                 emit_session_note(host, &ctx.pending_notes, &msg);
-                return msg;
+                return None;
             };
             let msg = match sub.discard_job(job_id) {
                 Ok(summary) => {
@@ -373,7 +428,7 @@ pub fn apply_session_action(
                 Err(err) => format!("[/discard] ERROR: {err}"),
             };
             emit_session_note(host, &ctx.pending_notes, &msg);
-            return msg;
+            return None;
         }
         SessionAction::SpawnSubagent { goal, driver } => {
             // `SDD-10` Fase 4: `/spawn` crea un worktree → bloqueado fuera de BUILD
@@ -384,12 +439,12 @@ pub fn apply_session_action(
                     ctx.mode_handle.get().as_label()
                 );
                 emit_session_note(host, &ctx.pending_notes, &msg);
-                return msg;
+                return None;
             }
             let Some(ref sub) = ctx.subagents else {
                 let msg = "[/spawn] Async subagents are unavailable in this session.".to_string();
                 emit_session_note(host, &ctx.pending_notes, &msg);
-                return msg;
+                return None;
             };
             // El job queda registrado en el grafo al completar (notificación proactiva);
             // aquí solo lanzamos: 0 trabajo del grafo, 0 turno de `root`.
@@ -414,7 +469,286 @@ pub fn apply_session_action(
                 Err(err) => format!("[/spawn] ERROR: {err}"),
             };
             emit_session_note(host, &ctx.pending_notes, &msg);
-            return msg;
+            return None;
+        }
+        SessionAction::DetShell { command } => {
+            // `SDD-07` Fase 2: gate de mutación (contadores reales) → bifurcación
+            // si `cursor < present` → `WorkspaceMode` → `[permissions]` → ejecución
+            // sandboxed → comando sellado reinyectado por la cadena de drivers.
+            if let Err(check) = check_mutation_gate(
+                host.graph(),
+                &host.vocab(),
+                llm_in_flight,
+                running_subagents(ctx),
+            ) {
+                let msg = format!("[!] Blocked: {}", check.reason().unwrap_or_default());
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            if !ctx.mode_handle.get().allows_mutation() {
+                let msg = format!(
+                    "[!] Blocked in `{}` mode: switch to BUILD to run `! <cmd>`.",
+                    ctx.mode_handle.get().as_label()
+                );
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            // `[permissions]` sobre `shell_exec`: `Deny` bloquea incondicionalmente;
+            // `Ask` se satisface por la verificación explícita del usuario (el
+            // prefijo `!` **es** la aprobación: el comando no lo pide el LLM).
+            let args_json = format!(
+                r#"{{"command":{}}}"#,
+                serde_json::to_string(&command).unwrap_or_else(|_| "\"\"".to_string())
+            );
+            if ctx
+                .tools
+                .policy()
+                .evaluate_permission("shell_exec", &args_json)
+                == PermissionDecision::Deny
+            {
+                let msg = format!(
+                    "[!] Blocked by permission policy (deny rule): `! {command}`. Adjust `[permissions]` or run it inside an agent turn."
+                );
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            let branch_note = match ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                Ok(Some(note)) => Some(note),
+                Ok(None) => None,
+                Err(err) => {
+                    emit_session_note(host, &ctx.pending_notes, &err);
+                    return None;
+                }
+            };
+            return match ctx.tools.exec_det_shell(command) {
+                Ok(exec) => {
+                    let mut output = if exec.timed_out {
+                        format!("timed_out: true\nstderr:\n{}", exec.stderr)
+                    } else {
+                        let mut buf = format!(
+                            "exit_code: {}\n",
+                            exec.exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "-1".into())
+                        );
+                        if !exec.stdout.is_empty() {
+                            buf.push_str("stdout:\n");
+                            buf.push_str(&exec.stdout);
+                        }
+                        if !exec.stderr.is_empty() {
+                            buf.push_str("stderr:\n");
+                            buf.push_str(&exec.stderr);
+                        }
+                        buf
+                    };
+                    // Cap sellado 8 KiB (valor de la Fase 2; UTF-8 safe).
+                    output = truncate_utf8_safe(&output, DET_SEALED_OUTPUT_CAP_BYTES);
+                    let sealed = encode_det_shell_command(&SealedShellResult {
+                        command: command.clone(),
+                        exit_code: exec.exit_code,
+                        timed_out: exec.timed_out,
+                        output,
+                    });
+                    let mut msg = format!("[!] Executed (sealed, 0 LLM tokens): `! {command}`.");
+                    if let Some(note) = branch_note {
+                        msg.push_str(&note);
+                    }
+                    emit_session_note(host, &ctx.pending_notes, &msg);
+                    return Some(sealed);
+                }
+                Err(err) => {
+                    let msg = format!("[!] ERROR: {err}");
+                    emit_session_note(host, &ctx.pending_notes, &msg);
+                    None
+                }
+            };
+        }
+        SessionAction::DetRead {
+            path,
+            start_line,
+            end_line,
+        } => {
+            // `SDD-07` Fase 2: gate + bifurcación + lectura verificada
+            // (`resolve_existing`, rango 1-based inclusivo, `scrub_secrets`,
+            // cap 8 KiB) → comando sellado reinyectado.
+            if let Err(check) = check_mutation_gate(
+                host.graph(),
+                &host.vocab(),
+                llm_in_flight,
+                running_subagents(ctx),
+            ) {
+                let msg = format!("[/read] Blocked: {}", check.reason().unwrap_or_default());
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            let branch_note = match ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                Ok(Some(note)) => Some(note),
+                Ok(None) => None,
+                Err(err) => {
+                    emit_session_note(host, &ctx.pending_notes, &err);
+                    return None;
+                }
+            };
+            let resolved = match ctx.tools.policy().resolve_existing(path) {
+                Ok(p) => p,
+                Err(err) => {
+                    let msg = format!("[/read] {err}");
+                    emit_session_note(host, &ctx.pending_notes, &msg);
+                    return None;
+                }
+            };
+            let display_path = resolved
+                .strip_prefix(&ctx.tools.policy().root)
+                .unwrap_or(&resolved)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content_raw = match fs::read_to_string(&resolved) {
+                Ok(c) => c,
+                Err(err) => {
+                    let msg = format!("[/read] cannot read `{display_path}`: {err}");
+                    emit_session_note(host, &ctx.pending_notes, &msg);
+                    return None;
+                }
+            };
+            let lines: Vec<&str> = content_raw.lines().collect();
+            let total = lines.len();
+            let start = start_line.unwrap_or(1).max(1);
+            let end = end_line.unwrap_or(total).min(total);
+            let content = if start > end || total == 0 {
+                String::new()
+            } else {
+                lines[(start - 1)..end].join("\n")
+            };
+            let content = truncate_utf8_safe(&scrub_secrets(&content), DET_SEALED_OUTPUT_CAP_BYTES);
+            let sealed = encode_det_read_command(&SealedReadResult {
+                path: display_path.clone(),
+                start_line: *start_line,
+                end_line: *end_line,
+                content,
+            });
+            let mut msg = format!("[/read] Loaded `{display_path}` (sealed, 0 LLM tokens).");
+            if let Some(note) = branch_note {
+                msg.push_str(&note);
+            }
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return Some(sealed);
+        }
+        SessionAction::Step(n) => {
+            // `SDD-07` Fase 2: N ticks deterministas con 0 LLM (requiere frozen).
+            let Some(td) = &ctx.time_debug else {
+                let msg = "[/step] Time debug is not available in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            };
+            if !td.is_frozen() {
+                let msg =
+                    "[/step] Not frozen: use `/time` (or F1) to freeze first, then `/step [n]`."
+                        .to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            let n = (*n).clamp(1, 64);
+            for _ in 0..n {
+                host.step(&mut HeadlessDriver::new());
+                td.record_tick(host.ticks() - 1, &host.graph().export());
+            }
+            let msg = format!(
+                "[step] Advanced {n} deterministic tick(s) with 0 LLM; clock at tick {} (frozen).",
+                host.ticks()
+            );
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return None;
+        }
+        SessionAction::StepLlm => {
+            // `SDD-07` Fase 2: gate + bifurcación + presupuesto 1 turno LLM +
+            // reactivación `Done`/`Failed` → `Idle` (sin memoria `user`): el
+            // runtime transita a `Thinking` al siguiente tick y el gate
+            // (`try_acquire_llm_turn`, budget 1) despacha exactamente 1 turno.
+            let Some(td) = &ctx.time_debug else {
+                let msg = "[/step-llm] Time debug is not available in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            };
+            if !td.is_frozen() {
+                let msg = "[/step-llm] Not frozen: use `/time` (or F1) to freeze first, then `/step-llm`.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            if let Err(check) = check_mutation_gate(
+                host.graph(),
+                &host.vocab(),
+                llm_in_flight,
+                running_subagents(ctx),
+            ) {
+                let msg = format!(
+                    "[/step-llm] Blocked: {}",
+                    check.reason().unwrap_or_default()
+                );
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            }
+            if let Err(err) = ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                emit_session_note(host, &ctx.pending_notes, &err);
+                return None;
+            }
+            td.grant_step_llm(1);
+            // La reactivación del root (`Done`/`Failed` → `Idle`, sin memoria
+            // `user`) viaja sellada por la cadena de drivers: el spawner la
+            // aplica en-tick (determinista, 0 I/O, bit-a-bit en replay) y el
+            // gate `try_acquire_llm_turn` (presupuesto 1) limita el despacho a
+            // exactamente 1 turno LLM.
+            let msg = "[step-llm] Granted 1 LLM turn under freeze.".to_string();
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return Some(crate::time_debug::DET_STEP_LLM_CMD_PREFIX.to_string());
+        }
+        SessionAction::Go => {
+            // `SDD-07` Fase 2: bifurca si `cursor < present` (gate incluido) y
+            // descongela; el LLM reanuda en el siguiente tick.
+            let Some(td) = &ctx.time_debug else {
+                let msg = "[go] Time debug is not available in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            };
+            let branch_note = match ensure_branch_from_cursor(host, ctx, llm_in_flight) {
+                Ok(Some(note)) => Some(note),
+                Ok(None) => None,
+                Err(err) => {
+                    emit_session_note(host, &ctx.pending_notes, &err);
+                    return None;
+                }
+            };
+            let was_frozen = td.is_frozen();
+            td.unfreeze();
+            let mut msg = if was_frozen {
+                "[go] Unfrozen; resuming normal ticks and LLM.".to_string()
+            } else {
+                "[go] Already at present (not frozen).".to_string()
+            };
+            if let Some(note) = branch_note {
+                msg.push_str(&note);
+            }
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return None;
+        }
+        SessionAction::TimeToggle => {
+            // `SDD-07` Fase 2: conmuta congelación (0 I/O, sin gate).
+            let Some(td) = &ctx.time_debug else {
+                let msg = "[/time] Time debug is not available in this session.".to_string();
+                emit_session_note(host, &ctx.pending_notes, &msg);
+                return None;
+            };
+            let msg = if td.is_frozen() {
+                td.unfreeze();
+                "[time] Unfrozen (frozen=false); resuming normal ticks.".to_string()
+            } else {
+                td.freeze();
+                format!(
+                    "[time] Frozen at tick {} (frozen=true); 0 autonomous ticks — use `/step [n]`, `/step-llm`, `/go` or `/graph`.",
+                    td.present()
+                )
+            };
+            emit_session_note(host, &ctx.pending_notes, &msg);
+            return None;
         }
         SessionAction::Rewind { .. } | SessionAction::Fork { .. } => {}
     }
@@ -423,7 +757,7 @@ pub fn apply_session_action(
         let msg =
             "[session] Snapshot persistence is disabled; pass `--snapshot-dir <dir>`.".to_string();
         emit_session_note(host, &ctx.pending_notes, &msg);
-        return msg;
+        return None;
     };
 
     match action {
@@ -451,14 +785,14 @@ pub fn apply_session_action(
                 Err(err) => format!("[/fork] ERROR: {err}"),
             };
             emit_session_note(host, &ctx.pending_notes, &note);
-            note
+            None
         }
         SessionAction::Rewind { requested_tick } => {
             if !host.is_settled() {
                 let msg = "[/rewind] Cannot rewind while an agent is active; wait until settled."
                     .to_string();
                 emit_session_note(host, &ctx.pending_notes, &msg);
-                return msg;
+                return None;
             }
             let src_dir = store.current_dir();
             let Some(target_tick) = store.resolve_tick_or_floor(requested_tick) else {
@@ -467,7 +801,7 @@ pub fn apply_session_action(
                     src_dir.display()
                 );
                 emit_session_note(host, &ctx.pending_notes, &msg);
-                return msg;
+                return None;
             };
             let latest_tick = store.latest_tick();
 
@@ -482,7 +816,7 @@ pub fn apply_session_action(
                 Err(err) => {
                     let msg = format!("[/rewind] ERROR reconciling workspace git state: {err}");
                     emit_session_note(host, &ctx.pending_notes, &msg);
-                    return msg;
+                    return None;
                 }
             };
 
@@ -502,7 +836,7 @@ pub fn apply_session_action(
                     Err(err) => {
                         let msg = format!("[/rewind] ERROR forking snapshot pack: {err}");
                         emit_session_note(host, &ctx.pending_notes, &msg);
-                        return msg;
+                        return None;
                     }
                 }
             }
@@ -547,12 +881,18 @@ pub fn apply_session_action(
             }
             summary.push_str(&branch_note);
             emit_session_note(host, &ctx.pending_notes, &summary);
-            summary
+            None
         }
         SessionAction::MergeSubagent { .. }
         | SessionAction::DiscardSubagent { .. }
-        | SessionAction::SpawnSubagent { .. } => {
-            unreachable!("subagent session actions return early above")
+        | SessionAction::SpawnSubagent { .. }
+        | SessionAction::DetShell { .. }
+        | SessionAction::DetRead { .. }
+        | SessionAction::Step(_)
+        | SessionAction::StepLlm
+        | SessionAction::Go
+        | SessionAction::TimeToggle => {
+            unreachable!("these session actions return early above")
         }
     }
 }

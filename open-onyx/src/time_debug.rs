@@ -29,6 +29,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use onyx_soul_agents::{
     AgentGraph, AgentHost, Graph, GraphView, HeadlessDriver, OnyxError, SnapshotStore, Vocab,
     pending_approvals, pending_tool_calls,
@@ -758,6 +760,90 @@ pub fn confirm_branch_from_cursor(
     Ok(summary)
 }
 
+// ---------------------------------------------------------------------------
+// `SDD-07` Fase 2 — Comandos sellados deterministas (`ONYXTR2`)
+// ---------------------------------------------------------------------------
+
+/// Cap (bytes) de la salida sellada de `! <cmd>` / `/read` antes del sellado
+/// (truncado `UTF-8`-safe; patrón del cap de `SDD-05`, valor de la Fase 2).
+pub const DET_SEALED_OUTPUT_CAP_BYTES: usize = 8 * 1024;
+
+/// Prefijo interno reservado para el resultado sellado de una ejecución shell
+/// verificada (`! <cmd>`, Fase 2). El payload JSON lleva el **resultado ya
+/// obtenido** (no el comando a ejecutar): en replay se consume con 0 I/O.
+/// Mismo patrón que [`crate::subagent::SUBAGENT_PROPOSAL_CMD_PREFIX`].
+pub const DET_SHELL_CMD_PREFIX: &str = "/__onyx_det_shell ";
+
+/// Prefijo interno reservado para el resultado sellado de una lectura
+/// verificada (`/read`, Fase 2).
+pub const DET_READ_CMD_PREFIX: &str = "/__onyx_det_read ";
+
+/// Prefijo interno reservado para el comando sellado de `/step-llm`
+/// (Fase 2): el spawner lo intercepta en-tick y reactiva el root
+/// (`Done`/`Failed` → `Idle`) de forma determinista (0 I/O); el despacho
+/// LLM queda limitado por `try_acquire_llm_turn` (presupuesto 1) en el
+/// driver. En replay el mismo comando produce el mismo EAV (bit-a-bit).
+pub const DET_STEP_LLM_CMD_PREFIX: &str = "/__onyx_step_llm";
+
+/// Resultado sellado de una ejecución shell del borde de sesión.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedShellResult {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub output: String,
+}
+
+/// Resultado sellado de una lectura de fichero del borde de sesión
+/// (líneas 1-based, inclusivas).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedReadResult {
+    pub path: String,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub content: String,
+}
+
+/// Serializa un [`SealedShellResult`] como comando interno determinista
+/// grabable en `ONYXTR2`.
+pub fn encode_det_shell_command(result: &SealedShellResult) -> String {
+    let payload = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string());
+    format!("{DET_SHELL_CMD_PREFIX}{payload}")
+}
+
+/// Decodifica un comando sellado `/__onyx_det_shell {...}`; `None` ante
+/// prefijo o payload corrupto/malformado (nunca pánico, nunca silencio).
+pub fn decode_det_shell_command(raw_cmd: &str) -> Option<SealedShellResult> {
+    let payload = raw_cmd.trim().strip_prefix(DET_SHELL_CMD_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// Serializa un [`SealedReadResult`] como comando interno determinista
+/// grabable en `ONYXTR2`.
+pub fn encode_det_read_command(result: &SealedReadResult) -> String {
+    let payload = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string());
+    format!("{DET_READ_CMD_PREFIX}{payload}")
+}
+
+/// Decodifica un comando sellado `/__onyx_det_read {...}` (misma disciplina
+/// que [`decode_det_shell_command`]).
+pub fn decode_det_read_command(raw_cmd: &str) -> Option<SealedReadResult> {
+    let payload = raw_cmd.trim().strip_prefix(DET_READ_CMD_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// Trunca a como mucho `max_bytes` sin partir un carácter `UTF-8`.
+pub fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,5 +1505,79 @@ mod tests {
             1,
             "el grafo debe restaurarse desde el anillo RAM (solo `alpha`)"
         );
+    }
+
+    // --- TEST-07.2: codecs sellados (`SDD-07` Fase 2) ------------------------
+
+    #[test]
+    fn det_shell_codec_round_trips_and_rejects_corruption() {
+        let result = SealedShellResult {
+            command: "cargo test".to_string(),
+            exit_code: Some(0),
+            timed_out: false,
+            output: "exit_code: 0\nstdout:\nok\nstderr:\n".to_string(),
+        };
+        let wire = encode_det_shell_command(&result);
+        assert!(wire.starts_with(DET_SHELL_CMD_PREFIX), "{wire}");
+        assert_eq!(decode_det_shell_command(&wire), Some(result.clone()));
+        // Idempotencia del decode: la segunda pasada devuelve el mismo valor.
+        assert_eq!(
+            decode_det_shell_command(&wire),
+            decode_det_shell_command(&wire)
+        );
+
+        // Payload corrupto / malformado → `None` (nunca pánico).
+        assert_eq!(decode_det_shell_command("/__onyx_det_shell {no json"), None);
+        assert_eq!(
+            decode_det_shell_command("/__onyx_det_shell {\"command\":"),
+            None
+        );
+        assert_eq!(
+            decode_det_shell_command("/__onyx_det_shell {\"command\":1}"),
+            None,
+            "tipos incorrectos se rechazan"
+        );
+        assert_eq!(decode_det_shell_command("/__onyx_det_read {}"), None);
+        assert_eq!(decode_det_shell_command("/new"), None);
+        assert_eq!(decode_det_shell_command(""), None);
+    }
+
+    #[test]
+    fn det_read_codec_round_trips_and_rejects_corruption() {
+        let result = SealedReadResult {
+            path: "notes.md".to_string(),
+            start_line: Some(2),
+            end_line: Some(5),
+            content: "line2\nline3\nline4\nline5".to_string(),
+        };
+        let wire = encode_det_read_command(&result);
+        assert!(wire.starts_with(DET_READ_CMD_PREFIX), "{wire}");
+        assert_eq!(decode_det_read_command(&wire), Some(result.clone()));
+        assert_eq!(
+            decode_det_read_command(&wire),
+            decode_det_read_command(&wire)
+        );
+
+        assert_eq!(decode_det_read_command("/__onyx_det_read [1,2"), None);
+        assert_eq!(
+            decode_det_read_command("/__onyx_det_read {\"path\":42}"),
+            None
+        );
+        assert_eq!(decode_det_read_command("/__onyx_det_shell {}"), None);
+        assert_eq!(decode_det_read_command("/read notes.md"), None);
+    }
+
+    #[test]
+    fn truncate_utf8_safe_never_splits_multibyte() {
+        // `hé` = 3 bytes; truncar a 4 debe dejar `hél` (4 bytes), no partir `ó`.
+        let s = "héllo wörld";
+        assert_eq!(truncate_utf8_safe(s, 4), "hél");
+        assert_eq!(truncate_utf8_safe(s, 4).len(), 4);
+        // Truncar a 2 deja `h` (1 byte), no medio carácter.
+        assert_eq!(truncate_utf8_safe(s, 2), "h");
+        // Sin traspaso de cap → cadena idéntica.
+        assert_eq!(truncate_utf8_safe(s, 1024), s);
+        // Cap 0 → cadena vacía.
+        assert_eq!(truncate_utf8_safe(s, 0), "");
     }
 }
