@@ -86,3 +86,36 @@ fn three_turns_without_rewind_reach_the_provider() {
     assert!(ok, "turn 3: state={state} says={says:?}");
     assert_eq!(fake.requests().len(), 3);
 }
+
+/// Rewind en vivo al milestone del turno 1 y nuevo turno: debe despacharse al proveedor.
+#[test]
+#[ignore = "BUG: DynamicLlmDriver::dispatched no se limpia tras /rewind; el turno nuevo reutiliza (agent, request) y nunca se envía al proveedor (open-onyx/src/llm_driver.rs:152)"]
+fn new_turn_after_live_rewind_is_dispatched_to_the_provider() {
+    let fake = FakeOpenAi::start(vec![text("uno"), text("dos"), text("tres")]);
+    let snaps = TempDir::new("snaps_rewind");
+    let serve = serve_with_snapshots(&fake, &snaps);
+
+    assert_eq!(run_goal(&serve, "primero").0, "done");
+    let tick_after_turn1 = state_json(&serve)["tick"].as_u64().unwrap();
+    let (ok, state, says) = continue_turn(&serve, &fake, "segundo", "dos");
+    assert!(ok, "turn 2: state={state} says={says:?}");
+
+    assert_eq!(
+        serve.command(&format!("/rewind {tick_after_turn1}")),
+        r#"{"ok":true}"#
+    );
+    // El rewind se aplica en el bucle: espera a que «dos» desaparezca de la memoria.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while root_says(&serve).1.iter().any(|s| s == "dos") {
+        assert!(Instant::now() < deadline, "rewind was not applied");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fake.requests().len(), 2);
+
+    let (ok, state, says) = continue_turn(&serve, &fake, "tercero", "tres");
+    let reqs = fake.requests().len();
+    assert!(
+        ok,
+        "turn after rewind must reach the provider and finish: requests={reqs} state={state} says={says:?}"
+    );
+}

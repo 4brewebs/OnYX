@@ -116,3 +116,31 @@ fn restore_with_fresh_bridge_redispatches_restored_request() {
         "calls after restore: {after:?}"
     );
 }
+
+/// Rewind en vivo: mismo host, mismo `RecordingBridge`. La petición `(agent, 1)` vuelve a
+/// estar pendiente tras el restore y debe despacharse otra vez.
+#[test]
+#[ignore = "BUG: RecordingBridge::dispatched no se limpia tras restore; la petición restaurada (agent, request) se salta y el agente queda colgado (onyx-soul-agents/src/bridge.rs:356)"]
+fn restore_with_same_bridge_redispatches_restored_request() {
+    let store = Store::default();
+    let calls: Calls = Rc::default();
+    let (mut host, mut bridge) = run_first_session(&store, &calls);
+    let agent = host.agents()[0];
+
+    host.request_restore("cut");
+    host.step(&mut bridge);
+    assert_ne!(
+        host.agent_state(agent),
+        Some(AgentState::Done),
+        "restore must bring back the pending request"
+    );
+    let settled = host.run_until_settled(&mut bridge, 50);
+    let after: Vec<(u64, u64)> = calls.borrow()[2..].to_vec();
+    assert_eq!(
+        after.first(),
+        Some(&(agent.0, 1)),
+        "restored request must be dispatched again; calls after restore: {after:?}"
+    );
+    assert!(settled, "agent must settle after restore");
+    assert_eq!(host.agent_state(agent), Some(AgentState::Done));
+}
