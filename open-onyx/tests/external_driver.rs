@@ -739,7 +739,7 @@ fn harness_does_not_inherit_user_xdg_cache_home() {
 /// `.onyx/vault/x`) se materializan en el worktree y el harness los lee.
 #[cfg(unix)]
 #[test]
-#[ignore = "BUG: FIX-91 el worktree del harness nace del árbol vivo con git add -A y materializa ficheros del plano de control no ignorados (.env*, .onyx/vault/**): el harness lee secretos del root (onyx-workspace/src/worktree.rs:299-303)"]
+#[ignore = "BUG: FIX-91 el worktree del harness nace del árbol vivo con git add -A y materializa ficheros del plano de control no ignorados (.env*, .onyx/vault/**): el harness lee secretos del root (onyx-workspace/src/worktree.rs:299-303 → state.rs:272-290, sin excluir el plano de control)"]
 fn control_plane_files_are_not_materialized_in_worktree() {
     let sc = Scenario::new("ext_cp_files");
     fs::write(sc.ws().join(".env.test"), "SECRET=forja-dummy-dotenv\n").unwrap();
