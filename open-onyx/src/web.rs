@@ -147,8 +147,8 @@ mod ctrl_c {
     const SIGTERM: i32 = 15;
     const SIG_DFL: usize = 0;
 
-    /// FFI directo a libc (sin añadir la crate `libc`: el `Cargo.lock` es
-    /// invariante de SDD-04).
+    // FFI directo a libc (sin añadir la crate `libc`: el `Cargo.lock` es
+    // invariante de SDD-04).
     unsafe extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
     }
