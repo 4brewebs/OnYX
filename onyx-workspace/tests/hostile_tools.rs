@@ -219,7 +219,7 @@ mod symlinks {
     /// enlace: lo da por inexistente, resuelve el padre (dentro) y `fs::write` sigue el
     /// enlace y crea el fichero fuera del workspace.
     #[test]
-    #[ignore = "BUG: fs_write a través de un symlink colgante crea el fichero FUERA del workspace: resolve_for_write usa exists() (sigue el enlace) y no comprueba symlink_metadata (onyx-workspace/src/policy.rs:1180-1196, tools.rs:1139-1144)"]
+    #[ignore = "BUG: FIX-04 fs_write a través de un symlink colgante crea el fichero FUERA del workspace: resolve_for_write usa exists() (sigue el enlace) y no comprueba symlink_metadata (onyx-workspace/src/policy.rs:1180-1196, tools.rs:1139-1144)"]
     fn dangling_symlink_to_outside_cannot_create_file_outside() {
         let env = Env::new("dangling");
         let target = env.outside().join("nuevo.txt");
@@ -236,7 +236,7 @@ mod symlinks {
     /// P0-4: symlink dentro del workspace que apunta a `.onyx/config.toml`. El control
     /// plane se comprueba sobre la ruta cruda (`ln`) y luego se canoniza y se escribe.
     #[test]
-    #[ignore = "BUG: fs_write a través de un symlink (de fichero o de directorio) que apunta al plano de control sobrescribe .onyx/config.toml: check_control_plane_write mira la ruta cruda antes de canonizar; fs_edit sí queda bloqueado (onyx-workspace/src/tools.rs:1136-1137; policy.rs:1015-1024, :1175-1197)"]
+    #[ignore = "BUG: FIX-05 fs_write a través de un symlink (de fichero o de directorio) que apunta al plano de control sobrescribe .onyx/config.toml: check_control_plane_write mira la ruta cruda antes de canonizar; fs_edit sí queda bloqueado (onyx-workspace/src/tools.rs:1136-1137; policy.rs:1015-1024, :1175-1197)"]
     fn symlink_to_control_plane_cannot_be_written() {
         let env = Env::new("cplink");
         fs::create_dir_all(env.ws().join(".onyx")).unwrap();
@@ -315,7 +315,7 @@ fn fs_read_many_lines_is_capped_by_max_read_bytes() {
 /// P0-11: UNA sola línea enorme sin `\n`. El límite se comprueba después de añadir la
 /// línea entera, así que la salida es ~1 MiB con `max_read_bytes = 1024`.
 #[test]
-#[ignore = "BUG: fs_read no acota una línea larga: el tope max_read_bytes se comprueba tras añadir la línea completa, y una línea de 1 MiB sale entera (onyx-workspace/src/tools.rs:1045-1056)"]
+#[ignore = "BUG: FIX-07 fs_read no acota una línea larga: el tope max_read_bytes se comprueba tras añadir la línea completa, y una línea de 1 MiB sale entera (onyx-workspace/src/tools.rs:1045-1056)"]
 fn fs_read_single_huge_line_is_capped_by_max_read_bytes() {
     let env = Env::new("hugeline");
     fs::write(env.ws().join("one.txt"), "y".repeat(1 << 20)).unwrap();
@@ -445,7 +445,7 @@ fn ask_allow_overlap_is_resolved_by_specificity() {
 /// P0-17: la regla `deny` se evalúa sobre la ruta cruda; `x/../secrets/k` o
 /// `secrets//k` apuntan al mismo fichero y no casan con `secrets/*`.
 #[test]
-#[ignore = "BUG: una regla deny de ruta se evade con rutas no normalizadas (x/../secrets/k, secrets//k): extract_rule_subject solo cambia \\ por / y quita ./ (onyx-workspace/src/policy.rs:445-451)"]
+#[ignore = "BUG: FIX-06 una regla deny de ruta se evade con rutas no normalizadas (x/../secrets/k, secrets//k): extract_rule_subject solo cambia \\ por / y quita ./ (onyx-workspace/src/policy.rs:445-451)"]
 fn deny_rule_cannot_be_evaded_with_unnormalized_paths() {
     let r = rules(&["fs_write(secrets/*)"], &["fs_write(*)"], &[]);
     for raw in ["x/../secrets/k", "secrets//k", "./secrets/./k"] {
@@ -612,7 +612,7 @@ fn plan_mode_policy_denies_fs_write() {
 /// Plan (el `WorkspaceModeHandle` compartido con el bridge dice Plan), cualquier llamada a
 /// `execute` sobre las mismas herramientas escribe igualmente: solo el bridge lo filtra.
 #[test]
-#[ignore = "BUG (diseño, decide Lince): WorkspaceTools::execute no aplica WorkspaceMode; con la sesión en Plan, fs_write por execute() escribe en disco; el modo solo se aplica en WorkspaceToolBridge (onyx-workspace/src/tools.rs:805-815, :1135-1144; bridge.rs:574)"]
+#[ignore = "BUG: FIX-26 (diseño, decide Lucas §7) WorkspaceTools::execute no reaplica WorkspaceMode; con la sesión en Plan, fs_write por execute() escribe en disco; el modo solo se aplica en WorkspaceToolBridge (onyx-workspace/src/tools.rs:805-815, :1135-1144; bridge.rs:574)"]
 fn execute_refuses_mutations_while_session_is_in_plan_mode() {
     use onyx_soul_agents::AgentHost;
     use onyx_workspace::{WorkspaceModeHandle, WorkspaceToolBridge};
