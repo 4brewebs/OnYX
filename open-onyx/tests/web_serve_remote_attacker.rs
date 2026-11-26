@@ -102,7 +102,7 @@ fn vps_bind_requires_the_explicit_key_and_never_prints_it() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG: read_line sin tope (web.rs:2046/2068); 4 conexiones con líneas de 64 MiB inflan el RSS cientos de MiB"]
+#[ignore = "BUG: FIX-08 read_line sin tope (web.rs:2046/2068); 4 conexiones con líneas de 64 MiB inflan el RSS cientos de MiB"]
 fn unauthenticated_giant_header_lines_do_not_grow_memory() {
     hard_timeout(Duration::from_secs(120), || {
         let srv = vps("vps_rss");
@@ -143,7 +143,7 @@ fn unauthenticated_giant_header_lines_do_not_grow_memory() {
 }
 
 #[test]
-#[ignore = "BUG: al superar 16 KiB de cabecera o 64 KiB de cuerpo el servidor cierra en silencio en vez de responder 431/413"]
+#[ignore = "BUG: FIX-11 al superar 16 KiB de cabecera o 64 KiB de cuerpo el servidor cierra en silencio en vez de responder 431/413"]
 fn oversized_requests_get_a_4xx_answer() {
     hard_timeout(Duration::from_secs(60), || {
         let srv = vps("vps_4xx");
@@ -275,7 +275,7 @@ fn slowloris_does_not_block_a_legitimate_client() {
 }
 
 #[test]
-#[ignore = "BUG: no hay plazo total por petición; un byte cada <10 s mantiene la conexión y su hilo indefinidamente"]
+#[ignore = "BUG: FIX-09 no hay plazo total por petición; un byte cada <10 s mantiene la conexión y su hilo indefinidamente"]
 fn slowloris_connections_are_cut_by_a_total_request_deadline() {
     hard_timeout(Duration::from_secs(90), || {
         let srv = vps("vps_slowloris_deadline");
@@ -343,7 +343,7 @@ fn idle_unauthenticated_connections_release_threads_and_fds_after_close() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG: sin tope de conexiones concurrentes; accept_loop crea un hilo por conexión (300 conexiones ociosas ⇒ ~300 hilos)"]
+#[ignore = "BUG: FIX-09 sin tope de conexiones concurrentes; accept_loop crea un hilo por conexión (300 conexiones ociosas ⇒ ~300 hilos)"]
 fn concurrent_unauthenticated_connections_are_capped() {
     hard_timeout(Duration::from_secs(60), || {
         let srv = vps("vps_conn_cap");
@@ -393,7 +393,7 @@ fn brute_force_never_locks_out_the_real_key() {
 }
 
 #[test]
-#[ignore = "BUG: login sin rate limit ni retardo; 200 intentos fallidos seguidos responden 401 al instante"]
+#[ignore = "BUG: FIX-14 login sin rate limit ni retardo; 200 intentos fallidos seguidos responden 401 al instante"]
 fn login_brute_force_is_rate_limited() {
     hard_timeout(Duration::from_secs(120), || {
         let srv = vps("vps_ratelimit");
@@ -422,7 +422,7 @@ fn login_brute_force_is_rate_limited() {
 // --------------------------------------------------------------- 6. logout (ver web_serve_bugs)
 
 #[test]
-#[ignore = "BUG: logout no revoca la sesión (token fijo desde WebHub::new, web.rs:505-507); también en bind público"]
+#[ignore = "BUG: FIX-10 logout no revoca la sesión (token fijo desde WebHub::new, web.rs:505-507); también en bind público"]
 fn vps_session_cookie_stops_working_after_logout() {
     hard_timeout(Duration::from_secs(60), || {
         let srv = vps("vps_logout");
@@ -584,7 +584,7 @@ fn cross_site_fetch_metadata_blocks_every_post_on_a_public_bind() {
 }
 
 #[test]
-#[ignore = "BUG: sin Sec-Fetch-Site el guard CSRF no mira Origin; POST con cookie y Origin ajeno se acepta (mitigado por SameSite=Lax)"]
+#[ignore = "BUG: FIX-42 sin Sec-Fetch-Site el guard CSRF no mira Origin; POST con cookie y Origin ajeno se acepta (mitigado por SameSite=Lax)"]
 fn foreign_origin_without_fetch_metadata_is_rejected() {
     hard_timeout(Duration::from_secs(60), || {
         let srv = vps("vps_origin");

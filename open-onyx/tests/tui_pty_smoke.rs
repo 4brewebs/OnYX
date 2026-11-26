@@ -342,7 +342,7 @@ mod pty {
 /// `Debug` (`Error: Os { code: 6, kind: Uncategorized, message: "No such device or
 /// address" }`) y el usuario no sabe que falta un terminal interactivo.
 #[test]
-#[ignore = "BUG: chat sin TTY imprime `Os { code: 6, .. }` en vez de pedir un terminal interactivo"]
+#[ignore = "BUG: FIX-92 chat sin TTY imprime `Os { code: 6, .. }` en vez de pedir un terminal interactivo"]
 fn chat_without_a_tty_explains_that_a_terminal_is_required() {
     let ws = TempWorkspace::new("tui_notty_msg");
     let mut cmd = hermetic_command(&ws.home);

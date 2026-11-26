@@ -278,7 +278,7 @@ fn serve_without_any_provider_key_fails_with_actionable_message() {
 /// BUG: los errores de E/S se imprimen con `Debug` (`Error: Os { code: 2, kind: NotFound,
 /// message: "No such file or directory" }`) sin decir qué ruta falló.
 #[test]
-#[ignore = "BUG: replay/doctor con ruta inexistente imprimen `Os { code: 2, .. }` sin la ruta"]
+#[ignore = "BUG: FIX-92 replay/doctor con ruta inexistente imprimen `Os { code: 2, .. }` sin la ruta"]
 fn missing_paths_are_named_in_the_error_message() {
     let ws = TempWorkspace::new("cli_missing");
     let missing = ws.ws.join("forja-missing.tr");

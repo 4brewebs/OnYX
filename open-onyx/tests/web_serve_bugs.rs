@@ -12,7 +12,7 @@ use std::time::Duration;
 /// autenticar puede hacer crecer la memoria del proceso sin límite enviando una línea
 /// sin `\n`. Lo correcto es dejar de leer (y cerrar) en cuanto se superan los 16 KiB.
 #[test]
-#[ignore = "BUG: read_line sin tope; el límite de 16 KiB de cabecera se comprueba después de leer la línea entera"]
+#[ignore = "BUG: FIX-08 read_line sin tope; el límite de 16 KiB de cabecera se comprueba después de leer la línea entera"]
 fn header_limit_is_enforced_while_reading_not_after() {
     for prefix in [&b"GET /"[..], &b"GET / HTTP/1.1\r\nX-Long: "[..]] {
         let mut srv = ServeGuard::start("bug_header_line");
@@ -42,7 +42,7 @@ fn header_limit_is_enforced_while_reading_not_after() {
 /// pide al navegador que borre la cookie: una cookie copiada antes del logout sigue
 /// autenticando hasta reiniciar `serve`. Logout debería revocar la sesión en el servidor.
 #[test]
-#[ignore = "BUG: logout no revoca la sesión; el token de cookie es fijo durante toda la vida del proceso"]
+#[ignore = "BUG: FIX-10 logout no revoca la sesión; el token de cookie es fijo durante toda la vida del proceso"]
 fn session_cookie_stops_working_after_logout() {
     let srv = ServeGuard::start("bug_logout");
     let cookie = srv.login_cookie();
