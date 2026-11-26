@@ -42,6 +42,14 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
+        // Los comandos de `shell_exec` crean `<temp_dir>/onyx-sandbox-<hash(ws)>` en el
+        // proceso de test. No se puede redirigir `TMPDIR` aquí (el entorno del proceso es
+        // compartido por los hilos del test: `set_var` es inseguro), así que se borra SOLO el
+        // directorio que corresponde a este `ws()` único (su nombre sale de la ruta del
+        // workspace); los restos de ejecuciones anteriores no se tocan.
+        if let Ok(tmp) = onyx_workspace::ensure_sandbox_tmp_dir(&self.ws()) {
+            let _ = fs::remove_dir_all(tmp);
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -131,8 +139,8 @@ fn limited_tools(env: &Env, mode: SandboxMode) -> WorkspaceTools {
 /// cgroup v2. Cualquiera de los dos mecanismos cuenta como límite aplicado.
 ///
 /// La sonda usa SOLO builtins de `sh` (`read`, `echo`, expansión de parámetros): nada de
-/// `cat`, `cut` ni `$(…)`, que hacen `fork`. Con `RLIMIT_NPROC = 37` (límite por USUARIO, y
-/// el usuario ya tiene más procesos que eso) un `fork` falla con «Cannot fork» aunque el
+/// `cat`, `cut` ni `$(…)`, que hacen `fork`. Con un `RLIMIT_NPROC` bajo (p. ej. 37; límite por
+/// USUARIO, y el usuario ya tiene más procesos que eso) un `fork` falla con «Cannot fork» aunque el
 /// límite esté bien aplicado, y la sonda daría un falso rojo con la corrección hecha.
 const PROBE: &str = r#"while IFS= read -r l; do echo "$l"; done </proc/self/limits
 cg=
@@ -174,8 +182,8 @@ fn mem_applied(out: &str) -> bool {
         || out.contains(&format!("CG_MEM={bytes}\n"))
 }
 
-/// Control FIX-39: la sonda funciona (el hijo ve sus límites) y en el estado actual no hay
-/// un límite de 37 procesos heredado del entorno del test.
+/// Control FIX-39: la sonda funciona (el hijo ve sus límites) y lee `Max processes`, `Max
+/// address space` y el cgroup sin hacer `fork`.
 #[cfg(target_os = "linux")]
 #[test]
 fn child_limits_probe_reads_proc_self_limits() {
@@ -191,7 +199,7 @@ fn child_limits_probe_reads_proc_self_limits() {
     assert!(out.contains("CG_PIDS=") && out.contains("CG_MEM="), "{out}");
 }
 
-/// FIX-39: con `max_pids = 37` y `max_memory_mb = 300`, el hijo de `shell_exec` no ve
+/// FIX-39: con `max_pids = 30_011` ([`PIDS`]) y `max_memory_mb = 300` ([`MEM_MB`]), el hijo de `shell_exec` no ve
 /// ninguno de los dos límites (ni rlimit ni cgroup). En Unix `ProcessJob::assign` ignora
 /// `ProcessLimits`.
 #[cfg(target_os = "linux")]
