@@ -103,7 +103,13 @@ fn writes_through_hardlink_do_not_modify_file_outside_workspace() {
 
 // ───────────── FIX-39: límites del hijo ─────────────
 
-const PIDS: u32 = 37;
+/// Tope de procesos pedido. Distinto del `Max processes` por defecto de cualquier máquina y
+/// MAYOR que los procesos que ya tiene el usuario: `RLIMIT_NPROC` cuenta por usuario, no por
+/// hijo, así que un tope bajo (p. ej. 37) hace fallar `fork`/`clone` del propio sandbox
+/// (`bwrap: Creating new namespace failed`) en cualquier máquina con más procesos del mismo
+/// usuario, aunque la corrección esté bien hecha. Lo que se comprueba es que el límite se
+/// APLICA al hijo, no que frene una fork bomb.
+const PIDS: u32 = 30_011;
 const MEM_MB: u64 = 300;
 
 fn limited_tools(env: &Env, mode: SandboxMode) -> WorkspaceTools {
@@ -123,7 +129,16 @@ fn limited_tools(env: &Env, mode: SandboxMode) -> WorkspaceTools {
 
 /// Lo que el hijo observa: `/proc/self/limits` y, si existe, `pids.max`/`memory.max` de su
 /// cgroup v2. Cualquiera de los dos mecanismos cuenta como límite aplicado.
-const PROBE: &str = "cat /proc/self/limits; cg=$(cut -d: -f3 /proc/self/cgroup | head -n1); echo \"CG_PIDS=$(cat /sys/fs/cgroup$cg/pids.max 2>/dev/null)\"; echo \"CG_MEM=$(cat /sys/fs/cgroup$cg/memory.max 2>/dev/null)\"";
+///
+/// La sonda usa SOLO builtins de `sh` (`read`, `echo`, expansión de parámetros): nada de
+/// `cat`, `cut` ni `$(…)`, que hacen `fork`. Con `RLIMIT_NPROC = 37` (límite por USUARIO, y
+/// el usuario ya tiene más procesos que eso) un `fork` falla con «Cannot fork» aunque el
+/// límite esté bien aplicado, y la sonda daría un falso rojo con la corrección hecha.
+const PROBE: &str = r#"while IFS= read -r l; do echo "$l"; done </proc/self/limits
+cg=
+{ IFS= read -r l; } </proc/self/cgroup 2>/dev/null && cg=${l##*:}
+v=; { IFS= read -r v; } </sys/fs/cgroup$cg/pids.max 2>/dev/null; echo "CG_PIDS=$v"
+v=; { IFS= read -r v; } </sys/fs/cgroup$cg/memory.max 2>/dev/null; echo "CG_MEM=$v""#;
 
 fn limit_soft(out: &str, label: &str) -> Option<String> {
     out.lines()
@@ -139,7 +154,12 @@ fn probe(env: &Env, mode: SandboxMode) -> String {
 }
 
 fn json_escape(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    )
 }
 
 fn pids_applied(out: &str) -> bool {
@@ -163,6 +183,12 @@ fn child_limits_probe_reads_proc_self_limits() {
     let out = probe(&env, SandboxMode::Off);
     assert!(out.contains("Max processes"), "{out}");
     assert!(out.contains("Max address space"), "{out}");
+    // La sonda no hace `fork`: ni «Cannot fork» ni comandos externos que falten.
+    assert!(
+        !out.contains("Cannot fork") && !out.contains("not found"),
+        "{out}"
+    );
+    assert!(out.contains("CG_PIDS=") && out.contains("CG_MEM="), "{out}");
 }
 
 /// FIX-39: con `max_pids = 37` y `max_memory_mb = 300`, el hijo de `shell_exec` no ve
