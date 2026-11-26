@@ -8,6 +8,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,11 @@ struct Srv {
     child: Child,
     port: u16,
     _home: TempDir,
-    ws: TempDir,
+    /// Raíz del escenario: contiene `ws/` (workspace), `.onyx-wt/` (hermano del workspace, lo crea
+    /// `serve`) y `tmp/` (`TMPDIR` de `serve`, donde va `onyx-sandbox-<hash>`); todo se borra
+    /// con ella y nada queda en `/tmp`.
+    _root: TempDir,
+    ws: PathBuf,
 }
 
 impl Drop for Srv {
@@ -36,12 +41,15 @@ impl Drop for Srv {
 fn launch(prefix: &[&str], extra: &[&str], api_base: &str, key_via_env: bool) -> Srv {
     use std::io::{BufRead, BufReader};
     let home = TempDir::new("vps_home");
-    let ws = TempDir::new("vps_ws");
-    std::fs::write(ws.0.join("README.md"), "fixture\n").unwrap();
+    let root = TempDir::new("vps_root");
+    let ws = root.0.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(root.0.join("tmp")).unwrap();
+    std::fs::write(ws.join("README.md"), "fixture\n").unwrap();
     assert!(
         Command::new("git")
             .args(["init", "-q"])
-            .current_dir(&ws.0)
+            .current_dir(&ws)
             .status()
             .unwrap()
             .success()
@@ -59,12 +67,13 @@ fn launch(prefix: &[&str], extra: &[&str], api_base: &str, key_via_env: bool) ->
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
+        .env("TMPDIR", root.0.join("tmp"))
         .env("ONYX_TRUST_FILE", home.0.join("trusted.toml"))
         .env("OPENAI_API_KEY", PROVIDER_KEY)
         .args([
             "serve",
             "--workspace",
-            ws.0.to_str().unwrap(),
+            ws.to_str().unwrap(),
             "--bind",
             "127.0.0.1:0",
             "--provider",
@@ -118,6 +127,7 @@ fn launch(prefix: &[&str], extra: &[&str], api_base: &str, key_via_env: bool) ->
         child,
         port,
         _home: home,
+        _root: root,
         ws,
     }
 }
@@ -372,9 +382,14 @@ fn listener_survives_burst_below_thread_limit() {
 
 /// FIX-35: al agotar hilos, `thread::spawn` hace pánico DENTRO del hilo de `accept_loop`;
 /// el listener muere para siempre y el proceso sigue vivo (sin reinicio por systemd).
+///
+/// OJO: sin user namespaces (o sin `prlimit`) este test imprime `SKIP: …` y SALE EN VERDE sin
+/// haber evaluado nada. Con `-- --ignored` en un host así pasa aunque el bug siga ahí: ese
+/// verde NO significa que FIX-35 esté arreglado. Hay que verlo en un host con `unshare` y
+/// `prlimit` (ejecutar con `--nocapture` y comprobar que no aparece `SKIP`).
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG: FIX-35 si thread::spawn falla (EAGAIN por RLIMIT_NPROC), el pánico mata el hilo de accept_loop; el proceso sigue vivo pero no vuelve a aceptar conexiones (open-onyx/src/web.rs:1520)"]
+#[ignore = "BUG: FIX-35 si thread::spawn falla (EAGAIN por RLIMIT_NPROC), el pánico mata el hilo de accept_loop; el proceso sigue vivo pero no vuelve a aceptar conexiones (open-onyx/src/web.rs:1520). Sin userns/prlimit sale `SKIP` EN VERDE: eso no significa que esté arreglado"]
 fn listener_survives_thread_exhaustion() {
     let Some(prefix) = nproc_prefix_or_skip("listener_survives_thread_exhaustion") else {
         return;
@@ -431,7 +446,7 @@ fn child_env(sandbox: &str) -> String {
         r#"{"command":"print the env"}"#,
     );
     assert_eq!(status, 200, "{resp}");
-    let leak = srv.ws.0.join("leak.txt");
+    let leak = srv.ws.join("leak.txt");
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline && fake.requests().len() < 2 {
         std::thread::sleep(Duration::from_millis(100));
@@ -519,6 +534,9 @@ fn login_behind_https_proxy_sets_secure_host_cookie() {
     let cookie = set_cookie_line(&resp);
     assert!(cookie.contains("__Host-"), "{cookie}");
     assert!(cookie.contains("Secure"), "{cookie}");
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+    assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    assert!(cookie.contains("Path=/"), "{cookie}");
 }
 
 /// Control FIX-36: en loopback puro y sin proxy, HTTP sin `Secure` es el comportamiento local
@@ -530,8 +548,15 @@ fn login_on_plain_loopback_keeps_local_http_cookie() {
     let (status, resp) = login_with(srv.port, &[]);
     assert_eq!(status, 200, "{resp}");
     let cookie = set_cookie_line(&resp);
-    assert!(cookie.contains("onyx_session="), "{cookie}");
+    assert!(cookie.starts_with("Set-Cookie: onyx_session="), "{cookie}");
+    assert!(!cookie.contains("__Host-"), "{cookie}");
     assert!(!cookie.contains("Secure"), "{cookie}");
+    assert!(!has_header(&resp, "Strict-Transport-Security"), "{resp}");
+    // Lo que el rojo de abajo no debe tocar: la cookie local sigue inaccesible a JS, no
+    // viaja en peticiones cross-site y cubre toda la app.
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+    assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    assert!(cookie.contains("Path=/"), "{cookie}");
 }
 
 /// FIX-36: con un bind NO loopback (despliegue en un VPS) y un proxy que no manda
