@@ -6,9 +6,9 @@
 //! workspace tiene ficheros con espacio y con `+` en el nombre para que cada lectura dé
 //! un resultado distinto.
 
-mod common;
+mod common_web;
 
-use common::{ServeGuard, ServeOpts};
+use common_web::{ServeGuard, ServeOpts};
 use std::path::Path;
 
 fn files(srv: &ServeGuard, raw_query: &str) -> Vec<String> {

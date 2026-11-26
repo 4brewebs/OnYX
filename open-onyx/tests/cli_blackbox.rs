@@ -4,9 +4,9 @@
 //! Invariantes: entrada inválida ⇒ código de salida distinto de cero, mensaje en
 //! stderr y nunca un `panicked`; ningún comando se cuelga (tiempo límite).
 
-mod common;
+mod common_web;
 
-use common::{TempWorkspace, hermetic_command, run_with_timeout};
+use common_web::{TempWorkspace, hermetic_command, run_with_timeout};
 use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(30);

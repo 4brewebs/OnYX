@@ -7,9 +7,9 @@
 //! - SSE: cabeceras, formato `event:`/`data:`, eventos vivos tras una mutación, límite de
 //!   32 suscriptores y liberación de plazas cuando el cliente corta.
 
-mod common;
+mod common_web;
 
-use common::{ServeGuard, build_request};
+use common_web::{ServeGuard, build_request};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};

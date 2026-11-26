@@ -5,9 +5,9 @@
 //! 10 s por conexión), concurrencia, rutas estáticas hostiles y fuzz determinista.
 //! Invariante común: el proceso sigue vivo y atendiendo después de cada agresión.
 
-mod common;
+mod common_web;
 
-use common::{Rng, ServeGuard, build_request};
+use common_web::{Rng, ServeGuard, build_request};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 

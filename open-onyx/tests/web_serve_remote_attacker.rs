@@ -5,9 +5,9 @@
 //! memoria, hilos y descriptores leen `/proc/<pid>` y solo se hacen en Linux. Lo que
 //! falla hoy está en `#[ignore = "BUG: ..."]` (ejecutar con `-- --ignored`).
 
-mod common;
+mod common_web;
 
-use common::{ServeGuard, ServeOpts, build_request};
+use common_web::{ServeGuard, ServeOpts, build_request};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};

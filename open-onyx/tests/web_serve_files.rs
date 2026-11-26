@@ -6,9 +6,9 @@
 //! `.onyx` ni artefactos `*.tr`/`*.onyxpack`. La consulta es un filtro, no una ruta: las
 //! secuencias de traversal no pueden sacar nada de fuera.
 
-mod common;
+mod common_web;
 
-use common::{ServeGuard, ServeOpts};
+use common_web::{ServeGuard, ServeOpts};
 use std::path::Path;
 
 fn files(srv: &ServeGuard, raw_query: &str) -> Vec<String> {

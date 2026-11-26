@@ -1,9 +1,9 @@
 //! Hallazgos de `openonyx serve` destapados por Forja. Cada test está en `#[ignore]`
 //! hasta que se arregle; ejecutar con `cargo test -p open-onyx --test web_serve_bugs -- --ignored`.
 
-mod common;
+mod common_web;
 
-use common::ServeGuard;
+use common_web::ServeGuard;
 use std::io::Write;
 use std::time::Duration;
 

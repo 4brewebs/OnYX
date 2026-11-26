@@ -4,9 +4,9 @@
 //! Contrato de referencia: `open-onyx/README.md` (sección `serve` y `src/web.rs`) y el
 //! propio código de `dispatch_http_request`.
 
-mod common;
+mod common_web;
 
-use common::{ServeGuard, ServeOpts, build_request};
+use common_web::{ServeGuard, ServeOpts, build_request};
 use std::time::{Duration, Instant};
 
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'";

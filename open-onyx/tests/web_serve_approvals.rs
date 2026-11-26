@@ -8,9 +8,9 @@
 //! aprobación de otra petición mientras hay una activa) necesita un LLM falso que proponga
 //! una herramienta mutante; queda para el servidor compatible OpenAI de Colorado.
 
-mod common;
+mod common_web;
 
-use common::ServeGuard;
+use common_web::ServeGuard;
 
 fn approve(srv: &ServeGuard, body: &str) -> common::Response {
     srv.post(

@@ -10,9 +10,9 @@
 //! Ningún test pulsa `Enter` sobre un prompt: el proveedor apunta a `127.0.0.1:9` y no
 //! hay LLM; los flujos con modelo quedan pendientes del servidor falso de Colorado.
 
-mod common;
+mod common_web;
 
-use common::{TempWorkspace, hermetic_command, run_with_timeout};
+use common_web::{TempWorkspace, hermetic_command, run_with_timeout};
 use std::time::Duration;
 
 #[test]
@@ -342,7 +342,7 @@ mod pty {
 /// `Debug` (`Error: Os { code: 6, kind: Uncategorized, message: "No such device or
 /// address" }`) y el usuario no sabe que falta un terminal interactivo.
 #[test]
-#[ignore = "BUG: FIX-92 chat sin TTY imprime `Os { code: 6, .. }` en vez de pedir un terminal interactivo"]
+#[ignore = "BUG: FIX-93 chat sin TTY imprime `Os { code: 6, .. }` en vez de pedir un terminal interactivo"]
 fn chat_without_a_tty_explains_that_a_terminal_is_required() {
     let ws = TempWorkspace::new("tui_notty_msg");
     let mut cmd = hermetic_command(&ws.home);
