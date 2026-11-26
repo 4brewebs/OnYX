@@ -66,10 +66,15 @@ fn continue_turn(
     }
 }
 
+/// El pack de snapshots vive en `snaps/pack`, no en `snaps` directamente: `/rewind` crea una
+/// rama hermana `pack.fork-t<N>` y, así, esa rama queda DENTRO del `TempDir` y se borra con
+/// él (antes quedaba `/tmp/onyx_sse_*_snaps_*.fork-t2` para siempre). `--fork-dir` no sirve
+/// aquí: solo afecta a `--resume`, no al `/rewind` en vivo.
 fn serve_with_snapshots(fake: &FakeOpenAi, snaps: &TempDir) -> Serve {
+    let pack = snaps.0.join("pack");
     Serve::start_with(
         &fake.base_url(),
-        &["--snapshot-dir", snaps.0.to_str().unwrap()],
+        &["--snapshot-dir", pack.to_str().unwrap()],
     )
 }
 
