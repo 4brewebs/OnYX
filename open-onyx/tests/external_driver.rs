@@ -133,7 +133,14 @@ impl Drop for Srv {
 fn launch(sc: &Scenario, api_base: &str, extra: &[&str], trusted: bool) -> Srv {
     use std::io::{BufRead, BufReader};
     let home = sc.tmp.0.join("home");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_openonyx"));
+    // umask 022 fija en el hijo, independiente de la umask del proceso de test (FIX-98):
+    // `ensure_sandbox_tmp_dir` hace `create_dir_all` sin `chmod`, así que con umask 077 el
+    // directorio nacería 0700 aunque el producto no lo ponga privado, y el rojo pasaría en
+    // falso. Con 022 queda 0755, que es el modo del bug, tanto si el padre tiene 022, 077 o 000.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(r#"umask 022; exec "$0" "$@""#)
+        .arg(env!("CARGO_BIN_EXE_openonyx"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &home)
@@ -1082,9 +1089,12 @@ fn sandbox_tmp_is_removed_when_job_is_discarded() {
 }
 
 /// §4.6: el nombre es previsible (`onyx-sandbox-<fnv(worktree)>`) y se crea con los permisos por
-/// defecto (umask del proceso, normalmente 0755; el test exige 0700 exacto para no depender de la
-/// umask de quien lo ejecute): otro usuario del host puede listar y leer el
+/// defecto (umask del proceso, normalmente 0755): otro usuario del host puede listar y leer el
 /// estado del harness y precrear el directorio o un symlink con ese nombre.
+///
+/// El test exige 0700 exacto. `launch` fija `umask 022` en el `serve` (independiente de la umask
+/// del padre), para que el directorio nazca 0755 mientras el producto no haga `chmod 0700`. Sin
+/// eso, con umask 077 el rojo pasaría en falso.
 #[cfg(unix)]
 #[test]
 #[ignore = "BUG: FIX-98 el tmp del sandbox del harness se crea con los permisos por defecto (0755 con umask 022) y nombre previsible: otros usuarios del host leen el HOME del harness (onyx-workspace/src/sandbox.rs:1152-1165)"]
