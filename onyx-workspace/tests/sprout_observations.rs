@@ -60,9 +60,30 @@ fn duplicate_named_service_tables_are_rejected() {
     }
 }
 
+/// Cuenta columnas de una fila TOON sin contar un `|` escapado con `\` (`\|`; `\\` es una
+/// barra literal y no escapa al `|` siguiente), como hace el formato de scent.
+fn toon_columns(row: &str) -> usize {
+    let mut cols = 1;
+    let mut escaped = false;
+    for c in row.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '|' {
+            cols += 1;
+        }
+    }
+    cols
+}
+
 /// La tabla `@TOON v1` separa columnas con `|` (y `as_toon_cell` ya sanea `|` en los
 /// motivos de fallo). Un id con `|` no se valida y descuadra la fila: o se rechaza el id al
 /// cargar, o cada fila de datos debe seguir teniendo exactamente 6 columnas.
+///
+/// Se aceptan tres arreglos: rechazar el id, escapar el `|` (`\|`, que `toon_columns` no
+/// cuenta) o sustituirlo por otro carácter (como ya hace `as_toon_cell` con `/`: entonces la
+/// fila simplemente no contiene ningún `|` extra).
 #[test]
 #[ignore = "BUG: FIX-33 los ids de servicio no se validan (sprout.rs:262 y :339-358); un id con `|` rompe las columnas de la tabla TOON de status_toon"]
 fn service_ids_cannot_break_the_toon_table() {
@@ -79,7 +100,7 @@ fn service_ids_cannot_break_the_toon_table() {
         .filter(|l| !l.starts_with('#') && *l != "@TOON v1")
     {
         assert_eq!(
-            row.split('|').count(),
+            toon_columns(row),
             6,
             "TOON row must keep 6 columns: {row:?}\n{toon}"
         );
@@ -131,4 +152,12 @@ fn from_config_respects_untrusted_policy() {
         !ws.path().join("ran.txt").exists(),
         "no process may run while untrusted"
     );
+}
+
+#[test]
+fn toon_columns_ignores_escaped_pipes_only() {
+    assert_eq!(toon_columns("a | b | c"), 3);
+    assert_eq!(toon_columns(r"a | b\|c | d"), 3);
+    assert_eq!(toon_columns(r"a | b\\|c | d"), 4);
+    assert_eq!(toon_columns("sin pipes"), 1);
 }
