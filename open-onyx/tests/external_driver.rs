@@ -305,6 +305,52 @@ fn pid_alive(pid_file: &Path) -> Option<bool> {
     Some(Path::new(&format!("/proc/{pid}")).exists())
 }
 
+/// Cuerpo de harness «con compuerta»: espera a que el test cree `$CTRL/go`, ejecuta `body` y
+/// escribe `$CTRL/finished` justo antes de salir.
+///
+/// Los controles que exigen la notificación «[subagent `ext-1` finished …]» NO pueden leer
+/// `/api/v1/state` mientras el job termina: `GET /state` llama a `SubagentHandle::list_summaries`
+/// → `SubagentManager::status` → `poll_completions` (open-onyx/src/subagent.rs:767), que drena
+/// el canal de finalizaciones y DESCARTA las propuestas; si gana esa carrera al `poll` del driver
+/// (subagent.rs:1794) el root no recibe nunca la notificación (FIX-99, ver
+/// `state_polling_must_not_swallow_the_completion_notification`). La compuerta permite sondear
+/// el estado mientras el job está bloqueado y dejar de hacerlo cuando se libera.
+fn gated(body: &str) -> String {
+    format!(
+        "while [ ! -e \"$CTRL/go\" ]; do sleep 0.05; done\n{body}\necho done > \"$CTRL/finished\""
+    )
+}
+
+/// Espera a que el harness esté corriendo (bloqueado en la compuerta): sondear `/state` ahora es
+/// inocuo porque el job aún no ha terminado.
+fn wait_harness_started(sc: &Scenario) {
+    assert!(
+        wait_until(30, || sc.runs() == 1),
+        "harness never started (runs={})",
+        sc.runs()
+    );
+}
+
+/// Libera la compuerta, espera a que el harness termine (fichero `finished`, no `/state`) y deja
+/// pasar 3 s SIN tocar `/state` para que el hilo principal drene la finalización y la ingiera.
+fn release_job_quietly(sc: &Scenario) {
+    fs::write(sc.ctrl().join("go"), "").unwrap();
+    assert!(
+        wait_until(30, || sc.ctrl().join("finished").exists()),
+        "harness did not finish"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+}
+
+/// Lanza `serve`, pide el `spawn_subagent` y espera a que el harness (con compuerta) arranque.
+fn start_gated_job(sc: &Scenario) -> (Srv, FakeOpenAi) {
+    let fake = FakeOpenAi::start(spawn_script());
+    let srv = launch(sc, &fake.base_url(), &[], true);
+    assert_eq!(command(&srv, "delegate"), r#"{"ok":true}"#);
+    wait_harness_started(sc);
+    (srv, fake)
+}
+
 /// Ejecuta un turno que lanza el harness y espera al job.
 fn run_job(sc: &Scenario, extra: &[&str], secs: u64) -> (Srv, FakeOpenAi, serde_json::Value) {
     let fake = FakeOpenAi::start(spawn_script());
@@ -351,14 +397,19 @@ fn notifications(srv: &Srv) -> Vec<(String, u64)> {
 #[test]
 fn proposal_comes_from_disk_not_from_stdout_and_lands_once() {
     let sc = Scenario::new("ext_lie");
-    sc.harness("echo 'DONE: I edited claimed.txt'; echo real > touched.txt");
+    sc.harness(&gated(
+        "echo 'DONE: I edited claimed.txt'; echo real > touched.txt",
+    ));
     sc.config(30, &[], ALLOW_FAKE);
-    let (srv, _fake, job) = run_job(&sc, &[], 30);
+    let (srv, _fake) = start_gated_job(&sc);
+    release_job_quietly(&sc);
+    let job = wait_job(&srv, 30);
     assert_eq!(job["status"], "done", "{job}");
     assert_eq!(touched(&job), vec!["touched.txt".to_string()]);
     assert!(
         wait_until(10, || !notifications(&srv).is_empty()),
-        "no notification"
+        "no notification; state: {}",
+        state(&srv)
     );
     std::thread::sleep(Duration::from_millis(500));
     let notes = notifications(&srv);
@@ -543,12 +594,18 @@ fn settled(srv: &Srv) -> bool {
 #[test]
 fn rewind_after_job_does_not_relaunch_harness() {
     let sc = Scenario::new("ext_rewind");
-    sc.harness("echo real > touched.txt");
+    sc.harness(&gated("echo real > touched.txt"));
     sc.config(30, &[], ALLOW_FAKE);
     let snaps = TempDir::new("ext_snaps");
     let (srv, _fake, tick1) = two_turns(&sc, &snaps.0);
+    wait_harness_started(&sc);
+    release_job_quietly(&sc);
     wait_job(&srv, 30);
-    assert!(wait_until(20, || !notifications(&srv).is_empty() && settled(&srv)));
+    assert!(
+        wait_until(20, || !notifications(&srv).is_empty() && settled(&srv)),
+        "no notification or root not settled; state: {}",
+        state(&srv)
+    );
     assert_eq!(command(&srv, &format!("/rewind {tick1}")), r#"{"ok":true}"#);
     assert!(
         wait_until(10, || rewind_applied(&srv)),
@@ -556,6 +613,141 @@ fn rewind_after_job_does_not_relaunch_harness() {
     );
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(sc.runs(), 1, "harness relaunched after rewind");
+}
+
+/// Notificaciones «[subagent `<id>` finished …]» recibidas por el root para ese `id`.
+fn notifications_of(srv: &Srv, id: &str) -> usize {
+    let prefix = format!("[subagent `{id}` finished");
+    root_memory(srv)
+        .iter()
+        .filter(|(_, text, _)| text.starts_with(&prefix))
+        .count()
+}
+
+/// Un intento de FIX-99: tres jobs externos (el máximo concurrente) que terminan, escalonados
+/// unos milisegundos, mientras el bucle principal está ocupado con ticks. Devuelve
+/// `Some((id, estado))` del primer job que sale `done` en `/state` sin que el root reciba su
+/// notificación.
+///
+/// La ventana de la carrera es de ~0,3 ms de CPU por tick (el worker envía la finalización
+/// DESPUÉS del `poll` de un tick y ANTES de su `present`/su comando `/subagents`), así que el test:
+/// 1. manda comandos `/subagents` sin pausa desde 8 clientes (casi siempre hay un tick en curso);
+/// 2. satura la CPU con hilos propios (tantos como CPUs) para que el reparto de turnos sea
+///    irregular;
+/// 3. libera los tres jobs con 15 ms de diferencia, para muestrear tres fases distintas del tick.
+#[cfg(unix)]
+fn swallowed_completion() -> Option<(String, String)> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const JOBS: [&str; 3] = ["ext-1", "ext-2", "ext-3"];
+    let spawn = || Step::Sse {
+        events: vec![
+            tool_call_event(
+                "spawn_subagent",
+                r#"{"goal":"edit claimed.txt","name":"ext","driver":"fake"}"#,
+            ),
+            FINISH_TOOLS.to_string(),
+        ],
+        done: true,
+    };
+    let mut script = vec![spawn(), spawn(), spawn()];
+    script.extend((0..6).map(|_| text_step("ok")));
+    let sc = Scenario::new("ext_swallow");
+    sc.harness(
+        "J=$(basename \"$PWD\")\nwhile [ ! -e \"$CTRL/go-$J\" ]; do sleep 0.02; done\necho real > touched.txt\necho done > \"$CTRL/finished-$J\"",
+    );
+    sc.config(30, &[], ALLOW_FAKE);
+    let fake = FakeOpenAi::start(script);
+    let srv = launch(&sc, &fake.base_url(), &[], true);
+    assert_eq!(command(&srv, "delegate"), r#"{"ok":true}"#);
+    assert!(
+        wait_until(30, || sc.runs() == 3),
+        "the three harnesses never started (runs={})",
+        sc.runs()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let clients = (0..8).map(|_| {
+        let (port, stop) = (srv.port, stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = http(
+                    port,
+                    "POST",
+                    "/api/v1/command",
+                    r#"{"command":"/subagents"}"#,
+                );
+            }
+        })
+    });
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let burners = (0..cpus).map(|_| {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut x = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                std::hint::black_box(x);
+            }
+        })
+    });
+    let threads: Vec<_> = clients.chain(burners).collect();
+    for id in JOBS {
+        fs::write(sc.ctrl().join(format!("go-{id}")), "").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let finished = wait_until(30, || {
+        JOBS.iter()
+            .all(|id| sc.ctrl().join(format!("finished-{id}")).exists())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, Ordering::Relaxed);
+    for th in threads {
+        th.join().unwrap();
+    }
+    assert!(finished, "harnesses did not finish");
+    assert!(
+        wait_until(30, || state(&srv)["subagents"].as_array().is_some_and(
+            |a| a.len() == 3 && a.iter().all(|j| j["status"] == "done")
+        )),
+        "jobs not done: {}",
+        state(&srv)
+    );
+    wait_until(10, || JOBS.iter().all(|id| notifications_of(&srv, id) > 0));
+    JOBS.iter()
+        .find(|id| notifications_of(&srv, id) == 0)
+        .map(|id| (id.to_string(), state(&srv).to_string()))
+}
+
+/// FIX-99: un job externo puede terminar como `done` en `/state` sin que el root reciba nunca
+/// la notificación «[subagent `ext-N` finished …]» (ni se ingiera la propuesta en el grafo).
+///
+/// Causa (open-onyx @ 3f49d57): `/state` lo publica el propio bucle principal al final de cada
+/// tick (`WebSurface::present`, web.rs:992-998 → `publish_snapshot` → `SubagentHandle::
+/// list_summaries`, web.rs:1252-1255), y `/subagents` hace lo mismo (command.rs:1195-1199).
+/// `list_summaries` llama a `SubagentManager::status`, que ejecuta
+/// `let _ = self.poll_completions()` (subagent.rs:767): drena el canal de finalizaciones, marca
+/// el job como `done` y DESCARTA la propuesta. `SubagentManagerDriver::poll` (subagent.rs:1794)
+/// es el único que la convierte en `IngressEvent::Command(encode_proposal_command(..))`. Si el
+/// worker envía la finalización (subagent.rs:1519-1524) después del `poll` de un tick y antes
+/// de su `present`, este la consume y el `poll` del tick siguiente no encuentra nada. Con el
+/// bucle ocioso no hay ventana (el tick empieza por `poll`); con ticks en curso (comandos web,
+/// turnos del root, máquina cargada) sí. Lo mismo ocurre con `subagent_status`, `spawn_job`
+/// (:611), `prepare_merge_preview` (:933) y el resto de llamadas que descartan
+/// `poll_completions()` (:790, :1088, :1117).
+///
+/// Es una carrera: hasta 40 intentos de 3 jobs cada uno, con su propio `serve`; basta un solo
+/// job perdido. Con el producto corregido el test tarda ~40 s y pasa.
+#[cfg(unix)]
+#[test]
+#[ignore = "BUG: FIX-99 SubagentManager::status (llamado desde publish_snapshot, web.rs:1252, y desde /subagents, command.rs:1199) drena y descarta las finalizaciones (`let _ = self.poll_completions()`, subagent.rs:767): si ocurre entre el envío del worker y el poll del driver, el root nunca recibe «[subagent … finished]» y la propuesta no se ingiere (subagent.rs:725-756, :1794)"]
+fn state_publication_must_not_swallow_the_completion_notification() {
+    for attempt in 1..=40 {
+        if let Some((id, st)) = swallowed_completion() {
+            panic!(
+                "attempt {attempt}: job {id} is done in /state but the root was never notified; state: {st}"
+            );
+        }
+    }
 }
 
 /// Respuesta tardía: el root asienta mientras el harness sigue corriendo; `/rewind` al turno 1
