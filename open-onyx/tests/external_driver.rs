@@ -320,7 +320,7 @@ fn pid_alive(pid_file: &Path) -> Option<bool> {
 /// → `SubagentManager::status` → `poll_completions` (open-onyx/src/subagent.rs:767), que drena
 /// el canal de finalizaciones y DESCARTA las propuestas; si gana esa carrera al `poll` del driver
 /// (subagent.rs:1794) el root no recibe nunca la notificación (FIX-99, ver
-/// `state_polling_must_not_swallow_the_completion_notification`). La compuerta permite sondear
+/// `state_publication_must_not_swallow_the_completion_notification`). La compuerta permite sondear
 /// el estado mientras el job está bloqueado y dejar de hacerlo cuando se libera.
 fn gated(body: &str) -> String {
     format!(
@@ -732,8 +732,9 @@ fn swallowed_completion() -> Option<(String, String)> {
 /// tick (`WebSurface::present`, web.rs:992-998 → `publish_snapshot` → `SubagentHandle::
 /// list_summaries`, web.rs:1252-1255), y `/subagents` hace lo mismo (command.rs:1195-1199).
 /// `list_summaries` llama a `SubagentManager::status`, que ejecuta
-/// `let _ = self.poll_completions()` (subagent.rs:767): drena el canal de finalizaciones, marca
-/// el job como `done` y DESCARTA la propuesta. `SubagentManagerDriver::poll` (subagent.rs:1794)
+/// `let _ = self.poll_completions()` (subagent.rs:766-784, ficha de Lince): drena el canal de
+/// finalizaciones, marca el job como `done` y DESCARTA la propuesta. `SubagentManagerDriver::poll`
+/// (subagent.rs:1794)
 /// es el único que la convierte en `IngressEvent::Command(encode_proposal_command(..))`. Si el
 /// worker envía la finalización (subagent.rs:1519-1524) después del `poll` de un tick y antes
 /// de su `present`, este la consume y el `poll` del tick siguiente no encuentra nada. Con el
@@ -746,7 +747,7 @@ fn swallowed_completion() -> Option<(String, String)> {
 /// job perdido. Con el producto corregido el test tarda ~40 s y pasa.
 #[cfg(unix)]
 #[test]
-#[ignore = "BUG: FIX-99 SubagentManager::status (llamado desde publish_snapshot, web.rs:1252, y desde /subagents, command.rs:1199) drena y descarta las finalizaciones (`let _ = self.poll_completions()`, subagent.rs:767): si ocurre entre el envío del worker y el poll del driver, el root nunca recibe «[subagent … finished]» y la propuesta no se ingiere (subagent.rs:725-756, :1794)"]
+#[ignore = "BUG: FIX-99 SubagentManager::status (llamado desde publish_snapshot, web.rs:1252, y desde /subagents, command.rs:1199) drena y descarta las finalizaciones (`let _ = self.poll_completions()`, subagent.rs:766-784): si ocurre entre el envío del worker y el poll del driver, el root nunca recibe «[subagent … finished]» y la propuesta no se ingiere (subagent.rs:725-756, :1794)"]
 fn state_publication_must_not_swallow_the_completion_notification() {
     for attempt in 1..=40 {
         if let Some((id, st)) = swallowed_completion() {
