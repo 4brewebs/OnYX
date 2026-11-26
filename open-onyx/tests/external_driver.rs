@@ -1082,7 +1082,8 @@ fn sandbox_tmp_is_removed_when_job_is_discarded() {
 }
 
 /// §4.6: el nombre es previsible (`onyx-sandbox-<fnv(worktree)>`) y se crea con los permisos por
-/// defecto (umask del proceso, normalmente 0755): otro usuario del host puede listar y leer el
+/// defecto (umask del proceso, normalmente 0755; el test exige 0700 exacto para no depender de la
+/// umask de quien lo ejecute): otro usuario del host puede listar y leer el
 /// estado del harness y precrear el directorio o un symlink con ese nombre.
 #[cfg(unix)]
 #[test]
@@ -1100,9 +1101,9 @@ fn sandbox_tmp_is_private_to_the_user() {
     );
     let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
     assert_eq!(
-        mode & 0o077,
-        0,
-        "sandbox tmp {} has mode {mode:o}",
+        mode,
+        0o700,
+        "sandbox tmp {} has mode {mode:o}, expected exactly 700",
         home.display()
     );
 }
