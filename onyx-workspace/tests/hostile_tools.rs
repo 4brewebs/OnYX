@@ -51,6 +51,14 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
+        // Los comandos de `shell_exec` crean `<temp_dir>/onyx-sandbox-<hash(ws)>` en el
+        // proceso de test. No se puede redirigir `TMPDIR` aquí (el entorno del proceso es
+        // compartido por los hilos del test: `set_var` es inseguro), así que se borra SOLO el
+        // directorio que corresponde a este `ws()` único (su nombre sale de la ruta del
+        // workspace); los restos de ejecuciones anteriores no se tocan.
+        if let Ok(tmp) = onyx_workspace::ensure_sandbox_tmp_dir(&self.ws()) {
+            let _ = fs::remove_dir_all(tmp);
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }
