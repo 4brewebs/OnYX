@@ -1214,6 +1214,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// La probe tiene un deadline fijo de 3 s (contrato de `doctor`, no ampliable aquí).
+    /// Bajo carga extrema de CI (runner de 2 vCPU corriendo la suite completa en paralelo),
+    /// el `spawn`+`exec` de un `sh` trivial puede excederlo por planificación del SO — no
+    /// por el binario: los fakes de este test responden al instante. Se reintentan solo
+    /// los artefactos de carga (`TimedOut` / `spawn failed`); un `Failed` real (código de
+    /// salida + stderr) se devuelve sin reintentar. Sin carga, el primer intento acierta
+    /// siempre (coste 0).
+    fn probe_driver_version_resilient(path: &Path, attempts: u32) -> DriverVersionProbe {
+        let mut probe = probe_driver_version(path);
+        for _ in 1..attempts {
+            let load_artifact = matches!(&probe, DriverVersionProbe::TimedOut)
+                || matches!(&probe, DriverVersionProbe::Failed(m) if m.starts_with("spawn failed"));
+            if !load_artifact {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            probe = probe_driver_version(path);
+        }
+        probe
+    }
+
     /// `SDD-10` Fase 4: la probe `--version` de un binario de harness externo —
     /// respuesta → `Responded` (primera línea, truncada), fallo → `Failed` (code + stderr),
     /// colgado → `TimedOut` tras el deadline de 3 s.
@@ -1257,7 +1278,7 @@ mod tests {
             "#!/bin/sh\necho \"opencode v9.9.9-fake\"\n",
         );
         assert!(matches!(
-            probe_driver_version(&ok_bin),
+            probe_driver_version_resilient(&ok_bin, 3),
             DriverVersionProbe::Responded(ref v) if v == "opencode v9.9.9-fake"
         ));
 
@@ -1269,7 +1290,7 @@ mod tests {
             "#!/bin/sh\necho boom >&2\nexit 1\n",
         );
         assert!(matches!(
-            probe_driver_version(&fail_bin),
+            probe_driver_version_resilient(&fail_bin, 3),
             DriverVersionProbe::Failed(ref m) if m.contains("code 1") && m.contains("boom")
         ));
 
@@ -1365,13 +1386,27 @@ mod tests {
 
         // 2) Bin resuelto y con `--version` → `[CHECK]` con la versión; la red → `[WARN]`
         //    advisory que distingue `--sandbox strict-container`.
+        //    La probe interna (deadline fijo de 3 s) puede expirar bajo carga extrema de CI
+        //    por planificación del SO y el audit emite `[ERR]` — artefacto de carga, no del
+        //    bin fake, que responde al instante → reintento acotado del audit antes de asertar.
         let mut report = DoctorReport::default();
-        audit_external_driver(
-            &mut report,
-            &drv("ok", &ok_bin, PromptTransport::Stdin),
-            &SandboxConfig::default(),
-            &[],
-        );
+        for _ in 0..3 {
+            report = DoctorReport::default();
+            audit_external_driver(
+                &mut report,
+                &drv("ok", &ok_bin, PromptTransport::Stdin),
+                &SandboxConfig::default(),
+                &[],
+            );
+            if report.errors.is_empty()
+                && report.checks.iter().any(|c| {
+                    c.contains("responds to `--version`") && c.contains("opencode v9.9.9-fake")
+                })
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         assert!(
             report.checks.iter().any(
                 |c| c.contains("responds to `--version`") && c.contains("opencode v9.9.9-fake")
