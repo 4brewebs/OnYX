@@ -14,22 +14,44 @@ use std::time::{Duration, Instant};
 
 const VPS_KEY: &str = "forja-vps-explicit-key-0123456789";
 
+thread_local! {
+    /// PIDs de los `serve` que arrancó el test que corre en este hilo (los rellena [`track`]);
+    /// [`hard_timeout`] los mata desde el hilo padre si el test no termina.
+    static SERVE_PIDS: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn track(srv: ServeGuard) -> ServeGuard {
+    SERVE_PIDS.with(|p| {
+        if let Some(pids) = p.borrow().as_ref() {
+            pids.lock().unwrap().push(srv.pid());
+        }
+    });
+    srv
+}
+
 fn vps(tag: &str) -> ServeGuard {
-    ServeGuard::start_with(
+    track(ServeGuard::start_with(
         tag,
         ServeOpts {
             bind: Some("0.0.0.0:0"),
             api_key: Some(VPS_KEY),
             ..ServeOpts::default()
         },
-    )
+    ))
 }
 
 /// Ejecuta `f` en un hilo y falla si no termina en `limit` (el hilo huérfano no bloquea
-/// la salida del binario de tests).
+/// la salida del binario de tests). Si vence el plazo, el hilo padre mata con SIGKILL los
+/// `serve` que arrancó `f` (registrados con [`track`]): el `Drop` de `ServeGuard` vive en el
+/// hilo atascado y no se ejecutaría, y el `serve` seguiría vivo (con su RSS y sus hilos)
+/// hasta que termine el binario de tests.
 fn hard_timeout<F: FnOnce() + Send + 'static>(limit: Duration, f: F) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let pids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let thread_pids = pids.clone();
     let h = std::thread::spawn(move || {
+        SERVE_PIDS.with(|p| *p.borrow_mut() = Some(thread_pids));
         f();
         let _ = tx.send(());
     });
@@ -41,6 +63,11 @@ fn hard_timeout<F: FnOnce() + Send + 'static>(limit: Duration, f: F) {
             }
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            for pid in pids.lock().unwrap().iter() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
             panic!("timeout duro de {limit:?} superado")
         }
     }
@@ -231,7 +258,7 @@ fn huge_or_lying_content_length_is_bounded_before_and_after_login() {
             // Mentiroso por abajo: anuncia 2 y manda más; solo se interpretan 2 bytes
             // (`{}`), lo sobrante no se cuela como segunda petición (Connection: close).
             let raw = format!(
-                "POST /api/v1/queue/clear HTTP/1.1\r\n{auth_hdr}Sec-Fetch-Site: same-origin\r\nContent-Length: 2\r\n\r\n{{}}GET /api/v1/state HTTP/1.1\r\n\r\n"
+                "POST /api/v1/queue/clear HTTP/1.1\r\n{auth_hdr}Sec-Fetch-Site: same-origin\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}GET /api/v1/state HTTP/1.1\r\n\r\n"
             );
             let r = srv.request(&raw);
             let want = if auth.is_some() { 200 } else { 401 };
@@ -505,7 +532,7 @@ fn sse_rejects_missing_expired_and_foreign_cookies() {
 #[test]
 fn file_search_survives_double_encoding_and_overlong_utf8() {
     hard_timeout(Duration::from_secs(60), || {
-        let srv = ServeGuard::start_with(
+        let srv = track(ServeGuard::start_with(
             "vps_files",
             ServeOpts {
                 bind: Some("0.0.0.0:0"),
@@ -520,7 +547,7 @@ fn file_search_survives_double_encoding_and_overlong_utf8() {
                 }),
                 ..ServeOpts::default()
             },
-        );
+        ));
         let bearer = format!("Bearer {VPS_KEY}");
         for q in [
             "%252e%252e%252f",
@@ -583,8 +610,34 @@ fn cross_site_fetch_metadata_blocks_every_post_on_a_public_bind() {
     });
 }
 
+/// FIX-42: un `POST` con cookie y `Content-Type: text/plain` (lo que puede enviar un formulario
+/// HTML cross-site con `enctype="text/plain"`) y sin `Sec-Fetch-Site` (navegadores antiguos o
+/// proxies que la quitan) se ejecuta. El guard CSRF solo mira `Sec-Fetch-Site`; el servidor no
+/// exige `application/json` en las rutas mutantes. Sin `Origin` a propósito: así el test solo
+/// pasa si se exige el tipo de contenido, y no se confunde con FIX-94. Basta cualquier 4xx
+/// (400/403/415).
 #[test]
-#[ignore = "BUG: FIX-42 sin Sec-Fetch-Site el guard CSRF no mira Origin; POST con cookie y Origin ajeno se acepta (mitigado por SameSite=Lax)"]
+#[ignore = "BUG: FIX-42 sin Sec-Fetch-Site el guard CSRF no exige Content-Type: application/json; un POST text/plain con cookie se ejecuta (mitigado por SameSite=Lax)"]
+fn mutating_post_without_json_content_type_is_rejected() {
+    hard_timeout(Duration::from_secs(60), || {
+        let srv = vps("vps_ctype");
+        let cookie = srv.login_cookie();
+        let raw = format!(
+            "POST /api/v1/queue/clear HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {cookie}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
+        let r = srv.request(&raw);
+        assert!(
+            (400..500).contains(&r.status),
+            "POST text/plain con cookie y sin Sec-Fetch-Site ⇒ {}",
+            r.status
+        );
+    });
+}
+
+/// FIX-94: aunque el cuerpo sea `application/json`, sin `Sec-Fetch-Site` el guard no mira
+/// `Origin`: un POST con cookie y `Origin` ajeno se acepta (mitigado por SameSite=Lax).
+#[test]
+#[ignore = "BUG: FIX-94 sin Sec-Fetch-Site el guard CSRF no mira Origin; POST application/json con cookie y Origin ajeno se acepta (mitigado por SameSite=Lax)"]
 fn foreign_origin_without_fetch_metadata_is_rejected() {
     hard_timeout(Duration::from_secs(60), || {
         let srv = vps("vps_origin");
@@ -596,7 +649,7 @@ fn foreign_origin_without_fetch_metadata_is_rejected() {
         );
         assert_eq!(
             r.status, 403,
-            "POST con Origin ajeno y sin Sec-Fetch-Site ⇒ {}",
+            "POST JSON con Origin ajeno y sin Sec-Fetch-Site ⇒ {}",
             r.status
         );
     });
