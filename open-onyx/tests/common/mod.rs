@@ -43,6 +43,43 @@ pub enum Step {
     Sse { events: Vec<String>, done: bool },
     /// Escribe bytes literales tras las cabeceras y cierra (para cortar a mitad de evento).
     Raw(String),
+    /// Escribe cada cadena como evento `data: <json>\n\n` y corta la conexión con RST (no FIN),
+    /// sin `[DONE]`: el cliente recibe los eventos y después un error de lectura
+    /// (`ECONNRESET`), no un fin de stream. Solo Linux: usa `SO_LINGER` con tiempo 0.
+    Reset { events: Vec<String> },
+}
+
+/// `SO_LINGER {on, 0}`: `close()` descarta lo pendiente y envía RST. Declarado a mano
+/// (sin añadir `libc` como dependencia); solo Linux.
+#[cfg(target_os = "linux")]
+pub fn set_linger_zero(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct Linger {
+        l_onoff: i32,
+        l_linger: i32,
+    }
+    unsafe extern "C" {
+        fn setsockopt(fd: i32, level: i32, name: i32, val: *const Linger, len: u32) -> i32;
+    }
+    const SOL_SOCKET: i32 = 1;
+    const SO_LINGER: i32 = 13;
+    let linger = Linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: `linger` es un `struct linger` válido y vive durante la llamada; el fd es de
+    // un socket abierto que `stream` posee.
+    let rc = unsafe {
+        setsockopt(
+            stream.as_raw_fd(),
+            SOL_SOCKET,
+            SO_LINGER,
+            &linger,
+            std::mem::size_of::<Linger>() as u32,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
 }
 
 pub struct FakeOpenAi {
@@ -115,6 +152,23 @@ impl FakeOpenAi {
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{raw}"
                         );
                     }
+                    #[cfg(target_os = "linux")]
+                    Some(Step::Reset { events }) => {
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                        );
+                        for e in events {
+                            let _ = write!(s, "data: {e}\n\n");
+                            let _ = s.flush();
+                        }
+                        // Deja que el cliente lea los eventos antes del RST.
+                        thread::sleep(Duration::from_millis(200));
+                        set_linger_zero(&s);
+                        continue; // `drop(s)` al final de la vuelta envía el RST.
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    Some(Step::Reset { .. }) => panic!("Step::Reset requires Linux"),
                     None => {
                         let body = r#"{"error":"script exhausted"}"#;
                         let _ = write!(
@@ -180,6 +234,32 @@ pub struct Serve {
     pub port: u16,
     _home: TempDir,
     pub ws: TempDir,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+/// Tope de stderr que se conserva para diagnóstico; el resto se lee y se descarta para que
+/// el pipe nunca se llene y bloquee al servidor.
+const STDERR_KEEP: usize = 64 * 1024;
+
+/// Vacía `stderr` del hijo en un hilo (el hilo termina solo al cerrarse el pipe, es decir,
+/// cuando el hijo muere) y conserva los primeros `STDERR_KEEP` bytes.
+fn drain_stderr(stderr: std::process::ChildStderr) -> Arc<Mutex<Vec<u8>>> {
+    let kept: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let sink = kept.clone();
+    thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut kept) = sink.lock() {
+                let room = STDERR_KEEP.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+    });
+    kept
 }
 
 pub const API_KEY: &str = "forja-test-key";
@@ -235,6 +315,7 @@ impl Serve {
             .spawn()
             .expect("spawn openonyx serve");
         let stdout = child.stdout.take().unwrap();
+        let stderr = drain_stderr(child.stderr.take().unwrap());
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -258,13 +339,18 @@ impl Serve {
         }
         let Some(port) = port else {
             let _ = child.kill();
-            panic!("serve did not print its URL; stdout: {seen:#?}");
+            let _ = child.wait();
+            let err =
+                String::from_utf8_lossy(&stderr.lock().map(|e| e.clone()).unwrap_or_default())
+                    .into_owned();
+            panic!("serve did not print its URL; stdout: {seen:#?}; stderr: {err}");
         };
         Self {
             child,
             port,
             _home: home,
             ws,
+            stderr,
         }
     }
 
@@ -291,6 +377,12 @@ impl Serve {
 
     pub fn state(&self) -> String {
         self.http("GET", "/api/v1/state", "")
+    }
+
+    /// Lo que el servidor ha escrito en stderr hasta ahora (tope `STDERR_KEEP`).
+    pub fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().map(|e| e.clone()).unwrap_or_default())
+            .into_owned()
     }
 }
 
