@@ -177,14 +177,8 @@ fn login(port: u16) -> String {
             l.starts_with("set-cookie:") && l.contains("onyx_session=")
         })
         .expect("session cookie");
-    line.split_once(':')
-        .map(|(_, v)| v)
-        .unwrap_or(&line)
-        .trim()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string()
+    let value = line.split_once(':').map(|(_, v)| v).unwrap_or(line);
+    value.trim().split(';').next().unwrap().to_string()
 }
 
 const CMD: &str = r#"{"command":"/mode plan"}"#;
