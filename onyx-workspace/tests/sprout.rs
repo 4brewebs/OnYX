@@ -1203,14 +1203,40 @@ mod supervisor {
         fs::write(ws.path().join("sprout.toml"), toml).unwrap();
     }
 
-    fn sup(ws: &TempWs, toml: &str) -> SproutSupervisor {
+    /// Guard de limpieza: si un test falla (panic) a mitad, `Drop` para todos los servicios
+    /// (`stop(None, true)`) para no dejar `sleep 30` huérfanos. Es el comportamiento que
+    /// `SproutSupervisor` debería tener solo (FIX-30); mientras no lo tenga, el test lo
+    /// pide explícitamente. Se comporta como `SproutSupervisor` vía `Deref`.
+    ///
+    /// El test de FIX-30 (`dropping_last_supervisor_clone_…`) NO usa este guard: justo
+    /// comprueba lo que `Drop` del supervisor debe hacer por sí mismo.
+    struct Sup(SproutSupervisor);
+
+    impl std::ops::Deref for Sup {
+        type Target = SproutSupervisor;
+        fn deref(&self) -> &SproutSupervisor {
+            &self.0
+        }
+    }
+
+    impl Drop for Sup {
+        fn drop(&mut self) {
+            let _ = self.0.stop(None, true);
+        }
+    }
+
+    fn sup_plain(ws: &TempWs, toml: &str) -> SproutSupervisor {
         write_toml(ws, toml);
         SproutSupervisor::new(WorkspacePolicy::new(ws.path()).unwrap())
     }
 
-    fn sup_cli(ws: &TempWs, toml: &str) -> SproutSupervisor {
+    fn sup(ws: &TempWs, toml: &str) -> Sup {
+        Sup(sup_plain(ws, toml))
+    }
+
+    fn sup_cli(ws: &TempWs, toml: &str) -> Sup {
         let cli = fake_cli(ws);
-        sup(ws, toml).with_container_cli_override(cli.display().to_string())
+        Sup(sup_plain(ws, toml).with_container_cli_override(cli.display().to_string()))
     }
 
     /// CLI de contenedores falsa: registra cada invocación en `cli-calls.log` como
@@ -1222,6 +1248,7 @@ mod supervisor {
         let root = ws.path().display().to_string();
         let script = format!(
             r#"#!/bin/sh
+if [ "$1" = "__probe" ]; then exit 0; fi
 LOG='{root}/cli-calls.log'
 printf 'CALL' >> "$LOG"
 for a in "$@"; do printf ' <%s>' "$a" >> "$LOG"; done
@@ -1250,7 +1277,34 @@ exit 0
         fs::write(&path, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&path);
         path
+    }
+
+    /// `fork` de otro test (los tests corren en paralelo, en hilos del mismo proceso) puede
+    /// heredar un instante el descriptor de escritura de este script, y mientras eso pasa
+    /// `exec` falla con ETXTBSY («Text file busy»). El descriptor se cierra solo al hacer
+    /// `exec` en ese hijo, así que basta con reintentar una sonda `__probe` (que el script
+    /// atiende con `exit 0` antes de registrar nada) mientras salga ETXTBSY. Cuando la sonda
+    /// pasa, el fichero ya no tiene escritores y los `exec` posteriores no pueden fallar.
+    fn wait_until_executable(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::process::Command::new(path).arg("__probe").status() {
+                Ok(status) => {
+                    assert!(
+                        status.success(),
+                        "probe of {} failed: {status}",
+                        path.display()
+                    );
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("cannot execute {}: {e}", path.display()),
+            }
+        }
     }
 
     fn cli_calls(ws: &TempWs) -> Vec<String> {
@@ -1753,7 +1807,7 @@ exit 0
 
     // --- logs ---------------------------------------------------------------
 
-    fn sup_with_logs(ws: &TempWs) -> SproutSupervisor {
+    fn sup_with_logs(ws: &TempWs) -> Sup {
         let s = sup(
             ws,
             "[services.p]\ncmd = \"for i in 1 2 3 4 5; do echo line-$i; done; echo abc; echo a.c; echo 'Authorization: Bearer sk-live-abcdefghijklmnopqrstuvwxyz123456'\"\n",
@@ -1828,7 +1882,7 @@ exit 0
         );
         let mut policy = WorkspacePolicy::new(ws.path()).unwrap();
         policy.max_output_bytes = 100;
-        let s = SproutSupervisor::new(policy);
+        let s = Sup(SproutSupervisor::new(policy));
         s.start("p", WAIT).unwrap();
         assert!(wait_until(Duration::from_secs(5), || {
             s.logs("p", Some(1), Some("END"), false).unwrap() == "END"
@@ -2032,7 +2086,7 @@ exit 0
     #[ignore = "BUG: FIX-30 los hilos internos (monitor child.wait y lectores de stdout/stderr) retienen Arc<SproutInner>; Drop no se ejecuta al soltar el último clon público mientras el servicio vive (sprout.rs:1448-1606)"]
     fn dropping_last_supervisor_clone_runs_stop_cmd_and_kills_service() {
         let ws = TempWs::new("sup_drop");
-        let s = sup(
+        let s = sup_plain(
             &ws,
             "[services.srv]\ncmd = \"echo UP; exec sleep 5\"\nready_log = \"UP\"\nstop_cmd = \"echo bye >> stopped.txt\"\n",
         );
