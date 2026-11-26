@@ -471,7 +471,7 @@ fn foreign_host_header_grants_nothing() {
 fn every_response_carries_the_promised_security_headers() {
     let srv = ServeGuard::start("headers");
     let bearer = srv.bearer();
-    let cases: Vec<(String, common::Response)> = vec![
+    let cases: Vec<(String, common_web::Response)> = vec![
         ("GET /".into(), srv.get("/", &[])),
         ("GET /app.js".into(), srv.get("/app.js", &[])),
         ("GET /api/v1/health".into(), srv.get("/api/v1/health", &[])),

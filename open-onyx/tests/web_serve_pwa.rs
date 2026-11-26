@@ -231,14 +231,14 @@ fn open_sse(srv: &ServeGuard, auth: (&str, &str)) -> (TcpStream, String, Vec<u8>
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let deadline = Instant::now() + Duration::from_secs(10);
-    while common::find(&buf, b"\r\n\r\n").is_none() && Instant::now() < deadline {
+    while common_web::find(&buf, b"\r\n\r\n").is_none() && Instant::now() < deadline {
         match s.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => break,
         }
     }
-    let split = common::find(&buf, b"\r\n\r\n").expect("cabecera SSE");
+    let split = common_web::find(&buf, b"\r\n\r\n").expect("cabecera SSE");
     let head = String::from_utf8_lossy(&buf[..split]).into_owned();
     let rest = buf[split + 4..].to_vec();
     (s, head, rest)
@@ -256,7 +256,7 @@ fn next_frame_matching(
         .unwrap();
     let mut chunk = [0u8; 8192];
     loop {
-        while let Some(i) = common::find(pending, b"\n\n") {
+        while let Some(i) = common_web::find(pending, b"\n\n") {
             let frame = String::from_utf8_lossy(&pending[..i]).into_owned();
             pending.drain(..i + 2);
             if pred(&frame) {

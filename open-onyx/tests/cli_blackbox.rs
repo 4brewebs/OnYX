@@ -11,13 +11,13 @@ use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(30);
 
-fn run(ws: &TempWorkspace, args: &[&str]) -> common::Finished {
+fn run(ws: &TempWorkspace, args: &[&str]) -> common_web::Finished {
     let mut cmd = hermetic_command(&ws.home);
     cmd.current_dir(&ws.ws).args(args);
     run_with_timeout(cmd, LIMIT).unwrap_or_else(|e| panic!("openonyx {args:?}: {e}"))
 }
 
-fn assert_clean_failure(out: &common::Finished, args: &[&str], must_mention: &[&str]) {
+fn assert_clean_failure(out: &common_web::Finished, args: &[&str], must_mention: &[&str]) {
     assert!(
         matches!(out.code, Some(c) if c != 0),
         "openonyx {args:?} debía fallar; code={:?} stdout={} stderr={}",
@@ -104,7 +104,7 @@ fn replay_rejects_empty_truncated_and_random_transcripts() {
     std::fs::write(d.join("magic_only.tr"), b"ONYXTR2").unwrap();
     std::fs::write(d.join("trunc.tr"), b"ONYXTR2\x00\x01\x02garbage").unwrap();
     std::fs::write(d.join("v1trunc.tr"), b"ONYXTR1\xff\xff\xff\xff").unwrap();
-    let mut rng = common::Rng::new(0x5EED);
+    let mut rng = common_web::Rng::new(0x5EED);
     let random: Vec<u8> = (0..4096).map(|_| rng.next_u64() as u8).collect();
     std::fs::write(d.join("random.tr"), &random).unwrap();
     std::fs::create_dir_all(d.join("a_dir.tr")).unwrap();

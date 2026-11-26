@@ -153,7 +153,7 @@ fn oversized_requests_get_a_4xx_answer() {
         );
         let r = srv
             .try_request(&big_header)
-            .unwrap_or_else(|_| common::Response::parse(b""));
+            .unwrap_or_else(|_| common_web::Response::parse(b""));
         assert!(
             (400..500).contains(&r.status),
             "cabecera > 16 KiB ⇒ {}",
@@ -162,7 +162,7 @@ fn oversized_requests_get_a_4xx_answer() {
         let big_line = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(20 * 1024));
         let r = srv
             .try_request(&big_line)
-            .unwrap_or_else(|_| common::Response::parse(b""));
+            .unwrap_or_else(|_| common_web::Response::parse(b""));
         assert!(
             (400..500).contains(&r.status),
             "request line > 16 KiB ⇒ {}",
@@ -170,7 +170,7 @@ fn oversized_requests_get_a_4xx_answer() {
         );
         let r = srv
             .try_request("POST /api/v1/auth/login HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n")
-            .unwrap_or_else(|_| common::Response::parse(b""));
+            .unwrap_or_else(|_| common_web::Response::parse(b""));
         assert!(
             (400..500).contains(&r.status),
             "Content-Length enorme ⇒ {}",

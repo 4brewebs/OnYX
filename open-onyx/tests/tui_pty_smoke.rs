@@ -42,7 +42,7 @@ fn chat_without_a_tty_fails_fast_without_panicking() {
 
 #[cfg(target_os = "linux")]
 mod pty {
-    use super::common::{BIN, TempWorkspace};
+    use super::common_web::{BIN, TempWorkspace};
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};

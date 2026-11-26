@@ -94,7 +94,7 @@ fn oversized_headers_and_bodies_are_dropped_without_a_response() {
     assert!(raw.len() > MAX_HEADER);
     let r = srv
         .try_request(&raw)
-        .unwrap_or_else(|_| common::Response::parse(b""));
+        .unwrap_or_else(|_| common_web::Response::parse(b""));
     assert_eq!(r.status, 0, "cabeceras > 16 KiB no deben procesarse");
     srv.assert_still_serving("tras cabeceras enormes");
 
@@ -121,7 +121,7 @@ fn oversized_headers_and_bodies_are_dropped_without_a_response() {
             &[("Authorization", &bearer)],
             Some(&body),
         ))
-        .unwrap_or_else(|_| common::Response::parse(b""));
+        .unwrap_or_else(|_| common_web::Response::parse(b""));
     assert_eq!(r.status, 0, "cuerpo de 64 KiB + 1 debe descartarse");
 
     // Content-Length enorme anunciado sin cuerpo: cierre inmediato, sin esperar.
@@ -223,7 +223,7 @@ fn concurrent_clients_get_consistent_answers() {
                     s.write_all(raw.as_bytes()).unwrap();
                     let mut buf = Vec::new();
                     s.read_to_end(&mut buf).unwrap();
-                    let r = common::Response::parse(&buf);
+                    let r = common_web::Response::parse(&buf);
                     assert_eq!(r.status, want, "hilo {t}");
                     if let Some(l) = len {
                         assert_eq!(r.body.len(), l, "hilo {t}: cuerpo truncado");

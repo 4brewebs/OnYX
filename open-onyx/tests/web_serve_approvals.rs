@@ -12,7 +12,7 @@ mod common_web;
 
 use common_web::ServeGuard;
 
-fn approve(srv: &ServeGuard, body: &str) -> common::Response {
+fn approve(srv: &ServeGuard, body: &str) -> common_web::Response {
     srv.post(
         "/api/v1/approval",
         &[
