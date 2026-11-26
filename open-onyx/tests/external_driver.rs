@@ -894,7 +894,7 @@ fn sandbox_tmp_is_removed_when_job_is_discarded() {
 /// estado del harness y precrear el directorio o un symlink con ese nombre.
 #[cfg(unix)]
 #[test]
-#[ignore = "BUG: FIX-97 el tmp del sandbox del harness se crea con los permisos por defecto (0755 con umask 022) y nombre previsible: otros usuarios del host leen el HOME del harness (onyx-workspace/src/sandbox.rs:1152-1165)"]
+#[ignore = "BUG: FIX-98 el tmp del sandbox del harness se crea con los permisos por defecto (0755 con umask 022) y nombre previsible: otros usuarios del host leen el HOME del harness (onyx-workspace/src/sandbox.rs:1152-1165)"]
 fn sandbox_tmp_is_private_to_the_user() {
     use std::os::unix::fs::PermissionsExt;
     let sc = Scenario::new("ext_sbx_mode");
