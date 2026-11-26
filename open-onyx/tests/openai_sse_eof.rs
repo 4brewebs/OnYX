@@ -63,3 +63,41 @@ fn stream_closed_cleanly_without_done_marker_is_not_a_stop() {
         "truncated stream accepted as complete answer; memory: {texts:?}"
     );
 }
+
+/// RST a mitad del stream con texto parcial y sin `finish_reason` ni `[DONE]`: el cliente
+/// ve un ERROR de lectura (no un EOF). `can_accept_partial_sse_eof` solo puede aceptar un
+/// corte así si el stream ya había terminado (`[DONE]` o `finish_reason`); con texto parcial
+/// a secas no es una respuesta: el turno falla y el texto truncado no queda como respuesta.
+/// Control del camino de error del lector SSE; mata la mutación «el EOF parcial siempre se
+/// acepta» (P4 de Adolfo), que los tests de FIN limpio no distinguen.
+#[cfg(target_os = "linux")]
+#[test]
+fn connection_reset_mid_stream_with_partial_text_is_not_an_answer() {
+    let fake = FakeOpenAi::start(vec![Step::Reset {
+        events: vec![delta("Hola "), delta("mun")],
+    }]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_eq!(state, "failed", "{texts:?}");
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("Hola") || t.contains("mun")),
+        "partial text must not become the answer: {texts:?}"
+    );
+}
+
+/// Contraste: RST DESPUÉS de un `finish_reason` (el stream ya estaba completo; solo faltó
+/// `[DONE]`) sí se acepta con el texto entero. Evita que un arreglo del caso anterior
+/// rechace también este.
+#[cfg(target_os = "linux")]
+#[test]
+fn connection_reset_after_finish_reason_keeps_the_complete_answer() {
+    let fake = FakeOpenAi::start(vec![Step::Reset {
+        events: vec![delta("Hola "), delta("mundo"), FINISH_STOP.to_string()],
+    }]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_eq!(state, "done", "{texts:?}");
+    assert_eq!(texts.last().map(String::as_str), Some("Hola mundo"));
+}
