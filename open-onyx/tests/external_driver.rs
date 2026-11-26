@@ -30,7 +30,9 @@ const SECRETS: &[(&str, &str)] = &[
 ];
 
 /// Escenario: `root/ws` (repo git con un commit), `root/ctrl` (contador, PID files, volcados),
-/// `root/outside` (objetivos de escape), `root/home`, `root/bin/fake.sh`.
+/// `root/outside` (objetivos de escape), `root/home`, `root/bin/fake.sh` y `root/tmp`
+/// (`TMPDIR` de `serve`: el tmp del sandbox del harness, `onyx-sandbox-<hash>`, se crea ahí
+/// y se borra con el escenario en vez de acumularse en `/tmp`, FIX-96).
 struct Scenario {
     tmp: TempDir,
 }
@@ -38,7 +40,7 @@ struct Scenario {
 impl Scenario {
     fn new(prefix: &str) -> Self {
         let tmp = TempDir::new(prefix);
-        for d in ["ws", "ctrl", "outside", "home", "bin"] {
+        for d in ["ws", "ctrl", "outside", "home", "bin", "tmp"] {
             fs::create_dir_all(tmp.0.join(d)).unwrap();
         }
         let ws = tmp.0.join("ws");
@@ -139,6 +141,7 @@ fn launch(sc: &Scenario, api_base: &str, extra: &[&str], trusted: bool) -> Srv {
         .env("ONYX_TRUST_FILE", home.join("trusted.toml"))
         .env("FORJA_ALLOWED", "forja-allowed-value")
         .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .env("TMPDIR", sc.tmp.0.join("tmp"))
         .env("PWD", sc.ws());
     for (k, v) in SECRETS {
         cmd.env(k, v);
@@ -191,6 +194,7 @@ fn launch(sc: &Scenario, api_base: &str, extra: &[&str], trusted: bool) -> Srv {
     }
     let Some(port) = port else {
         let _ = child.kill();
+        let _ = child.wait();
         panic!("serve did not print its URL");
     };
     Srv { child, port }
@@ -492,14 +496,19 @@ fn text_step(t: &str) -> Step {
 }
 
 /// Turno 1 (texto, milestone) y turno 2 (`spawn_subagent`). Devuelve el tick del turno 1.
+/// `snaps` es un `TempDir`; el pack va en `snaps/pack` para que la rama que crea `/rewind`
+/// (`pack.fork-t<N>`, hermana del pack) quede DENTRO del `TempDir` y se borre con él (antes
+/// quedaba `/tmp/onyx_sse_ext_snaps_*.fork-t2`). `--fork-dir` no sirve: solo afecta a
+/// `--resume`, no al `/rewind` en vivo.
 fn two_turns(sc: &Scenario, snaps: &Path) -> (Srv, FakeOpenAi, u64) {
+    let pack = snaps.join("pack");
     let mut script = vec![text_step("uno")];
     script.extend(spawn_script());
     let fake = FakeOpenAi::start(script);
     let srv = launch(
         sc,
         &fake.base_url(),
-        &["--snapshot-dir", snaps.to_str().unwrap()],
+        &["--snapshot-dir", pack.to_str().unwrap()],
         true,
     );
     assert_eq!(command(&srv, "primero"), r#"{"ok":true}"#);
@@ -754,6 +763,155 @@ fn control_plane_files_are_not_materialized_in_worktree() {
     assert!(
         seen.is_empty(),
         "control-plane files visible to the harness: {seen:?}"
+    );
+}
+
+/// Lecturas fuera del worktree (Colorado §4.3): el harness lee la clave SSH, las credenciales
+/// del usuario (en su `HOME` real, `root/home`) y un fichero cualquiera de `outside/`. Los tres
+/// ficheros son ficticios. Vuelca lo leído en `ctrl/` y lee también un fichero DEL worktree
+/// (`README.md`) como sonda positiva.
+const READ_OUTSIDE: &str = r#"for f in "$OUT/../home/.ssh/id_forja" "$OUT/../home/.aws/credentials" "$OUT/secret.txt"; do
+  cat "$f" >> "$CTRL/read_outside.txt" 2>/dev/null
+done
+cat README.md > "$CTRL/read_inside.txt""#;
+
+fn read_outside_case(prefix: &str) -> Scenario {
+    let sc = Scenario::new(prefix);
+    let home = sc.tmp.0.join("home");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(home.join(".aws")).unwrap();
+    fs::write(home.join(".ssh/id_forja"), "FORJA-DUMMY-PRIVATE-KEY\n").unwrap();
+    fs::write(
+        home.join(".aws/credentials"),
+        "FORJA-DUMMY-AWS-CREDENTIALS\n",
+    )
+    .unwrap();
+    fs::write(
+        sc.outside().join("secret.txt"),
+        "FORJA-DUMMY-OUTSIDE-SECRET\n",
+    )
+    .unwrap();
+    sc.harness(READ_OUTSIDE);
+    sc.config(30, &[], ALLOW_FAKE);
+    let (_srv, _fake, _job) = run_job(&sc, &[], 30);
+    sc
+}
+
+/// Control (§4.3): la sonda funciona: el harness lee `README.md` de su worktree.
+#[cfg(unix)]
+#[test]
+fn harness_can_read_files_inside_its_worktree() {
+    let sc = read_outside_case("ext_read_in");
+    assert_eq!(
+        fs::read_to_string(sc.ctrl().join("read_inside.txt")).unwrap(),
+        "fixture\n"
+    );
+}
+
+/// §4.3: el `HOME` falso es solo una variable de entorno; con rutas absolutas el harness lee
+/// `~/.ssh/*`, `~/.aws/*` y cualquier fichero del host con los permisos del usuario que corre
+/// `serve`. Misma causa raíz que FIX-86..89 (sin jail de FS), pero en lectura: exfiltración,
+/// no escritura. El fichero `ctrl/read_outside.txt` no debe existir o debe estar vacío.
+#[cfg(unix)]
+#[test]
+#[ignore = "BUG: FIX-97 el harness externo LEE ficheros fuera del worktree por ruta absoluta (~/.ssh, ~/.aws, cualquier fichero del usuario): HOME falso es solo entorno y no hay jail de FS (open-onyx/src/external_driver.rs:164-182; onyx-workspace/src/sandbox.rs:962)"]
+fn harness_cannot_read_user_files_outside_worktree() {
+    let sc = read_outside_case("ext_read_out");
+    let read = fs::read_to_string(sc.ctrl().join("read_outside.txt")).unwrap_or_default();
+    assert!(
+        read.is_empty(),
+        "harness read files outside its worktree:\n{read}"
+    );
+}
+
+/// Tmp del sandbox del harness (Colorado §4.6): `HOME` del harness = `$TMPDIR/onyx-sandbox-<hash>`.
+const SANDBOX_HOME: &str = r#"echo "$HOME" > "$CTRL/sandbox_home"
+echo "state of the harness" > "$HOME/marker.txt""#;
+
+/// Ejecuta un job, lo descarta (`/discard`) y devuelve el `HOME` del sandbox que usó el harness.
+fn sandbox_home_after_discard(prefix: &str) -> (Scenario, PathBuf) {
+    let sc = Scenario::new(prefix);
+    sc.harness(SANDBOX_HOME);
+    sc.config(30, &[], ALLOW_FAKE);
+    let (srv, _fake, job) = run_job(&sc, &[], 30);
+    let id = job["job_id"].as_str().expect("job_id").to_string();
+    let home = PathBuf::from(
+        fs::read_to_string(sc.ctrl().join("sandbox_home"))
+            .unwrap()
+            .trim(),
+    );
+    assert_eq!(command(&srv, &format!("/discard {id}")), r#"{"ok":true}"#);
+    let discarded = wait_until(15, || {
+        state(&srv)["subagents"]
+            .as_array()
+            .and_then(|a| a.first())
+            .is_some_and(|j| j["status"] == "discarded")
+    });
+    assert!(discarded, "job was not discarded: {}", state(&srv));
+    (sc, home)
+}
+
+/// Control (§4.6): el `HOME` del harness es un directorio del sandbox (no el del usuario), vive
+/// bajo el `TMPDIR` de `serve`, es escribible y el harness guardó ahí su estado.
+#[cfg(unix)]
+#[test]
+fn harness_home_is_a_sandbox_dir_under_serve_tmpdir() {
+    let sc = Scenario::new("ext_sbx_home");
+    sc.harness(SANDBOX_HOME);
+    sc.config(30, &[], ALLOW_FAKE);
+    let (_srv, _fake, _job) = run_job(&sc, &[], 30);
+    let home = PathBuf::from(
+        fs::read_to_string(sc.ctrl().join("sandbox_home"))
+            .unwrap()
+            .trim(),
+    );
+    assert!(
+        home.starts_with(sc.tmp.0.join("tmp")) && home.to_string_lossy().contains("onyx-sandbox-"),
+        "sandbox home: {}",
+        home.display()
+    );
+    assert_ne!(home, sc.tmp.0.join("home"));
+    assert!(home.join("marker.txt").is_file());
+}
+
+/// §4.6: el directorio del sandbox (el `HOME` del harness, con su estado y posibles credenciales)
+/// no se borra al descartar el job: `ensure_sandbox_tmp_dir` lo crea y nadie lo limpia.
+#[cfg(unix)]
+#[test]
+#[ignore = "BUG: FIX-96 el tmp del sandbox del harness (onyx-sandbox-<hash>, su HOME) no se borra al descartar el job: ensure_sandbox_tmp_dir lo crea y remove_worktree no lo limpia (onyx-workspace/src/sandbox.rs:1152-1165; worktree.rs:522)"]
+fn sandbox_tmp_is_removed_when_job_is_discarded() {
+    let (_sc, home) = sandbox_home_after_discard("ext_sbx_rm");
+    assert!(
+        !home.exists(),
+        "sandbox tmp {} survives /discard (marker: {:?})",
+        home.display(),
+        fs::read_to_string(home.join("marker.txt")).ok()
+    );
+}
+
+/// §4.6: el nombre es previsible (`onyx-sandbox-<fnv(worktree)>`) y se crea con los permisos por
+/// defecto (umask del proceso, normalmente 0755): otro usuario del host puede listar y leer el
+/// estado del harness y precrear el directorio o un symlink con ese nombre.
+#[cfg(unix)]
+#[test]
+#[ignore = "BUG: FIX-97 el tmp del sandbox del harness se crea con los permisos por defecto (0755 con umask 022) y nombre previsible: otros usuarios del host leen el HOME del harness (onyx-workspace/src/sandbox.rs:1152-1165)"]
+fn sandbox_tmp_is_private_to_the_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let sc = Scenario::new("ext_sbx_mode");
+    sc.harness(SANDBOX_HOME);
+    sc.config(30, &[], ALLOW_FAKE);
+    let (_srv, _fake, _job) = run_job(&sc, &[], 30);
+    let home = PathBuf::from(
+        fs::read_to_string(sc.ctrl().join("sandbox_home"))
+            .unwrap()
+            .trim(),
+    );
+    let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "sandbox tmp {} has mode {mode:o}",
+        home.display()
     );
 }
 
