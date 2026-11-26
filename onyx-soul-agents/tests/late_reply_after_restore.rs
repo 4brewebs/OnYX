@@ -94,10 +94,26 @@ fn late_reply_to_superseded_request_is_discarded() {
     assert_eq!(host.result(agent).as_deref(), Some("NEW"));
 }
 
-/// Rewind con petición en vuelo: la respuesta de la petición `(agent, 2)` de antes del restore
-/// llega cuando el turno nuevo ya tiene pendiente su propia `(agent, 2)`. No debe aplicarse.
+/// La única petición pendiente `(agent, request)` que ve un bridge observador.
+fn the_pending_request(host: &mut AgentHost) -> (u64, u64) {
+    let pending = pending_requests(host);
+    assert_eq!(pending.len(), 1, "exactly one pending request: {pending:?}");
+    pending[0]
+}
+
+/// Rewind con petición en vuelo: la respuesta de la petición en vuelo de antes del restore
+/// (la «vieja», con su `(agent, request)`) llega cuando el turno nuevo ya tiene pendiente su
+/// propia petición. No debe aplicarse al turno nuevo, y este debe terminar con SU respuesta.
+///
+/// Este test NO fija qué número de `request` tiene cada petición tras el restore: hoy el
+/// restore rebobina `request` (la vieja y la nueva comparten clave, que es justo el bug), pero
+/// FIX-31 prevé una época por petición, con lo que los números pueden cambiar. Por eso solo
+/// aserta lo observable y estable: exactamente una pendiente en cada momento, que OLD no
+/// completa nada y que el turno nuevo acaba con la respuesta que corresponde a su pendiente.
+/// Cuando se decida cómo viaja la época en `Reply`, la respuesta vieja se construirá con la
+/// época vieja y este test se adaptará (el resto de asserts se mantiene).
 #[test]
-#[ignore = "BUG: la respuesta tardía de antes del restore se aplica al turno nuevo: Reply solo lleva (agent, request) y el restore rebobina request, sin época/generación que distinga peticiones (onyx-soul-agents/src/runtime.rs:433-439, reply.rs:68-75)"]
+#[ignore = "BUG: FIX-31 la respuesta tardía de antes del restore se aplica al turno nuevo: Reply solo lleva (agent, request) y el restore rebobina request, sin época/generación que distinga peticiones (onyx-soul-agents/src/runtime.rs:433-439, reply.rs:68-75)"]
 fn late_reply_from_before_restore_is_not_applied_to_new_turn() {
     let store = Store::default();
     let mut host = host(store.clone());
@@ -107,23 +123,26 @@ fn late_reply_from_before_restore_is_not_applied_to_new_turn() {
     assert!(store.0.borrow().contains_key("cut"));
     step_until_thinking(&mut host, &mut drv);
     let agent = host.agents()[0];
-    // Turno previo al rewind: request 1 contesta `say`, request 2 queda en vuelo y su
-    // respuesta "OLD" se retrasa.
-    drv.push_event(Reply::say(agent, 1, "before").to_event());
+    // Turno previo al rewind: la primera petición contesta `say` y la siguiente queda en
+    // vuelo; su respuesta "OLD" se retrasa.
+    let (_, first) = the_pending_request(&mut host);
+    drv.push_event(Reply::say(agent, first, "before").to_event());
     host.step(&mut drv);
     step_until_thinking(&mut host, &mut drv);
-    let late = Reply::done(agent, 2, "OLD");
+    let (old_agent, old_request) = the_pending_request(&mut host);
+    assert_eq!(old_agent, agent.0);
+    let late = Reply::done(agent, old_request, "OLD");
 
     host.request_restore("cut");
     host.step(&mut drv);
     step_until_thinking(&mut host, &mut drv);
-    // El restore rebobinó `request`: la petición pendiente vuelve a ser la 1.
-    assert_eq!(pending_requests(&mut host), vec![(agent.0, 1)]);
-    drv.push_event(Reply::say(agent, 1, "after").to_event());
+    // Turno nuevo: una petición pendiente, que se contesta con `say`.
+    let (_, first_after) = the_pending_request(&mut host);
+    drv.push_event(Reply::say(agent, first_after, "after").to_event());
     host.step(&mut drv);
     step_until_thinking(&mut host, &mut drv);
-    // Turno nuevo con su propia (agent, 2) pendiente. Llega la respuesta vieja.
-    assert_eq!(pending_requests(&mut host), vec![(agent.0, 2)]);
+    // Segunda petición del turno nuevo, pendiente. Llega la respuesta vieja.
+    let (_, current) = the_pending_request(&mut host);
     drv.push_event(late.to_event());
     host.step(&mut drv);
     assert_ne!(
@@ -132,4 +151,15 @@ fn late_reply_from_before_restore_is_not_applied_to_new_turn() {
         "a reply produced before the restore must not complete the new turn"
     );
     assert_eq!(host.agent_state(agent), Some(AgentState::Thinking));
+    assert_eq!(
+        the_pending_request(&mut host),
+        (agent.0, current),
+        "the new turn's request must still be pending"
+    );
+
+    // El turno nuevo acaba con su propia respuesta.
+    drv.push_event(Reply::done(agent, current, "NEW").to_event());
+    host.step(&mut drv);
+    assert_eq!(host.agent_state(agent), Some(AgentState::Done));
+    assert_eq!(host.result(agent).as_deref(), Some("NEW"));
 }
