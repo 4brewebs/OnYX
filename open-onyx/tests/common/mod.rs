@@ -233,7 +233,11 @@ pub struct Serve {
     child: Child,
     pub port: u16,
     _home: TempDir,
-    pub ws: TempDir,
+    /// Raíz del escenario: `serve` crea `.onyx-wt/` como HERMANO del workspace, así que el
+    /// workspace va en `<root>/ws` y `.onyx-wt` queda dentro de `root` (se borra con él) en vez
+    /// de acumularse en `/tmp/.onyx-wt`.
+    _root: TempDir,
+    pub ws: PathBuf,
     stderr: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -271,11 +275,13 @@ impl Serve {
 
     pub fn start_with(api_base: &str, extra: &[&str]) -> Self {
         let home = TempDir::new("home");
-        let ws = TempDir::new("ws");
-        fs::write(ws.0.join("README.md"), "fixture\n").unwrap();
+        let root = TempDir::new("serve");
+        let ws = root.0.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("README.md"), "fixture\n").unwrap();
         let git_ok = Command::new("git")
             .args(["init", "-q"])
-            .current_dir(&ws.0)
+            .current_dir(&ws)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -292,7 +298,7 @@ impl Serve {
             .args([
                 "serve",
                 "--workspace",
-                ws.0.to_str().unwrap(),
+                ws.to_str().unwrap(),
                 "--bind",
                 "127.0.0.1:0",
                 "--api-key",
@@ -349,6 +355,7 @@ impl Serve {
             child,
             port,
             _home: home,
+            _root: root,
             ws,
             stderr,
         }
