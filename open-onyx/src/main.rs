@@ -645,7 +645,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [--workspace <dir>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--shell-timeout <secs>] [--auto-approve] [--trust-workspace] [--api-base <url>] [--allow-custom-auth-host] [--effort <low|medium|high>] [--thinking-budget <tokens>]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [--workspace <dir>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-approve] [--trust-workspace] [--api-base <url>] [--allow-custom-auth-host] [--effort <low|medium|high>] [--thinking-budget <tokens>]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -683,6 +683,10 @@ OPTIONS:
       --max-steps <n>      Max agent steps per turn (default: 128 in `chat`, 64 in `run`)
       --max-subagents <n>  Max parallel async subagent worktrees (default: 3, or `ONYX_MAX_SUBAGENTS`)
       --shell-timeout <s>  Timeout in seconds per `shell_exec` command
+      --llm-timeout-connect <s>
+                           Max seconds to establish the TCP/TLS connection to an LLM provider (default: 30, or `ONYX_LLM_TIMEOUT_CONNECT_SECS`)
+      --llm-timeout-read <s>
+                           Max seconds between bytes/SSE chunks of the LLM response (default: 120, or `ONYX_LLM_TIMEOUT_READ_SECS`); a silent provider fails with a classified transport error instead of hanging the session (read timeouts are not retried)
       --auto-save          Auto-save snapshots + ONYXTR2 transcript together in `.onyx/vault/<timestamp>_<model>[_<branch|goal>]/` (or `ONYX_AUTO_SAVE=1`)
       --save-transcript <f>, --record <f>
                            Record deterministic `ONYXTR2` transcript (short names go inside `--snapshot-dir`, or `.onyx/vault/unassigned/` if no snapshot dir)
@@ -787,7 +791,11 @@ ENVIRONMENT VARIABLES:
                            Custom OpenAI-compatible API endpoint
   ANTHROPIC_API_BASE       Custom Anthropic API endpoint (default `https://api.anthropic.com`)
   ANTHROPIC_THINKING_BUDGET
-                           Anthropic extended thinking budget in tokens (`0` = off, or 1024..=60000); overrides the `--effort`-derived budget"#
+                           Anthropic extended thinking budget in tokens (`0` = off, or 1024..=60000); overrides the `--effort`-derived budget
+  ONYX_LLM_TIMEOUT_CONNECT_SECS
+                           Max seconds to establish the TCP/TLS connection to an LLM provider (default: 30; `--llm-timeout-connect` takes precedence)
+  ONYX_LLM_TIMEOUT_READ_SECS
+                           Max seconds between bytes/SSE chunks of the LLM response (default: 120; `--llm-timeout-read` takes precedence); a silent provider fails with a classified transport error instead of hanging the session (read timeouts are not retried)"#
         .replace("__GEMINI_MODEL__", DEFAULT_GEMINI_MODEL)
         .replace("__OPENAI_MODEL__", DEFAULT_OPENAI_MODEL)
         .replace("__ANTHROPIC_MODEL__", DEFAULT_ANTHROPIC_MODEL);
@@ -807,11 +815,15 @@ fn allow_custom_auth_host_from_env() -> bool {
 }
 
 /// `FIX-02`: segundos de timeout desde env, si hay (`ONYX_LLM_TIMEOUT_*_SECS`).
+/// `0` o no numérico cuentan como **no fijado** (mismo contrato `> 0` que la
+/// CLI, que lo rechaza con error explícito al parsear): nunca se genera
+/// `Duration::ZERO` para ureq.
 fn llm_timeout_secs_from_env(name: &str) -> Option<u64> {
     env::var(name)
         .ok()
         .filter(|s| !s.trim().is_empty())
         .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// `FIX-02`: timeouts HTTP de los proveedores LLM. Precedencia: CLI
@@ -2549,6 +2561,61 @@ mod tests {
     };
 
     use super::*;
+
+    /// `FIX-02` (cierre de auditoría): precedencia CLI > env > default y el
+    /// contrato `> 0`: `0` o no numérico en env cuentan como no fijado (nunca
+    /// `Duration::ZERO` para ureq). El `0` en la CLI se rechaza con error
+    /// explícito al parsear y no llega a `resolve_llm_timeouts`.
+    #[test]
+    fn llm_timeouts_resolve_cli_over_env_over_default_and_env_zero_is_unset() {
+        unsafe {
+            env::remove_var("ONYX_LLM_TIMEOUT_CONNECT_SECS");
+            env::remove_var("ONYX_LLM_TIMEOUT_READ_SECS");
+        }
+        let cli = CliArgs::simple(Mode::Chat);
+        // Default (sin CLI ni env).
+        assert_eq!(resolve_llm_timeouts(&cli), LlmTimeouts::DEFAULT);
+
+        // Env `0` y no numérico: cuentan como no fijado (no `Duration::ZERO`).
+        unsafe {
+            env::set_var("ONYX_LLM_TIMEOUT_CONNECT_SECS", "0");
+            env::set_var("ONYX_LLM_TIMEOUT_READ_SECS", "not-a-number");
+        }
+        assert_eq!(
+            resolve_llm_timeouts(&cli),
+            LlmTimeouts::DEFAULT,
+            "env 0/no numérico no debe fijar timeouts"
+        );
+
+        // Env válidos > default.
+        unsafe {
+            env::set_var("ONYX_LLM_TIMEOUT_CONNECT_SECS", "7");
+            env::set_var("ONYX_LLM_TIMEOUT_READ_SECS", "11");
+        }
+        assert_eq!(
+            resolve_llm_timeouts(&cli),
+            LlmTimeouts {
+                connect: Duration::from_secs(7),
+                read: Duration::from_secs(11)
+            }
+        );
+
+        // CLI > env.
+        let mut cli = CliArgs::simple(Mode::Chat);
+        cli.llm_timeout_connect_secs = Some(3);
+        cli.llm_timeout_read_secs = Some(5);
+        assert_eq!(
+            resolve_llm_timeouts(&cli),
+            LlmTimeouts {
+                connect: Duration::from_secs(3),
+                read: Duration::from_secs(5)
+            }
+        );
+        unsafe {
+            env::remove_var("ONYX_LLM_TIMEOUT_CONNECT_SECS");
+            env::remove_var("ONYX_LLM_TIMEOUT_READ_SECS");
+        }
+    }
 
     #[test]
     fn command_spawner_spawns_agent_on_follow_up_tick() {

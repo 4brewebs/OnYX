@@ -5,7 +5,8 @@
 //!
 //! Caja negra: binario + proveedor falso OpenAI-compatible en loopback (solo
 //! `std::net`). `--llm-timeout-read 1` / `--llm-timeout-connect 2` mantienen
-//! el test acotado (3 intentos × 1 s + backoff 400 + 1200 ms ≈ 4,6 s).
+//! el test acotado: el timeout de read **no** es reintenable (cierre de
+//! auditoría FIX-02), así que el fallo llega en el primer intento (~1 s).
 #![cfg(unix)]
 
 mod common;
@@ -72,7 +73,7 @@ fn hung_llm_request_keeps_health_up_and_rewind_works_after_timeout() {
     assert_eq!(serve.command("colgar"), r#"{"ok":true}"#);
 
     // Espera a que el proveedor reciba la petición: a partir de ahí el
-    // cliente está bloqueado en el read (vencimiento ≈ 4,6 s).
+    // cliente está bloqueado en el read (vencimiento ≈ 1 s; sin reintentos).
     let deadline = Instant::now() + Duration::from_secs(10);
     while fake.requests().is_empty() {
         assert!(

@@ -304,13 +304,15 @@ pub(crate) const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
 
 pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
+    // `FIX-02` (cierre de auditoría): el timeout de read mid-stream
+    // ("timed out ...") NO es reintenable: es el proveedor mudo con el prompt
+    // ya enviado (mismo criterio que `is_transport_read_timeout`).
     lower.contains("decoding chunks")
         || lower.contains("unexpected eof")
         || lower.contains("early eof")
         || lower.contains("connection reset")
         || lower.contains("connection aborted")
         || lower.contains("broken pipe")
-        || lower.contains("timed out")
         // `REQ-04.1`: `error` event in-stream de Anthropic con
         // `error.type == "overloaded_error"` (p. ej. 529) es reintenable.
         || lower.contains("overloaded_error")
@@ -525,7 +527,10 @@ fn post_openai_json(
                     transport_detail(&t)
                 ),
             ),
-            retryable: true,
+            // `FIX-02` (cierre de auditoría): el timeout de read NO es
+            // reintenable (`is_transport_read_timeout`); connect/DNS/reset
+            // siguen siéndolo.
+            retryable: !is_transport_read_timeout(&t),
         }),
     }
 }
@@ -544,6 +549,24 @@ pub(crate) fn transport_detail(t: &ureq::Transport) -> String {
                 .map(ToString::to_string)
         })
         .unwrap_or_else(|| "request failed".to_string())
+}
+
+/// `FIX-02` (cierre de auditoría): `true` si el error de transporte es un
+/// **timeout de read** (el proveedor aceptó la conexión y no responde entre
+/// bytes/chunks). A diferencia de los fallos de connect/DNS/reset —transitorios
+/// y reintentables—, reintentar ciegamente contra un servidor que calla por
+/// completo rara vez ayuda y puede disparar inferencias duplicadas (POST no
+/// idempotente con el prompt ya enviado). ureq lo clasifica como `Io` +
+/// `io::Error` `TimedOut` (o `WouldBlock` sin normalizar); un timeout de
+/// **connect** llega como `ConnectionFailed` y **no** coincide.
+pub(crate) fn is_transport_read_timeout(t: &ureq::Transport) -> bool {
+    use std::error::Error as _;
+    use std::io::ErrorKind as IoKind;
+    t.kind() == ureq::ErrorKind::Io
+        && t
+            .source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some_and(|e| matches!(e.kind(), IoKind::TimedOut | IoKind::WouldBlock))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -998,9 +1021,11 @@ mod tests {
     }
 
     /// `FIX-02` (criterio 2): un proveedor que acepta la conexión y **no
-    /// responde nunca** debe terminar en tiempo **acotado** con un error
-    /// clasificado (`timeout_read` → `Io`/`TimedOut`), no colgar. Antes del
-    /// fix, ureq sin `timeout_read` se bloqueaba eternamente en el read.
+    /// responde nunca** debe terminar en **un solo presupuesto de read** con
+    /// un error clasificado (`timeout_read` → `Io`/`TimedOut`), no colgar, y
+    /// **sin reintentos** (cierre de auditoría: el timeout de read no es
+    /// reintenable). Antes del fix, ureq sin `timeout_read` se bloqueaba
+    /// eternamente en el read.
     #[test]
     fn silent_provider_terminates_with_classified_error_within_timeout() {
         use std::net::TcpListener;
@@ -1037,12 +1062,13 @@ mod tests {
             true,
         );
         let elapsed = start.elapsed();
-        // 3 intentos (1 s de read cada uno) + backoff (400 + 1200 ms) ≈ 4,6 s:
-        // la cota es ~2× ese tope (holgura para jitter de CI) y acotada frente
+        // Sin reintentos (el timeout de read no es reintenable): con
+        // read=1 s el fallo llega en el primer intento (~1 s). La cota
+        // < 4 s demuestra que no reintentó 3 veces (~4,6 s) y acota frente
         // al hang eterno del pre-fix.
         assert!(
-            elapsed < Duration::from_secs(10),
-            "el proveedor mudo debe fallar en tiempo acotado (elapsed: {elapsed:?})"
+            elapsed < Duration::from_secs(4),
+            "el proveedor mudo debe fallar en el primer intento (elapsed: {elapsed:?})"
         );
         assert!(
             matches!(reply.verb, onyx_soul_agents::Verb::Fail),

@@ -44,8 +44,8 @@ use crate::gemini::{
 };
 use crate::llm_profile::{LlmTimeouts, api_base_host, is_loopback_host};
 use crate::openai::{
-    MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_MS, is_retryable_stream_error, lowercase_json_schema_types,
-    transport_detail,
+    MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_MS, is_retryable_stream_error, is_transport_read_timeout,
+    lowercase_json_schema_types, transport_detail,
 };
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
@@ -916,7 +916,10 @@ fn post_anthropic_json(
                     transport_detail(&t)
                 ),
             ),
-            retryable: true,
+            // `FIX-02` (cierre de auditoría): el timeout de read NO es
+            // reintenable (`is_transport_read_timeout`); connect/DNS/reset
+            // siguen siéndolo.
+            retryable: !is_transport_read_timeout(&t),
             retry_after_ms: None,
         }),
     }
