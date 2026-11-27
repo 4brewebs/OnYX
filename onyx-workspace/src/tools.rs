@@ -147,6 +147,18 @@ pub fn spawn_agent_is_isolated(args_json: &str) -> bool {
     }
 }
 
+/// `SDD-07` Fase 2: resultado de una ejecución shell verificada por el usuario
+/// en el borde de sesión (`! <cmd>`): pipes ya `scrub_secrets`, cap
+/// `policy.max_output_bytes`, y `timed_out` en vez de `Err` para el timeout
+/// (el resultado sigue siendo sellable, no un fallo de transporte).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetShellExecResult {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 impl WorkspaceTools {
     pub fn new(policy: WorkspacePolicy) -> Self {
         let sprout = SproutSupervisor::new(policy.clone());
@@ -1705,6 +1717,95 @@ impl WorkspaceTools {
         let stdout = scrub_secrets(&out_handle.join().unwrap_or_default());
         let stderr = scrub_secrets(&err_handle.join().unwrap_or_default());
         Ok((status.code().unwrap_or(-1), stdout, stderr))
+    }
+
+    /// `SDD-07` Fase 2: ejecuta un comando shell verificado por el usuario en el
+    /// borde de sesión (`! <cmd>`). Misma pipeline que `shell_exec` (sandbox
+    /// `prepare_sandboxed_shell_command`, `ProcessJob`, `command_timeout`), pero
+    /// sin escribir en el grafo ni consumir un turno de LLM: el resultado se
+    /// devuelve para sellarlo en `ONYXTR2` (`/__onyx_det_shell <json>`).
+    pub fn exec_det_shell(&self, command: &str) -> Result<DetShellExecResult, String> {
+        if command.trim().is_empty() {
+            return Err("command cannot be empty".to_string());
+        }
+        let sandbox_tmp = ensure_sandbox_tmp_dir(&self.policy.root)?;
+        let mut cmd = prepare_sandboxed_shell_command(
+            &self.policy.sandbox,
+            &self.policy.root,
+            &sandbox_tmp,
+            command,
+        )?;
+        cmd.current_dir(clean_process_path(&self.policy.root))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_isolation(&mut cmd, false);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn shell command: {e}"))?;
+        let mut job = ProcessJob::assign(&child, self.policy.sandbox.limits());
+        let out_handle = read_pipe_capped(child.stdout.take(), self.policy.max_output_bytes);
+        let err_handle = read_pipe_capped(child.stderr.take(), self.policy.max_output_bytes);
+        let deadline = Instant::now() + self.policy.command_timeout;
+
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        if let Some(ref mut j) = job {
+                            j.terminate();
+                        } else {
+                            #[cfg(windows)]
+                            {
+                                let _ = Command::new("taskkill")
+                                    .args(["/F", "/T", "/PID", &child.id().to_string()])
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status();
+                            }
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        drop(job);
+                        let _ = out_handle.join();
+                        let _ = err_handle.join();
+                        return Ok(DetShellExecResult {
+                            exit_code: None,
+                            timed_out: true,
+                            stdout: String::new(),
+                            stderr: format!(
+                                "shell command timed out after {:?}",
+                                self.policy.command_timeout
+                            ),
+                        });
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    if let Some(ref mut j) = job {
+                        j.terminate();
+                    }
+                    drop(job);
+                    return Err(format!("wait failed: {e}"));
+                }
+            }
+        };
+
+        // Termina explícitamente el `ProcessJob` RAII antes de devolver (misma
+        // disciplina que `exec_bounded_raw`).
+        if let Some(ref mut j) = job {
+            j.terminate();
+        }
+        drop(job);
+        let stdout = scrub_secrets(&out_handle.join().unwrap_or_default());
+        let stderr = scrub_secrets(&err_handle.join().unwrap_or_default());
+        Ok(DetShellExecResult {
+            exit_code: status.code(),
+            timed_out: false,
+            stdout,
+            stderr,
+        })
     }
 
     #[cfg(feature = "scent")]

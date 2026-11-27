@@ -1,5 +1,5 @@
-//! Hallazgos de `openonyx serve` destapados por Forja. Cada test está en `#[ignore]`
-//! hasta que se arregle; ejecutar con `cargo test -p open-onyx --test web_serve_bugs -- --ignored`.
+//! Hallazgos de `openonyx serve` destapados por Forja. Cada test cubre su arreglo
+//! (FIX-08/10) y corre en verde con el resto de la suite.
 
 mod common_web;
 
@@ -7,12 +7,10 @@ use common_web::ServeGuard;
 use std::io::Write;
 use std::time::Duration;
 
-/// `read_http_request` usa `BufRead::read_line` sin tope: acumula la línea entera en
-/// memoria y solo después compara con `MAX_HTTP_HEADER_BYTES` (16 KiB). Un cliente sin
-/// autenticar puede hacer crecer la memoria del proceso sin límite enviando una línea
-/// sin `\n`. Lo correcto es dejar de leer (y cerrar) en cuanto se superan los 16 KiB.
+/// FIX-08 (arreglado): `read_capped_line` corta la línea EN CUANTO supera
+/// `MAX_HTTP_HEADER_BYTES` (16 KiB) DURING la lectura, contesta 431 y cierra:
+/// un cliente sin autenticar ya no puede inflar la memoria con una línea sin `\n`.
 #[test]
-#[ignore = "BUG: FIX-08 read_line sin tope; el límite de 16 KiB de cabecera se comprueba después de leer la línea entera"]
 fn header_limit_is_enforced_while_reading_not_after() {
     for prefix in [&b"GET /"[..], &b"GET / HTTP/1.1\r\nX-Long: "[..]] {
         let mut srv = ServeGuard::start("bug_header_line");
@@ -38,11 +36,9 @@ fn header_limit_is_enforced_while_reading_not_after() {
     }
 }
 
-/// El token de sesión se deriva una sola vez al arrancar (`WebHub::new`) y logout solo
-/// pide al navegador que borre la cookie: una cookie copiada antes del logout sigue
-/// autenticando hasta reiniciar `serve`. Logout debería revocar la sesión en el servidor.
+/// FIX-10 (arreglado): cada login emite un token aleatorio y el logout revoca la
+/// sesión EN EL SERVIDOR: una cookie copiada antes del logout deja de autenticar.
 #[test]
-#[ignore = "BUG: FIX-10 logout no revoca la sesión; el token de cookie es fijo durante toda la vida del proceso"]
 fn session_cookie_stops_working_after_logout() {
     let srv = ServeGuard::start("bug_logout");
     let cookie = srv.login_cookie();

@@ -178,7 +178,43 @@ The root agent can delegate subtasks in two ways: **synchronous** graph subagent
 
 ---
 
-## 7. Quick Reference of Keys & Slash Commands (`chat`)
+## 7. Interactive Time Debugger (`TimeFreeze`, SDD-07)
+
+`TimeFreeze` lets you **pause the session at any tick** and step through it without spending tokens or touching disk: tick boundaries live in a **RAM ring** (on-disk milestones from `--snapshot-dir` overlay it as references) and the whole state is **100 % ephemeral** until you confirm a branch (`/go` with the cursor anchored in the past creates the fork; nothing is written before that).
+
+### Freezing, scrubbing, and getting out
+
+| Action | How |
+| --- | --- |
+| Freeze / unfreeze at the cursor | `Ctrl+T` or `/time` (ephemeral toggle) |
+| Scrub −1 / +1 over available ticks | `Alt+←` / `Alt+→` (looking at the past auto-freezes) |
+| Return to present **without quitting** the app | `Esc` while `TIME FROZEN` (a second `Esc` when live: exit) |
+| Jump to a specific tick (milestones `[pack:*]`, `[ram]`, `(present)`) | `F5 Timeline` → `Down`/`Up` → `Enter` |
+
+While frozen, the **amber banner** appears (`⏸ TIME FROZEN · tick X / present Y` + the files that would be reverted when branching, RAM-only) and plain prompts are blocked: an out-of-order turn would break the bit-for-bit replay. The **escape routes** (`/…` and `!…`) keep working **always**, even with the agent busy in `Thinking` (the pre-LLM breakpoint): they run immediately, never queued.
+
+### 0-token primitives and frozen-graph surgery
+
+| Command | What it does |
+| --- | --- |
+| `/step [n]` | Advance `n` deterministic ticks with **0 LLM** calls (default `1`; works frozen) |
+| `/step-llm` | **Exactly one** LLM turn: gate + branch if needed + re-freeze when it answers |
+| `/go` (alias `/unfreeze`) | Branch from the cursor if it looks at the past, then **resume at present** |
+| `! <cmd>` | Run a deterministic shell command in the sandbox and **seal** the result (0 network, 0 disk) |
+| `/read <path> [a..b]` | Read a file (or line range) into memory, 0 tokens, frozen-safe |
+| `/inject <text>` | Stage a **sealed** `user` memory into the timeline (0 tokens) |
+| `/graph inspect [agent\|mem\|ws]` | **Read-only** report of the frozen graph (memories with `mem_seq`, agents, workspace) |
+| `/graph drop-mem <seq\|a..b>` | Drop memories by `mem_seq` without advancing time |
+| `/graph edit-mem <seq> <text>` | Edit an existing memory in place |
+| `/graph set-goal <text>` | Change the root agent's goal inside the frozen graph |
+
+These primitives are **sealed into `ONYXTR2`** (`/__onyx_det_*`): offline replay reproduces them bit-for-bit with 0 I/O and 0 network. The Web/PWA view (`openonyx serve`) has **full parity**: the `#tick-pill` opens the same amber bar, `POST /api/v1/time/scrub` applies ephemeral scrubs, plain prompts under freeze get an actionable `409 Conflict`, and root memories expose `✎`/`×` buttons — see [chapter 04](04-time-travel-snapshots-and-forking.md).
+
+> **Non-goal**: **Sprout** (services/containers) and **MCP server** effects are external process side effects, not graph mutations: `TimeFreeze` **does not rewind** them (nor revert them when branching).
+
+---
+
+## 8. Quick Reference of Keys & Slash Commands (`chat`)
 
 | Key / Command | Action |
 | --- | --- |
@@ -189,7 +225,9 @@ The root agent can delegate subtasks in two ways: **synchronous** graph subagent
 | `Ctrl+Tab` | Quick-cycle focused agent (terminal-dependent alias for `F2` / `/agent`) |
 | `y` / `n` | Approve or deny a pending mutating tool diff (**only in `F1 Chat`**; other views hint to press `F1`) |
 | `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End`/`Ctrl+U`/`Ctrl+D` | Scroll `Memory & Trace` history |
-| `Esc` | Close popup/palette; in `F2..F5` back to `F1 Chat`; in `F1 Chat` exit cleanly (flushing snapshot & transcript) |
+| `Alt+←` / `Alt+→` | TimeFreeze: scrub the cursor −1/+1 over available ticks (auto-freezes when looking at the past) |
+| `Ctrl+T` | TimeFreeze: toggle freeze at the cursor / return to present (ephemeral, 0 disk) |
+| `Esc` | Close popup/palette; while `TIME FROZEN` return to present **without quitting**; in `F2..F5` back to `F1 Chat`; in `F1 Chat` exit cleanly (flushing snapshot & transcript) |
 | `Ctrl+C` | Exit cleanly (flushing `exit` snapshot & transcript, if configured) |
 | `/view <chat\|agents\|sprout\|plan\|timeline>` | Switch views from the prompt (ephemeral: 0 bus events, 0 ticks, 0 graph writes) |
 | `/agent [id\|name]` | Open agent selector or focus specific agent |
@@ -197,6 +235,14 @@ The root agent can delegate subtasks in two ways: **synchronous** graph subagent
 | `/undo` | Revert latest reversible Git checkpoint (also cleans newly created `fs_write` files) |
 | `/rewind [tick]` | List milestones or rewind live to `<tick>` into a safe sibling fork |
 | `/fork [name]` | Branch snapshots up to current tick into a sibling directory |
+| `/time` | TimeFreeze: toggle freeze at the current cursor (ephemeral, 0 disk) |
+| `/go` (alias `/unfreeze`) | TimeFreeze: branch if the cursor looks at the past, then resume at present |
+| `/step [n]` | TimeFreeze: `n` deterministic ticks with 0 LLM (default `1`; frozen-safe) |
+| `/step-llm` | TimeFreeze: exactly one LLM turn (gate + branch + re-freeze) |
+| `! <cmd>` | Deterministic sandboxed shell with the result sealed into `ONYXTR2` (frozen-safe) |
+| `/read <path> [a..b]` | Read a file (or range) into memory, 0 tokens (frozen-safe) |
+| `/inject <text>` | Sealed `user` memory staged into the timeline, 0 tokens (frozen-safe) |
+| `/graph <inspect\|drop-mem\|edit-mem\|set-goal>` | Read-only inspection or surgery on the frozen graph (memories by `mem_seq`, goal) without advancing time |
 | `/compact [focus]` | Compact older turns while rescuing focus matches and discovered files |
 | `/services` | Print `@TOON v1` status of services defined in `sprout.toml` |
 | `/service <start\|stop\|logs> <id\|all> [tail]` | Control Sprout services directly from the TUI |

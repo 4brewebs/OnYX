@@ -37,6 +37,7 @@ use crate::openai::{
     DEFAULT_OPENAI_API_BASE, OpenAiSharedState, OpenAiStreamTarget, build_openai_request_body,
     execute_openai_stream_http,
 };
+use crate::time_debug::TimeDebugState;
 
 /// Driver asíncrono con streaming SSE y **objetivo LLM dinámico** (hot-swap en
 /// caliente, `SDD-03` Fase 2). Envuelve al driver de subagentes (`wrapping`),
@@ -51,6 +52,9 @@ pub struct DynamicLlmDriver {
     in_flight_count: Arc<AtomicUsize>,
     has_ready: Arc<AtomicBool>,
     stream_preview: Option<StreamPreviewHandle>,
+    /// `SDD-07`: gate de congelación — con `frozen` y sin presupuesto de
+    /// `/step-llm`, `present()` no despacha (ni marca `dispatched`).
+    time_debug: Option<TimeDebugState>,
     rx: mpsc::Receiver<Reply>,
     tx: mpsc::Sender<Reply>,
     inner: Option<Box<dyn PlatformDriver>>,
@@ -88,6 +92,7 @@ impl DynamicLlmDriver {
             in_flight_count,
             has_ready,
             stream_preview: None,
+            time_debug: None,
             rx,
             tx,
             inner: None,
@@ -126,6 +131,32 @@ impl DynamicLlmDriver {
         self.anthropic_shared.mcp_schemas = mcp_schemas;
         self
     }
+
+    /// `SDD-07` Fase 1: gate `frozen`/`step_llm_budget` en `present()`.
+    pub fn with_time_debug(mut self, time_debug: TimeDebugState) -> Self {
+        self.time_debug = Some(time_debug);
+        self
+    }
+}
+
+/// `SDD-07` (fix de auditoría): decisión de despacho de un request pendiente.
+///
+/// El registro `dispatched` se comprueba **antes** que el gate de
+/// congelación: un request ya despachado nunca quema presupuesto de
+/// `/step-llm`. Si el gate pasa (o no hay depurador), se consume exactamente
+/// 1 turno (solo bajo congelación).
+fn llm_dispatch_allowed(
+    time_debug: &Option<TimeDebugState>,
+    dispatched: &HashSet<(u64, u64)>,
+    key: (u64, u64),
+) -> bool {
+    if dispatched.contains(&key) {
+        return false;
+    }
+    match time_debug {
+        Some(td) => td.try_acquire_llm_turn(),
+        None => true,
+    }
 }
 
 impl PlatformDriver for DynamicLlmDriver {
@@ -148,10 +179,17 @@ impl PlatformDriver for DynamicLlmDriver {
         }
         let preview = self.stream_preview.clone();
         for req in pending_requests(graph, &self.vocab) {
+            // `SDD-07`: congelado sin presupuesto de `/step-llm` → no se
+            // despacha **ni** se marca `dispatched`: al descongelar, el request
+            // pendiente sale al siguiente `present()` sin reintento ni pérdida.
+            // Fix de auditoría: `dispatched` se comprueba **antes** que el
+            // gate (un request ya en vuelo no quema presupuesto) y la
+            // inserción ocurre **después** de adquirir el turno.
             let key = (req.agent.0, req.request);
-            if !self.dispatched.insert(key) {
+            if !llm_dispatch_allowed(&self.time_debug, &self.dispatched, key) {
                 continue;
             }
+            self.dispatched.insert(key);
             // Continuation de tool call: se entrega sin HTTP (cola compartida).
             if let Some(queued_reply) = next_queued_call(&self.gemini_shared.pending_calls, &req) {
                 if self.tx.send(queued_reply).is_ok() {
@@ -324,5 +362,49 @@ impl PlatformDriver for DynamicLlmDriver {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SDD-07` fix de auditoría: un request **ya despachado** no quema
+    /// presupuesto de `/step-llm` (`dispatched` se comprueba antes que el
+    /// gate) y no se re-despacha.
+    #[test]
+    fn dispatched_request_does_not_burn_step_llm_budget() {
+        let state = TimeDebugState::new(None);
+        state.freeze();
+        state.grant_step_llm(1);
+        let td = Some(state.clone());
+        let mut dispatched = HashSet::new();
+
+        // Primer despacho: consume el único turno autorizado.
+        assert!(llm_dispatch_allowed(&td, &dispatched, (1, 1)));
+        dispatched.insert((1, 1));
+        assert!(
+            !state.try_acquire_llm_turn(),
+            "presupuesto agotado tras el primer despacho"
+        );
+
+        // El mismo request en un `present()` posterior: ni re-despacho ni
+        // consumo (con el orden antiguo, gate → dispatched, este request
+        // habría quemado el turno recién concedido).
+        state.grant_step_llm(1);
+        assert!(
+            !llm_dispatch_allowed(&td, &dispatched, (1, 1)),
+            "un request ya despachado nunca se re-despacha"
+        );
+        assert!(
+            state.try_acquire_llm_turn(),
+            "el request duplicado no debe haber consumido el turno"
+        );
+
+        // Un request nuevo sigue respetando el gate (presupuesto 0).
+        assert!(!llm_dispatch_allowed(&td, &dispatched, (2, 1)));
+
+        // Sin depurador (sesiones sin `TimeDebugState`): el gate no aplica.
+        assert!(llm_dispatch_allowed(&None, &dispatched, (2, 1)));
     }
 }

@@ -158,7 +158,7 @@ openonyx rewind feat-auth 12 --transcript chat.tr
 
 ## 7. Transcripts & 100% Offline Replay (`ONYXTR2`)
 
-Recording with `--auto-save` or `--record <file>` writes all LLM decisions, structured tool calls (`call_id`), slash commands (`Tab`, `/mode`, `/undo`, `/compact`, etc.), and checkpoint markers (`[checkpoint:<head>:<tree>]`).
+Recording with `--auto-save` or `--record <file>` writes all LLM decisions, structured tool calls (`call_id`), slash commands (`Tab`, `/mode`, `/undo`, `/compact`, etc.), and checkpoint markers (`[checkpoint:<head>:<tree>]`). The time debugger's 0-token primitives are **sealed** in the transcript as `/__onyx_det_*` (shell `!cmd`, `/read`, `/inject`, `/step`, `/step-llm`, and `/graph` surgery): replay reproduces them **bit-for-bit with 0 I/O and 0 network** (no command is re-executed).
 
 ```sh
 # Record a session in the vault
@@ -186,6 +186,21 @@ openonyx doctor --snapshot-dir feat-auth --transcript chat.tr
 5. Transcript header and parse integrity (`ONYXTR1` / `ONYXTR2`).
 6. Host OS sandbox driver (`bwrap`/`sandbox-exec`/`win32-job`) and OCI container CLI.
 7. `sprout.toml` syntax, acyclic DAG, container runtime, and occupied ports (if present).
+
+---
+
+## 9. Web Parity: the Time Debugger in `openonyx serve`
+
+The embedded PWA has **full parity** with the TUI time debugger (SDD-07 Phase 4A): the same session state feeds both surfaces, so what you do from the browser affects the live session and vice versa.
+
+- **Tick pill**: the header shows `#tick-pill` (an accessible button). Live it reads `tick N`; under freeze or with the cursor anchored in the past it reads `⏸ X/Y` and **auto-opens** the **amber Time Debugger bar** (you can close it; it reopens on the next freeze).
+- **Amber bar**: status (`⏸ TIME FROZEN · tick X / present Y` / `LIVE · tick Y`), a slider that **snaps to the nearest available tick** (purged/future ticks are rejected with an actionable notice), ◀/▶ buttons, `Freeze`/`Present`, `Step`, `Step 1 LLM`, and `Resume` — the last three go through the **sealed command tunnel** (`/step 1`, `/step-llm`, `/go`), not the scrub API: the branch is applied in the session with its gates.
+- **Ephemeral API**: `POST /api/v1/time/scrub` (JSON: `action: freeze|unfreeze|return_to_present|scrub_to|scrub_delta`) mutates only the debugger's RAM state — **0 disk, 0 bus events** — and replies with the updated `time_debug` snapshot. It inherits the Bearer auth and CSRF guard of every `/api/v1/*` endpoint (401 without credentials, 403 cross-site, actionable 400 for future/purged ticks or unknown actions).
+- **Plain prompts under freeze**: `POST /api/v1/command` answers **`409 Conflict`** with an actionable message (`Paused in TIME FROZEN: use /go to resume or /inject to stage memory…`); `/go`, `/graph …`, `/inject …`, `/read …`, `/step …`, `/step-llm`, `/time` and `!cmd` keep working.
+- **Memory surgery in the UI**: with the root agent frozen, each root memory exposes `✎` (edit via a dialog → flat `/graph edit-mem <seq> <text>`) and `×` (delete with confirmation → `/graph drop-mem <seq>`).
+- **Projection preview & revert notice**: the Web snapshot carries the full `time_debug` block (`frozen`, `cursor_tick`, `present_tick`, `available_ticks`, `pending_revert_files` from the live graph's effects, 0 I/O) and, with `--snapshot-dir` + a real LLM target, the **`bench_hint`**: a copy-paste `openonyx bench --snapshot-dir … --tick … --models provider:model` command to compare the live model against a deterministic benchmark from the same cursor (SDD-05 §9.4 synergy).
+
+> **Non-goal**: **Sprout** and **MCP server** effects are external process side effects: TimeFreeze (TUI or Web) **does not rewind** them.
 
 ---
 

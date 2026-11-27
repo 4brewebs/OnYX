@@ -173,6 +173,13 @@ Por seguridad, `/rewind <tick>` en vivo requiere que ningún agente esté `think
 - Workspace **no confiado** con `[mcp.servers.*]` de proyecto: `[WARN]` `MCP config in ... ignored: workspace is not trusted (use --trust-workspace or openonyx trust)` — aprueba con `openonyx trust` o usa `--trust-workspace`.
 - Tools `mcp__*` siempre piden aprobación en `BUILD` y quedan `Deny` en `PLAN`/`EXPLORE`; si quieres auto-aprobarlas, declara `allow = ["mcp__<server>__*"]` en `.onyx/config.toml` (workspace confiado).
 
+### 11. La Web (o la TUI) no acepta mi prompt: `409 Conflict` / "Paused in TIME FROZEN"
+Es el guard de `TimeFreeze` (capítulo 04, sección 9): la sesión está **congelada** (breakpoint temporal activo) y un prompt plano desordenado rompería la bit-a-bit del replay. No es un fallo — son las vías de escape:
+- `/go` (o `/unfreeze`): bifurca si el cursor mira el pasado y reanuda en el presente.
+- `/inject <texto>` / `/graph …` / `/read …` / `/step [n]` / `/step-llm` / `! <cmd>`: siguen funcionando bajo freeze (primitivas 0-tokens selladas).
+- En la Web, la barra ámbar (pulsar `#tick-pill`) tiene `Resume`; en la TUI, `Esc` vuelve al presente sin salir y `Ctrl+T` alterna el freeze.
+- En `POST /api/v1/command` el 409 incluye el mensaje accionable completo; un `400` en `POST /api/v1/time/scrub` significa tick futuro/purgado o acción desconocida (el body lo explica).
+
 ---
 
 [← 05. Herramientas, Scent, Sprout y Skills](05-herramientas-scent-sprout-y-skills.md) · [Volver al Índice del Manual](index.md)

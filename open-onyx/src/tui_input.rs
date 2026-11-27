@@ -62,6 +62,21 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Branch snapshots into sibling folder (`[name]`)",
     },
     SlashCommandHint {
+        command: "/go",
+        insert: "/go",
+        description: "Resume: return to present, unfreeze and continue live (time debugger)",
+    },
+    SlashCommandHint {
+        command: "/graph",
+        insert: "/graph ",
+        description: "Agent graph surgery (`inspect|drop-mem|edit-mem|set-goal`)",
+    },
+    SlashCommandHint {
+        command: "/inject",
+        insert: "/inject ",
+        description: "Stage memory text into the graph deterministically (time debugger)",
+    },
+    SlashCommandHint {
         command: "/merge",
         insert: "/merge ",
         description: "3-way merge finished async subagent into root (`<job_id>`)",
@@ -92,6 +107,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Hot-swap LLM provider (`gemini|openai|anthropic`)",
     },
     SlashCommandHint {
+        command: "/read",
+        insert: "/read ",
+        description: "Deterministic file read, sealed for bit-for-bit replay (time debugger)",
+    },
+    SlashCommandHint {
         command: "/rewind",
         insert: "/rewind ",
         description: "List milestones or rewind live to `<tick>`",
@@ -112,9 +132,24 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandHint] = &[
         description: "Launch background subagent without a root turn (`[--driver <id>] <task>`)",
     },
     SlashCommandHint {
+        command: "/step",
+        insert: "/step ",
+        description: "Advance the deterministic loop `N` ticks under TimeFreeze",
+    },
+    SlashCommandHint {
+        command: "/step-llm",
+        insert: "/step-llm",
+        description: "Allow exactly one LLM turn under TimeFreeze",
+    },
+    SlashCommandHint {
         command: "/subagents",
         insert: "/subagents",
         description: "List background async worktree subagent jobs",
+    },
+    SlashCommandHint {
+        command: "/time",
+        insert: "/time",
+        description: "Toggle TimeFreeze (freeze now / resume live) — time debugger",
     },
     SlashCommandHint {
         command: "/trust",
@@ -527,6 +562,21 @@ impl PopupState {
         true
     }
 
+    /// `SDD-07` Fase 3: ¿el ítem seleccionado coincide ya con el texto del
+    /// token (aceptar sería un no-op)? Con `Enter` eso significa que la
+    /// tecla es un **envío**, no un aceptado de completado (comandos sin
+    /// argumento: `/go`, `/time`, `/cancel`…).
+    pub fn selected_matches_input(&self, buf: &InputBuffer) -> bool {
+        let Some(item) = self.items.get(self.selected) else {
+            return false;
+        };
+        let text = buf.as_str();
+        let end = self.replace_end.min(text.len());
+        let start = self.replace_start.min(end);
+        let token = text.get(start..end).unwrap_or("");
+        token == item.replacement || token == item.replacement.trim_end_matches(' ')
+    }
+
     /// Recalcula el popup activo según el texto y posición del cursor en `buf`.
     pub fn sync_from_buffer(
         &mut self,
@@ -822,13 +872,15 @@ mod tests {
         let mut buf = InputBuffer::default();
         let mut popup = PopupState::default();
 
-        // 1. Slash command autocomplete
+        // 1. Slash command autocomplete (`SDD-07`: `/read` precede a
+        // `/rewind` alfabéticamente y ambos aparecen en el popup)
         buf.set_text("/re");
         popup.sync_from_buffer(&buf, &mut files, None, None);
         assert_eq!(popup.kind, Some(PopupKind::Slash));
+        assert!(popup.items.iter().any(|i| i.label == "/read"));
         assert!(popup.items.iter().any(|i| i.label == "/rewind"));
         assert!(popup.accept_into(&mut buf));
-        assert_eq!(buf.as_str(), "/rewind ");
+        assert_eq!(buf.as_str(), "/read ");
 
         // 2. Email should NOT trigger `@` popup
         buf.set_text("contact user@example.com");

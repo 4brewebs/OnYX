@@ -73,8 +73,11 @@ fn malformed_requests_never_crash_the_server() {
     }
 }
 
+/// FIX-08/11 (arreglado): una petición demasiado grande ya no se descarta en
+/// silencio (cierre sin respuesta); se contesta al instante con 4xx (431 para
+/// cabeceras > 16 KiB, 413 para cuerpos > 64 KiB) y el proceso sigue atendiendo.
 #[test]
-fn oversized_headers_and_bodies_are_dropped_without_a_response() {
+fn oversized_requests_get_a_4xx_answer_immediately() {
     let mut srv = ServeGuard::start("limits");
     let bearer = srv.bearer();
 
@@ -85,7 +88,7 @@ fn oversized_headers_and_bodies_are_dropped_without_a_response() {
     ));
     assert_eq!(ok.status, 200);
 
-    // Cabeceras por encima del límite (varias líneas): sin respuesta, conexión cerrada.
+    // Cabeceras por encima del límite (varias líneas): 431 inmediato.
     let mut raw = String::from("GET / HTTP/1.1\r\nHost: x\r\n");
     for i in 0..40 {
         raw.push_str(&format!("X-H{i}: {}\r\n", "b".repeat(512)));
@@ -95,7 +98,7 @@ fn oversized_headers_and_bodies_are_dropped_without_a_response() {
     let r = srv
         .try_request(&raw)
         .unwrap_or_else(|_| common_web::Response::parse(b""));
-    assert_eq!(r.status, 0, "cabeceras > 16 KiB no deben procesarse");
+    assert_eq!(r.status, 431, "cabeceras > 16 KiB ⇒ 431");
     srv.assert_still_serving("tras cabeceras enormes");
 
     // Cuerpo en el límite exacto (64 KiB): se procesa.
@@ -112,7 +115,7 @@ fn oversized_headers_and_bodies_are_dropped_without_a_response() {
     );
     assert_eq!(r.status, 200, "cuerpo de 64 KiB exactos debe aceptarse");
 
-    // Un byte más: se descarta sin leerlo ni responder.
+    // Un byte más: 413 sin leer ni procesar el cuerpo.
     let body = format!("{json_core}{}", " ".repeat(MAX_BODY + 1 - json_core.len()));
     let r = srv
         .try_request(&build_request(
@@ -122,17 +125,17 @@ fn oversized_headers_and_bodies_are_dropped_without_a_response() {
             Some(&body),
         ))
         .unwrap_or_else(|_| common_web::Response::parse(b""));
-    assert_eq!(r.status, 0, "cuerpo de 64 KiB + 1 debe descartarse");
+    assert_eq!(r.status, 413, "cuerpo de 64 KiB + 1 ⇒ 413");
 
-    // Content-Length enorme anunciado sin cuerpo: cierre inmediato, sin esperar.
+    // Content-Length enorme anunciado sin cuerpo: 413 inmediato, sin esperar.
     let mut s = srv.connect();
     s.write_all(b"POST /api/v1/command HTTP/1.1\r\nContent-Length: 999999999999\r\n\r\n")
         .unwrap();
     let (resp, took) = read_until_closed(&mut s, Duration::from_secs(5));
+    let text = String::from_utf8_lossy(&resp);
     assert!(
-        resp.is_empty(),
-        "sin respuesta: {:?}",
-        String::from_utf8_lossy(&resp)
+        text.starts_with("HTTP/1.1 413"),
+        "413 inmediato sin esperar el cuerpo: {text}"
     );
     assert!(
         took < Duration::from_secs(2),

@@ -12,7 +12,7 @@
 //!   CSRF guard y `Clear-Site-Data` en logout).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,12 +33,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{ReasoningEffort, SessionTelemetryHandle};
 use crate::gemini::StreamPreviewHandle;
-use crate::llm_profile::LlmProfileHandle;
+use crate::llm_profile::{LlmProfileHandle, LlmProvider};
 use crate::pack::SharedPackStore;
 use crate::session::UiIdlePump;
 use crate::subagent::{
     MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, effective_merge_decision,
 };
+use crate::time_debug::TimeDebugState;
 use crate::tui_input::WorkspaceFileIndex;
 use crate::vault::session_display_label;
 
@@ -49,6 +50,23 @@ const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_CLIENTS: usize = 32;
 const STREAM_SSE_THROTTLE_MS: u64 = 120;
 const MAX_STREAM_THOUGHT_BYTES: usize = 4 * 1024;
+/// FIX-09: tope de hilos de conexión simultáneas (una conexión aparcada sin datos
+/// pendientes NO cuenta: no tiene hilo). Dimensionado para el peor caso legítimo
+/// conocido: 150 slowloris con datos pendientes + cliente legítimo + SSE
+/// long-lived (`MAX_SSE_CLIENTS + margen`). El exceso recibe `503` sin crear hilo.
+const MAX_CONCURRENT_CONNECTIONS: usize = 160;
+/// FIX-10: tope de sesiones web vivas (evita DoS de memoria con logins válidos).
+const MAX_LIVE_SESSIONS: usize = 16;
+/// FIX-08/FIX-09: presupuesto TOTAL de lectura de la petición (línea + cabeceras +
+/// cuerpo) desde que se acepta la conexión. El timeout de 10 s por `read` no basta:
+/// un byte goteado cada <10 s lo renueva para siempre (slowloris).
+const TOTAL_REQUEST_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// FIX-14: ventana deslizante del rate limit de login (por IP y global).
+const LOGIN_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const LOGIN_MAX_FAILURES_PER_IP: usize = 5;
+const LOGIN_MAX_FAILURES_GLOBAL: usize = 20;
+/// FIX-36: HSTS en modo expuesto (bind no loopback o `--behind-tls`).
+const HSTS_VALUE: &str = "max-age=31536000; includeSubDomains";
 
 const ASSET_INDEX_HTML: &str = include_str!("../web/index.html");
 const ASSET_STYLES_CSS: &str = include_str!("../web/styles.css");
@@ -217,6 +235,23 @@ pub struct WebServerConfig {
     pub api_key: String,
     pub generated_key: bool,
     pub cors_origin: Option<String>,
+    /// FIX-16/FIX-36: modo explícito «detrás de proxy TLS» (`--behind-tls`).
+    /// Es la única vía (junto con el propio bind no loopback) para el modo
+    /// seguro: cookie `__Host-…; Secure` + HSTS. La cabecera `X-Forwarded-Proto`
+    /// del cliente **nunca** se usa para decidirlo (FIX-16).
+    pub behind_tls: bool,
+    /// FIX-17: lista de `Host` permitidos (`--allowed-hosts a,b`). `None` =
+    /// sin validación (comportamiento por defecto; el Host del cliente solo se
+    /// compara, nunca se usa para generar URLs).
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
+impl WebServerConfig {
+    /// FIX-36: el modo seguro es explícito — o el bind no es loopback (VPS),
+    /// o el arranque declara `--behind-tls`.
+    pub fn secure_mode(&self) -> bool {
+        !self.bind_addr.ip().is_loopback() || self.behind_tls
+    }
 }
 
 impl WebServerConfig {
@@ -265,6 +300,13 @@ impl WebServerConfig {
                     "invalid --cors-origin `{origin}`: must be an explicit `http://` or `https://` origin (wildcard `*` is not allowed)"
                 ));
             }
+            // FIX-37: fuera de loopback un origen `http://` no protege la cookie
+            // `Secure`: se rechaza al arrancar (solo `https://` o sin CORS).
+            if !is_loopback && origin.starts_with("http://") {
+                return Err(format!(
+                    "refusing to bind non-loopback address `{bind_addr}` with `--cors-origin {origin}`: only `https://` origins are allowed in exposed mode (or omit `--cors-origin`)"
+                ));
+            }
         }
 
         Ok(Self {
@@ -272,7 +314,28 @@ impl WebServerConfig {
             api_key,
             generated_key,
             cors_origin: clean_cors,
+            behind_tls: false,
+            allowed_hosts: None,
         })
+    }
+
+    /// FIX-16/FIX-36: declare que hay un proxy que termina TLS delante (la cookie
+    /// sale con `__Host-…; Secure` y la respuesta con HSTS, sin depender de la
+    /// cabecera `X-Forwarded-Proto` del cliente).
+    pub fn behind_tls(mut self) -> Self {
+        self.behind_tls = true;
+        self
+    }
+
+    /// FIX-17: lista de hosts `Host` permitidos (comparación exacta, minúsculas).
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        let hosts = hosts
+            .into_iter()
+            .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self.allowed_hosts = Some(hosts);
+        self
     }
 }
 
@@ -332,13 +395,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0 && a.len() == b.len()
-}
-
-fn derive_session_cookie_token(api_key: &str, salt: &[u8; 32]) -> String {
-    let mut hasher = blake3::Hasher::new_keyed(salt);
-    hasher.update(b"openonyx-web-session-v1:");
-    hasher.update(api_key.as_bytes());
-    hasher.finalize().to_hex().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +488,20 @@ pub struct WebSubagentSnapshot {
     pub summary: String,
 }
 
+/// `SDD-07` Fase 4A: proyección web del depurador temporal (`TimeFreeze`).
+/// `pending_revert_files` sale de `live_effects` (grafo vivo, 0 I/O): es
+/// exacto aunque `agents` proyecte el `preview_graph(cursor)`.
+#[derive(Clone, Debug, Serialize)]
+pub struct WebTimeDebugSnapshot {
+    pub frozen: bool,
+    pub cursor_tick: u64,
+    pub present_tick: u64,
+    pub available_ticks: Vec<u64>,
+    pub pending_revert_files: Vec<String>,
+    /// Sinergia `SDD-05` §9.4: comando copiable `openonyx bench --snapshot-dir <dir> --tick <cursor> --models <provider>:<model>` (solo si hay store de snapshots y objetivo LLM vivo con provider+modelo).
+    pub bench_hint: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WebStateSnapshot {
     pub schema: &'static str,
@@ -461,6 +531,9 @@ pub struct WebStateSnapshot {
     pub services: Option<String>,
     pub telemetry: WebTelemetrySnapshot,
     pub queued_prompts: Vec<String>,
+    /// `SDD-07` Fase 4A: paridad TimeFreeze (TUI F1): `None` si la sesión no
+    /// tiene depurador temporal (p. ej. `run`/`replay` headless).
+    pub time_debug: Option<WebTimeDebugSnapshot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -482,9 +555,91 @@ struct HubState {
     tick: u64,
 }
 
+/// FIX-14: ventana deslizante de fallos de login, por dirección de origen y global.
+/// El global existe porque detrás de un proxy el por-IP se puede distribuir
+/// (y el coste de `blake3` de cada intento no se quiere multiplicar).
+struct LoginRateLimiter {
+    per_ip: BTreeMap<std::net::IpAddr, VecDeque<Instant>>,
+    global: VecDeque<Instant>,
+}
+
+impl LoginRateLimiter {
+    fn new() -> Self {
+        Self {
+            per_ip: BTreeMap::new(),
+            global: VecDeque::new(),
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(front) = self.global.front() {
+            if now.duration_since(*front) > LOGIN_FAIL_WINDOW {
+                self.global.pop_front();
+            } else {
+                break;
+            }
+        }
+        for v in self.per_ip.values_mut() {
+            while let Some(front) = v.front() {
+                if now.duration_since(*front) > LOGIN_FAIL_WINDOW {
+                    v.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.per_ip.retain(|_, v| !v.is_empty());
+    }
+
+    /// Devuelve los segundos hasta que la ventana vuelva a permitir (para
+    /// `Retry-After`); `None` si no hay límite activo.
+    fn limited_for(&mut self, ip: &std::net::IpAddr, now: Instant) -> Option<u64> {
+        self.prune(now);
+        let per_ip_limited = self
+            .per_ip
+            .get(ip)
+            .is_some_and(|v| v.len() >= LOGIN_MAX_FAILURES_PER_IP);
+        let global_limited = self.global.len() >= LOGIN_MAX_FAILURES_GLOBAL;
+        if !per_ip_limited && !global_limited {
+            return None;
+        }
+        let oldest = self
+            .global
+            .front()
+            .copied()
+            .or_else(|| self.per_ip.get(ip).and_then(|v| v.front().copied()));
+        let wait = oldest
+            .map(|o| {
+                (LOGIN_FAIL_WINDOW - now.duration_since(o))
+                    .as_secs()
+                    .saturating_add(1)
+            })
+            .unwrap_or(60);
+        Some(wait.clamp(1, 120))
+    }
+
+    fn record_failure(&mut self, ip: std::net::IpAddr, now: Instant) {
+        self.prune(now);
+        self.per_ip.entry(ip).or_default().push_back(now);
+        self.global.push_back(now);
+    }
+}
+
 struct WebHub {
     api_key: String,
-    session_token: String,
+    /// FIX-10: almacén de sesiones vivas (token aleatorio por login, tope
+    /// `MAX_LIVE_SESSIONS`). Reemplaza el token único derivado por proceso:
+    /// cada login emite uno nuevo, el logout lo revoca y un token filtrado
+    /// deja de valer sin reiniciar `serve`.
+    sessions: Mutex<Vec<String>>,
+    /// FIX-14: rate limit de `POST /api/v1/auth/login`.
+    login_rate: Mutex<LoginRateLimiter>,
+    /// FIX-09: conexiones TCP activas (RAII en `ConnectionSlot`).
+    conn_active: AtomicUsize,
+    /// FIX-16/36: cookie `__Host-…; Secure` + HSTS (explícito, nunca por cabecera).
+    secure_mode: bool,
+    /// FIX-17: `Host` permitidos (`None` = sin validación).
+    allowed_hosts: Option<Vec<String>>,
     cors_origin: Option<String>,
     workspace_root: Option<PathBuf>,
     policy: Option<WorkspacePolicy>,
@@ -494,6 +649,25 @@ struct WebHub {
     input_cv: Condvar,
     quit: Arc<AtomicBool>,
     sse_clients: AtomicUsize,
+    /// `SDD-07` Fase 4A: depurador temporal (mismo estado del bucle de
+    /// sesión): `POST /api/v1/time/scrub` y el 409 de `POST /api/v1/command`
+    /// bajo freeze lo leen directamente del hub. `Mutex` porque el
+    /// `WebDriver` se construye **antes** del bucle de sesión: el
+    /// `TimeDebugState` se inyecta en caliente vía `with_time_debug`
+    /// (wiring diferido, 0 reconstrucción del hub).
+    time_debug: Mutex<Option<TimeDebugState>>,
+    /// `SDD-07` Fase 4A: scrub pendiente de republicar. El endpoint lo
+    /// levanta (+`input_cv`); `pump_idle` lo consume **solo** cuando el
+    /// `graph` recibido ya refleja el nuevo cursor (véase la lógica de
+    /// defer dentro de `pump_idle`).
+    time_scrub_dirty: AtomicBool,
+}
+
+/// Rechazo de `POST /api/v1/command`. `BadRequest` → `400`; `TimeFrozen` →
+/// `409 Conflict` (paridad TimeFreeze, `SDD-07` Fase 4A).
+enum WebCommandRejection {
+    BadRequest(String),
+    TimeFrozen(String),
 }
 
 impl WebHub {
@@ -502,12 +676,13 @@ impl WebHub {
         workspace_root: Option<PathBuf>,
         policy: Option<WorkspacePolicy>,
     ) -> Result<Arc<Self>, String> {
-        let mut salt = [0u8; 32];
-        fill_os_random(&mut salt)?;
-        let session_token = derive_session_cookie_token(&config.api_key, &salt);
         Ok(Arc::new(Self {
             api_key: config.api_key.clone(),
-            session_token,
+            sessions: Mutex::new(Vec::new()),
+            login_rate: Mutex::new(LoginRateLimiter::new()),
+            conn_active: AtomicUsize::new(0),
+            secure_mode: config.secure_mode(),
+            allowed_hosts: config.allowed_hosts.clone(),
             cors_origin: config.cors_origin.clone(),
             workspace_root,
             policy,
@@ -530,6 +705,8 @@ impl WebHub {
             input_cv: Condvar::new(),
             quit: Arc::new(AtomicBool::new(false)),
             sse_clients: AtomicUsize::new(0),
+            time_debug: Mutex::new(None),
+            time_scrub_dirty: AtomicBool::new(false),
         }))
     }
 
@@ -544,23 +721,88 @@ impl WebHub {
         constant_time_eq(candidate.as_bytes(), self.api_key.as_bytes())
     }
 
-    fn verify_session_cookie(&self, candidate: &str) -> bool {
-        constant_time_eq(candidate.as_bytes(), self.session_token.as_bytes())
+    /// FIX-10: emite un token de sesión aleatorio de 256 bits. Si el almacén está
+    /// a tope (`MAX_LIVE_SESSIONS`), rechaza en vez de expulsar (no se rompe una
+    /// sesión legítima por llegar otra).
+    fn create_session(&self) -> Result<String, String> {
+        let mut bytes = [0u8; 32];
+        fill_os_random(&mut bytes).map_err(|e| format!("failed to generate session token: {e}"))?;
+        let mut token = String::with_capacity(64);
+        for b in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(token, "{b:02x}");
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.len() >= MAX_LIVE_SESSIONS {
+            return Err(format!(
+                "too many active web sessions (max {MAX_LIVE_SESSIONS}); log out a browser and retry"
+            ));
+        }
+        sessions.push(token.clone());
+        Ok(token)
     }
 
-    fn push_web_command(&self, raw_cmd: &str) -> Result<(), String> {
+    /// FIX-10: revoca una sesión (logout). `false` si no estaba viva.
+    fn revoke_session(&self, token: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|t| !constant_time_eq(t.as_bytes(), token.as_bytes()));
+        sessions.len() != before
+    }
+
+    /// FIX-10: comparación en tiempo constante contra el almacén (se recorren
+    /// TODAS las sesiones aunque una casa, para no filtrar posición por timing).
+    fn verify_session_cookie(&self, candidate: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .any(|t| constant_time_eq(t.as_bytes(), candidate.as_bytes()))
+    }
+
+    /// `SDD-07` Fase 4A: paridad TimeFreeze en Web (igual que el `F1 Chat`
+    /// del TUI). Bajo congelación (o con el cursor anclado en el pasado) un
+    /// prompt **plano** no se encola al bus — un turno desordenado rompería la
+    /// bit-a-bit del replay. Los comandos `/…` y `!…` sí se encolan (vías de
+    /// escape: `/go`, `/inject`, `/graph`, `/step`, `/step-llm`).
+    ///
+    /// Devuelve `Err(TimeFrozenRejection)` si el prompt plano está bloqueado
+    /// (el handler lo mapea a `409 Conflict`); el resto de rechazos (prefix
+    /// reservado, vacío) siguen siendo `400`.
+    fn push_web_command(&self, raw_cmd: &str) -> Result<(), WebCommandRejection> {
         let cmd = raw_cmd.trim();
         if cmd.is_empty() {
-            return Err("command cannot be empty".to_string());
+            return Err(WebCommandRejection::BadRequest(
+                "command cannot be empty".to_string(),
+            ));
         }
         if cmd.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX.trim_end()) || cmd.starts_with("/__onyx_") {
-            return Err("reserved internal command prefix".to_string());
+            return Err(WebCommandRejection::BadRequest(
+                "reserved internal command prefix".to_string(),
+            ));
+        }
+        // `SDD-07` Fase 4A: el handle se clona bajo lock breve (Arcs baratos);
+        // el resto de la lectura es thread-safe en `TimeDebugState` (atomics).
+        let td = self
+            .time_debug
+            .lock()
+            .map(|guard| guard.as_ref().cloned())
+            .unwrap_or(None);
+        if let Some(td) = td {
+            if (td.is_frozen() || td.cursor() < td.present())
+                && !cmd.starts_with('/')
+                && !cmd.starts_with('!')
+            {
+                return Err(WebCommandRejection::TimeFrozen(
+                    "Paused in TIME FROZEN: use /go to resume or /inject to stage memory (or return to present)"
+                        .to_string(),
+                ));
+            }
         }
         let mut guard = self
             .state
             .lock()
-            .map_err(|_| "web hub lock poisoned".to_string())?;
-        if guard.root_busy && !is_immediate_web_slash(cmd) {
+            .map_err(|_| WebCommandRejection::BadRequest("web hub lock poisoned".to_string()))?;
+        if guard.root_busy && !crate::command::is_immediate_session_command(cmd) {
             guard.queued_prompts.push_back(cmd.to_string());
             guard.state_dirty = true;
         } else {
@@ -580,6 +822,89 @@ impl WebHub {
         }
         self.input_cv.notify_all();
         Ok(())
+    }
+
+    /// `SDD-07` Fase 4A: aplica un scrub efímero al depurador temporal y
+    /// levanta `time_scrub_dirty` + `input_cv` para el push SSE inmediato.
+    ///
+    /// Payload flexible (JSON):
+    /// - `{ "action": "freeze" | "unfreeze" | "return_to_present" |
+    ///   "scrub_to" | "scrub_delta", "tick"?: u64, "delta"?: i64 }`
+    /// - Shorthands: `{ "freeze": true }`, `{ "tick": 5 }`, `{ "delta": -1 }`.
+    ///
+    /// **100% efímero**: solo muta `TimeDebugState`; nunca escribe en
+    /// `ONYXTR2` ni avanza ticks. Devuelve el snapshot `time_debug` actualizado
+    /// (para el body `{"ok":true,"time_debug":...}`) o `Err` accionable
+    /// (p. ej. tick purgado/futuro → `400`).
+    fn apply_time_scrub(&self, body: &[u8]) -> Result<WebTimeDebugSnapshot, String> {
+        let td = self
+            .time_debug
+            .lock()
+            .map_err(|_| "web hub time_debug lock poisoned".to_string())?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "time debug is not available in this session".to_string())?;
+        let v: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|_| "expected a JSON object for time/scrub".to_string())?;
+        if !v.is_object() {
+            return Err("expected a JSON object for time/scrub".to_string());
+        }
+        let action = v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .map(|a| a.to_ascii_lowercase());
+        let tick = v.get("tick").and_then(|t| t.as_u64());
+        let delta = v.get("delta").and_then(|d| d.as_i64());
+
+        match action.as_deref() {
+            // `action` explícito (forma canónica).
+            Some(a) => match a {
+                "freeze" => td.freeze(),
+                "unfreeze" => td.unfreeze(),
+                "return_to_present" => td.return_to_present(),
+                "scrub_to" => {
+                    let t = tick.ok_or("scrub_to requires `tick`")?;
+                    td.scrub_to(t).map_err(|e| e.0.clone())?;
+                }
+                "scrub_delta" => {
+                    let d = delta.ok_or("scrub_delta requires `delta`")?;
+                    td.scrub_delta(d).map_err(|e| e.0.clone())?;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown time/scrub action `{other}` (expected freeze | unfreeze | \
+                         return_to_present | scrub_to | scrub_delta)"
+                    ));
+                }
+            },
+            // Shorthands: `{ "freeze": true }` / `{ "tick": N }` / `{ "delta": N }`.
+            None => {
+                if v.get("freeze").and_then(|f| f.as_bool()) == Some(true) {
+                    td.freeze();
+                } else if v.get("unfreeze").and_then(|f| f.as_bool()) == Some(true) {
+                    td.unfreeze();
+                } else if v.get("return_to_present").and_then(|f| f.as_bool()) == Some(true) {
+                    td.return_to_present();
+                } else if let Some(t) = tick {
+                    td.scrub_to(t).map_err(|e| e.0.clone())?;
+                } else if let Some(d) = delta {
+                    td.scrub_delta(d).map_err(|e| e.0.clone())?;
+                } else {
+                    return Err(
+                        "time/scrub needs an `action` (or shorthand `freeze`/`tick`/`delta`)"
+                            .to_string(),
+                    );
+                }
+            }
+        };
+
+        // Push SSE inmediato: despierta `pump_idle`, que republica el
+        // `WebStateSnapshot` con el nuevo `preview_graph(cursor)` (0 ticks,
+        // 0 `ONYXTR2`).
+        self.time_scrub_dirty.store(true, Ordering::Release);
+        self.input_cv.notify_all();
+
+        Ok(web_time_debug_snapshot(&td, None))
     }
 
     fn push_web_approval(
@@ -657,37 +982,6 @@ impl WebHub {
     }
 }
 
-fn is_immediate_web_slash(cmd: &str) -> bool {
-    let lower = cmd.trim().to_ascii_lowercase();
-    lower == "/mode"
-        || lower.starts_with("/mode ")
-        || lower == "/profile"
-        || lower.starts_with("/profile ")
-        || lower == "/provider"
-        || lower.starts_with("/provider ")
-        || lower == "/model"
-        || lower.starts_with("/model ")
-        || lower == "/effort"
-        || lower.starts_with("/effort ")
-        || lower == "/services"
-        || lower.starts_with("/services ")
-        || lower == "/service"
-        || lower.starts_with("/service ")
-        || lower == "/subagents"
-        || lower == "/subagent"
-        || lower == "/spawn"
-        || lower.starts_with("/spawn ")
-        || lower.starts_with("/merge ")
-        || lower.starts_with("/discard ")
-        || lower == "/trust"
-        || lower.starts_with("/trust ")
-        || lower == "/undo"
-        || lower == "/cancel"
-        || lower.starts_with("/cancel ")
-        || lower == "/stop"
-        || lower.starts_with("/stop ")
-}
-
 // ---------------------------------------------------------------------------
 // WebDriver (`PlatformDriver`) y WebHandle (`UiIdlePump`)
 // ---------------------------------------------------------------------------
@@ -711,6 +1005,10 @@ struct WebRuntimeInner {
     reasoning_effort: Option<ReasoningEffort>,
     session_label: Option<String>,
     snapshot_store: Option<SharedPackStore>,
+    /// `SDD-07` Fase 4A: depurador temporal (para `publish_snapshot`:
+    /// `WebStateSnapshot.time_debug`, proyección del `preview_graph(cursor)`
+    /// + `pending_revert_files` desde `live_effects`).
+    time_debug: Option<TimeDebugState>,
     native_driver: SandboxDriverKind,
     hub: Arc<WebHub>,
     cached_approval_diff: Option<String>,
@@ -743,18 +1041,48 @@ impl UiIdlePump for WebHandle {
     }
 
     fn pump_idle(&self, graph: &dyn GraphView) {
+        // `SDD-07` Fase 4A: el `graph` recibido fue calculado por `run_session`
+        // justo antes de llamar (puede ser el `preview_graph(cursor)`). Captura
+        // el `(frozen, cursor, present)` de `TimeDebugState` en ese momento: si
+        // cambia DURANTE el wait, el `graph` queda obsoleto y la republicación
+        // debe esperar a la siguiente iteración del bucle (que recalcula el
+        // `preview_graph`), no a esta llamada.
+        // `TimeDebugState` es clonable (Arcs internos): se clona bajo lock breve
+        // y el resto de la lógica opera sobre el handle thread-safe.
+        let td = self
+            .hub
+            .time_debug
+            .lock()
+            .map(|guard| guard.as_ref().cloned())
+            .unwrap_or(None);
+        let key_at_call = td
+            .as_ref()
+            .map(|t| (t.is_frozen(), t.cursor(), t.present()));
+        let scrub_pending = self.hub.time_scrub_dirty.load(Ordering::Acquire);
+
         // Espera breve sobre Condvar (35ms): despierta al instante si llega un comando web,
-        // sin consumir CPU y sin avanzar `host.ticks()`.
+        // sin consumir CPU y sin avanzar `host.ticks()`. Con un scrub pendiente
+        // no se espera: se regresa al bucle para que `run_session` recalculé el
+        // `preview_graph` y la siguiente llamada republicá de inmediato.
         if let Ok(guard) = self.hub.state.lock() {
             // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del
             // watcher de apago (`spawn_shutdown_watcher`).
-            if guard.incoming_events.is_empty() && !self.hub.quit.load(Ordering::Acquire) {
+            let needs_wait = guard.incoming_events.is_empty()
+                && !self.hub.quit.load(Ordering::Acquire)
+                && !scrub_pending;
+            if needs_wait {
                 let _ = self
                     .hub
                     .input_cv
                     .wait_timeout(guard, Duration::from_millis(35));
             }
         }
+        // ¿El depurador cambió durante el wait? (scrub/`/go`/`/rewind` en caliente)
+        let key_after = td.map(|t| (t.is_frozen(), t.cursor(), t.present()));
+        let graph_is_fresh = match (key_at_call, key_after) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
         if let Ok(mut inner) = self.inner.lock() {
             let stream_dirty = inner.stream_preview.take_dirty();
             let telemetry_dirty = inner.telemetry.take_dirty();
@@ -767,9 +1095,18 @@ impl UiIdlePump for WebHandle {
             let dispatched = inner.dispatch_queued_if_idle(graph);
             let hub_dirty = self.hub.take_state_dirty();
 
+            // `SDD-07` Fase 4A: se consume el flag de scrub SOLO si el `graph`
+            // es fresco; si no, se deja puesto para que la siguiente llamada
+            // (con el `preview_graph` recalculado) haga el push SSE.
+            let scrub_dirty = if graph_is_fresh {
+                self.hub.time_scrub_dirty.swap(false, Ordering::AcqRel)
+            } else {
+                false
+            };
+
             // Solo serializamos y difundimos `event: state` completo cuando realmente cambió
-            // el estado de sesión/telemetría/cola/objetivo LLM (0 trabajo de grafo en reposo o durante streaming).
-            if telemetry_dirty || dispatched || hub_dirty || llm_dirty {
+            // el estado de sesión/telemetría/cola/objetivo LLM/TimeFreeze (0 trabajo de grafo en reposo o durante streaming).
+            if telemetry_dirty || dispatched || hub_dirty || llm_dirty || scrub_dirty {
                 inner.publish_snapshot(graph, true);
             }
 
@@ -784,6 +1121,16 @@ impl UiIdlePump for WebHandle {
                 inner.last_stream_emit = Instant::now();
                 inner.publish_stream_preview(graph);
             }
+        }
+    }
+
+    /// `SDD-07` Fase 2: encola el comando sellado; el próximo
+    /// `WebDriver::poll` drena `incoming_events` vía `bridge.push`
+    /// (queda grabado en `ONYXTR2`).
+    fn queue_ingress(&self, event: OnyxEvent) {
+        if let Ok(mut guard) = self.hub.state.lock() {
+            guard.incoming_events.push_back(event);
+            self.hub.input_cv.notify_all();
         }
     }
 }
@@ -829,6 +1176,7 @@ impl WebDriver {
             reasoning_effort: None,
             session_label: None,
             snapshot_store: None,
+            time_debug: None,
             native_driver,
             hub: Arc::clone(&hub),
             cached_approval_diff: None,
@@ -934,6 +1282,20 @@ impl WebDriver {
         if let Ok(mut inner) = self.inner.lock() {
             inner.session_label = session_label;
             inner.snapshot_store = snapshot_store;
+        }
+        self
+    }
+
+    /// `SDD-07` Fase 4A: paridad TimeFreeze en Web. El mismo `TimeDebugState`
+    /// del bucle de sesión (clon barato: Arcs internos) alimenta
+    /// `WebStateSnapshot.time_debug` (preview + `pending_revert_files` desde
+    /// `live_effects`) y el endpoint efímero `POST /api/v1/time/scrub`.
+    pub fn with_time_debug(self, time_debug: TimeDebugState) -> Self {
+        if let Ok(mut guard) = self.hub.time_debug.lock() {
+            *guard = Some(time_debug.clone());
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.time_debug = Some(time_debug);
         }
         self
     }
@@ -1327,6 +1689,14 @@ impl WebRuntimeInner {
                     Vec::new(),
                 ),
             };
+        // `SDD-07` Fase 4A: paridad TimeFreeze. `agents` ya proyecta el
+        // `preview_graph(cursor)` (0 reconstrucción en JS); `pending_revert_files`
+        // sale de `live_effects` (grafo vivo) y `bench_hint` es la sinergia
+        // `SDD-05` §9.4 (solo con store de snapshots + objetivo LLM vivo).
+        let time_debug_snap = self
+            .time_debug
+            .as_ref()
+            .map(|td| web_time_debug_snapshot(td, time_debug_bench_hint(td, &provider, &model)));
         let snap = WebStateSnapshot {
             schema: "onyx.web.state.v1",
             version: next_version,
@@ -1358,6 +1728,7 @@ impl WebRuntimeInner {
                 estimated_cost_usd: tel.estimated_cost_usd,
             },
             queued_prompts: guard.queued_prompts.iter().cloned().collect(),
+            time_debug: time_debug_snap,
         };
 
         if let Ok(json) = serde_json::to_string(&snap) {
@@ -1372,6 +1743,42 @@ impl WebRuntimeInner {
             }
         }
     }
+}
+
+/// `SDD-07` Fase 4A: proyección `TimeDebugState` → [`WebTimeDebugSnapshot`].
+/// 0 I/O: solo atomics + `live_effects` (RAM).
+fn web_time_debug_snapshot(
+    td: &TimeDebugState,
+    bench_hint: Option<String>,
+) -> WebTimeDebugSnapshot {
+    WebTimeDebugSnapshot {
+        frozen: td.is_frozen(),
+        cursor_tick: td.cursor(),
+        present_tick: td.present(),
+        available_ticks: td.available_ticks(),
+        pending_revert_files: td.pending_revert_file_names(),
+        bench_hint,
+    }
+}
+
+/// `SDD-05` §9.4 (sinergia `SDD-07` Fase 4A): comando copiable para comparar
+/// el modelo vivo contra un `bench` determinista desde el mismo cursor:
+/// `openonyx bench --snapshot-dir <dir> --tick <cursor> --models <provider>:<model>`.
+/// `None` si no hay store de snapshots (sin `--snapshot-dir`) o el objetivo
+/// LLM no expone `provider`+`model` (el candidato vivo exige ambos).
+fn time_debug_bench_hint(td: &TimeDebugState, provider: &str, model: &str) -> Option<String> {
+    let dir = td.pack_store()?.current_dir();
+    // El candidato vivo de `bench` exige `provider:model` con un provider real;
+    // el parser del LLM es la fuente única de qué providers existen (el
+    // fallback estático `default` no califica).
+    if dir.as_os_str().is_empty() || LlmProvider::parse(provider).is_err() || model.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "openonyx bench --snapshot-dir {} --tick {} --models {provider}:{model}",
+        dir.display(),
+        td.cursor()
+    ))
 }
 
 fn strip_version(json: &str) -> &str {
@@ -1508,27 +1915,154 @@ struct HttpRequest {
     query: String,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    /// Dirección del socket cliente (FIX-14: origen del rate limit de login
+    /// cuando no hay proxy de confianza delante).
+    peer: Option<std::net::IpAddr>,
+}
+
+/// Estado de una conexión aparcada (FIX-09), sonda con `peek` no bloqueante.
+enum ParkedProbe {
+    /// Hay datos en el buffer del kernel: toca crear el hilo que la atienda.
+    Data,
+    /// Sin datos todavía: sigue aparcada (0 hilos, solo un fd).
+    Idle,
+    /// El cliente cerró o el socket está roto: se descarta.
+    Closed,
+}
+
+/// Sonda no destructiva (no consume bytes) si un socket no bloqueante tiene
+/// datos pendientes de leer.
+fn probe_stream(stream: &TcpStream) -> ParkedProbe {
+    let mut one = [0u8; 1];
+    match stream.peek(&mut one) {
+        Ok(n) if n > 0 => ParkedProbe::Data,
+        Ok(_) => ParkedProbe::Closed,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => ParkedProbe::Idle,
+        Err(_) => ParkedProbe::Closed,
+    }
 }
 
 fn accept_loop(listener: TcpListener, hub: Arc<WebHub>) {
     // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del watcher
     // de apago (`spawn_shutdown_watcher`).
+    //
+    // FIX-09: una conexión que llega **sin datos pendientes** se aparca sin
+    // crear hilo (300 sockets ociosos ocupan 0 hilos, no solo un fd y el
+    // buffer del kernel). En cuanto el `peek` detecta datos, se promociona
+    // a hilo normal (con tope `MAX_CONCURRENT_CONNECTIONS`).
+    let mut parked: Vec<TcpStream> = Vec::new();
     while !hub.quit.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                let conn_hub = Arc::clone(&hub);
-                thread::spawn(move || {
-                    let _ = handle_connection(stream, conn_hub);
-                });
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => {
-                thread::sleep(Duration::from_millis(50));
+        loop {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    // FIX-09: en Unix el socket aceptado NO hereda O_NONBLOCK del
+                    // listener (sí lo hereda en Windows/BSD): sin forzar el modo
+                    // no bloqueante aquí, el `peek` de `probe_stream` sobre una
+                    // conexión ociosa (sin datos pendientes) bloquearía el hilo
+                    // de accept para siempre y el backlog de 128 se desbordaría
+                    // (SYN descartados → `connect_timeout` en clientes legítimos).
+                    let probe = if stream.set_nonblocking(true).is_ok() {
+                        probe_stream(&stream)
+                    } else {
+                        ParkedProbe::Data
+                    };
+                    match probe {
+                        ParkedProbe::Data => {
+                            if stream.set_nonblocking(false).is_ok() {
+                                spawn_connection(stream, &hub, &mut default_connection_spawner);
+                            }
+                        }
+                        ParkedProbe::Idle => parked.push(stream),
+                        ParkedProbe::Closed => {}
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(50));
+                    break;
+                }
             }
         }
+        if !parked.is_empty() {
+            let waiting = std::mem::take(&mut parked);
+            for stream in waiting {
+                match probe_stream(&stream) {
+                    ParkedProbe::Data => {
+                        if stream.set_nonblocking(false).is_ok() {
+                            spawn_connection(stream, &hub, &mut default_connection_spawner);
+                        }
+                    }
+                    ParkedProbe::Idle => parked.push(stream),
+                    ParkedProbe::Closed => {}
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// FIX-35: el spawner real. `thread::Builder::spawn` devuelve `Err` (EAGAIN por
+/// RLIMIT_NPROC / TasksMax / pids.max) donde el `thread::spawn` antiguo hacía
+/// pánico DENTRO del hilo de accept y lo mataba para siempre (el proceso
+/// seguía vivo pero ya no aceptaba: caída permanente sin autenticar).
+fn default_connection_spawner(
+    stream: TcpStream,
+    hub: Arc<WebHub>,
+) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("openonyx-conn".to_string())
+        .spawn(move || {
+            let _slot = ConnectionSlot(Arc::clone(&hub));
+            let _ = handle_connection(stream, hub);
+        })
+}
+
+/// FIX-09: slot RAII del contador de conexiones activas (lo libera al terminar
+/// la conexión, por el camino que sea).
+struct ConnectionSlot(Arc<WebHub>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.conn_active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// FIX-09/FIX-35: acepta UNA conexión. El exceso sobre `MAX_CONCURRENT_CONNECTIONS`
+/// cierra la conexión con `503` sin crear hilo y SIN matar al aceptador; si el
+/// `spawner` falla (EAGAIN), el stream se cierra igualmente y el aceptador
+/// sigue vivo. El `spawner` se inyecta para poder probar el camino de fallo de
+/// spawn de forma determinista (test unitario).
+fn spawn_connection(
+    mut stream: TcpStream,
+    hub: &Arc<WebHub>,
+    spawner: &mut impl FnMut(TcpStream, Arc<WebHub>) -> io::Result<thread::JoinHandle<()>>,
+) {
+    if hub.conn_active.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_CONNECTIONS {
+        hub.conn_active.fetch_sub(1, Ordering::AcqRel);
+        respond_capacity_exceeded(&mut stream);
+        return;
+    }
+    // FIX-35: si el spawn falla, el stream (movido al closure) se cierra por el
+    // drop del closure: el cliente recibe EOF y el aceptador **sigue vivo**
+    // (antes, `thread::spawn` hacía pánico aquí y mataba el hilo de accept).
+    if let Err(e) = spawner(stream, Arc::clone(hub)) {
+        hub.conn_active.fetch_sub(1, Ordering::AcqRel);
+        eprintln!(
+            "openonyx serve: no se pudo crear el hilo de conexión ({e}); se cierra esa conexión"
+        );
+    }
+}
+
+fn respond_capacity_exceeded(stream: &mut TcpStream) {
+    let _ = write_http_response(
+        stream,
+        503,
+        "Service Unavailable",
+        "text/plain; charset=utf-8",
+        b"too many concurrent connections",
+        &[],
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 fn handle_connection(mut stream: TcpStream, hub: Arc<WebHub>) -> io::Result<()> {
@@ -1540,8 +2074,30 @@ fn handle_connection(mut stream: TcpStream, hub: Arc<WebHub>) -> io::Result<()> 
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-    let Some(req) = read_http_request(stream.try_clone()?)? else {
-        return Ok(());
+    // FIX-09: presupuesto TOTAL por petición (slowloris: el timeout por read se
+    // renueva con cada fragmento goteado; el deadline absoluto no).
+    let deadline = Instant::now() + TOTAL_REQUEST_READ_DEADLINE;
+    let peer_ip = stream.peer_addr().ok().map(|p| p.ip());
+    let req = match read_http_request(stream.try_clone()?, peer_ip, deadline) {
+        Ok(Some(req)) => req,
+        Ok(None) => return Ok(()),
+        // FIX-11/FIX-41: los errores de framing se contestan (400/408/413/431)
+        // en vez de cerrar en silencio; el fallo de `read` del cuerpo (cuerpo
+        // incompleto goteado) sigue cortando sin responder (no hay nada que
+        // procesar y responder podría enmascarar el framing).
+        Err(HttpReadError::Io(e)) => return Err(e),
+        Err(other) => {
+            let (status, reason) = match other {
+                HttpReadError::LineTooLong => (431, "Request Header Fields Too Large"),
+                HttpReadError::BodyTooLarge => (413, "Content Too Large"),
+                HttpReadError::Deadline => (408, "Request Timeout"),
+                HttpReadError::Malformed => (400, "Bad Request"),
+                HttpReadError::Io(_) => unreachable!(),
+            };
+            let _ = write_json_error(&mut stream, status, reason, other.to_string().as_str(), &[]);
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            return Ok(());
+        }
     };
     if let Some(sse_extra) = dispatch_http_request(&req, &hub, &mut stream)? {
         return handle_sse_stream(stream, hub, &sse_extra);
@@ -1557,7 +2113,32 @@ fn dispatch_http_request<W: Write>(
     hub: &Arc<WebHub>,
     out: &mut W,
 ) -> io::Result<Option<Vec<(&'static str, String)>>> {
+    // FIX-17: con lista de hosts permitidos (`--allowed-hosts`), un `Host`
+    // ajeno (o ausente) se rechaza con 421. Comparación exacta en minúsculas;
+    // el `Host` del cliente NUNCA se usa para generar URLs ni cookies.
+    if let Some(allowed) = &hub.allowed_hosts {
+        let host = req
+            .headers
+            .get("host")
+            .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase());
+        if !host.is_some_and(|h| allowed.contains(&h)) {
+            write_json_error(out, 421, "Misdirected Request", "Host not allowed", &[])?;
+            return Ok(None);
+        }
+    }
+
     let cors_header = resolve_cors_origin(req, hub.cors_origin.as_deref());
+
+    // FIX-36: en modo expuesto (bind no loopback o `--behind-tls`) toda
+    // respuesta lleva HSTS. No depende de la cabecera del proxy.
+    let mut base_extra: Vec<(&'static str, String)> = Vec::new();
+    if hub.secure_mode {
+        base_extra.push(("Strict-Transport-Security", HSTS_VALUE.to_string()));
+    }
+    if let Some(orig) = cors_header.clone() {
+        base_extra.push(("Access-Control-Allow-Origin", orig));
+        base_extra.push(("Access-Control-Allow-Credentials", "true".to_string()));
+    }
 
     // Preflight CORS (`OPTIONS`)
     if req.method == "OPTIONS" {
@@ -1585,12 +2166,6 @@ fn dispatch_http_request<W: Write>(
             &extra,
         )?;
         return Ok(None);
-    }
-
-    let mut base_extra: Vec<(&'static str, String)> = Vec::new();
-    if let Some(orig) = cors_header.clone() {
-        base_extra.push(("Access-Control-Allow-Origin", orig));
-        base_extra.push(("Access-Control-Allow-Credentials", "true".to_string()));
     }
 
     // Assets estáticos PWA (sin datos sensibles de sesión)
@@ -1680,14 +2255,38 @@ fn dispatch_http_request<W: Write>(
         }
     }
 
-    // Fetch Metadata CSRF guard en rutas mutantes `POST` (antes de auth per modern-web-guidance `security`).
+    // Guardas CSRF/auth de los `POST` mutantes (antes de auth per modern-web-guidance `security`):
+    // - FIX-37: si la petición trae `Authorization: Bearer`, o se valida o se responde
+    //   401. No hay fallback silencioso a la cookie (antes, CUALQUIER Bearer presente
+    //   desactivaba la guarda Sec-Fetch-Site y la cookie autentica).
+    // - FIX-94: sin `Sec-Fetch-Site`, la guarda mira `Origin`: un Origin ajeno al
+    //   propio host ni al `--cors-origin` configurado se rechaza (antes solo se
+    //   mitigaba con SameSite=Lax).
+    // - FIX-42: un POST autenticado por cookie exige `Content-Type: application/json`
+    //   (415): un formulario HTML cross-site `enctype="text/plain"` sin Fetch
+    //   Metadata no puede ejecutar comandos.
     if req.method == "POST" {
+        // FIX-37: Bearer trivalente: presente pero inválido → 401, sin fallback a
+        // cookie. (El bug original: la guarda miraba si HABÍA Bearer, no si era
+        // válido, y la cookie auténtica saltaba la guarda cross-site.)
+        let bearer_valid = match extract_bearer_token(req) {
+            Some(b) if hub.verify_api_key(b) => true,
+            Some(_) => {
+                write_json_error(out, 401, "Unauthorized", "invalid API key", &base_extra)?;
+                return Ok(None);
+            }
+            None => false,
+        };
+        let cookie_auth = extract_session_cookie(req).is_some();
         if let Some(site) = req.headers.get("sec-fetch-site") {
             let s = site.trim().to_ascii_lowercase();
-            let has_bearer = extract_bearer_token(req).is_some();
-            let allowed_site = matches!(s.as_str(), "same-origin" | "none")
-                || (has_bearer && cors_header.is_some());
-            if !allowed_site {
+            // Cross-site / same-site POST: solo se permite con Bearer VÁLIDO cuyo
+            // `Origin` sea el `--cors-origin` configurado (`cors_header` solo lleva
+            // valor cuando el Origin de la petición lo empareja) o Fetch Metadata
+            // same-origin/none.
+            let allowed = matches!(s.as_str(), "same-origin" | "none")
+                || (bearer_valid && cors_header.is_some());
+            if !allowed {
                 write_json_error(
                     out,
                     403,
@@ -1698,10 +2297,66 @@ fn dispatch_http_request<W: Write>(
                 return Ok(None);
             }
         }
+        if cookie_auth {
+            if let Some(origin) = req.headers.get("origin") {
+                // FIX-94: sin Fetch Metadata, la guarda mira `Origin`: debe ser el
+                // propio host o el `--cors-origin` configurado.
+                if !origin_matches_own_host(origin, req, hub.secure_mode) && cors_header.is_none() {
+                    write_json_error(
+                        out,
+                        403,
+                        "Forbidden",
+                        "POST blocked: foreign Origin",
+                        &base_extra,
+                    )?;
+                    return Ok(None);
+                }
+            }
+            // FIX-42: un POST autenticado por cookie exige
+            // `Content-Type: application/json` (un formulario HTML cross-site
+            // `enctype="text/plain"` sin Fetch Metadata no puede ejecutar
+            // comandos).
+            if !content_type_is_json(req) {
+                write_json_error(
+                    out,
+                    415,
+                    "Unsupported Media Type",
+                    "API POST requires Content-Type: application/json",
+                    &base_extra,
+                )?;
+                return Ok(None);
+            }
+        }
     }
 
     // Autenticación login / logout
     if req.method == "POST" && req.path == "/api/v1/auth/login" {
+        // FIX-14: rate limit deslizante por origen + global ANTES de comprobar
+        // la clave (un 429 inmediato no debe multiplicar el coste de blake3).
+        // Detrás de proxy (`secure_mode`) se usa el último hop de
+        // `X-Forwarded-For` (el que añade el proxy, nunca a ciegas); sin proxy,
+        // la dirección del socket.
+        let source_ip = resolve_login_source_ip(req, hub.secure_mode);
+        let mut retry_after: Option<u64> = None;
+        {
+            let mut rl = hub.login_rate.lock().unwrap();
+            if let Some(wait) = rl.limited_for(&source_ip, Instant::now()) {
+                retry_after = Some(wait);
+            }
+        }
+        if let Some(wait) = retry_after {
+            let mut extra = base_extra.clone();
+            extra.push(("Retry-After", wait.to_string()));
+            write_json_error(
+                out,
+                429,
+                "Too Many Requests",
+                "too many failed login attempts, retry later",
+                &extra,
+            )?;
+            return Ok(None);
+        }
+
         #[derive(Deserialize)]
         struct LoginBody {
             api_key: String,
@@ -1720,23 +2375,33 @@ fn dispatch_http_request<W: Write>(
             }
         };
         if !hub.verify_api_key(parsed.api_key.trim()) {
+            hub.login_rate
+                .lock()
+                .unwrap()
+                .record_failure(source_ip, Instant::now());
             write_json_error(out, 401, "Unauthorized", "invalid API key", &base_extra)?;
             return Ok(None);
         }
-        let is_https_proxy = req
-            .headers
-            .get("x-forwarded-proto")
-            .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"));
-        let cookie = if is_https_proxy {
+
+        // FIX-10: cada login emite un token de sesión NUEVO y aleatorio.
+        let token = match hub.create_session() {
+            Ok(t) => t,
+            Err(msg) => {
+                write_json_error(out, 503, "Service Unavailable", &msg, &base_extra)?;
+                return Ok(None);
+            }
+        };
+        // FIX-16/FIX-36: el modo seguro es explícito (`secure_mode`: bind no
+        // loopback o `--behind-tls`). La cabecera `X-Forwarded-Proto` del
+        // cliente NO se mira: un cliente directo ya no puede forzar (o
+        // desforzar) el modo HTTPS.
+        let cookie = if hub.secure_mode {
             format!(
                 "__Host-onyx_session={}; HttpOnly; SameSite=Lax; Secure; Path=/",
-                hub.session_token
+                token
             )
         } else {
-            format!(
-                "onyx_session={}; HttpOnly; SameSite=Lax; Path=/",
-                hub.session_token
-            )
+            format!("onyx_session={}; HttpOnly; SameSite=Lax; Path=/", token)
         };
         base_extra.push(("Set-Cookie", cookie));
         write_http_response(
@@ -1751,6 +2416,12 @@ fn dispatch_http_request<W: Write>(
     }
 
     if req.method == "POST" && req.path == "/api/v1/auth/logout" {
+        // FIX-10: el logout revoca la sesión EN EL SERVIDOR (antes solo caducaba
+        // la cookie en el cliente: una cookie copiada antes del logout seguía
+        // autenticando hasta reiniciar el proceso).
+        if let Some(cookie) = extract_session_cookie(req) {
+            let _ = hub.revoke_session(cookie);
+        }
         base_extra.push((
             "Set-Cookie",
             "onyx_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/".to_string(),
@@ -1775,16 +2446,26 @@ fn dispatch_http_request<W: Write>(
     }
 
     // A partir de aquí, todas las rutas `/api/v1/...` exigen autenticación válida (Bearer o cookie).
-    if !is_authenticated(req, hub) {
-        base_extra.push(("WWW-Authenticate", "Bearer realm=\"openOnyx\"".to_string()));
-        write_json_error(
-            out,
-            401,
-            "Unauthorized",
-            "authentication required",
-            &base_extra,
-        )?;
-        return Ok(None);
+    // FIX-37: un `Authorization: Bearer` presente pero inválido da 401 directo,
+    // sin fallback a la cookie (antes podía enmascarar o saltarse la cookie).
+    match check_auth(req, hub) {
+        AuthCheck::Authenticated => {}
+        AuthCheck::InvalidBearer => {
+            base_extra.push(("WWW-Authenticate", "Bearer realm=\"openOnyx\"".to_string()));
+            write_json_error(out, 401, "Unauthorized", "invalid API key", &base_extra)?;
+            return Ok(None);
+        }
+        AuthCheck::Anonymous => {
+            base_extra.push(("WWW-Authenticate", "Bearer realm=\"openOnyx\"".to_string()));
+            write_json_error(
+                out,
+                401,
+                "Unauthorized",
+                "authentication required",
+                &base_extra,
+            )?;
+            return Ok(None);
+        }
     }
 
     match (req.method.as_str(), req.path.as_str()) {
@@ -1846,6 +2527,35 @@ fn dispatch_http_request<W: Write>(
                     br#"{"ok":true}"#,
                     &base_extra,
                 )?,
+                Err(WebCommandRejection::BadRequest(msg)) => {
+                    write_json_error(out, 400, "Bad Request", &msg, &base_extra)?
+                }
+                // `SDD-07` Fase 4A: prompt plano bajo TimeFreeze → 409 (no se
+                // encola al bus); `/…` y `!…` pasan normal.
+                Err(WebCommandRejection::TimeFrozen(msg)) => {
+                    write_json_error(out, 409, "Conflict", &msg, &base_extra)?
+                }
+            }
+            Ok(None)
+        }
+        ("POST", "/api/v1/time/scrub") => {
+            // `SDD-07` Fase 4A: el único endpoint efímero del Time Debugger.
+            // 100% efímero: opera solo sobre `TimeDebugState` (0 escritura en
+            // `ONYXTR2`, 0 avance de ticks) y levanta `time_scrub_dirty` +
+            // `input_cv` para el push SSE inmediato de `pump_idle`.
+            match hub.apply_time_scrub(&req.body) {
+                Ok(snapshot) => {
+                    let body =
+                        serde_json::json!({ "ok": true, "time_debug": snapshot }).to_string();
+                    write_http_response(
+                        out,
+                        200,
+                        "OK",
+                        "application/json; charset=utf-8",
+                        body.as_bytes(),
+                        &base_extra,
+                    )?
+                }
                 Err(msg) => write_json_error(out, 400, "Bad Request", &msg, &base_extra)?,
             }
             Ok(None)
@@ -1963,11 +2673,15 @@ fn handle_sse_stream(
     let _guard = SseGuard(Arc::clone(&hub));
 
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    // FIX-66: `X-Accel-Buffering: no` solo en el stream (no en `write_http_response`
+    // genérico): nginx/Caddy con ese header no bufferizan el SSE (el «Live»
+    // avanzaba a rachas si el proxy bufferizaba).
     let mut head = String::from(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/event-stream; charset=utf-8\r\n\
          Cache-Control: no-cache, no-store\r\n\
          Connection: keep-alive\r\n\
+         X-Accel-Buffering: no\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\n\
          Referrer-Policy: strict-origin-when-cross-origin\r\n\
@@ -2030,7 +2744,14 @@ fn handle_sse_stream(
             }
             last_ping = Instant::now();
         } else if last_ping.elapsed() >= Duration::from_secs(15) {
-            if stream.write_all(b": ping\n\n").is_err() || stream.flush().is_err() {
+            // FIX-67: el keep-alive era un comentario SSE (`: ping`), invisible a
+            // JavaScript: el cliente no podía distinguir «sigo vivo» de «el proxy
+            // me tiene colgado». Ahora es un evento NOMBREADO (`event: ping`)
+            // que un watchdog con `addEventListener('ping', …)` puede ver; el
+            // comentario se mantiene por compatibilidad con intermediarios.
+            if stream.write_all(sse_keepalive_frame().as_bytes()).is_err()
+                || stream.flush().is_err()
+            {
                 break;
             }
             last_ping = Instant::now();
@@ -2040,21 +2761,166 @@ fn handle_sse_stream(
     Ok(())
 }
 
-fn read_http_request<R: Read>(input: R) -> io::Result<Option<HttpRequest>> {
-    let mut reader = BufReader::new(input);
-    let mut request_line = String::new();
-    let n = reader.read_line(&mut request_line)?;
-    if n == 0 {
-        return Ok(None);
+/// FIX-67: frame de keep-alive SSE: comentario (intermediarios) + evento
+/// `ping` visible para el cliente (watchdog).
+fn sse_keepalive_frame() -> &'static str {
+    ": ping\nevent: ping\ndata: {}\n\n"
+}
+
+/// Error de lectura de la petición HTTP/1.1 (FIX-08/09/11/41/12). Todo salvo
+/// `Io` se CONTESTA con un 4xx (el cliente no recibe un cierre en silencio);
+/// `Io` (cuerpo incompleto, conexión perdida) corta sin responder.
+#[derive(Debug)]
+pub(crate) enum HttpReadError {
+    /// Línea de petición o bloque de cabeceras > 16 KiB (FIX-08) → 431.
+    LineTooLong,
+    /// Cuerpo declarado > 64 KiB (FIX-11) → 413.
+    BodyTooLarge,
+    /// Vencido el presupuesto total de lectura (slowloris, FIX-09) → 408.
+    Deadline,
+    /// Framing mal formado (FIX-41) o cabecera/Content-Length duplicado (FIX-12) → 400.
+    Malformed,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for HttpReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpReadError::LineTooLong => write!(
+                f,
+                "request line or header block exceeds {MAX_HTTP_HEADER_BYTES} bytes"
+            ),
+            HttpReadError::BodyTooLarge => {
+                write!(f, "body larger than {MAX_HTTP_BODY_BYTES} bytes")
+            }
+            HttpReadError::Deadline => write!(f, "request read deadline exceeded"),
+            HttpReadError::Malformed => write!(f, "malformed HTTP/1.1 request"),
+            HttpReadError::Io(e) => write!(f, "io error: {e}"),
+        }
     }
-    let trimmed_line = request_line.trim_end_matches(['\r', '\n']);
-    let mut parts = trimmed_line.split_whitespace();
-    let Some(method) = parts.next() else {
+}
+
+/// Buffer de bytes con posición. `R::read` puede devolver VARIAS líneas de
+/// golpe (el kernel ya tiene la petición entera; en memoria, el `Cursor` la
+/// devuelve toda en la primera lectura), así que NUNCA se descarta lo que
+/// va después del primer `\n`: le pertenece a la siguiente línea o al cuerpo.
+struct BufLine<R: Read> {
+    inner: R,
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl<R: Read> BufLine<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            data: Vec::with_capacity(8 * 1024),
+            pos: 0,
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.pos < self.data.len()
+    }
+
+    /// Recarga el buffer (solo cuando no hay datos pendientes). `Ok(false)` = EOF.
+    fn fill(&mut self) -> Result<bool, HttpReadError> {
+        let mut chunk = [0u8; 8 * 1024];
+        let n = self.inner.read(&mut chunk).map_err(HttpReadError::Io)?;
+        self.data.clear();
+        self.data.extend_from_slice(&chunk[..n]);
+        self.pos = 0;
+        Ok(n > 0)
+    }
+
+    /// Lee UNA línea terminada en CRLF con tope de bytes DURANTE la lectura
+    /// (FIX-08: `read_line` sin tope dejaba acumular una línea sin `\n` sin
+    /// límite de memoria, sin autenticar) y exige CRLF estricto (FIX-41: el
+    /// parser antiguo aceptaba solo LF). `Ok(None)`: EOF limpio sin bytes.
+    fn read_capped_line(
+        &mut self,
+        deadline: Instant,
+        cap: usize,
+    ) -> Result<Option<String>, HttpReadError> {
+        let mut line: Vec<u8> = Vec::with_capacity(128);
+        loop {
+            if Instant::now() > deadline {
+                return Err(HttpReadError::Deadline);
+            }
+            if !self.pending() && !self.fill()? {
+                return if line.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(HttpReadError::Malformed) // línea truncada (sin CRLF)
+                };
+            }
+            let b = self.data[self.pos];
+            self.pos += 1;
+            line.push(b);
+            if line.len() > cap {
+                return Err(HttpReadError::LineTooLong);
+            }
+            if b == b'\n' {
+                if line.len() < 2 || line[line.len() - 2] != b'\r' {
+                    return Err(HttpReadError::Malformed); // solo LF → 400
+                }
+                line.pop(); // '\n'
+                line.pop(); // '\r'
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+        }
+    }
+
+    /// Lee EXACTAMENTE `len` bytes de cuerpo. El buffer pendiente se consume
+    /// antes (el cliente puede haber enviado cuerpo y basura a la vez); un
+    /// EOF a medias es error, nunca 0 (FIX-11).
+    fn read_body(&mut self, deadline: Instant, len: usize) -> Result<Vec<u8>, HttpReadError> {
+        let mut body = Vec::with_capacity(len.min(64 * 1024));
+        while body.len() < len {
+            if Instant::now() > deadline {
+                return Err(HttpReadError::Deadline);
+            }
+            if !self.pending() && !self.fill()? {
+                return Err(HttpReadError::Io(io::ErrorKind::UnexpectedEof.into()));
+            }
+            let take = (len - body.len()).min(self.data.len() - self.pos);
+            body.extend_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+        }
+        Ok(body)
+    }
+}
+
+/// FIX-41: línea de petición estricta `METHOD SP TARGET SP HTTP/1.x`
+/// (sin versión → 400, método alfabético, sin espacios extra).
+fn parse_request_line(line: &str) -> Result<(String, String), HttpReadError> {
+    let mut parts = line.split(' ');
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    let extra = parts.next();
+    if extra.is_some() || method.is_empty() || target.is_empty() || version.is_empty() {
+        return Err(HttpReadError::Malformed);
+    }
+    if !method.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(HttpReadError::Malformed);
+    }
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(HttpReadError::Malformed);
+    }
+    Ok((method.to_ascii_uppercase(), target.to_string()))
+}
+
+fn read_http_request<R: Read>(
+    input: R,
+    peer_ip: Option<std::net::IpAddr>,
+    deadline: Instant,
+) -> Result<Option<HttpRequest>, HttpReadError> {
+    let mut reader = BufLine::new(input);
+    let Some(request_line) = reader.read_capped_line(deadline, MAX_HTTP_HEADER_BYTES)? else {
         return Ok(None);
     };
-    let Some(target) = parts.next() else {
-        return Ok(None);
-    };
+    let (method, target) = parse_request_line(&request_line)?;
 
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -2062,44 +2928,74 @@ fn read_http_request<R: Read>(input: R) -> io::Result<Option<HttpRequest>> {
     };
 
     let mut headers = BTreeMap::new();
+    let mut content_len = 0usize;
     let mut total_header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
-        let read_n = reader.read_line(&mut line)?;
-        if read_n == 0 {
+        let line = match reader.read_capped_line(deadline, MAX_HTTP_HEADER_BYTES)? {
+            Some(line) => line,
+            None => return Err(HttpReadError::Malformed), // sin línea vacía final
+        };
+        if line.is_empty() {
             break;
         }
-        total_header_bytes += read_n;
+        total_header_bytes += line.len() + 2;
         if total_header_bytes > MAX_HTTP_HEADER_BYTES {
-            return Ok(None);
+            return Err(HttpReadError::LineTooLong);
         }
-        let clean = line.trim_end_matches(['\r', '\n']);
-        if clean.is_empty() {
-            break;
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(HttpReadError::Malformed); // obs-fold (FIX-41)
         }
-        if let Some((k, v)) = clean.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(HttpReadError::Malformed); // campo sin ':' (o ':' mal ubicado)
+        };
+        let name = name.to_ascii_lowercase();
+        // FIX-41: nombre de campo token estricto — nada de espacio antes de ':'
+        // (`Content-Length : 5`), ni control chars.
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|c| c == ' ' || !('\u{21}'..='\u{7e}').contains(&c))
+        {
+            return Err(HttpReadError::Malformed);
         }
+        // FIX-12: cabecera duplicada → 400 (RFC 9110 la exige para
+        // Content-Length; se aplica a todas: en peticiones HTTP/1.1 no hay
+        // cabeceras legítimas multi-valor).
+        if headers.contains_key(&name) {
+            return Err(HttpReadError::Malformed);
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if value.bytes().any(|b| (b < 0x20 && b != 0x09) || b == 0x7f) {
+            return Err(HttpReadError::Malformed);
+        }
+        if name == "transfer-encoding" {
+            // FIX-41: no se soporta chunked (TE+CL era ambiguo: «gana CL»).
+            return Err(HttpReadError::Malformed);
+        }
+        if name == "content-length" {
+            // FIX-41: solo dígitos ASCII (ni negativo ni no numérico: antes se
+            // tomaba como 0).
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HttpReadError::Malformed);
+            }
+            let len: u64 = value.parse().map_err(|_| HttpReadError::Malformed)?;
+            if len > MAX_HTTP_BODY_BYTES as u64 {
+                return Err(HttpReadError::BodyTooLarge);
+            }
+            content_len = len as usize;
+        }
+        headers.insert(name, value.to_string());
     }
 
-    let content_len = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_len > MAX_HTTP_BODY_BYTES {
-        return Ok(None);
-    }
-    let mut body = vec![0u8; content_len];
-    if content_len > 0 {
-        reader.read_exact(&mut body)?;
-    }
+    let body = reader.read_body(deadline, content_len)?;
 
     Ok(Some(HttpRequest {
-        method: method.to_ascii_uppercase(),
+        method,
         path,
         query,
         headers,
         body,
+        peer: peer_ip,
     }))
 }
 
@@ -2139,18 +3035,107 @@ fn extract_session_cookie(req: &HttpRequest) -> Option<&str> {
     None
 }
 
-fn is_authenticated(req: &HttpRequest, hub: &WebHub) -> bool {
+/// FIX-37: resultado de la comprobación de autenticación. Un Bearer PRESENTE
+/// pero inválido es un estado distinto de «sin credenciales»: antes se
+/// caía silenciosamente a la cookie, así que un Bearer erróneo podía
+/// enmascarar (o validar sobre) una cookie válida.
+enum AuthCheck {
+    Anonymous,
+    Authenticated,
+    InvalidBearer,
+}
+
+fn check_auth(req: &HttpRequest, hub: &WebHub) -> AuthCheck {
     if let Some(bearer) = extract_bearer_token(req) {
-        if hub.verify_api_key(bearer) {
-            return true;
-        }
+        return if hub.verify_api_key(bearer) {
+            AuthCheck::Authenticated
+        } else {
+            AuthCheck::InvalidBearer
+        };
     }
     if let Some(cookie) = extract_session_cookie(req) {
         if hub.verify_session_cookie(cookie) {
-            return true;
+            return AuthCheck::Authenticated;
         }
     }
-    false
+    AuthCheck::Anonymous
+}
+
+/// FIX-42: un POST autenticado por cookie debe declarar `application/json`
+/// (con parámetros opcionales, p. ej. `charset`): un formulario HTML
+/// cross-site `enctype="text/plain"` sin Fetch Metadata no puede ejecutar
+/// comandos sobre la API.
+fn content_type_is_json(req: &HttpRequest) -> bool {
+    req.headers.get("content-type").is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .map(str::trim)
+            .is_some_and(|m| m.eq_ignore_ascii_case("application/json"))
+    })
+}
+
+/// FIX-94: el `Origin` coincide con el propio origen del servidor: mismo
+/// host (el que envió el cliente, ignorando puertos: detrás de proxy el
+/// navegador ve el puerto público, no el interno) y el esquema según el
+/// modo seguro (`https` en expuesto/`--behind-tls`, `http` en loopback).
+fn origin_matches_own_host(origin: &str, req: &HttpRequest, secure_mode: bool) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let scheme_ok = if secure_mode {
+        scheme.eq_ignore_ascii_case("https")
+    } else {
+        scheme.eq_ignore_ascii_case("http")
+    };
+    if !scheme_ok {
+        return false;
+    }
+    let origin_host = rest.split('/').next().unwrap_or("").trim_end_matches('/');
+    let host = req
+        .headers
+        .get("host")
+        .map(|h| h.trim().trim_end_matches('/'))
+        .unwrap_or("");
+    // Comparación de host ignorando el puerto de ambos lados.
+    fn host_portion(addr: &str) -> &str {
+        // IPv6 `[::1]:8080` → `[::1]`; IPv4/hostname `h:8080` → `h`.
+        if let Some(inner) = addr.strip_prefix('[') {
+            return inner.split(']').next().unwrap_or(inner);
+        }
+        addr.rsplit_once(':')
+            .filter(|(h, _p)| !h.contains(':'))
+            .map(|(h, _)| h)
+            .unwrap_or(addr)
+    }
+    host_portion(host).eq_ignore_ascii_case(host_portion(origin_host))
+}
+
+/// FIX-14: origen del intento de login para el rate limiter. Sin modo seguro
+/// (ni proxy) se usa la dirección del socket. En modo seguro (`--behind-tls`
+/// o bind expuesto) se lee `X-Forwarded-For` DESPRENDIENDO de la derecha los
+/// hops de confianza (loopback: la dirección privada que añade el proxy);
+/// el primer hop no loopback es el cliente. Sin `X-Forwarded-For`, el socket.
+fn resolve_login_source_ip(req: &HttpRequest, secure_mode: bool) -> std::net::IpAddr {
+    let socket = req
+        .peer
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    if !secure_mode {
+        return socket;
+    }
+    let Some(xff) = req.headers.get("x-forwarded-for") else {
+        return socket;
+    };
+    let hops: Vec<std::net::IpAddr> = xff
+        .split(',')
+        .filter_map(|h| h.trim().parse().ok())
+        .collect();
+    for hop in hops.iter().rev() {
+        if hop.is_loopback() {
+            continue;
+        }
+        return *hop;
+    }
+    socket
 }
 
 fn parse_query_param(query: &str, key: &str) -> Option<String> {
@@ -2244,14 +3229,21 @@ fn write_http_response<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onyx_soul_agents::{AgentConfig, AgentHost, AgentView, RecordingBridge, Reply};
+    use onyx_soul_agents::{
+        AgentConfig, AgentHost, AgentView, AttrRegistry, Ctx, Graph, HeadlessDriver, OnyxError,
+        OnyxSystem, RecordingBridge, Reply,
+    };
     use onyx_workspace::{WorkspaceLedgerSystem, WorkspaceMode, WorkspaceToolBridge};
     use std::env;
 
     fn in_memory_exchange(hub: &Arc<WebHub>, raw_req: &str) -> (String, bool) {
-        let req = read_http_request(io::Cursor::new(raw_req.as_bytes()))
-            .unwrap()
-            .expect("valid HTTP request");
+        let req = read_http_request(
+            io::Cursor::new(raw_req.as_bytes()),
+            None,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+        .expect("valid HTTP request");
         let mut buf = Vec::new();
         let sse = dispatch_http_request(&req, hub, &mut buf)
             .unwrap()
@@ -2329,9 +3321,11 @@ mod tests {
         );
 
         // 2b. Embedded real openOnyx logo is served with image/jpeg and exact byte payload.
-        let logo_req = read_http_request(io::Cursor::new(
-            b"GET /logo.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".as_slice(),
-        ))
+        let logo_req = read_http_request(
+            io::Cursor::new(b"GET /logo.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".as_slice()),
+            None,
+            Instant::now() + Duration::from_secs(10),
+        )
         .unwrap()
         .expect("valid HTTP request");
         let mut logo_buf = Vec::new();
@@ -2403,17 +3397,43 @@ mod tests {
             "{authed_cookie}"
         );
 
-        // 5. HTTPS proxy login issues `__Host-onyx_session` with `Secure`.
-        let https_login_req = format!(
-            "POST /api/v1/auth/login HTTP/1.1\r\nHost: vps.example.com\r\nX-Forwarded-Proto: https\r\nContent-Length: {}\r\n\r\n{}",
-            login_body.len(),
-            login_body
+        // 5. FIX-16/36: el modo seguro es EXPLÍCITO (`--behind-tls` o bind no
+        // loopback). La cabecera `X-Forwarded-Proto` del cliente ya no se
+        // consulta (un cliente directo podía forzarla).
+        // 5a. Loopback sin flag: `X-Forwarded-Proto: https` sola no basta.
+        let (plain_xff, _) = in_memory_exchange(
+            &hub,
+            &format!(
+                "POST /api/v1/auth/login HTTP/1.1\r\nHost: vps.example.com\r\nX-Forwarded-Proto: https\r\nContent-Length: {}\r\n\r\n{}",
+                login_body.len(),
+                login_body
+            ),
         );
-        let (https_login_resp, _) = in_memory_exchange(&hub, &https_login_req);
+        assert!(
+            plain_xff.contains("Set-Cookie: onyx_session=")
+                && !plain_xff.contains("__Host-onyx_session"),
+            "X-Forwarded-Proto sola no debe activar el modo seguro: {plain_xff}"
+        );
+        // 5b. Hub con `--behind-tls`: cookie `__Host-…; Secure` + HSTS.
+        let secure_cfg = cfg.clone().behind_tls();
+        let secure_driver = WebDriver::start(host.vocab(), &secure_cfg, None, None).unwrap();
+        let secure_hub = Arc::clone(&secure_driver.hub);
+        let (https_login_resp, _) = in_memory_exchange(
+            &secure_hub,
+            &format!(
+                "POST /api/v1/auth/login HTTP/1.1\r\nHost: vps.example.com\r\nContent-Length: {}\r\n\r\n{}",
+                login_body.len(),
+                login_body
+            ),
+        );
         assert!(
             https_login_resp.contains("Set-Cookie: __Host-onyx_session=")
                 && https_login_resp.contains("Secure"),
             "{https_login_resp}"
+        );
+        assert!(
+            https_login_resp.contains("Strict-Transport-Security"),
+            "el modo expuesto debe emitir HSTS: {https_login_resp}"
         );
 
         // 6. Bearer + allowlisted CORS origin works for external Svelte SPA.
@@ -2830,5 +3850,665 @@ mod tests {
             .join()
             .expect("el watcher termina tras propagar el apago");
         reset_serve_shutdown_request();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // `SDD-07` Fase 4A — TEST-07.7: paridad Web del Time Debugger (0 navegador
+    // real: exchanges HTTP en memoria sobre el hub + contratos estáticos PWA).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    const TD_KEY: &str = "td-web-api-key-1122334455";
+
+    /// `TimeDebugState` con ticks 0..=2 en el anillo (present = 2, cursor = 2).
+    fn td_state_with_ticks() -> TimeDebugState {
+        let td = TimeDebugState::new(None);
+        td.record_tick(0, &[0]);
+        td.record_tick(1, &[0]);
+        td.record_tick(2, &[0]);
+        td
+    }
+
+    fn web_driver_with_time_debug(
+        host: &AgentHost,
+        td: TimeDebugState,
+    ) -> (WebDriver, Arc<WebHub>) {
+        let cfg = WebServerConfig::resolve("127.0.0.1:0", Some(TD_KEY.to_string()), None).unwrap();
+        let driver = WebDriver::start(host.vocab(), &cfg, None, None)
+            .unwrap()
+            .with_time_debug(td);
+        let hub = Arc::clone(&driver.hub);
+        (driver, hub)
+    }
+
+    fn td_post(hub: &Arc<WebHub>, body: &str, extra_headers: &str) -> String {
+        let (resp, _) = in_memory_exchange(
+            hub,
+            &format!(
+                "POST /api/v1/time/scrub HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        resp
+    }
+
+    fn td_cmd(hub: &Arc<WebHub>, command: &str) -> String {
+        let body = format!("{{\"command\":{}}}", serde_json::json!(command));
+        let (resp, _) = in_memory_exchange(
+            hub,
+            &format!(
+                "POST /api/v1/command HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TD_KEY}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        resp
+    }
+
+    #[test]
+    fn test_07_7_1_time_scrub_endpoint_auth_csrf_ephemeral_and_actionable_400() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // ancla en el pasado → auto-freeze (cursor=1, present=2)
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td.clone());
+
+        // 1a. 401 sin credenciales (el endpoint hereda el guard de auth).
+        let unauth = td_post(&hub, "{\"action\":\"scrub_to\",\"tick\":2}", "");
+        assert!(unauth.starts_with("HTTP/1.1 401 Unauthorized"), "{unauth}");
+        assert_eq!(td.cursor(), 1, "el 401 no debe mutar el depurador");
+
+        // 1b. 403 cross-site por el guard CSRF (Sec-Fetch-Site), sin Bearer.
+        let csrf = td_post(
+            &hub,
+            "{\"action\":\"scrub_to\",\"tick\":2}",
+            "Sec-Fetch-Site: cross-site\r\n",
+        );
+        assert!(csrf.starts_with("HTTP/1.1 403 Forbidden"), "{csrf}");
+
+        // 1c. 200 con scrub válido: el body lleva el snapshot `time_debug`
+        // actualizado (cursor en el presente, descongelado).
+        let ok = td_post(
+            &hub,
+            "{\"action\":\"scrub_to\",\"tick\":2}",
+            &format!("Authorization: Bearer {TD_KEY}\r\n"),
+        );
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+        assert!(ok.contains("\"ok\":true"), "{ok}");
+        assert!(ok.contains("\"time_debug\":{"), "{ok}");
+        assert!(ok.contains("\"cursor_tick\":2"), "{ok}");
+        assert!(ok.contains("\"frozen\":false"), "{ok}");
+        assert_eq!(td.cursor(), 2, "el scrub debe mutar el estado compartido");
+
+        // 1d. 400 accionable: tick futuro.
+        let future = td_post(
+            &hub,
+            "{\"action\":\"scrub_to\",\"tick\":99}",
+            "Authorization: Bearer td-web-api-key-1122334455\r\n",
+        );
+        assert!(future.starts_with("HTTP/1.1 400 Bad Request"), "{future}");
+        assert!(future.contains("futuro"), "{future}");
+
+        // 1e. 400 accionable: acción desconocida.
+        let bad_action = td_post(
+            &hub,
+            "{\"action\":\"warp\"}",
+            "Authorization: Bearer td-web-api-key-1122334455\r\n",
+        );
+        assert!(
+            bad_action.starts_with("HTTP/1.1 400 Bad Request"),
+            "{bad_action}"
+        );
+        assert!(
+            bad_action.contains("unknown time/scrub action"),
+            "{bad_action}"
+        );
+
+        // 1f. 100% efímero: 0 eventos encolados en el bus por el scrub.
+        let queued = hub
+            .state
+            .lock()
+            .map(|g| g.incoming_events.len())
+            .unwrap_or(usize::MAX);
+        assert_eq!(queued, 0, "el scrub no encola eventos en incoming_events");
+    }
+
+    #[test]
+    fn test_07_7_2_time_frozen_command_409_and_escape_slashes_pass() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // congelado mirando el pasado
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td);
+
+        // 2a. Prefix interno reservado → 400 (aun bajo freeze).
+        let reserved = td_cmd(&hub, "/__onyx_time_warp");
+        assert!(
+            reserved.starts_with("HTTP/1.1 400 Bad Request"),
+            "{reserved}"
+        );
+        assert!(
+            reserved.contains("reserved internal command prefix"),
+            "{reserved}"
+        );
+
+        // 2b. Prompt plano bajo TIME FROZEN → 409 Conflict accionable.
+        let frozen = td_cmd(&hub, "hello onyx, edit the file");
+        assert!(frozen.starts_with("HTTP/1.1 409 Conflict"), "{frozen}");
+        assert!(frozen.contains("Paused in TIME FROZEN"), "{frozen}");
+
+        // 2c. Vías de escape selladas pasan → 200.
+        let go = td_cmd(&hub, "/go");
+        assert!(go.starts_with("HTTP/1.1 200 OK"), "{go}");
+        let inspect = td_cmd(&hub, "/graph inspect mem");
+        assert!(inspect.starts_with("HTTP/1.1 200 OK"), "{inspect}");
+        let bang = td_cmd(&hub, "!echo hi");
+        assert!(bang.starts_with("HTTP/1.1 200 OK"), "{bang}");
+
+        // 2d. Los escapes sí encolan comandos en el bus (el 409 no encoló nada).
+        let queued = hub
+            .state
+            .lock()
+            .map(|g| g.incoming_events.len())
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            queued, 3,
+            "/go + /graph + !echo encolan; el 409 y el 400 no"
+        );
+    }
+
+    /// `SDD-07` Fase 4B (fix de auditoría — regresión del deadlock): con el
+    /// agente raíz ocupado (`root_busy`, Thinking) **y** TIME FROZEN (el
+    /// breakpoint principal pre-LLM de SDD-07), las vías de escape deben
+    /// llegar al bus inmediato (`incoming_events`), NO a la cola de prompts
+    /// pendientes (donde esperarían un idle que nunca llega mientras el
+    /// tiempo sigue congelado → el usuario queda atrapado en el freeze).
+    #[test]
+    fn test_07_7_5_escape_commands_immediate_while_root_busy_frozen() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // frozen + cursor < present (breakpoint pre-LLM)
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td);
+        // Escenario crítico: el agente está pausado en Thinking y congelado.
+        hub.state.lock().unwrap().root_busy = true;
+
+        for cmd in ["/go", "/step-llm", "/graph drop-mem 1", "!echo hi"] {
+            let resp = td_cmd(&hub, cmd);
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{cmd} → {resp}");
+        }
+
+        let guard = hub.state.lock().unwrap();
+        assert_eq!(
+            guard.incoming_events.len(),
+            4,
+            "las 4 vías de escape entran al bus inmediato"
+        );
+        assert!(
+            guard.queued_prompts.is_empty(),
+            "nada se encola en queued_prompts (deadlock: idle que nunca llega)"
+        );
+    }
+
+    /// Sistema de test: siembra 1 efecto registrado (`hello.txt`, tick 2) en el
+    /// grafo vivo para que `sync_live_effects` capture algo real (0 I/O).
+    struct TdEffectSeeder {
+        wv: Option<WorkspaceVocab>,
+        seeded: bool,
+    }
+
+    impl OnyxSystem for TdEffectSeeder {
+        fn name(&self) -> &str {
+            "test_td_effect_seeder"
+        }
+
+        fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+            self.wv = Some(WorkspaceVocab::resolve(attrs));
+            Ok(())
+        }
+
+        fn run(&mut self, ctx: &mut Ctx) {
+            if self.seeded {
+                return;
+            }
+            let Some(wv) = self.wv else {
+                return;
+            };
+            let id = ctx.graph.create();
+            ctx.graph.set(id, wv.effect_tick, Value::Int(2));
+            ctx.graph.set(id, wv.effect_agent, Value::Int(1));
+            ctx.graph
+                .set(id, wv.effect_tool, Value::Text("fs_edit".to_string()));
+            ctx.graph
+                .set(id, wv.effect_target, Value::Text("hello.txt".to_string()));
+            ctx.graph
+                .set(id, wv.effect_reversibility, Value::Text("git".to_string()));
+            ctx.graph.set(
+                id,
+                wv.effect_summary,
+                Value::Text("test effect".to_string()),
+            );
+            self.seeded = true;
+        }
+    }
+
+    #[test]
+    fn test_07_7_3_state_snapshot_time_debug_full_after_scrub_with_live_effects() {
+        let mut host = AgentHost::builder(1)
+            .system(Box::new(TdEffectSeeder {
+                wv: None,
+                seeded: false,
+            }))
+            .build()
+            .unwrap();
+        let ws_vocab = onyx_workspace::WorkspaceVocab::resolve_with(|n| host.attr(n));
+        host.run(&mut HeadlessDriver::new(), 3); // el seeder escribe el efecto (tick 2)
+
+        let td = TimeDebugState::new(None);
+        td.record_tick(0, &host.graph().export());
+        td.record_tick(1, &host.graph().export());
+        td.record_tick(2, &host.graph().export());
+        // Borde de sesión: captura los efectos del grafo vivo (fuente de
+        // `pending_revert_files` — el preview(cursor) no los contiene).
+        td.sync_live_effects(host.graph(), &ws_vocab);
+        td.scrub_to(1).unwrap(); // ancla en el pasado → auto-freeze
+
+        let (driver, hub) = web_driver_with_time_debug(&host, td);
+
+        // Publica el snapshot con la proyección del cursor scrubbeado
+        // (render = publish_snapshot sin broadcast SSE).
+        driver.handle().render(host.graph());
+
+        let (resp, _) = in_memory_exchange(
+            &hub,
+            &format!(
+                "GET /api/v1/state HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TD_KEY}\r\n\r\n"
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("\"time_debug\":{"),
+            "el snapshot debe llevar time_debug, {resp}"
+        );
+        assert!(resp.contains("\"frozen\":true"), "{resp}");
+        assert!(resp.contains("\"cursor_tick\":1"), "{resp}");
+        assert!(resp.contains("\"present_tick\":2"), "{resp}");
+        assert!(
+            resp.contains("\"available_ticks\":[0,1,2]"),
+            "available = anillo ∪ presente, {resp}"
+        );
+        assert!(
+            resp.contains("\"pending_revert_files\":[\"hello.txt\"]"),
+            "pending_revert_files sale de live_effects (tick 2 > cursor 1), {resp}"
+        );
+    }
+
+    #[test]
+    fn test_07_7_4_pwa_assets_contract_time_debugger() {
+        // index.html: `#tick-pill` es un <button> (la etiqueta de apertura
+        // más cercana antes del id debe ser <button sin cierre intermedio).
+        let pos = ASSET_INDEX_HTML
+            .find("id=\"tick-pill\"")
+            .expect("tick-pill");
+        let before = &ASSET_INDEX_HTML[..pos];
+        let btn_start = before
+            .rfind("<button")
+            .expect("debe existir un <button antes del id tick-pill");
+        assert!(
+            !before[btn_start..].contains("</button>"),
+            "tick-pill debe ser el id de un <button> abierto (no de un span)"
+        );
+        // Barra ámbar + diálogo de edición de memoria + controles.
+        for needle in [
+            "id=\"time-debug-bar\"",
+            "id=\"tdb-status\"",
+            "id=\"tdb-slider\"",
+            "id=\"tdb-prev\"",
+            "id=\"tdb-next\"",
+            "id=\"tdb-freeze\"",
+            "id=\"tdb-step\"",
+            "id=\"tdb-step-llm\"",
+            "id=\"tdb-resume\"",
+            "id=\"tdb-revert-warn\"",
+            "id=\"tdb-bench-copy\"",
+            "id=\"edit-mem-dialog\"",
+            "id=\"edit-mem-input\"",
+        ] {
+            assert!(
+                ASSET_INDEX_HTML.contains(needle),
+                "index.html falta {needle}"
+            );
+        }
+
+        // app.js: endpoint scrub, comandos sellados, hints y 0 innerHTML.
+        for needle in [
+            "/api/v1/time/scrub",
+            "scrub_delta",
+            "return_to_present",
+            "/graph drop-mem",
+            "/graph edit-mem",
+            "{ key: '/time',",
+            "{ key: '/go',",
+            "{ key: '/step',",
+            "{ key: '/step-llm',",
+            "{ key: '/read',",
+            "{ key: '/inject',",
+            "TIME FROZEN",
+            "attachMemActions",
+        ] {
+            assert!(ASSET_APP_JS.contains(needle), "app.js falta {needle}");
+        }
+        assert!(
+            !ASSET_APP_JS.contains("innerHTML"),
+            "app.js no puede usar innerHTML (CSP estricto)"
+        );
+
+        // styles.css: barra ámbar, pill congelada y botones de memoria.
+        for needle in [
+            ".time-debug-bar",
+            "#tick-pill.is-frozen",
+            ".mem-actions",
+            ".tdb-bench",
+        ] {
+            assert!(
+                ASSET_STYLES_CSS.contains(needle),
+                "styles.css falta {needle}"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // FIX-35 (unitario determinista): el fallo del spawner (EAGAIN por RLIMIT_NPROC)
+    // no puede matar al aceptador; el camino se prueba inyectando un spawner que
+    // falla SIEMPRE, sin depender de `unshare`/`prlimit` (ver vps_audit para el
+    // repro de integración bajo userns).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    fn unit_hub() -> Arc<WebHub> {
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("test-api-key-1234567890".to_string()),
+            None,
+        )
+        .unwrap();
+        WebHub::new(&cfg, None, None).unwrap()
+    }
+
+    /// FIX-35: `spawn_connection` con un spawner que siempre falla (EAGAIN):
+    /// sin pánico, el stream se cierra (el cliente ve EOF) y el contador de
+    /// conexiones activas vuelve a 0: el aceptador puede seguir sirviendo.
+    #[test]
+    fn spawn_connection_failing_spawner_keeps_acceptor_alive() {
+        let hub = unit_hub();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let (stream, _) = listener.accept().unwrap();
+
+        let mut always_fail =
+            |_: TcpStream, _: Arc<WebHub>| -> io::Result<thread::JoinHandle<()>> {
+                Err(io::ErrorKind::Other.into())
+            };
+        // No debe pánicar (antes, `thread::spawn` lo hacía DENTRO del aceptador).
+        spawn_connection(stream, &hub, &mut always_fail);
+        assert_eq!(
+            hub.conn_active.load(Ordering::Acquire),
+            0,
+            "el contador de conexiones activas debe volver a 0"
+        );
+
+        // El cliente ve el cierre de esa conexión: EOF (FIN) o RST (el kernel
+        // manda RST si el servidor cierra con bytes leídos pendientes, como
+        // aquí: la petición nunca se leyó). Ambas formas cierran la conexión.
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        match client.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("la conexión con spawn fallido debe cerrarse: {other:?}"),
+        }
+
+        // El listener sigue aceptando (el aceptador no ha muerto).
+        drop(client);
+        let mut client2 = TcpStream::connect(addr).unwrap();
+        assert!(client2.write_all(b"GET / HTTP/1.1\r\n\r\n").is_ok());
+    }
+
+    /// FIX-09 (unitario): por encima de `MAX_CONCURRENT_CONNECTIONS` la conexión
+    /// recibe `503` SIN crear hilo (el spawner no se llama) y el contador no se
+    /// corrompe.
+    #[test]
+    fn spawn_connection_over_capacity_answers_503_without_thread() {
+        let hub = unit_hub();
+        hub.conn_active
+            .store(MAX_CONCURRENT_CONNECTIONS, Ordering::Release);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+
+        let mut never = |_: TcpStream, _: Arc<WebHub>| -> io::Result<thread::JoinHandle<()>> {
+            panic!("el spawner no debe llamarse sin capacidad")
+        };
+        spawn_connection(stream, &hub, &mut never);
+        assert_eq!(
+            hub.conn_active.load(Ordering::Acquire),
+            MAX_CONCURRENT_CONNECTIONS,
+            "el exceso no debe corromper el contador"
+        );
+
+        let mut buf = Vec::new();
+        let _ = client.read_to_end(&mut buf);
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // FIX-12 / FIX-16 / FIX-17 / FIX-67: tests deterministas nuevos (en main no
+    // había ningún test de estos; el verde anterior no los cubría).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// FIX-12: una cabecera duplicada (en CUALQUIER orden) → `Malformed`, que el
+    /// handler contesta con 400 (no cierre en silencio). RFC 9110 la exige para
+    /// `Content-Length`; la aplicamos a cualquier cabecera: en peticiones
+    /// HTTP/1.1 no hay cabeceras legítimas multi-valor.
+    #[test]
+    fn fix12_duplicate_headers_are_rejected_in_any_order() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let dup = |first: &str, second: &str| {
+            read_http_request(
+                io::Cursor::new(
+                    format!(
+                        "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n{first}\r\n{second}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                ),
+                None,
+                deadline,
+            )
+        };
+        assert!(matches!(
+            dup("Content-Length: 0", "Content-Length: 0"),
+            Err(HttpReadError::Malformed)
+        ));
+        // Duplicada que NO es Content-Length (cualquier cabecera): igual 400.
+        assert!(matches!(
+            dup("X-Forwarded-For: 1.2.3.4", "X-Forwarded-For: 5.6.7.8"),
+            Err(HttpReadError::Malformed)
+        ));
+        assert!(matches!(
+            dup("Content-Length: 1", "Content-Length: 2"),
+            Err(HttpReadError::Malformed)
+        ));
+        // Control: `Content-Length` único sigue siendo válido.
+        let single = read_http_request(
+            io::Cursor::new(
+                b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+            ),
+            None,
+            deadline,
+        );
+        assert!(matches!(single, Ok(Some(_))));
+    }
+
+    /// FIX-16: el modo seguro es EXPLÍCITO (bind no loopback o `--behind-tls`):
+    /// cookie `__Host-…; Secure` + HSTS en TODAS las respuestas. La cabecera
+    /// `X-Forwarded-Proto` de un cliente directo ya no se consulta (podía
+    /// forzar o desforzar el modo HTTPS).
+    fn session_cookie_line(resp: &str) -> &str {
+        resp.lines()
+            .find(|l| l.starts_with("Set-Cookie: "))
+            .unwrap_or_else(|| panic!("no Set-Cookie en la respuesta del login: {resp}"))
+    }
+
+    #[test]
+    fn fix16_secure_cookie_and_hsts_only_when_explicit() {
+        let body = r#"{"api_key":"test-api-key-1234567890"}"#;
+        let login = |hub: &Arc<WebHub>| {
+            in_memory_exchange(
+                hub,
+                &format!(
+                    "POST /api/v1/auth/login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .0
+        };
+
+        // 1. Loopback sin flag: cookie plana, sin `Secure`, sin HSTS — ni
+        //    aunque el cliente mande `X-Forwarded-Proto: https` forzada.
+        let local = unit_hub();
+        let resp = login(&local);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let cookie = session_cookie_line(&resp);
+        assert!(
+            cookie.contains("onyx_session=")
+                && !cookie.contains("__Host-")
+                && !cookie.contains("Secure"),
+            "{cookie}"
+        );
+        assert!(
+            !resp.contains("Strict-Transport-Security"),
+            "loopback sin flag no debe emitir HSTS: {resp}"
+        );
+        let forged = in_memory_exchange(
+            &local,
+            &format!(
+                "POST /api/v1/auth/login HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Forwarded-Proto: https\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .0;
+        let forged_cookie = session_cookie_line(&forged);
+        assert!(
+            forged_cookie.contains("onyx_session=") && !forged_cookie.contains("__Host-"),
+            "X-Forwarded-Proto forzada no debe activar el modo seguro: {forged}"
+        );
+
+        // 2. Loopback + `--behind-tls`: `__Host-…; Secure` + HSTS en el login
+        //    Y en cualquier otra respuesta.
+        let secured = WebHub::new(
+            &WebServerConfig::resolve(
+                "127.0.0.1:0",
+                Some("test-api-key-1234567890".to_string()),
+                None,
+            )
+            .unwrap()
+            .behind_tls(),
+            None,
+            None,
+        )
+        .unwrap();
+        let resp = login(&secured);
+        let cookie = session_cookie_line(&resp);
+        assert!(
+            cookie.contains("__Host-onyx_session=")
+                && cookie.contains("Secure")
+                && cookie.contains("Path=/"),
+            "{cookie}"
+        );
+        assert!(
+            resp.contains("Strict-Transport-Security: max-age=31536000; includeSubDomains"),
+            "{resp}"
+        );
+        let health = in_memory_exchange(
+            &secured,
+            "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .0;
+        assert!(
+            health.contains("Strict-Transport-Security"),
+            "HSTS debe ir en toda respuesta en modo expuesto: {health}"
+        );
+
+        // 3. Bind no loopback sin flag: modo expuesto (despliegue VPS).
+        let exposed = WebServerConfig::resolve(
+            "0.0.0.0:0",
+            Some("test-api-key-1234567890".to_string()),
+            None,
+        )
+        .unwrap();
+        assert!(exposed.secure_mode());
+        let exposed_hub = WebHub::new(&exposed, None, None).unwrap();
+        let resp = login(&exposed_hub);
+        let cookie = session_cookie_line(&resp);
+        assert!(
+            cookie.contains("__Host-onyx_session=") && cookie.contains("Secure"),
+            "{cookie}"
+        );
+        assert!(resp.contains("Strict-Transport-Security"), "{resp}");
+    }
+
+    /// FIX-17: `--allowed-hosts` es OPT-IN. Con la lista, un `Host` ajeno o
+    /// ausente → 421 (comparación exacta en minúsculas); sin lista, no hay
+    /// validación (los tests de VPS mandan `Host: x` y deben seguir pasando).
+    #[test]
+    fn fix17_allowed_hosts_reject_foreign_or_missing_host() {
+        let cfg = WebServerConfig::resolve(
+            "127.0.0.1:0",
+            Some("test-api-key-1234567890".to_string()),
+            None,
+        )
+        .unwrap()
+        .with_allowed_hosts(vec![
+            "vps.example.com".to_string(),
+            "ui.example.com".to_string(),
+        ]);
+        let hub = WebHub::new(&cfg, None, None).unwrap();
+        let get = |host: Option<&str>| {
+            let hdr = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+            in_memory_exchange(&hub, &format!("GET /api/v1/health HTTP/1.1\r\n{hdr}\r\n")).0
+        };
+        assert!(get(Some("vps.example.com")).starts_with("HTTP/1.1 200"));
+        // La comparación es insensible a mayúsculas.
+        assert!(get(Some("VPS.EXAMPLE.COM")).starts_with("HTTP/1.1 200"));
+        // Host ajeno → 421 Misdirected Request.
+        let evil = get(Some("evil.example.com"));
+        assert!(evil.starts_with("HTTP/1.1 421"), "{evil}");
+        // Host ausente con lista configurada → 421 (misdirección es la norma).
+        let none = get(None);
+        assert!(none.starts_with("HTTP/1.1 421"), "{none}");
+
+        // Control: sin lista, cualquier `Host` se atiende.
+        let open = unit_hub();
+        let r = in_memory_exchange(&open, "GET /api/v1/health HTTP/1.1\r\nHost: x\r\n\r\n").0;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    }
+
+    /// FIX-67: el keep-alive SSE es un evento NOMBREADO (`event: ping`),
+    /// visible para JS con `addEventListener('ping', …). Un comentario puro
+    /// (`: ping`) era invisible al cliente: «proxy que me tiene colgado» y
+    /// «servidor lento» eran indistinguibles. El comentario se mantiene por
+    /// compatibilidad con intermediarios. `app.js` solo escucha los eventos
+    /// `state`/`stream`, así que un `ping` nunca choca con `onmessage`.
+    #[test]
+    fn fix67_sse_keepalive_frame_is_a_named_event() {
+        assert_eq!(sse_keepalive_frame(), ": ping\nevent: ping\ndata: {}\n\n");
+        assert!(sse_keepalive_frame().contains("event: ping"));
+        assert!(!sse_keepalive_frame().contains("event: message"));
     }
 }

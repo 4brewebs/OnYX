@@ -160,7 +160,7 @@ openonyx rewind .snaps_feat 12 --transcript feat.tr
 
 ## 7. Transcripciones y Replay 100% Offline (`ONYXTR2`)
 
-Grabando una sesión con `--record <archivo.tr>` (alias `--save-transcript <archivo.tr>`), `RecordingBridge` registra todas las decisiones del LLM, llamadas estructuradas (`call_id`), comandos slash (`Tab`, `/mode`, `/undo`, `/compact`, etc.) y metadatos de checkpoints (`[checkpoint:<head>:<tree>]`).
+Grabando una sesión con `--record <archivo.tr>` (alias `--save-transcript <archivo.tr>`), `RecordingBridge` registra todas las decisiones del LLM, llamadas estructuradas (`call_id`), comandos slash (`Tab`, `/mode`, `/undo`, `/compact`, etc.) y metadatos de checkpoints (`[checkpoint:<head>:<tree>]`). Las primitivas 0-tokens del depurador temporal se **sellan** en la transcripción como `/__onyx_det_*` (shell `!cmd`, `/read`, `/inject`, `/step`, `/step-llm` y la cirugía `/graph`): el replay las reproduce **bit-a-bit con 0 I/O y 0 red** (no se re-ejecuta ningún comando).
 
 ```sh
 # Grabar una sesión
@@ -192,6 +192,21 @@ openonyx doctor --snapshot-dir .snaps_feat --transcript feat.tr
 4. Cabecera y legibilidad de la transcripción (`ONYXTR1` / `ONYXTR2`).
 5. Capacidades de sandbox OS del sistema anfitrión (`bwrap`/`sandbox-exec`/`win32-job`, runtime OCI).
 6. Validación del DAG y puertos ocupados de `sprout.toml` (si existe en el workspace).
+
+---
+
+## 9. Paridad Web: el Time Debugger en `openonyx serve`
+
+La PWA embebida tiene **paridad completa** con el depurador temporal de la TUI (SDD-07 Fase 4A): el mismo estado de sesión alimenta ambas superficies, por lo que lo que haces desde el navegador afecta a la sesión en vivo y viceversa.
+
+- **Pill de tick**: la cabecera muestra `#tick-pill` (botonera aria). En vivo dice `tick N`; bajo freeze o con el cursor anclado en el pasado dice `⏸ X/Y` y abre la **barra ámbar de Time Debugger** automáticamente (puedes cerrarla; se vuelve a abrir sola al congelar).
+- **Barra ámbar**: estado (`⏸ TIME FROZEN · tick X / present Y` / `LIVE · tick Y`), slider que **snapea al tick disponible más cercano** (rechaza ticks purgados o futuros con aviso accionable), botones ◀/▶, `Freeze`/`Present`, `Step`, `Step 1 LLM` y `Resume` — estos tres últimos van por el **túnel de comandos sellado** (`/step 1`, `/step-llm`, `/go`), no por la API de scrub: la bifurcación se aplica en la sesión con sus gates.
+- **API efímera**: `POST /api/v1/time/scrub` (JSON: `action: freeze|unfreeze|return_to_present|scrub_to|scrub_delta`) muta solo el estado RAM del depurador — **0 disco, 0 eventos en el bus** — y responde con el snapshot `time_debug` actualizado. Hereda la autenticación Bearer y el guard CSRF de todo `/api/v1/*` (401 sin credenciales, 403 cross-site, 400 accionable para tick futuro o acción desconocida).
+- **Prompts planos bajo freeze**: `POST /api/v1/command` responde **`409 Conflict`** con mensaje accionable (`Paused in TIME FROZEN: use /go to resume or /inject to stage memory…`); `/go`, `/graph …`, `/inject …`, `/read …`, `/step …`, `/step-llm`, `/time` y `!cmd` siguen aceptándose.
+- **Cirugía de memorias en la UI**: con el agente raíz congelado, cada memoria del root muestra `✎` (editar en un diálogo → `/graph edit-mem <seq> <texto>` plano) y `×` (eliminar con confirmación → `/graph drop-mem <seq>`).
+- **Preview de proyección y aviso de revert**: el snapshot Web incluye `time_debug` completo (`frozen`, `cursor_tick`, `present_tick`, `available_ticks`, `pending_revert_files` desde los efectos del grafo vivo, 0 I/O) y, con `--snapshot-dir` + objetivo LLM real, el **`bench_hint`**: un comando `openonyx bench --snapshot-dir … --tick … --models provider:model` copiable para comparar el modelo vivo contra un benchmark determinista desde el mismo cursor (sinergia SDD-05 §9.4).
+
+> **Non-goal**: los efectos de **Sprout** y de los **servidores MCP** son efectos externos de proceso: el TimeFreeze (TUI o Web) **no los rebobina**.
 
 ---
 

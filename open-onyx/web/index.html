@@ -53,7 +53,14 @@
         <span id="sandbox-pill" class="pill pill-sandbox" title="Active OS sandbox profile">SANDBOX:workspace</span>
         <button id="trust-pill" type="button" class="pill pill-danger hidden" title="Workspace Trust restricted">UNTRUSTED</button>
         <button id="agents-btn" type="button" class="pill pill-interactive" title="Select active agent">Agent #1</button>
-        <span id="tick-pill" class="pill pill-mono" title="Deterministic graph tick">tick 0</span>
+        <button
+          id="tick-pill"
+          type="button"
+          class="pill pill-mono"
+          title="Deterministic graph tick — click to open the Time Debugger bar"
+          aria-expanded="false"
+          aria-controls="time-debug-bar"
+        >tick 0</button>
         <span id="vault-pill" class="pill pill-mono hidden" title="Active Session Vault">vault</span>
         <div class="ctx-meter" title="Context window usage">
           <div class="ctx-bar-track" aria-hidden="true">
@@ -65,6 +72,43 @@
         <button id="logout-btn" type="button" class="icon-btn" aria-label="Sign out" title="Sign out">⎋</button>
       </div>
     </header>
+
+    <!-- SDD-07 Fase 4A: Time Debugger bar (TimeFreeze) — amber, visible on demand or auto when frozen/cursor<present -->
+    <section id="time-debug-bar" class="time-debug-bar hidden" aria-label="Time debugger (TimeFreeze)">
+      <div class="tdb-main">
+        <span id="tdb-status" class="tdb-status" title="TimeFreeze state (cursor vs present tick)">LIVE · tick 0</span>
+        <div class="tdb-controls" role="group" aria-label="Time controls">
+          <button id="tdb-prev" type="button" class="tdb-btn" aria-label="Scrub one tick back" title="Scrub −1 tick (auto-freezes)">◀</button>
+          <input
+            id="tdb-slider"
+            type="range"
+            min="0"
+            max="0"
+            step="1"
+            value="0"
+            aria-label="Scrub to tick"
+            title="Scrub to tick (snaps to available ticks)"
+          >
+          <button id="tdb-next" type="button" class="tdb-btn" aria-label="Scrub one tick forward" title="Scrub +1 tick">▶</button>
+          <button id="tdb-freeze" type="button" class="tdb-btn tdb-freeze" title="Freeze here (pause) or return to present">Freeze</button>
+          <button id="tdb-step" type="button" class="tdb-btn" title="Advance one deterministic tick without LLM (/step 1)">Step</button>
+          <button id="tdb-step-llm" type="button" class="tdb-btn" title="Advance one LLM turn while frozen (/step-llm)">Step 1 LLM</button>
+          <button id="tdb-resume" type="button" class="tdb-btn tdb-resume" title="Return to present and resume (/go)">Resume</button>
+        </div>
+      </div>
+      <p id="tdb-revert-warn" class="tdb-revert-warn hidden" aria-live="polite"></p>
+      <p id="tdb-error" class="tdb-error hidden" aria-live="assertive"></p>
+      <div id="tdb-bench" class="tdb-bench hidden">
+        <code id="tdb-bench-hint" class="tdb-bench-hint" title="Deterministic bench from this cursor (SDD-05 synergy)"></code>
+        <button id="tdb-bench-copy" type="button" class="tdb-btn" title="Copy bench command">Copy</button>
+      </div>
+      <p
+        class="tdb-nongoal"
+        title="Non-goal: Sprout services and MCP sessions are NOT rewound. Only the deterministic agent graph is scrubbed."
+      >
+        <span aria-hidden="true">ⓘ</span> non-goal: Sprout/MCP no se rebobinan — solo el grafo determinista se scrubbea
+      </p>
+    </section>
 
     <nav class="mobile-tabs" aria-label="Workspace views">
       <button type="button" class="mobile-tab is-active" data-tab="chat">Chat</button>
@@ -328,6 +372,32 @@
         <button id="goal-dialog-close" type="button" class="icon-btn" aria-label="Close">✕</button>
       </div>
       <pre id="goal-dialog-text" class="goal-dialog-text"></pre>
+    </div>
+  </dialog>
+
+  <!-- SDD-07 Fase 4A: Edit root memory while paused (TIME FROZEN) — saves via `/graph edit-mem <seq> <texto>` -->
+  <dialog id="edit-mem-dialog" closedby="any" aria-labelledby="edit-mem-title">
+    <div class="dialog-body">
+      <div class="dialog-head-row">
+        <h2 id="edit-mem-title">Edit memory <span id="edit-mem-seq" class="pill pill-mono">#0</span></h2>
+        <button id="edit-mem-close" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="dialog-sub">
+        Paused (TIME FROZEN): editing is staged and sealed on the tick boundary via <code>/graph edit-mem &lt;seq&gt; &lt;text&gt;</code>.
+      </p>
+      <label class="field-label" for="edit-mem-input">Memory text (single line)</label>
+      <textarea
+        id="edit-mem-input"
+        class="text-input"
+        rows="4"
+        spellcheck="false"
+        placeholder="New memory text…"
+      ></textarea>
+      <p id="edit-mem-error" class="form-error" aria-live="assertive"></p>
+      <div class="dialog-footer">
+        <button id="edit-mem-cancel" type="button" class="btn btn-ghost">Cancel</button>
+        <button id="edit-mem-save" type="button" class="btn btn-primary">Save</button>
+      </div>
     </div>
   </dialog>
 
