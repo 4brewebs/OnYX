@@ -1040,10 +1040,12 @@ mod tests {
             let _ = wait_release.recv();
         });
 
-        let mut shared = OpenAiSharedState::default();
-        shared.timeouts = LlmTimeouts {
-            connect: Duration::from_secs(2),
-            read: Duration::from_secs(1),
+        let shared = OpenAiSharedState {
+            timeouts: LlmTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(1),
+            },
+            ..Default::default()
         };
         let body = json!({"model": "gpt-4o", "messages": []});
         let start = Instant::now();
