@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -1592,6 +1592,10 @@ pub struct SubagentManagerDriver {
     mode_handle: WorkspaceModeHandle,
     proactive_notifications: bool,
     current_poll: u64,
+    /// `FIX-01`: época de sesión (la sube `/rewind`); al cambiar, `present()`
+    /// limpia `dispatched` y `handled_approvals` (estado de la línea vieja).
+    restore_epoch: Option<Arc<AtomicU64>>,
+    last_restore_epoch: u64,
     last_completed_proposals: Vec<SubagentProposal>,
     /// Propuestas de *worktrees* aislados drenadas en `present` y pendientes de notificar
     /// en el próximo `poll` (`SDD-05` REQ-05.5 pulido A2): misma semántica que los jobs
@@ -1615,6 +1619,8 @@ impl SubagentManagerDriver {
             mode_handle: WorkspaceModeHandle::new(WorkspaceMode::Build),
             proactive_notifications: false,
             current_poll: 0,
+            restore_epoch: None,
+            last_restore_epoch: 0,
             last_completed_proposals: Vec::new(),
             pending_isolated_proposals: Vec::new(),
         }
@@ -1630,6 +1636,12 @@ impl SubagentManagerDriver {
 
     pub fn with_ready_flag(mut self, ready_flag: Arc<AtomicBool>) -> Self {
         self.ready_flag = Some(ready_flag);
+        self
+    }
+
+    /// `FIX-01`: época de sesión para el reset en pull tras `/rewind`.
+    pub fn with_restore_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.restore_epoch = Some(epoch);
         self
     }
 
@@ -1817,6 +1829,18 @@ impl PlatformDriver for SubagentManagerDriver {
     }
 
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        // `FIX-01`: `/rewind` subió la época → las claves (agent, request) de
+        // la línea vieja quedaron huérfanas: sin limpiar, un turno nuevo que
+        // reutilice una clave nunca despacharía sus herramientas subagent
+        // ni recibiría sus aprobaciones.
+        if let Some(epoch) = &self.restore_epoch {
+            let current = epoch.load(Ordering::Acquire);
+            if current != self.last_restore_epoch {
+                self.last_restore_epoch = current;
+                self.dispatched.clear();
+                self.handled_approvals.clear();
+            }
+        }
         // Evalúa `pending_approvals` para `subagent_merge` con *Scent-Heated Approval* sobre el
         // diff 3-way real antes de delegar en la UI/CLI interna, evitando banners innecesarios si
         // está por debajo de umbral (cuando la política lo permite) o si hay conflicto directo.

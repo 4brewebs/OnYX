@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use onyx_soul_agents::{
     AgentState, Attr, ConceptId, EventBus, GraphView, PlatformDriver, Reply, SurfaceBinding, Value,
@@ -60,6 +60,11 @@ pub struct WorkspaceToolBridge {
     isolated_errors: BTreeMap<u64, String>,
     /// Secuencia determinista para `job_id` de *worktrees* aislados.
     isolated_seq: u64,
+    /// `FIX-01`: época de sesión (la sube `/rewind` en `openonyx serve`/`chat`);
+    /// al cambiar, `present()` limpia `dispatched` y `handled_approvals`
+    /// (claves (agent, request) de la línea temporal anterior).
+    restore_epoch: Option<Arc<AtomicU64>>,
+    last_restore_epoch: u64,
 }
 
 /// Slot de un subagente hijo aislado: su *worktree* y las herramientas re-enraizadas
@@ -128,6 +133,8 @@ impl WorkspaceToolBridge {
             isolated_results: BTreeMap::new(),
             isolated_errors: BTreeMap::new(),
             isolated_seq: 1,
+            restore_epoch: None,
+            last_restore_epoch: 0,
         }
     }
 
@@ -136,6 +143,13 @@ impl WorkspaceToolBridge {
     /// `.onyx-wt` → `temp`), vía [`WorktreeManager::with_base_dir_override`].
     pub fn with_worktree_base_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.worktree_base_dir = dir;
+        self
+    }
+
+    /// `FIX-01`: época de sesión para el reset en pull tras `/rewind`. Sin ella
+    /// (replay, bench, tests sin restore en vivo) no hay reset.
+    pub fn with_restore_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.restore_epoch = Some(epoch);
         self
     }
 
@@ -618,6 +632,18 @@ impl PlatformDriver for WorkspaceToolBridge {
     }
 
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        // `FIX-01`: `/rewind` subió la época → las claves (agent, request) de
+        // la línea vieja quedaron huérfanas: sin limpiar, un turno nuevo que
+        // reutilice una clave no ejecutaría sus herramientas ni recibiría
+        // sus aprobaciones.
+        if let Some(epoch) = &self.restore_epoch {
+            let current = epoch.load(Ordering::Acquire);
+            if current != self.last_restore_epoch {
+                self.last_restore_epoch = current;
+                self.dispatched.clear();
+                self.handled_approvals.clear();
+            }
+        }
         if let Some(wv) = &self.ws_vocab {
             if let Some(mode) = graph_workspace_mode(graph, wv) {
                 self.mode.set(mode);

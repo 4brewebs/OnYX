@@ -13,7 +13,7 @@
 //! call se entregue por el mismo provider aunque el objetivo cambie de perfil.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -55,6 +55,12 @@ pub struct DynamicLlmDriver {
     /// `SDD-07`: gate de congelación — con `frozen` y sin presupuesto de
     /// `/step-llm`, `present()` no despacha (ni marca `dispatched`).
     time_debug: Option<TimeDebugState>,
+    /// `FIX-01`: época de sesión compartida (la sube `/rewind` en
+    /// [`crate::session::apply_session_action`]). Al detectar un cambio en
+    /// `present()`, se limpia `dispatched`, se drenan las respuestas en
+    /// buffer del canal `rx` y la cola compartida de tool calls.
+    restore_epoch: Option<Arc<AtomicU64>>,
+    last_restore_epoch: u64,
     rx: mpsc::Receiver<Reply>,
     tx: mpsc::Sender<Reply>,
     inner: Option<Box<dyn PlatformDriver>>,
@@ -93,6 +99,8 @@ impl DynamicLlmDriver {
             has_ready,
             stream_preview: None,
             time_debug: None,
+            restore_epoch: None,
+            last_restore_epoch: 0,
             rx,
             tx,
             inner: None,
@@ -147,6 +155,13 @@ impl DynamicLlmDriver {
         self.anthropic_shared.timeouts = timeouts;
         self
     }
+
+    /// `FIX-01`: época de sesión para el reset en pull tras `/rewind`. Sin
+    /// ella (replay/bench/tests unitarios sin restore en vivo) no hay reset.
+    pub fn with_restore_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.restore_epoch = Some(epoch);
+        self
+    }
 }
 
 /// `SDD-07` (fix de auditoría): decisión de despacho de un request pendiente.
@@ -184,6 +199,28 @@ impl PlatformDriver for DynamicLlmDriver {
     }
 
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        // `FIX-01`: `/rewind` subió la época → la línea temporal anterior
+        // dejó de existir. Se limpian los restos que enlazaban (agent, request)
+        // de la época vieja: el registro `dispatched` (sin esto un turno nuevo
+        // que reutilice una clave jamás llegaría al proveedor — el bug del
+        // dossier) y las respuestas que un hilo HTTP pudo dejar en buffer
+        // entre la comprobación `in_flight == 0` y el rewind: el guard de
+        // session bloquea el rewind con HTTP real en vuelo, pero la respuesta
+        // puede llegar al canal antes de que el guard decaiga.
+        if let Some(epoch) = &self.restore_epoch {
+            let current = epoch.load(Ordering::Acquire);
+            if current != self.last_restore_epoch {
+                self.last_restore_epoch = current;
+                self.dispatched.clear();
+                while self.rx.try_recv().is_ok() {}
+                // La cola compartida de tool calls está keyed SOLO por agente
+                // (`next_queued_call`): una continuation de la línea vieja se
+                // entregaría al primer request nuevo de ese agente.
+                if let Ok(mut queue) = self.gemini_shared.pending_calls.lock() {
+                    queue.clear();
+                }
+            }
+        }
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
