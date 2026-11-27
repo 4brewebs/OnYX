@@ -224,6 +224,9 @@ impl PlatformDriver for DynamicLlmDriver {
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
+        // `FIX-31` criterio 3: cada respuesta se compara con la época de la
+        // sesión; se stampea en el momento en que entra al transporte.
+        let epoch_handle = self.restore_epoch.clone();
         let preview = self.stream_preview.clone();
         for req in pending_requests(graph, &self.vocab) {
             // `SDD-07`: congelado sin presupuesto de `/step-llm` → no se
@@ -238,7 +241,12 @@ impl PlatformDriver for DynamicLlmDriver {
             }
             self.dispatched.insert(key);
             // Continuation de tool call: se entrega sin HTTP (cola compartida).
-            if let Some(queued_reply) = next_queued_call(&self.gemini_shared.pending_calls, &req) {
+            if let Some(mut queued_reply) =
+                next_queued_call(&self.gemini_shared.pending_calls, &req)
+            {
+                if let Some(e) = &epoch_handle {
+                    queued_reply = queued_reply.with_epoch(e.load(Ordering::Acquire));
+                }
                 if self.tx.send(queued_reply).is_ok() {
                     self.has_ready.store(true, Ordering::Release);
                 }
@@ -291,6 +299,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
+                    let epoch = epoch_handle.clone();
                     thread::spawn(move || {
                         let _guard = guard;
                         let reply = execute_gemini_stream_http(
@@ -307,6 +316,10 @@ impl PlatformDriver for DynamicLlmDriver {
                             },
                             body,
                         );
+                        let reply = match &epoch {
+                            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+                            None => reply,
+                        };
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
                         }
@@ -334,6 +347,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     );
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
+                    let epoch = epoch_handle.clone();
                     thread::spawn(move || {
                         let _guard = guard;
                         let reply = execute_openai_stream_http(
@@ -349,6 +363,10 @@ impl PlatformDriver for DynamicLlmDriver {
                             },
                             body,
                         );
+                        let reply = match &epoch {
+                            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+                            None => reply,
+                        };
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
                         }
@@ -386,6 +404,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
+                    let epoch = epoch_handle.clone();
                     thread::spawn(move || {
                         let _guard = guard;
                         let reply = execute_anthropic_stream_http(
@@ -402,6 +421,10 @@ impl PlatformDriver for DynamicLlmDriver {
                             },
                             body,
                         );
+                        let reply = match &epoch {
+                            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+                            None => reply,
+                        };
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
                         }

@@ -1683,6 +1683,12 @@ impl SubagentManagerDriver {
     }
 
     fn push_reply(&mut self, reply: Reply) {
+        // `FIX-31` criterio 3: cada respuesta se compara con la época de la
+        // sesión; se stampea en el momento en que entra a la cola.
+        let reply = match &self.restore_epoch {
+            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+            None => reply,
+        };
         self.queued.push(reply);
         if let Some(flag) = &self.ready_flag {
             flag.store(true, Ordering::Release);

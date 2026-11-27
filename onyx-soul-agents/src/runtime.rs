@@ -156,6 +156,7 @@ impl OnyxSystem for AgentRuntime {
             mem: &*self.memory,
             approval: &*self.approval,
             now,
+            epoch: &self.restore_epoch,
         };
         let inbox = ctx.inbox;
 
@@ -236,6 +237,8 @@ struct Step<'a> {
     mem: &'a dyn MemoryPolicy,
     approval: &'a dyn ApprovalPolicy,
     now: u64,
+    /// `FIX-31`: contador de época de la sesión (compartido con el host).
+    epoch: &'a Arc<AtomicU64>,
 }
 
 impl Step<'_> {
@@ -453,6 +456,19 @@ impl Step<'_> {
     fn apply(&self, ctx: &mut Ctx, r: Reply) {
         let v = &self.v;
         let id = r.agent;
+        // `FIX-31`: una respuesta stampeada con una época distinta de la
+        // actual pertenece a una línea temporal que ya no existe (se restauró
+        // encima): se descarta aunque su `(agent, request)` coincida con la
+        // petición pendiente, que el restore rebobinó hasta la misma clave.
+        if let Some(e) = r.epoch {
+            let current = self.epoch.load(Ordering::Acquire);
+            if e != current {
+                return ctx.outbox.push(fault(format!(
+                    "stale reply for agent {} (epoch {e} != session epoch {current})",
+                    id.0
+                )));
+            }
+        }
         let Some(state) = self.state_of(ctx, id) else {
             return ctx
                 .outbox

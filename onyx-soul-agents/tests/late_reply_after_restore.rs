@@ -105,15 +105,14 @@ fn the_pending_request(host: &mut AgentHost) -> (u64, u64) {
 /// (la «vieja», con su `(agent, request)`) llega cuando el turno nuevo ya tiene pendiente su
 /// propia petición. No debe aplicarse al turno nuevo, y este debe terminar con SU respuesta.
 ///
-/// Este test NO fija qué número de `request` tiene cada petición tras el restore: hoy el
-/// restore rebobina `request` (la vieja y la nueva comparten clave, que es justo el bug), pero
-/// FIX-31 prevé una época por petición, con lo que los números pueden cambiar. Por eso solo
-/// aserta lo observable y estable: exactamente una pendiente en cada momento, que OLD no
-/// completa nada y que el turno nuevo acaba con la respuesta que corresponde a su pendiente.
-/// Cuando se decida cómo viaja la época en `Reply`, la respuesta vieja se construirá con la
-/// época vieja y este test se adaptará (el resto de asserts se mantiene).
+/// Este test NO fija qué número de `request` tiene cada petición tras el restore (el restore
+/// rebobina `request`: la vieja y la nueva comparten clave), de modo que la protección no
+/// viene del número sino de la época: la respuesta vieja se construye con la época previa al
+/// restore (`host.restore_epoch()`), y el runtime la descarta al no coincidir con la época
+/// vigente (v3 de `Reply`). Solo aserta lo observable y estable: exactamente una pendiente en
+/// cada momento, que OLD no completa nada y que el turno nuevo acaba con la respuesta que
+/// corresponde a su pendiente.
 #[test]
-#[ignore = "BUG: FIX-31 la respuesta tardía de antes del restore se aplica al turno nuevo: Reply solo lleva (agent, request) y el restore rebobina request, sin época/generación que distinga peticiones (onyx-soul-agents/src/runtime.rs:433-439, reply.rs:68-75)"]
 fn late_reply_from_before_restore_is_not_applied_to_new_turn() {
     let store = Store::default();
     let mut host = host(store.clone());
@@ -131,7 +130,10 @@ fn late_reply_from_before_restore_is_not_applied_to_new_turn() {
     step_until_thinking(&mut host, &mut drv);
     let (old_agent, old_request) = the_pending_request(&mut host);
     assert_eq!(old_agent, agent.0);
-    let late = Reply::done(agent, old_request, "OLD");
+    // `FIX-31`: la respuesta vieja nace en la época pre-restore; tras el
+    // restore el runtime la descarta por época aunque `(agent, request)`
+    // coincida con la pendiente del turno nuevo.
+    let late = Reply::done(agent, old_request, "OLD").with_epoch(host.restore_epoch());
 
     host.request_restore("cut");
     host.step(&mut drv);

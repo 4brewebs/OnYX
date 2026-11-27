@@ -760,7 +760,11 @@ fn run_candidate(
                     &[],
                     &Arc::new(Vec::new()),
                 );
+                // `FIX-31` criterio 3: el bench hace un `request_restore` en vivo al
+                // arranque; con el handle, el bridge re-despacha las peticiones
+                // restauradas y stampea la época de cada respuesta del responder.
                 let mut driver = onyx_soul_agents::RecordingBridge::new(host.vocab(), responder)
+                    .with_restore_epoch(host.restore_epoch_handle())
                     .wrapping(ws_bridge);
                 let settled = step_until_settled(&mut host, &mut driver, MAX_BENCH_TICKS);
                 let snap = telemetry.snapshot();
