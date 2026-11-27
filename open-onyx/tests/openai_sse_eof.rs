@@ -1,0 +1,103 @@
+//! Caja negra de `openonyx serve` contra un proveedor falso OpenAI-compatible en loopback
+//! (solo `std::net`), centrado en el final del stream SSE (`open-onyx/src/openai.rs`).
+//!
+//! Contrato OpenAI de streaming: el stream termina con `data: [DONE]` y el último chunk con
+//! contenido trae `finish_reason`. Un cierre TCP limpio sin `[DONE]` ni `finish_reason` es un
+//! stream truncado: no puede darse por terminado con `finish_reason = "stop"`.
+//!
+//! Hermético: `env_clear`, `HOME`/`ONYX_TRUST_FILE` en un tempdir, clave falsa, sin red externa.
+#![cfg(unix)]
+
+mod common;
+
+use common::{FINISH_STOP, FakeOpenAi, Serve, Step, delta, run_goal};
+
+/// Control: stream completo con `finish_reason: "stop"` y `[DONE]` => `done` con el texto entero.
+#[test]
+fn complete_stream_with_done_marker_finishes_with_full_text() {
+    let fake = FakeOpenAi::start(vec![Step::Sse {
+        events: vec![delta("Hola "), delta("mundo"), FINISH_STOP.to_string()],
+        done: true,
+    }]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_eq!(state, "done", "{texts:?}");
+    assert_eq!(texts.last().map(String::as_str), Some("Hola mundo"));
+    let reqs = fake.requests();
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert!(reqs[0].starts_with("/v1/chat/completions "), "{reqs:?}");
+    assert!(
+        reqs[0].contains("\"stream\":true"),
+        "serve must stream: {reqs:?}"
+    );
+}
+
+/// Control: cortado a mitad de un evento (JSON incompleto) => no es un `done`.
+#[test]
+fn stream_cut_in_the_middle_of_an_event_fails() {
+    let fake = FakeOpenAi::start(vec![Step::Raw(format!(
+        "data: {}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"mun",
+        delta("Hola ")
+    ))]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_eq!(state, "failed", "{texts:?}");
+    assert!(
+        !texts.iter().any(|t| t == "Hola "),
+        "partial text must not become the answer: {texts:?}"
+    );
+}
+
+/// Stream truncado: deltas de texto sin `finish_reason` ni `[DONE]` y cierre TCP limpio.
+#[test]
+#[ignore = "BUG: FIX-03 EOF limpio sin [DONE] ni finish_reason se acepta como finish_reason=stop y el texto truncado queda como respuesta final (open-onyx/src/openai.rs:468-470)"]
+fn stream_closed_cleanly_without_done_marker_is_not_a_stop() {
+    let fake = FakeOpenAi::start(vec![Step::Sse {
+        events: vec![delta("Hola "), delta("mun")],
+        done: false,
+    }]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_ne!(
+        state, "done",
+        "truncated stream accepted as complete answer; memory: {texts:?}"
+    );
+}
+
+/// RST a mitad del stream con texto parcial y sin `finish_reason` ni `[DONE]`: el cliente
+/// ve un ERROR de lectura (no un EOF). `can_accept_partial_sse_eof` solo puede aceptar un
+/// corte así si el stream ya había terminado (`[DONE]` o `finish_reason`); con texto parcial
+/// a secas no es una respuesta: el turno falla y el texto truncado no queda como respuesta.
+/// Control del camino de error del lector SSE; mata la mutación «el EOF parcial siempre se
+/// acepta» (P4 de Adolfo), que los tests de FIN limpio no distinguen.
+#[cfg(target_os = "linux")]
+#[test]
+fn connection_reset_mid_stream_with_partial_text_is_not_an_answer() {
+    let fake = FakeOpenAi::start(vec![Step::Reset {
+        events: vec![delta("Hola "), delta("mun")],
+    }]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_eq!(state, "failed", "{texts:?}");
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("Hola") || t.contains("mun")),
+        "partial text must not become the answer: {texts:?}"
+    );
+}
+
+/// Contraste: RST DESPUÉS de un `finish_reason` (el stream ya estaba completo; solo faltó
+/// `[DONE]`) sí se acepta con el texto entero. Evita que un arreglo del caso anterior
+/// rechace también este.
+#[cfg(target_os = "linux")]
+#[test]
+fn connection_reset_after_finish_reason_keeps_the_complete_answer() {
+    let fake = FakeOpenAi::start(vec![Step::Reset {
+        events: vec![delta("Hola "), delta("mundo"), FINISH_STOP.to_string()],
+    }]);
+    let serve = Serve::start(&fake.base_url());
+    let (state, texts) = run_goal(&serve, "saluda");
+    assert_eq!(state, "done", "{texts:?}");
+    assert_eq!(texts.last().map(String::as_str), Some("Hola mundo"));
+}
