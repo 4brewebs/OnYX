@@ -443,9 +443,7 @@ pub struct WebTimeDebugSnapshot {
     pub present_tick: u64,
     pub available_ticks: Vec<u64>,
     pub pending_revert_files: Vec<String>,
-    /// Sinergia `SDD-05` §9.4: comando copiable `openonyx bench --snapshot-dir
-    /// <dir> --tick <cursor> --models <provider>:<model>` (solo si hay store
-    /// de snapshots y objetivo LLM vivo con provider+modelo).
+    /// Sinergia `SDD-05` §9.4: comando copiable `openonyx bench --snapshot-dir <dir> --tick <cursor> --models <provider>:<model>` (solo si hay store de snapshots y objetivo LLM vivo con provider+modelo).
     pub bench_hint: Option<String>,
 }
 
