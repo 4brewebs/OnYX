@@ -45,6 +45,8 @@ openonyx [--help | -h | --version | -V]
 | `--max-steps <n>` | `chat`, `run` | Max root agent steps per turn (default: `128` in `chat`, `64` in `run`; subagents capped at `32` by default). |
 | `--max-subagents <n>` | `chat`, `run`, `serve`, `rewind --interactive` | Max parallel async subagent Git worktrees (default: `3`, or `ONYX_MAX_SUBAGENTS`). |
 | `--shell-timeout <secs>` | `chat`, `run` | Timeout in seconds per `shell_exec` command (default: `30s`). |
+| `--llm-timeout-connect <secs>` | `chat`, `run`, `serve` | LLM HTTP connect (TCP/TLS) timeout in seconds (default: `30s`; or `ONYX_LLM_TIMEOUT_CONNECT_SECS`). |
+| `--llm-timeout-read <secs>` | `chat`, `run`, `serve` | LLM HTTP read timeout in seconds between bytes/SSE chunks (default: `120s`; or `ONYX_LLM_TIMEOUT_READ_SECS`). A hung provider fails the turn in bounded time instead of blocking the session forever. |
 | `--auto-save` | `chat`, `run` | Auto-create `.onyx/vault/<YYYYMMDD-HHMMSS>_<model>[_<branch\|goal>]/` storing both `snapshots.onyxpack` and `<id>.tr` together (or `ONYX_AUTO_SAVE=1`). |
 | `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Save deterministic `ONYXTR2` transcript (short names go inside `--snapshot-dir`, or `.onyx/vault/unassigned/` if no snapshot dir). |
 | `--snapshot-dir <dir>` | `chat`, `run`, `replay`, `doctor` | Snapshot directory for `snapshots.onyxpack` (short names resolve under `.onyx/vault/<dir>/`). |
@@ -87,7 +89,7 @@ openonyx bench \
 - **Per candidate (sequential):** rewind the worktree to the tick → fresh restored host → if no agent is active at the tick, spawn a root agent from `--goal` → run until settled (internal 256-tick cap) with real telemetry (tokens/cost) for live candidates (replay: tokens/cost `0`).
 - **`--auto-approve`:** for **unattended** runs on disposable worktrees: each candidate runs only inside its own worktree and the root is never touched; `[permissions].deny` still applies.
 - **Output:** a 9-column Markdown table on `stdout` — `| model | passed_verify | ticks | tool_calls | input_tokens | cached_tokens | output_tokens | estimated_cost_usd | wall_time_ms |` — plus, with `--out`, the JSON report (`metadata` with snapshot/tick/models/verify + per-candidate `results` with every column).
-- **Reused flags:** `--workspace <dir>`, `--sandbox <off|workspace-write|strict-container>`, `--sandbox-net <offline|localhost|unrestricted>`, `--shell-timeout <secs>`, `--trust-workspace`, `--api-base <url>`, `--allow-custom-auth-host`, `--effort <low|medium|high>`, `--thinking-budget <n>` (a live candidate determines its own `provider:model`).
+- **Reused flags:** `--workspace <dir>`, `--sandbox <off|workspace-write|strict-container>`, `--sandbox-net <offline|localhost|unrestricted>`, `--shell-timeout <secs>`, `--llm-timeout-connect <secs>`, `--llm-timeout-read <secs>`, `--trust-workspace`, `--api-base <url>`, `--allow-custom-auth-host`, `--effort <low|medium|high>`, `--thinking-budget <n>` (a live candidate determines its own `provider:model`).
 - **Actionable validation:** missing `--snapshot-dir`/`--tick`/`--models` produces an error naming the missing flag; unknown provider → `unsupported provider ... (expected `gemini`, `openai` or `anthropic`)`; a missing snapshot store → floor warning, not an error.
 
 ---
@@ -105,6 +107,8 @@ openonyx bench \
 | `ONYX_EFFORT` | All | Default reasoning effort (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`; on Anthropic, `ANTHROPIC_THINKING_BUDGET` governs thinking). |
 | `ONYX_AUTO_SAVE` | Both | Enable `--auto-save` by default (`1` \| `true` \| `yes` \| `on`) storing sessions in `.onyx/vault/`. |
 | `ONYX_MAX_SUBAGENTS` | Both | Max parallel async subagent worktrees (used when `--max-subagents <n>` is omitted; default: `3`). |
+| `ONYX_LLM_TIMEOUT_CONNECT_SECS` | All | LLM HTTP connect timeout in seconds (default: `30`; fallback for `--llm-timeout-connect`). |
+| `ONYX_LLM_TIMEOUT_READ_SECS` | All | LLM HTTP read timeout in seconds between bytes/SSE chunks (default: `120`; fallback for `--llm-timeout-read`). |
 | `GEMINI_API_BASE` | Gemini | Custom Gemini API base URL. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Custom OpenAI-compatible API endpoint (default: `https://api.openai.com/v1`). |
 | `ANTHROPIC_API_BASE` | Anthropic | Custom Anthropic API base URL (default: `https://api.anthropic.com`). |
@@ -118,9 +122,10 @@ openonyx bench \
 
 Local inference servers and proxies (vLLM, LiteLLM, nginx, Cloudflare) occasionally close chunked SSE streams abruptly right after emitting `finish_reason` or return transient errors (`408`, `429`, `500`, `502`, `503`, `504`, or brief transport drops).
 
-`open-onyx/src/openai.rs` builds in two automatic safeguards:
+`open-onyx/src/openai.rs` builds in three automatic safeguards:
 1. **Completed-SSE EOF tolerance**: if a chunk decode error happens after `finish_reason` / `[DONE]` with complete assistant content or `tool_calls`, the response is accepted cleanly instead of failing the turn.
 2. **Automatic transient retries with backoff**: retries transient transport/408/429/5xx/stream errors up to **2 times** (`400ms`, `1200ms`) before surfacing an error to the agent.
+3. **Explicit HTTP timeouts (`FIX-02`)**: every request to the three providers sets a configurable `timeout_connect` (default `30s`) and `timeout_read` (default `120s`, per SSE chunk) via `--llm-timeout-connect` / `--llm-timeout-read` (or `ONYX_LLM_TIMEOUT_CONNECT_SECS` / `ONYX_LLM_TIMEOUT_READ_SECS`). A provider that accepts the connection and then goes silent surfaces a classified transport error in bounded time instead of blocking the session (e.g. `serve`) forever. The read timeout is **not** retried by the transient policy (point 2): a silent provider fails once, within the read budget, because blindly retrying after the full prompt was sent could trigger duplicate inference; connect failures, resets and `408`/`429`/`5xx` remain retried with backoff.
 
 The native `open-onyx/src/anthropic.rs` adapter applies the same retry policy (`408`, `429`, `500`, `502`, `503`, `504`, and Anthropic's own `overloaded_error` `529`), honoring the `retry-after` header when the server sends it.
 

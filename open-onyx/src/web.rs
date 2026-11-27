@@ -3464,7 +3464,7 @@ mod tests {
     /// de arranque (regresión: la cabecera "mentía" hasta reiniciar).
     #[test]
     fn web_state_snapshot_model_and_effort_follow_live_llm_handle() {
-        use crate::llm_profile::{LlmConfig, LlmProvider};
+        use crate::llm_profile::{LlmConfig, LlmProvider, LlmTimeouts};
 
         let cfg = WebServerConfig::resolve(
             "127.0.0.1:0",
@@ -3481,6 +3481,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let handle = LlmProfileHandle::new(&startup, &[], false);
         let web_driver = WebDriver::start(host.vocab(), &cfg, None, None)
@@ -3523,7 +3524,7 @@ mod tests {
     /// de seguridad: el snapshot web solo lleva metadatos).
     #[test]
     fn web_state_snapshot_exposes_llm_profiles_without_credentials() {
-        use crate::llm_profile::{LlmConfig, LlmProvider};
+        use crate::llm_profile::{LlmConfig, LlmProvider, LlmTimeouts};
         use onyx_workspace::LlmProfileConfig;
 
         let cfg = WebServerConfig::resolve(
@@ -3541,6 +3542,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         // Perfil OpenAI sin `api_key_env` resuelta → no disponible, con motivo.
         let profiles = vec![LlmProfileConfig {

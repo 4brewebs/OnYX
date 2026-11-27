@@ -23,7 +23,7 @@ use crate::gemini::{
     system_instruction_text,
 };
 
-use crate::llm_profile::{api_base_host, is_loopback_host};
+use crate::llm_profile::{LlmTimeouts, api_base_host, is_loopback_host};
 
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
 pub const DEFAULT_OPENAI_API_BASE: &str = "https://api.openai.com/v1";
@@ -44,6 +44,8 @@ pub(crate) struct OpenAiSharedState {
     /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
     /// declaran en el body filtradas por los tools del spec del agente.
     pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub(crate) timeouts: LlmTimeouts,
 }
 
 fn tool_call_args_as_string(raw: &JsonValue) -> String {
@@ -302,13 +304,15 @@ pub(crate) const RETRY_BACKOFF_MS: [u64; MAX_TRANSIENT_RETRIES] = [400, 1200];
 
 pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
+    // `FIX-02` (cierre de auditoría): el timeout de read mid-stream
+    // ("timed out ...") NO es reintenable: es el proveedor mudo con el prompt
+    // ya enviado (mismo criterio que `is_transport_read_timeout`).
     lower.contains("decoding chunks")
         || lower.contains("unexpected eof")
         || lower.contains("early eof")
         || lower.contains("connection reset")
         || lower.contains("connection aborted")
         || lower.contains("broken pipe")
-        || lower.contains("timed out")
         // `REQ-04.1`: `error` event in-stream de Anthropic con
         // `error.type == "overloaded_error"` (p. ej. 529) es reintenable.
         || lower.contains("overloaded_error")
@@ -489,8 +493,17 @@ fn post_openai_json(
     body: &JsonValue,
     agent: ConceptId,
     request: u64,
+    timeouts: LlmTimeouts,
 ) -> Result<ureq::Response, OpenAiHttpError> {
-    let mut req = ureq::post(url);
+    // `FIX-02`: timeouts explícitos por petición. `timeout_connect` acota el
+    // TCP/TLS; `timeout_read` acota el tiempo entre bytes/chunks (SSE). Sin
+    // ellos ureq solo limita el connect (30 s por defecto) y un proveedor
+    // colgado después del handshake se queda en read **eternamente**.
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .build();
+    let mut req = http.post(url);
     if !api_key.trim().is_empty() {
         req = req.set("Authorization", &format!("Bearer {api_key}"));
     }
@@ -511,12 +524,48 @@ fn post_openai_json(
                 format!(
                     "openai transport error ({:?}): {}",
                     t.kind(),
-                    t.message().unwrap_or("request failed")
+                    transport_detail(&t)
                 ),
             ),
-            retryable: true,
+            // `FIX-02` (cierre de auditoría): el timeout de read NO es
+            // reintenable (`is_transport_read_timeout`); connect/DNS/reset
+            // siguen siéndolo.
+            retryable: !is_transport_read_timeout(&t),
         }),
     }
+}
+
+/// Detalle accionable de un error de transporte ureq: la `message` del error
+/// o, si no la tiene, la fuente `io::Error` (p. ej. `FIX-02`:
+/// `"timed out reading response"` en vez de un genérico `"request failed"`).
+/// `pub(crate)`: lo reusan `anthropic.rs` y `gemini.rs` (misma forma de error).
+pub(crate) fn transport_detail(t: &ureq::Transport) -> String {
+    use std::error::Error as _;
+    t.message()
+        .map(|m| m.to_string())
+        .or_else(|| {
+            t.source()
+                .and_then(|s| s.downcast_ref::<std::io::Error>())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "request failed".to_string())
+}
+
+/// `FIX-02` (cierre de auditoría): `true` si el error de transporte es un
+/// **timeout de read** (el proveedor aceptó la conexión y no responde entre
+/// bytes/chunks). A diferencia de los fallos de connect/DNS/reset —transitorios
+/// y reintentables—, reintentar ciegamente contra un servidor que calla por
+/// completo rara vez ayuda y puede disparar inferencias duplicadas (POST no
+/// idempotente con el prompt ya enviado). ureq lo clasifica como `Io` +
+/// `io::Error` `TimedOut` (o `WouldBlock` sin normalizar); un timeout de
+/// **connect** llega como `ConnectionFailed` y **no** coincide.
+pub(crate) fn is_transport_read_timeout(t: &ureq::Transport) -> bool {
+    use std::error::Error as _;
+    use std::io::ErrorKind as IoKind;
+    t.kind() == ureq::ErrorKind::Io
+        && t.source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some_and(|e| matches!(e.kind(), IoKind::TimedOut | IoKind::WouldBlock))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -530,8 +579,9 @@ pub(crate) fn execute_openai_http(
     model: &str,
     is_local_endpoint: bool,
 ) -> Reply {
+    let timeouts = shared.timeouts;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
-        let resp = match post_openai_json(url, api_key, &body, agent, request) {
+        let resp = match post_openai_json(url, api_key, &body, agent, request, timeouts) {
             Ok(r) => r,
             Err(err) => {
                 if err.retryable {
@@ -584,6 +634,7 @@ pub(crate) struct OpenAiStreamTarget<'a> {
 }
 
 pub(crate) fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: JsonValue) -> Reply {
+    let timeouts = target.shared.timeouts;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         let resp = match post_openai_json(
             target.url,
@@ -591,6 +642,7 @@ pub(crate) fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: J
             &body,
             target.agent,
             target.request,
+            timeouts,
         ) {
             Ok(r) => r,
             Err(err) => {
@@ -707,6 +759,12 @@ impl OpenAiResponder {
     /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
     pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
         self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
+
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub fn with_llm_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.shared.timeouts = timeouts;
         self
     }
 }
@@ -959,5 +1017,83 @@ mod tests {
         });
         let err = accumulate_openai_sse_reader(reader_err, ConceptId(2), 2, None).unwrap_err();
         assert!(is_retryable_stream_error(&err), "{err}");
+    }
+
+    /// `FIX-02` (criterio 2): un proveedor que acepta la conexión y **no
+    /// responde nunca** debe terminar en **un solo presupuesto de read** con
+    /// un error clasificado (`timeout_read` → `Io`/`TimedOut`), no colgar, y
+    /// **sin reintentos** (cierre de auditoría: el timeout de read no es
+    /// reintenable). Antes del fix, ureq sin `timeout_read` se bloqueaba
+    /// eternamente en el read.
+    #[test]
+    fn silent_provider_terminates_with_classified_error_within_timeout() {
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        // Acepta (connect OK) y se queda mudo hasta que el test lo libere.
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let _conn = conn; // abierto y silencioso
+            let _ = wait_release.recv();
+        });
+
+        let shared = OpenAiSharedState {
+            timeouts: LlmTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(1),
+            },
+            ..Default::default()
+        };
+        let body = json!({"model": "gpt-4o", "messages": []});
+        let start = Instant::now();
+        let reply = execute_openai_http(
+            &url,
+            "test-key",
+            body,
+            ConceptId(1),
+            7,
+            &shared,
+            "gpt-4o",
+            true,
+        );
+        let elapsed = start.elapsed();
+        // Sin reintentos (el timeout de read no es reintenable): con
+        // read=1 s el fallo llega en el primer intento (~1 s). La cota
+        // < 4 s demuestra que no reintentó 3 veces (~4,6 s) y acota frente
+        // al hang eterno del pre-fix.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "el proveedor mudo debe fallar en el primer intento (elapsed: {elapsed:?})"
+        );
+        assert!(
+            matches!(reply.verb, onyx_soul_agents::Verb::Fail),
+            "se esperaba un fallo clasificado, se obtuvo: {reply:?}"
+        );
+        assert!(
+            reply.payload.contains("transport error (Io)"),
+            "se esperaba un error de transporte clasificado (Io), se obtuvo: {}",
+            reply.payload
+        );
+        // El detalle exacto del timeout depende de la plataforma: ureq
+        // normaliza a `"timed out reading response"` en Unix, pero en
+        // Windows el mensaje del SO `10060` (WSAETIMEDOUT) llega traducido.
+        // En ambas, la clasificación es timeout de read.
+        #[cfg(unix)]
+        assert!(
+            reply.payload.contains("timed out"),
+            "se esperaba timeout de read clasificado, se obtuvo: {}",
+            reply.payload
+        );
+        #[cfg(windows)]
+        assert!(
+            reply.payload.contains("10060"),
+            "se esperaba timeout de read clasificado (WSAETIMEDOUT), se obtuvo: {}",
+            reply.payload
+        );
+        drop(release);
+        let _ = holder.join();
     }
 }

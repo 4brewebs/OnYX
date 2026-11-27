@@ -47,6 +47,11 @@ pub enum Step {
     /// sin `[DONE]`: el cliente recibe los eventos y después un error de lectura
     /// (`ECONNRESET`), no un fin de stream. Solo Linux: usa `SO_LINGER` con tiempo 0.
     Reset { events: Vec<String> },
+    /// Acepta la petición y **no responde nunca**: sostiene la conexión abierta
+    /// hasta que se pare el fake. Simula un proveedor colgado después del
+    /// handshake (read sin bytes); sin `timeout_read` del cliente colgaría
+    /// eternamente (`FIX-02`).
+    Silent,
 }
 
 /// `SO_LINGER {on, 0}`: `close()` descarta lo pendiente y envía RST. Declarado a mano
@@ -151,6 +156,15 @@ impl FakeOpenAi {
                             s,
                             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{raw}"
                         );
+                    }
+                    Some(Step::Silent) => {
+                        // `FIX-02`: sostiene la conexión sin responder hasta
+                        // `stop`. El `Drop` levanta `stop` y pata con un
+                        // `connect` nuevo; el `break` al inicio de la vuelta de
+                        // `incoming()` termina el hilo y `join()` regresa.
+                        while !stop2.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(50));
+                        }
                     }
                     #[cfg(target_os = "linux")]
                     Some(Step::Reset { events }) => {

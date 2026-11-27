@@ -137,6 +137,16 @@ impl DynamicLlmDriver {
         self.time_debug = Some(time_debug);
         self
     }
+
+    /// `FIX-02`: timeouts HTTP (connect/read) de las llamadas a los tres
+    /// proveedores, por sesión (no por perfil: un hot-swap de `/profile`
+    /// no muta el timeout de las peticiones en vuelo ni el de la sesión).
+    pub fn with_llm_timeouts(mut self, timeouts: crate::llm_profile::LlmTimeouts) -> Self {
+        self.gemini_shared.timeouts = timeouts;
+        self.openai_shared.timeouts = timeouts;
+        self.anthropic_shared.timeouts = timeouts;
+        self
+    }
 }
 
 /// `SDD-07` (fix de auditoría): decisión de despacho de un request pendiente.

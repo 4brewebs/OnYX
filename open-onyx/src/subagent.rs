@@ -2497,7 +2497,7 @@ mod tests {
     /// subagente sigue usando el perfil congelado, no el modelo activo.
     #[test]
     fn spawn_job_pins_active_llm_target_across_hot_swap() {
-        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider};
+        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider, LlmTimeouts};
 
         let repo = init_temp_git_repo("llm_pin");
         let wt_base = repo
@@ -2515,6 +2515,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let handle = LlmProfileHandle::new(&startup, &[], false);
 
