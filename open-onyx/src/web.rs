@@ -1954,15 +1954,28 @@ fn accept_loop(listener: TcpListener, hub: Arc<WebHub>) {
     while !hub.quit.load(Ordering::Acquire) {
         loop {
             match listener.accept() {
-                Ok((stream, _addr)) => match probe_stream(&stream) {
-                    ParkedProbe::Data => {
-                        if stream.set_nonblocking(false).is_ok() {
-                            spawn_connection(stream, &hub, &mut default_connection_spawner);
+                Ok((stream, _addr)) => {
+                    // FIX-09: en Unix el socket aceptado NO hereda O_NONBLOCK del
+                    // listener (sí lo hereda en Windows/BSD): sin forzar el modo
+                    // no bloqueante aquí, el `peek` de `probe_stream` sobre una
+                    // conexión ociosa (sin datos pendientes) bloquearía el hilo
+                    // de accept para siempre y el backlog de 128 se desbordaría
+                    // (SYN descartados → `connect_timeout` en clientes legítimos).
+                    let probe = if stream.set_nonblocking(true).is_ok() {
+                        probe_stream(&stream)
+                    } else {
+                        ParkedProbe::Data
+                    };
+                    match probe {
+                        ParkedProbe::Data => {
+                            if stream.set_nonblocking(false).is_ok() {
+                                spawn_connection(stream, &hub, &mut default_connection_spawner);
+                            }
                         }
+                        ParkedProbe::Idle => parked.push(stream),
+                        ParkedProbe::Closed => {}
                     }
-                    ParkedProbe::Idle => parked.push(stream),
-                    ParkedProbe::Closed => {}
-                },
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => {
                     thread::sleep(Duration::from_millis(50));
