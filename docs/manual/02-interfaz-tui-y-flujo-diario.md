@@ -180,7 +180,43 @@ El agente raíz puede delegar subtareas de dos formas: subagentes **síncronos**
 
 ---
 
-## 7. Resumen de Atajos y Comandos en `chat`
+## 7. Depurador Temporal Interactivo (`TimeFreeze`, SDD-07)
+
+`TimeFreeze` permite **pausar la sesión en cualquier tick** y examinarla paso a paso sin gastar tokens ni tocar disco: las fronteras de tick viven en un **anillo RAM** (los hitos en disco de `--snapshot-dir` se superponen como referencias) y todo el estado es **100 % efímero** hasta que confirmes una bifurcación (`/go` con el cursor anclado en el pasado crea el fork; sin confirmación no se escribe nada).
+
+### Congelar, scrubear y salir
+
+| Acción | Cómo |
+| --- | --- |
+| Congelar / descongelar en el cursor | `Ctrl+T` o `/time` (toggle efímero) |
+| Scrubear −1 / +1 sobre ticks disponibles | `Alt+←` / `Alt+→` (mirar el pasado auto-congela) |
+| Volver al presente **sin cerrar** la app | `Esc` mientras `TIME FROZEN` (segundo `Esc` en vivo: sale) |
+| Ir a un tick concreto (hitos `[pack:*]`, `[ram]`, `(present)`) | `F5 Timeline` → `Down`/`Up` → `Enter` |
+
+Bajo freeze aparece el **banner ámbar** (`⏸ TIME FROZEN · tick X / present Y` + archivos que se revertirían al bifurcar, solo RAM) y el prompt plano se bloquea: un turno desordenado rompería la bit-a-bit del replay. Las **vías de escape** (`/…` y `!…`) siguen funcionando **siempre**, incluso con el agente ocupado en `Thinking` (breakpoint pre-LLM): se ejecutan inmediatas, sin colas.
+
+### Primitivas 0-tokens y cirugía del grafo congelado
+
+| Comando | Qué hace |
+| --- | --- |
+| `/step [n]` | Avanza `n` ticks deterministas con **0 LLM** (default `1`; funciona congelado) |
+| `/step-llm` | **Un solo turno** de LLM: gate + bifurcación si aplica + recongelado al responder |
+| `/go` (alias `/unfreeze`) | Bifurca desde el cursor si mira el pasado y **reanuda en el presente** |
+| `! <cmd>` | Ejecuta un comando shell determinista en sandbox y **sella** el resultado (0 red, 0 disco) |
+| `/read <ruta> [a..b]` | Lee un archivo (o rango de líneas) a memoria, 0 tokens, frozen-safe |
+| `/inject <texto>` | Inyecta una memoria `user` **sellada** en la línea temporal (0 tokens) |
+| `/graph inspect [agent\|mem\|ws]` | Informe **read-only** del grafo congelado (memorias con `mem_seq`, agentes, workspace) |
+| `/graph drop-mem <seq\|a..b>` | Elimina memorias por `mem_seq` sin avanzar el tiempo |
+| `/graph edit-mem <seq> <texto>` | Edita una memoria existente in-place |
+| `/graph set-goal <texto>` | Cambia el objetivo del agente raíz en el grafo congelado |
+
+Estas primitivas se **sellan en `ONYXTR2`** (`/__onyx_det_*`): el replay offline las reproduce bit-a-bit con 0 I/O y 0 red. En la vista Web/PWA (`openonyx serve`) hay **paridad completa**: la pill `#tick-pill` abre la misma barra ámbar, `POST /api/v1/time/scrub` aplica scrubs efímeros, los prompts planos bajo freeze reciben `409 Conflict` accionable y las memorias del agente raíz exponen botones `✎`/`×` — ver [capítulo 04](04-time-travel-snapshots-y-forking.md).
+
+> **Non-goal**: los efectos de **Sprout** (servicios/contenedores) y de los **servidores MCP** son efectos externos de proceso, no mutaciones del grafo: `TimeFreeze` **no los rebobina** (ni los revierte al bifurcar).
+
+---
+
+## 8. Resumen de Atajos y Comandos en `chat`
 
 | Tecla / Comando | Acción |
 | --- | --- |
@@ -191,7 +227,9 @@ El agente raíz puede delegar subtareas de dos formas: subagentes **síncronos**
 | `Ctrl+Tab` | Rota rápidamente el agente enfocado (alias opcional de `F2` / `/agent`) |
 | `y` / `n` | Aprueba o rechaza la herramienta mutante pendiente (**solo en `F1 Chat`**; en otras vistas la TUI avisa a pulsar `F1`) |
 | `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End`/`Ctrl+U`/`Ctrl+D` | Desplaza el historial `Memory & Trace` |
-| `Esc` | Cierra popup/paleta; en `F2..F5` vuelve a `F1 Chat`; en `F1 Chat` sale limpiamente guardando snapshot y transcripción |
+| `Alt+←` / `Alt+→` | TimeFreeze: scrub del cursor −1/+1 sobre ticks disponibles (auto-congela al mirar el pasado) |
+| `Ctrl+T` | TimeFreeze: toggle de freeze en el cursor / volver al presente (efímero, 0 disco) |
+| `Esc` | Cierra popup/paleta; bajo `TIME FROZEN` vuelve al presente **sin salir**; en `F2..F5` vuelve a `F1 Chat`; en `F1 Chat` sale limpiamente guardando snapshot y transcripción |
 | `Ctrl+C` | Sale limpiamente (snapshot de salida y transcripción, si están configurados) |
 | `/view <chat\|agents\|sprout\|plan\|timeline>` | Cambia de vista desde el prompt (efímero: 0 eventos de bus, 0 ticks, 0 grafo) |
 | `/agent [id\|name]` | Abre el selector de agentes o enfoca el agente indicado |
@@ -199,6 +237,14 @@ El agente raíz puede delegar subtareas de dos formas: subagentes **síncronos**
 | `/undo` | Revierte el último checkpoint Git reversible (y limpia archivos nuevos de `fs_write`) |
 | `/rewind [tick]` | Lista hitos o retrocede en caliente a `<tick>` creando un fork seguro |
 | `/fork [name]` | Crea una rama de snapshots hasta el tick actual en un directorio hermano |
+| `/time` | TimeFreeze: alterna el freeze en el cursor actual (efímero, 0 disco) |
+| `/go` (alias `/unfreeze`) | TimeFreeze: bifurca si el cursor mira el pasado y reanuda en el presente |
+| `/step [n]` | TimeFreeze: `n` ticks deterministas con 0 LLM (default `1`; frozen-safe) |
+| `/step-llm` | TimeFreeze: exactamente un turno de LLM (gate + bifurcación + recongelado) |
+| `! <cmd>` | Shell determinista en sandbox con resultado sellado en `ONYXTR2` (frozen-safe) |
+| `/read <ruta> [a..b]` | Lee un archivo (o rango) a memoria, 0 tokens (frozen-safe) |
+| `/inject <texto>` | Memoria `user` sellada en la línea temporal, 0 tokens (frozen-safe) |
+| `/graph <inspect\|drop-mem\|edit-mem\|set-goal>` | Inspección read-only o cirugía del grafo congelado (memorias por `mem_seq`, objetivo) sin avanzar el tiempo |
 | `/compact [focus]` | Compacta turnos anteriores rescatando archivos y coincidencias del foco |
 | `/services` | Muestra estado `@TOON v1` de servicios definidos en `sprout.toml` |
 | `/service <start\|stop\|logs> <id\|all> [tail]` | Controla servicios Sprout directamente desde la TUI |

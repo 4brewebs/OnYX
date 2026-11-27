@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use onyx_soul_agents::{
-    AgentSpec, AgentState, AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError,
+    AgentSpec, AgentState, Attr, AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError,
     OnyxEvent, OnyxSystem, SystemEvent, Value, Vocab, append_agent_memory, continue_agent,
     spawn_event,
 };
@@ -24,6 +24,10 @@ use crate::context::{
 use crate::llm_profile::{LlmProfileHandle, LlmProvider, ResolvedLlmTarget, effort_label};
 use crate::pack::SharedPackStore;
 use crate::subagent::{SubagentHandle, decode_proposal_command};
+use crate::time_debug::{
+    DET_STEP_LLM_CMD_PREFIX, SealedGraphOp, decode_det_graph_command, decode_det_inject_command,
+    decode_det_read_command, decode_det_shell_command,
+};
 
 /// Acción de sesión solicitada por un comando slash que requiere operar sobre `AgentHost`,
 /// `PackSnapshotStore` o el árbol Git fuera de un tick individual (`REQ-03.2`, `REQ-03.3`).
@@ -47,6 +51,108 @@ pub enum SessionAction {
         goal: String,
         driver: Option<String>,
     },
+    /// `! <cmd>` (`SDD-07` Fase 2): el spawner solo **solicita** la acción
+    /// (no-op en `openonyx replay`, 0 I/O); en vivo `apply_session_action`
+    /// ejecuta (gate + bifurcación + sandbox) y reinyecta el resultado sellado.
+    DetShell {
+        command: String,
+    },
+    /// `/read <ruta> [a..b]` (`SDD-07` Fase 2): mismo patrón que [`SessionAction::DetShell`].
+    DetRead {
+        path: String,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    },
+    /// `/step [n]` (`SDD-07` Fase 2): `n` ticks deterministas con 0 LLM (frozen).
+    Step(usize),
+    /// `/step-llm` (`SDD-07` Fase 2): gate + bifurcación + `grant_step_llm(1)`
+    /// + reactivación `Done`→`Idle` (1 turno exacto, recongelado al responder).
+    StepLlm,
+    /// `/go` / `/unfreeze` (`SDD-07` Fase 2): bifurca si aplica + `unfreeze`.
+    Go,
+    /// `/time` (`SDD-07` Fase 2): conmuta `frozen`.
+    TimeToggle,
+    /// `/inject <texto>` (fix de auditoría Fase 2): memoria `user` sellada
+    /// (mismo patrón que [`SessionAction::DetShell`]): gate + bifurcación y
+    /// reinyección en-tick del comando sellado. En `openonyx replay` el
+    /// slash crudo es no-op (0 I/O).
+    Inject {
+        text: String,
+    },
+    /// `/graph drop-mem <seq|a..b>` (fix de auditoría Fase 2): sellado
+    /// `drop-mem`/`edit-mem`/`set-goal` reejecutado en-tick por el spawner.
+    GraphDropMem {
+        start: i64,
+        end: i64,
+    },
+    /// `/graph edit-mem <seq> <texto>` (fix de auditoría Fase 2).
+    GraphEditMem {
+        seq: i64,
+        text: String,
+    },
+    /// `/graph set-goal <texto>` (fix de auditoría Fase 2).
+    GraphSetGoal {
+        text: String,
+    },
+}
+
+/// `SDD-07` Fase 4B (fix de auditoría): comandos de sesión que deben ejecutarse
+/// **inmediatamente** aunque el agente raíz esté ocupado (`root_busy == true`).
+///
+/// Sin esta lista, bajo `TimeFreeze` en el breakpoint principal (pre-LLM:
+/// `root_busy` + `frozen`) las vías de escape (`/go`, `/step-llm`,
+/// `/graph drop-mem`, `!cmd`…) se encolarían en los prompts pendientes
+/// esperando un idle que nunca llega mientras el tiempo sigue congelado →
+/// deadlock (el usuario no puede salir del freeze con su propia UI).
+///
+/// Función única compartida por TUI y Web para que las dos superficies no
+/// diverjan: antes eran dos copias idénticas byte a byte
+/// (`is_immediate_slash_cmd` en `tui.rs` y `is_immediate_web_slash` en
+/// `web.rs`).
+pub(crate) fn is_immediate_session_command(cmd: &str) -> bool {
+    let lower = cmd.trim().to_ascii_lowercase();
+    lower == "/mode"
+        || lower.starts_with("/mode ")
+        || lower == "/profile"
+        || lower.starts_with("/profile ")
+        || lower == "/provider"
+        || lower.starts_with("/provider ")
+        || lower == "/model"
+        || lower.starts_with("/model ")
+        || lower == "/effort"
+        || lower.starts_with("/effort ")
+        || lower == "/services"
+        || lower.starts_with("/services ")
+        || lower == "/service"
+        || lower.starts_with("/service ")
+        || lower == "/subagents"
+        || lower == "/subagent"
+        || lower == "/spawn"
+        || lower.starts_with("/spawn ")
+        || lower.starts_with("/merge ")
+        || lower.starts_with("/discard ")
+        || lower == "/trust"
+        || lower.starts_with("/trust ")
+        || lower == "/undo"
+        || lower == "/cancel"
+        || lower.starts_with("/cancel ")
+        || lower == "/stop"
+        || lower.starts_with("/stop ")
+        // `SDD-07` Fase 4B: vías de escape del TimeFreeze y primitivas
+        // 0-tokens (deben llegar al bus incluso con `root_busy` + `frozen`).
+        || lower == "/time"
+        || lower == "/go"
+        || lower == "/unfreeze"
+        || lower == "/step"
+        || lower.starts_with("/step ")
+        || lower == "/step-llm"
+        || lower == "/graph"
+        || lower.starts_with("/graph ")
+        || lower == "/inject"
+        || lower.starts_with("/inject ")
+        || lower == "/read"
+        || lower.starts_with("/read ")
+        || lower.starts_with('!')
 }
 
 #[derive(Clone, Default)]
@@ -145,6 +251,48 @@ pub enum SlashCommand {
     Cancel {
         all: bool,
     },
+    /// `! <cmd>` (`SDD-07` Fase 2): shell determinista sellado; se ejecuta en el
+    /// borde de sesión (sandbox + `[permissions]` + `WorkspaceMode`) y el
+    /// resultado viaja sellado en `ONYXTR2`. En replay es no-op (0 I/O).
+    DetShell(String),
+    /// `/read <ruta> [start..end|start-end]` (`SDD-07` Fase 2): lectura directa
+    /// sellada (mismo patrón que [`SlashCommand::DetShell`]). Líneas 1-based.
+    DetRead {
+        path: String,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    },
+    /// `/read` con rango/path inválido (`SDD-07` Fase 2): nota de uso accionable.
+    DetReadInvalid(String),
+    /// `/inject <texto>` (`SDD-07` Fase 2): memoria `user` verificada **sin
+    /// disparar LLM** (queda disponible para el siguiente turno real).
+    Inject(String),
+    /// `/step [n]` (`SDD-07` Fase 2): `n` ticks deterministas con 0 LLM
+    /// (requiere congelación; clamp `1..=64`).
+    Step(usize),
+    /// `/step-llm` (`SDD-07` Fase 2): autoriza exactamente 1 turno LLM.
+    StepLlm,
+    /// `/go` / `/unfreeze` (`SDD-07` Fase 2): descongela y reanuda al LLM.
+    Go,
+    /// `/time` (`SDD-07` Fase 2): conmuta congelación.
+    TimeToggle,
+    /// `/graph inspect [agent|mem|ws]` (`SDD-07` Fase 2): inspección read-only.
+    GraphInspect(Option<String>),
+    /// `/graph drop-mem <seq|a..b>` (`SDD-07` Fase 2): `unrelate`+`destroy` por
+    /// `mem_seq` inclusivo (sin decrementar `mem_count`; `mem_seq` monótono).
+    GraphDropMem {
+        start: i64,
+        end: i64,
+    },
+    /// `/graph edit-mem <seq> <texto>` (`SDD-07` Fase 2): reescribe `mem_text`.
+    GraphEditMem {
+        seq: i64,
+        text: String,
+    },
+    /// `/graph set-goal <texto>` (`SDD-07` Fase 2): reescribe `goal` del root.
+    GraphSetGoal(String),
+    /// `/graph <sub>` no válido (`SDD-07` Fase 2): nota listando los 4 válidos.
+    GraphInvalid(String),
 }
 
 pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
@@ -365,6 +513,174 @@ pub fn parse_slash_command(raw: &str) -> Option<SlashCommand> {
             all: arg == "all" || arg == "root",
         });
     }
+
+    // --- `SDD-07` Fase 2: primitivas 0-tokens y cirugía `/graph` -------------
+    // La **palabra** matchea case-insensitive; los **args** conservan la case
+    // del usuario (patrón `/spawn`). El `!` es un prefijo reservado (no slash).
+
+    if cmd.starts_with('!') {
+        let rest = cmd.strip_prefix('!').unwrap_or("").trim();
+        return Some(SlashCommand::DetShell(rest.to_string()));
+    }
+
+    if lower == "/read" || lower.starts_with("/read ") {
+        let rest = cmd["/read".len()..].trim();
+        if rest.is_empty() {
+            return Some(SlashCommand::DetReadInvalid(
+                "usage: /read <path> [start..end]".to_string(),
+            ));
+        }
+        let (path, range_tok) = split_last_token(rest);
+        let (start_line, end_line) = parse_read_range(range_tok).unwrap_or((None, None));
+        let path = if start_line.is_some() || end_line.is_some() {
+            path
+        } else {
+            // El último token no era rango: es parte de la ruta.
+            rest.to_string()
+        };
+        return Some(SlashCommand::DetRead {
+            path,
+            start_line,
+            end_line,
+        });
+    }
+
+    if lower == "/inject" || lower.starts_with("/inject ") {
+        let trimmed = cmd["/inject".len()..].trim();
+        return Some(SlashCommand::Inject(trimmed.to_string()));
+    }
+
+    if lower == "/step" {
+        return Some(SlashCommand::Step(1));
+    }
+    if lower.starts_with("/step ") {
+        let trimmed = cmd["/step".len()..].trim();
+        let n = trimmed.parse::<usize>().ok().unwrap_or(1).clamp(1, 64);
+        return Some(SlashCommand::Step(n));
+    }
+    if lower == "/step-llm" {
+        return Some(SlashCommand::StepLlm);
+    }
+    if lower == "/go" || lower == "/unfreeze" {
+        return Some(SlashCommand::Go);
+    }
+    if lower == "/time" {
+        return Some(SlashCommand::TimeToggle);
+    }
+
+    if lower == "/graph" || lower.starts_with("/graph ") {
+        let rest = cmd["/graph".len()..].trim();
+        if rest.is_empty() {
+            return Some(SlashCommand::GraphInvalid(
+                "usage: /graph <inspect|drop-mem|edit-mem|set-goal>".to_string(),
+            ));
+        }
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let arg = parts.next().unwrap_or("").trim();
+        let cmd = match sub.as_str() {
+            "inspect" => SlashCommand::GraphInspect(if arg.is_empty() {
+                None
+            } else {
+                Some(arg.to_string())
+            }),
+            "drop-mem" => {
+                let usage = "usage: /graph drop-mem <seq|a..b>".to_string();
+                if arg.is_empty() {
+                    SlashCommand::GraphInvalid(usage)
+                } else if let Some((a, b)) = parse_i64_range(arg) {
+                    SlashCommand::GraphDropMem { start: a, end: b }
+                } else if let Ok(s) = arg.parse::<i64>() {
+                    SlashCommand::GraphDropMem { start: s, end: s }
+                } else {
+                    SlashCommand::GraphInvalid(usage)
+                }
+            }
+            "edit-mem" => {
+                let usage = "usage: /graph edit-mem <seq> <text>".to_string();
+                let mut p = arg.splitn(2, char::is_whitespace);
+                let seq_tok = p.next().unwrap_or("").trim();
+                let text = p.next().unwrap_or("").trim();
+                match seq_tok.parse::<i64>() {
+                    Ok(seq) if !text.is_empty() => SlashCommand::GraphEditMem {
+                        seq,
+                        text: text.to_string(),
+                    },
+                    _ => SlashCommand::GraphInvalid(usage),
+                }
+            }
+            "set-goal" => {
+                if arg.is_empty() {
+                    SlashCommand::GraphInvalid("usage: /graph set-goal <text>".to_string())
+                } else {
+                    SlashCommand::GraphSetGoal(arg.to_string())
+                }
+            }
+            other => SlashCommand::GraphInvalid(format!(
+                "unknown /graph subcommand `{other}` (use `inspect`, `drop-mem`, `edit-mem` or `set-goal`)"
+            )),
+        };
+        return Some(cmd);
+    }
+
+    None
+}
+
+/// Divide `s` en (todo salvo el último token, con trailing trim, último token).
+fn split_last_token(s: &str) -> (String, &str) {
+    match s.rfind(char::is_whitespace) {
+        Some(idx) => {
+            let path = s[..idx].trim_end();
+            let last = s[idx + 1..].trim_start();
+            (path.to_string(), last)
+        }
+        None => (String::new(), s.trim()),
+    }
+}
+
+/// Parsea un rango de `/read`: `a..b` o `a-b` (1-based inclusivo) o `a`
+/// (solo inicio). `None` si no es un rango numérico válido.
+fn parse_read_range(tok: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let digits = |t: &str| t.parse::<usize>().ok().filter(|&n| n >= 1);
+    if let Some((a, b)) = tok.split_once("..") {
+        return match (digits(a), digits(b)) {
+            (Some(x), Some(y)) => Some((Some(x), Some(y))),
+            _ => None,
+        };
+    }
+    if let Some((a, b)) = tok.split_once('-') {
+        return match (digits(a), digits(b)) {
+            (Some(x), Some(y)) => Some((Some(x), Some(y))),
+            _ => None,
+        };
+    }
+    if let Some(a) = digits(tok) {
+        return Some((Some(a), None));
+    }
+    None
+}
+
+/// Parsea un rango `a..b` (o `a-b`) de enteros para `/graph drop-mem`.
+fn parse_i64_range(tok: &str) -> Option<(i64, i64)> {
+    let nums = |t: &str| t.trim().parse::<i64>().ok();
+    if let Some((a, b)) = tok.split_once("..") {
+        let (a, b) = (nums(a), nums(b));
+        if let (Some(a), Some(b)) = (a, b) {
+            if a <= b {
+                return Some((a, b));
+            }
+        }
+        return None;
+    }
+    if let Some((a, b)) = tok.split_once('-') {
+        // `-` también es signo: solo tratamos como rango si ambas partes parsean.
+        let (a, b) = (nums(a), nums(b));
+        if let (Some(a), Some(b)) = (a, b) {
+            if a <= b {
+                return Some((a, b));
+            }
+        }
+    }
     None
 }
 
@@ -554,6 +870,24 @@ pub fn find_latest_root_agent<G: GraphView + ?Sized>(graph: &G, v: &Vocab) -> Op
         .rfind(|id| graph.related(*id, v.rel_parent).is_empty())
 }
 
+/// `SDD-07` Fase 2: lee un atributo `Text` del grafo (read-only, para
+/// `/graph inspect`).
+fn graph_text<G: GraphView + ?Sized>(graph: &G, id: ConceptId, attr: Attr) -> Option<String> {
+    match graph.get(id, attr) {
+        Some(Value::Text(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// `SDD-07` Fase 2: lee un atributo `Int` del grafo (read-only, para
+/// `/graph inspect`).
+fn graph_int<G: GraphView + ?Sized>(graph: &G, id: ConceptId, attr: Attr) -> Option<i64> {
+    match graph.get(id, attr) {
+        Some(Value::Int(n)) => Some(n),
+        _ => None,
+    }
+}
+
 impl CommandSpawnerSystem {
     /// `SDD-03` Fase 2: nota de error accionable cuando un comando LLM se ejecuta
     /// sin handle (sesión sin LLM inyectado).
@@ -607,6 +941,159 @@ impl CommandSpawnerSystem {
         if let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) {
             append_agent_memory(ctx.graph, v, root_id, "system", note, now);
         }
+    }
+
+    /// `SDD-07` Fase 2: `/graph inspect [agent|mem|ws]` — informe read-only
+    /// determinista en memoria `system` del root (sin gate, sin efectos EAV
+    /// más que la propia memoria).
+    /// Reejecuta una mutación de `/graph` sellada en-tick (fix de auditoría
+    /// Fase 2): `unrelate`+`destroy` por `mem_seq` inclusivo (sin decrementar
+    /// `mem_count`), reescrita de `mem_text` o de `goal`. Función pura de
+    /// (grafo, comando, tick): **no** se tocan atributos reservados
+    /// (`state`, `pending`, `steps`, `max_steps`) y en replay produce el mismo
+    /// EAV (0 I/O).
+    fn apply_det_graph_op(&mut self, ctx: &mut Ctx, v: &Vocab, now: u64, op: SealedGraphOp) {
+        let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) else {
+            return;
+        };
+        match op {
+            SealedGraphOp::DropMem { start, end } => {
+                let mut dropped = 0;
+                for mem in ctx.graph.related(root_id, v.rel_memory) {
+                    let in_range = matches!(
+                        ctx.graph.get(mem, v.mem_seq),
+                        Some(Value::Int(n)) if (start..=end).contains(&n)
+                    );
+                    if in_range {
+                        ctx.graph.unrelate(root_id, v.rel_memory, mem);
+                        ctx.graph.destroy(mem);
+                        dropped += 1;
+                    }
+                }
+                // Misma disciplina que `/compact`: la deduplicación de
+                // `fs_read` anclaba a lecturas que ya no están en contexto.
+                if let Some(tools) = &self.tools {
+                    tools.clear_seen_reads();
+                }
+                append_agent_memory(
+                    ctx.graph,
+                    v,
+                    root_id,
+                    "system",
+                    &format!(
+                        "[/graph drop-mem] Dropped {dropped} memory node(s) with mem_seq in [{start}..={end}]. `mem_count` stays monotonic (gaps are intentional)."
+                    ),
+                    now,
+                );
+            }
+            SealedGraphOp::EditMem { seq, text } => {
+                let mut found = false;
+                for mem in ctx.graph.related(root_id, v.rel_memory) {
+                    if matches!(
+                        ctx.graph.get(mem, v.mem_seq),
+                        Some(Value::Int(n)) if n == seq
+                    ) {
+                        ctx.graph.set(mem, v.mem_text, Value::Text(text.clone()));
+                        found = true;
+                        break;
+                    }
+                }
+                if let Some(tools) = &self.tools {
+                    tools.clear_seen_reads();
+                }
+                let note = if found {
+                    format!("[/graph edit-mem] Rewrote mem_seq {seq}.")
+                } else {
+                    format!(
+                        "[/graph edit-mem] No memory with mem_seq {seq} on root (seqs are monotonic; use `/graph inspect mem` to list them)."
+                    )
+                };
+                append_agent_memory(ctx.graph, v, root_id, "system", &note, now);
+            }
+            SealedGraphOp::SetGoal { text } => {
+                ctx.graph.set(root_id, v.goal, Value::Text(text.clone()));
+                let preview: String = text.chars().take(80).collect();
+                append_agent_memory(
+                    ctx.graph,
+                    v,
+                    root_id,
+                    "system",
+                    &format!("[/graph set-goal] Root goal rewritten.\n  goal: {preview}"),
+                    now,
+                );
+            }
+        }
+    }
+
+    fn graph_inspect(&self, ctx: &mut Ctx, v: &Vocab, now: u64, scope: Option<String>) {
+        let Some(root_id) = find_latest_root_agent(&*ctx.graph, v) else {
+            return;
+        };
+        let agents = ctx.graph.query(&[v.state]);
+        let mut report = String::from("[/graph inspect] ");
+        match scope.as_deref().map(str::to_ascii_lowercase) {
+            Some(ref s) if s == "agent" => {
+                report.push_str(&format!("{} agent(s):\n", agents.len()));
+                for id in &agents {
+                    let is_root = ctx.graph.related(*id, v.rel_parent).is_empty();
+                    let state =
+                        graph_text(&*ctx.graph, *id, v.state).unwrap_or_else(|| "?".to_string());
+                    let goal = graph_text(&*ctx.graph, *id, v.goal).unwrap_or_default();
+                    let goal_preview: String = goal.chars().take(60).collect();
+                    report.push_str(&format!(
+                        "  - #{} {} state={state} mem={}\n    goal: {goal_preview}\n",
+                        id.0,
+                        if is_root { "[root]" } else { "[sub]" },
+                        ctx.graph.related(*id, v.rel_memory).len(),
+                    ));
+                }
+            }
+            Some(ref s) if s == "mem" => {
+                let mems = ctx.graph.related(root_id, v.rel_memory);
+                report.push_str(&format!(
+                    "root memories: {} (mem_count={})",
+                    mems.len(),
+                    graph_int(&*ctx.graph, root_id, v.mem_count).unwrap_or(0)
+                ));
+                for mem in &mems {
+                    let seq = graph_int(&*ctx.graph, *mem, v.mem_seq).unwrap_or(-1);
+                    let kind = graph_text(&*ctx.graph, *mem, v.mem_kind).unwrap_or_default();
+                    let tick = graph_int(&*ctx.graph, *mem, v.mem_tick).unwrap_or(0);
+                    let text = graph_text(&*ctx.graph, *mem, v.mem_text).unwrap_or_default();
+                    let preview: String = text.replace('\n', "\\n").chars().take(80).collect();
+                    report.push_str(&format!("\n  seq={seq} kind={kind} tick={tick} {preview}"));
+                }
+            }
+            Some(ref s) if s == "ws" => {
+                report.push_str(&format!(
+                    "workspace mode={} · root={} · agents={}",
+                    self.mode_handle.get().as_label(),
+                    self.workspace_root
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".to_string()),
+                    agents.len(),
+                ));
+            }
+            Some(ref other) => {
+                report.push_str(&format!(
+                    "unknown scope `{other}` (use `agent`, `mem` or `ws`)"
+                ));
+            }
+            None => {
+                let root_state =
+                    graph_text(&*ctx.graph, root_id, v.state).unwrap_or_else(|| "?".to_string());
+                let root_goal = graph_text(&*ctx.graph, root_id, v.goal).unwrap_or_default();
+                let goal_preview: String = root_goal.chars().take(60).collect();
+                report.push_str(&format!(
+                    "tick={} · mode={} · agents={} · root state={root_state}\n  goal: {goal_preview}",
+                    now,
+                    self.mode_handle.get().as_label(),
+                    agents.len(),
+                ));
+            }
+        }
+        append_agent_memory(ctx.graph, v, root_id, "system", &report, now);
     }
 }
 
@@ -735,6 +1222,80 @@ impl OnyxSystem for CommandSpawnerSystem {
                         )
                     {
                         append_agent_memory(ctx.graph, &v, root_id, "system", &notice, now);
+                    }
+                }
+                continue;
+            }
+
+            // `SDD-07` Fase 2: reinyección del resultado sellado grabado en
+            // `ONYXTR2` durante el borde de sesión en vivo (`! <cmd>` /
+            // `/read`). El spawner es la única función de (grafo, comando,
+            // tick): convierte el **resultado ya obtenido** en memoria del
+            // root con `mem_kind` `"shell"`/`"observe"` — 0 I/O, 0 LLM; en
+            // replay no se vuelve a ejecutar nada (bit-a-bit).
+            if let Some(result) = decode_det_shell_command(cmd) {
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    let report = format!("[det-shell] `{}`\n{}", result.command, result.output);
+                    append_agent_memory(ctx.graph, &v, root_id, "shell", &report, now);
+                }
+                continue;
+            }
+            if let Some(result) = decode_det_read_command(cmd) {
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    let range = match (result.start_line, result.end_line) {
+                        (Some(a), Some(b)) => format!(" (lines {a}..{b})"),
+                        (Some(a), None) => format!(" (from line {a})"),
+                        (None, Some(b)) => format!(" (up to line {b})"),
+                        (None, None) => String::new(),
+                    };
+                    let report = format!("[det-read] `{}`{range}\n{}", result.path, result.content);
+                    append_agent_memory(ctx.graph, &v, root_id, "observe", &report, now);
+                }
+                continue;
+            }
+            // Fix de auditoría Fase 2: memoria `user` sellada de `/inject`
+            // (0 I/O, 0 LLM; bit-a-bit en replay).
+            if let Some(result) = decode_det_inject_command(cmd) {
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    append_agent_memory(ctx.graph, &v, root_id, "user", &result.text, now);
+                }
+                continue;
+            }
+            // Fix de auditoría Fase 2: mutación sellada de `/graph`
+            // (función pura de (grafo, comando, tick): bit-a-bit en replay).
+            if let Some(op) = decode_det_graph_command(cmd) {
+                self.apply_det_graph_op(ctx, &v, now, op);
+                continue;
+            }
+            // `SDD-07` Fase 2: comando sellado `/step-llm`: reactiva el root
+            // (`Done`/`Failed` → `Idle`) en-tick, sin memoria `user` y con 0 I/O.
+            // El siguiente tick el runtime lo lleva a `Thinking` y el gate
+            // (`try_acquire_llm_turn`, presupuesto 1) despacha exactamente 1
+            // turno; en replay el mismo comando produce el mismo EAV.
+            if cmd.starts_with(DET_STEP_LLM_CMD_PREFIX) {
+                if let Some(root_id) = find_latest_root_agent(&*ctx.graph, &v) {
+                    let terminal = matches!(
+                        ctx.graph.get(root_id, v.state),
+                        Some(Value::Text(ref s))
+                            if AgentState::parse(s).is_some_and(|st| st.is_terminal())
+                    );
+                    if terminal {
+                        let steps = match ctx.graph.get(root_id, v.steps) {
+                            Some(Value::Int(n)) => n,
+                            _ => 0,
+                        };
+                        ctx.graph.set(
+                            root_id,
+                            v.max_steps,
+                            Value::Int(steps + self.max_steps_per_turn),
+                        );
+                        ctx.graph.set(root_id, v.result, Value::Text(String::new()));
+                        ctx.graph.set(root_id, v.pending, Value::Int(0));
+                        ctx.graph.set(
+                            root_id,
+                            v.state,
+                            Value::Text(AgentState::Idle.as_str().into()),
+                        );
                     }
                 }
                 continue;
@@ -1611,6 +2172,87 @@ impl OnyxSystem for CommandSpawnerSystem {
                                 }
                             }
                         }
+                    }
+                    // --- `SDD-07` Fase 2: primitivas 0-tokens y cirugía `/graph` ----
+                    SlashCommand::DetShell(command) => {
+                        if command.trim().is_empty() {
+                            self.llm_note(
+                                ctx,
+                                &v,
+                                now,
+                                "[!] Usage: `! <command>` — runs a user-verified shell command (sandboxed, `[permissions]`-checked) and injects the sealed result with 0 LLM tokens.",
+                            );
+                        } else {
+                            self.pending_action.set(SessionAction::DetShell { command });
+                        }
+                    }
+                    SlashCommand::DetRead {
+                        path,
+                        start_line,
+                        end_line,
+                    } => {
+                        self.pending_action.set(SessionAction::DetRead {
+                            path,
+                            start_line,
+                            end_line,
+                        });
+                    }
+                    SlashCommand::DetReadInvalid(msg) => {
+                        self.llm_note(ctx, &v, now, &format!("[/read] {msg}"));
+                    }
+                    SlashCommand::Inject(text) => {
+                        // Fix de auditoría Fase 2: el spawner solo **solicita**
+                        // la acción (no-op en `openonyx replay`, 0 I/O); en vivo
+                        // `apply_session_action` aplica gate + bifurcación y
+                        // reinyecta el sellado `/__onyx_det_inject` (memoria
+                        // `user` en-tick, 0 LLM).
+                        if text.trim().is_empty() {
+                            self.llm_note(
+                                ctx,
+                                &v,
+                                now,
+                                "[/inject] Usage: `/inject <text>` — appends verified user memory without spending an LLM turn.",
+                            );
+                        } else {
+                            self.pending_action.set(SessionAction::Inject { text });
+                        }
+                    }
+                    SlashCommand::Step(n) => {
+                        self.pending_action.set(SessionAction::Step(n));
+                    }
+                    SlashCommand::StepLlm => {
+                        self.pending_action.set(SessionAction::StepLlm);
+                    }
+                    SlashCommand::Go => {
+                        self.pending_action.set(SessionAction::Go);
+                    }
+                    SlashCommand::TimeToggle => {
+                        self.pending_action.set(SessionAction::TimeToggle);
+                    }
+                    SlashCommand::GraphInspect(scope) => {
+                        self.graph_inspect(ctx, &v, now, scope);
+                    }
+                    SlashCommand::GraphDropMem { start, end } => {
+                        // Fix de auditoría Fase 2: el spawner solo **solicita**
+                        // la mutación (no-op en `openonyx replay`, 0 I/O); en
+                        // vivo `apply_session_action` aplica gate +
+                        // bifurcación y reinyecta el sellado
+                        // `/__onyx_det_graph` (`drop-mem`/`edit-mem`/`set-goal`
+                        // reejecutado en-tick; `mem_seq` monótono, atributos
+                        // reservados intactos — spec SDD-07 §7).
+                        self.pending_action
+                            .set(SessionAction::GraphDropMem { start, end });
+                    }
+                    SlashCommand::GraphEditMem { seq, text } => {
+                        self.pending_action
+                            .set(SessionAction::GraphEditMem { seq, text });
+                    }
+                    SlashCommand::GraphSetGoal(text) => {
+                        self.pending_action
+                            .set(SessionAction::GraphSetGoal { text });
+                    }
+                    SlashCommand::GraphInvalid(msg) => {
+                        self.llm_note(ctx, &v, now, &format!("[/graph] {msg}"));
                     }
                 }
                 continue;

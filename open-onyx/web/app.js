@@ -21,6 +21,16 @@
     { key: '/compact', desc: 'Compact older turns into verified summary' },
     { key: '/fork', desc: 'Branch snapshots into sibling folder' },
     { key: '/rewind', desc: 'List milestones or jump to <tick>' },
+    { key: '/time', desc: 'TimeFreeze: pause here (freeze) or resume at present' },
+    { key: '/go', desc: 'Return to present tick and resume (unfreeze)' },
+    { key: '/step', desc: 'Advance one deterministic tick without LLM (`/step 1`)' },
+    { key: '/step-llm', desc: 'Advance one LLM turn while frozen' },
+    { key: '/read', desc: 'Read a workspace file into context (safe under freeze)' },
+    { key: '/inject', desc: 'Stage a memory entry without spending a turn (safe under freeze)' },
+    { key: '/graph inspect mem', desc: 'Inspect root memory entries with their seq ids' },
+    { key: '/graph drop-mem', desc: 'Drop a root memory entry by seq (`/graph drop-mem <seq>`)' },
+    { key: '/graph edit-mem', desc: 'Edit a root memory entry (`/graph edit-mem <seq> <texto>`)' },
+    { key: '/graph set-goal', desc: 'Replace the root agent goal (`/graph set-goal <texto>`)' },
     { key: '/services', desc: 'Show sprout.toml services status' },
     { key: '/service start all', desc: 'Start all enabled Sprout services' },
     { key: '/service stop all', desc: 'Stop all running Sprout services' },
@@ -49,6 +59,28 @@
     trustPill: document.getElementById('trust-pill'),
     agentsBtn: document.getElementById('agents-btn'),
     tickPill: document.getElementById('tick-pill'),
+    // `SDD-07` Fase 4A: Time Debugger bar (TimeFreeze) + diálogo de edición de memoria.
+    timeDebugBar: document.getElementById('time-debug-bar'),
+    tdbStatus: document.getElementById('tdb-status'),
+    tdbPrev: document.getElementById('tdb-prev'),
+    tdbSlider: document.getElementById('tdb-slider'),
+    tdbNext: document.getElementById('tdb-next'),
+    tdbFreeze: document.getElementById('tdb-freeze'),
+    tdbStep: document.getElementById('tdb-step'),
+    tdbStepLlm: document.getElementById('tdb-step-llm'),
+    tdbResume: document.getElementById('tdb-resume'),
+    tdbRevertWarn: document.getElementById('tdb-revert-warn'),
+    tdbError: document.getElementById('tdb-error'),
+    tdbBench: document.getElementById('tdb-bench'),
+    tdbBenchHint: document.getElementById('tdb-bench-hint'),
+    tdbBenchCopy: document.getElementById('tdb-bench-copy'),
+    editMemDialog: document.getElementById('edit-mem-dialog'),
+    editMemSeq: document.getElementById('edit-mem-seq'),
+    editMemInput: document.getElementById('edit-mem-input'),
+    editMemError: document.getElementById('edit-mem-error'),
+    editMemCancel: document.getElementById('edit-mem-cancel'),
+    editMemSave: document.getElementById('edit-mem-save'),
+    editMemClose: document.getElementById('edit-mem-close'),
     vaultPill: document.getElementById('vault-pill'),
     ctxBarFill: document.getElementById('ctx-bar-fill'),
     ctxLabel: document.getElementById('ctx-label'),
@@ -156,7 +188,7 @@
     }
   }
 
-  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog, dom.llmModal]) {
+  for (const dlg of [dom.loginDialog, dom.agentDialog, dom.trustDialog, dom.goalDialog, dom.llmModal, dom.editMemDialog]) {
     dlg.addEventListener('close', () => { dlg.returnValue = ''; });
   }
 
@@ -317,6 +349,248 @@
     });
   }
 
+  // `SDD-07` Fase 4A: Time Debugger (TimeFreeze) — paridad con el TUI.
+  // Scrubs efímeros vía `POST /api/v1/time/scrub` (0 ticks, 0 `ONYXTR2`);
+  // el push SSE inmediato de `pump_idle` trae el snapshot `time_debug`
+  // fresco (preview proyección + `pending_revert_files` de `live_effects`).
+  let tdbAvailable = []; // ticks scrubeables (ascendente), último snapshot
+  let tdbUserClosed = false; // el usuario cerró la barra manualmente
+
+  function timeDebugOf() {
+    return (state && state.time_debug) || null;
+  }
+
+  function scrub(action, extra) {
+    return apiJson('/api/v1/time/scrub', {
+      method: 'POST',
+      body: JSON.stringify(Object.assign({ action }, extra || {})),
+    });
+  }
+
+  // El slider cruza `available_ticks` (no contiguos): el valor se "snapea"
+  // al tick scrubeable más alto ≤ al valor (si no existe, al primero).
+  function scrubToNearest(raw) {
+    if (!tdbAvailable.length) return null;
+    for (let i = tdbAvailable.length - 1; i >= 0; i--) {
+      if (tdbAvailable[i] <= raw) return tdbAvailable[i];
+    }
+    return tdbAvailable[0];
+  }
+
+  let tdbErrorTimer = null;
+  function showTdbError(msg) {
+    if (!dom.tdbError) return;
+    dom.tdbError.textContent = String(msg);
+    dom.tdbError.classList.remove('hidden');
+    if (tdbErrorTimer) clearTimeout(tdbErrorTimer);
+    tdbErrorTimer = setTimeout(() => {
+      dom.tdbError.classList.add('hidden');
+      dom.tdbError.textContent = '';
+    }, 8000);
+  }
+
+  async function onScrub(fn) {
+    try {
+      await fn();
+    } catch (err) {
+      // Errores accionables (tick purgado/futuro → 400, prompt plano → 409…).
+      showTdbError(err.message || String(err));
+    }
+  }
+
+  function openTdb() {
+    dom.timeDebugBar.classList.remove('hidden');
+    dom.tickPill.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeTdb() {
+    dom.timeDebugBar.classList.add('hidden');
+    dom.tickPill.setAttribute('aria-expanded', 'false');
+    tdbUserClosed = true;
+  }
+
+  function renderTimeDebugBar(s) {
+    const td = (s && s.time_debug) || null;
+    const presentTick = s.tick || 0;
+    if (!td) {
+      // Sesión sin depurador temporal (p. ej. headless): pill plano.
+      dom.tickPill.textContent = `tick ${presentTick}`;
+      dom.tickPill.classList.remove('is-frozen');
+      dom.timeDebugBar.classList.add('hidden');
+      dom.tickPill.setAttribute('aria-expanded', 'false');
+      return;
+    }
+
+    const frozen = Boolean(td.frozen);
+    const cursor = Number(td.cursor_tick || 0);
+    const present = Number(td.present_tick || presentTick);
+    tdbAvailable = Array.isArray(td.available_ticks) ? td.available_ticks.map(Number) : [];
+
+    dom.tickPill.textContent = frozen ? `⏸ ${cursor}/${present}` : `tick ${present}`;
+    dom.tickPill.classList.toggle('is-frozen', frozen);
+    dom.tdbStatus.textContent = frozen
+      ? `⏸ TIME FROZEN · tick ${cursor} / present ${present}`
+      : `LIVE · tick ${present}`;
+    dom.tdbStatus.classList.toggle('is-frozen', frozen);
+
+    const min = tdbAvailable.length ? tdbAvailable[0] : 0;
+    const max = Math.max(present, min);
+    dom.tdbSlider.min = String(min);
+    dom.tdbSlider.max = String(max);
+    dom.tdbSlider.value = String(Math.min(cursor, max));
+    // `SDD-07` Fase 4B (fix de auditoría): deshabilitado solo si no hay
+    // ticks disponibles — en el presente con anillo poblado el slider debe
+    // poder arrastrarse hacia el pasado sin pulsar ◀ antes.
+    dom.tdbSlider.disabled = tdbAvailable.length <= 1;
+
+    // `Freeze` / `Present` según estado (auto-congela si el cursor ya ancla).
+    const anchored = frozen || cursor < present;
+    dom.tdbFreeze.textContent = anchored ? 'Present' : 'Freeze';
+
+    // Aviso ámbar: archivos que se revertirían al bifurcar desde el cursor
+    // (fuente: `live_effects` del grafo vivo, 0 I/O).
+    const files = Array.isArray(td.pending_revert_files) ? td.pending_revert_files : [];
+    if (files.length) {
+      dom.tdbRevertWarn.textContent =
+        `⚠ branch from cursor reverts ${files.length} file(s): ` +
+        files.slice(0, 6).join(', ') +
+        (files.length > 6 ? ` (+${files.length - 6} more)` : '');
+      dom.tdbRevertWarn.classList.remove('hidden');
+    } else {
+      dom.tdbRevertWarn.classList.add('hidden');
+    }
+
+    // Sinergia `SDD-05` §9.4: bench determinista copiable desde este cursor.
+    if (td.bench_hint) {
+      dom.tdbBenchHint.textContent = td.bench_hint;
+      dom.tdbBench.classList.remove('hidden');
+    } else {
+      dom.tdbBench.classList.add('hidden');
+    }
+
+    // Auto-abre la barra si está congelado o anclado en el pasado (una vez;
+    // el cierre manual la respeta hasta que vuelva a present).
+    const shouldAutoOpen = frozen || cursor < present;
+    if (shouldAutoOpen && !tdbUserClosed) openTdb();
+    if (!shouldAutoOpen) tdbUserClosed = false;
+  }
+
+  function setupTimeDebugBar() {
+    dom.tickPill.addEventListener('click', () => {
+      if (dom.timeDebugBar.classList.contains('hidden')) openTdb();
+      else closeTdb();
+    });
+    dom.tdbPrev.addEventListener('click', () =>
+      onScrub(() => scrub('scrub_delta', { delta: -1 }))
+    );
+    dom.tdbNext.addEventListener('click', () =>
+      onScrub(() => scrub('scrub_delta', { delta: 1 }))
+    );
+    dom.tdbSlider.addEventListener('change', () => {
+      const target = scrubToNearest(Number(dom.tdbSlider.value));
+      if (target == null) return;
+      onScrub(() => scrub('scrub_to', { tick: target }));
+    });
+    dom.tdbFreeze.addEventListener('click', () => {
+      const td = timeDebugOf();
+      const anchored = Boolean(
+        td && (td.frozen || Number(td.cursor_tick || 0) < Number(td.present_tick || 0))
+      );
+      onScrub(() => scrub(anchored ? 'return_to_present' : 'freeze'));
+    });
+    // Step / Step LLM / Resume van por el túnel de comandos sellado (mismo
+    // `SessionAction` que el TUI: gate de mutación + bifurcación al confirmar).
+    dom.tdbStep.addEventListener('click', () => onScrub(() => sendCommand('/step 1')));
+    dom.tdbStepLlm.addEventListener('click', () => onScrub(() => sendCommand('/step-llm')));
+    dom.tdbResume.addEventListener('click', () => onScrub(() => sendCommand('/go')));
+    dom.tdbBenchCopy.addEventListener('click', async () => {
+      const cmd = dom.tdbBenchHint.textContent || '';
+      let ok = false;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        ok = true;
+      } catch (_) {
+        ok = false;
+      }
+      dom.tdbBenchCopy.textContent = ok ? 'Copied' : 'Copy failed';
+      setTimeout(() => {
+        dom.tdbBenchCopy.textContent = 'Copy';
+      }, 1500);
+    });
+  }
+  setupTimeDebugBar();
+
+  // `SDD-07` Fase 4A: memarias del root bajo TIME FROZEN — ✎ edita (vía
+  // diálogo) y × suelta; ambos encuelan el slash sellado correspondiente
+  // (`/graph edit-mem` / `/graph drop-mem`) por el túnel autenticado de
+  // comandos (0 efectos hasta el tick confirmado, 0 `ONYXTR2`).
+  let editMemSeq = 0;
+  function openEditMemDialog(seq, currentText) {
+    editMemSeq = Number(seq);
+    dom.editMemSeq.textContent = `#${editMemSeq}`;
+    dom.editMemInput.value = String(currentText || '').replace(/\s*\n\s*/g, ' ').slice(0, 1000);
+    dom.editMemError.textContent = '';
+    dom.editMemDialog.showModal();
+    dom.editMemInput.focus();
+  }
+
+  function attachMemActions(card, seq, text) {
+    const wrap = document.createElement('div');
+    wrap.className = 'mem-wrap';
+    wrap.append(card);
+
+    const actions = document.createElement('div');
+    actions.className = 'mem-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'mem-btn';
+    editBtn.textContent = '✎';
+    editBtn.title = `Edit memory #${seq} (/graph edit-mem ${seq} <texto>)`;
+    editBtn.setAttribute('aria-label', `Edit memory ${seq}`);
+    editBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openEditMemDialog(seq, text);
+    });
+
+    const dropBtn = document.createElement('button');
+    dropBtn.type = 'button';
+    dropBtn.className = 'mem-btn mem-btn-drop';
+    dropBtn.textContent = '×';
+    dropBtn.title = `Drop memory #${seq} (/graph drop-mem ${seq})`;
+    dropBtn.setAttribute('aria-label', `Drop memory ${seq}`);
+    dropBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const ok = window.confirm(
+        `Drop root memory #${seq}? Stages /graph drop-mem ${seq} (takes effect on the next confirmed tick).`
+      );
+      if (!ok) return;
+      onScrub(() => sendCommand(`/graph drop-mem ${seq}`));
+    });
+
+    actions.append(editBtn, dropBtn);
+    wrap.append(actions);
+    return wrap;
+  }
+
+  dom.editMemSave.addEventListener('click', async () => {
+    const raw = dom.editMemInput.value.replace(/\s*\n\s*/g, ' ').trim();
+    if (!raw) {
+      dom.editMemError.textContent = 'Memory text cannot be empty';
+      return;
+    }
+    try {
+      await sendCommand(`/graph edit-mem ${editMemSeq} ${raw}`);
+      dom.editMemDialog.close();
+    } catch (err) {
+      dom.editMemError.textContent = err.message || String(err);
+    }
+  });
+  dom.editMemCancel.addEventListener('click', () => dom.editMemDialog.close());
+  dom.editMemClose.addEventListener('click', () => dom.editMemDialog.close());
+
   async function bootstrap() {
     try {
       const initial = await apiJson('/api/v1/state', { method: 'GET' });
@@ -383,6 +657,20 @@
     dom.promptInput.placeholder = spawning
       ? `Background task for ${driver} (no root turn)…`
       : NATIVE_PLACEHOLDER;
+  }
+
+  // `SDD-07` Fase 4A: bajo TIME FROZEN el composer avisa de que los prompts
+  // planos serán rechazados (409) y sugiere las vías de escape selladas.
+  const FROZEN_PLACEHOLDER =
+    'TIME FROZEN: /go to resume · /inject to stage memory · /step-llm · /graph…';
+  function updateComposerFreezeUI() {
+    const td = timeDebugOf();
+    const frozen = Boolean(td && td.frozen);
+    if (frozen) {
+      dom.promptInput.placeholder = FROZEN_PLACEHOLDER;
+    } else {
+      updateComposerDriverUI();
+    }
   }
   dom.driverSelect.addEventListener('change', updateComposerDriverUI);
   updateComposerDriverUI();
@@ -901,7 +1189,9 @@
     dom.modeBtn.classList.toggle('is-plan', s.mode !== 'BUILD');
     dom.sandboxPill.textContent = `SANDBOX:${s.sandbox_badge || 'workspace'}`;
     dom.trustPill.classList.toggle('hidden', !s.untrusted);
-    dom.tickPill.textContent = `tick ${s.tick || 0}`;
+    // `SDD-07` Fase 4A: Time Debugger (TimeFreeze) — pill + barra ámbar.
+    renderTimeDebugBar(s);
+    updateComposerFreezeUI();
     renderDriverSelect(s);
 
     if (s.vault_label) {
@@ -1159,8 +1449,18 @@
   function renderMessages(focused, streamPreview, currentTick) {
     const memory = (focused && Array.isArray(focused.memory)) ? focused.memory : [];
     const lastEntry = memory.length > 0 ? memory[memory.length - 1] : null;
+    // `SDD-07` Fase 4A: el estado de freeze entra en la key para que los
+    // botones ✎/× de memoria aparezcan/desaparezcan al congelar/descongelar.
+    const td = (state && state.time_debug) || null;
+    const memFrozen = Boolean(td && td.frozen);
+    const canEditMem = Boolean(focused && focused.is_root && memFrozen);
+    // `SDD-07` Fase 4B (pulido): `cursor_tick` + longitud total del texto de
+    // la memoria en la key — re-render garantizado al cambiar de tick en
+    // preview o al editar una memoria antigua in-place con ✎ (misma
+    // longitud, distinto contenido).
+    const memTextTotal = memory.reduce((acc, m) => acc + (m.text || '').length, 0);
     const historyKey = focused
-      ? `${focused.id}|${focused.goal}|${memory.length}|${lastEntry ? lastEntry.seq : 0}|${lastEntry ? (lastEntry.text || '').length : 0}|${traceMode}`
+      ? `${focused.id}|${focused.goal}|${memory.length}|${lastEntry ? lastEntry.seq : 0}|${lastEntry ? (lastEntry.text || '').length : 0}|${memTextTotal}|${td ? td.cursor_tick : 0}|${traceMode}|${memFrozen ? 'F' : 'L'}`
       : 'empty';
 
     if (historyKey !== lastHistoryKey) {
@@ -1204,15 +1504,23 @@
           const seq = entry.seq != null ? entry.seq : i;
           const tick = entry.tick != null ? entry.tick : 0;
 
+          let card;
           if (kind === 'user') {
-            historyContainer.append(buildMessageCard('user', 'You', text, false));
+            card = buildMessageCard('user', 'You', text, false);
           } else if (kind === 'say' || kind === 'result') {
-            historyContainer.append(buildMessageCard('assistant', 'openOnyx', text, false));
+            card = buildMessageCard('assistant', 'openOnyx', text, false);
           } else if (kind === 'system') {
-            historyContainer.append(buildSystemCard(text, tick));
+            card = buildSystemCard(text, tick);
           } else {
-            historyContainer.append(buildToolCard(focused.id, seq, kind, text, tick));
+            card = buildToolCard(focused.id, seq, kind, text, tick);
           }
+
+          // `SDD-07` Fase 4A: memarias del root con `seq >= 0` exponen
+          // ✎/× solo bajo TIME FROZEN (sellado vía `/graph edit-mem|drop-mem`).
+          if (canEditMem && Number(seq) >= 0) {
+            card = attachMemActions(card, Number(seq), text);
+          }
+          historyContainer.append(card);
         }
       }
     }

@@ -33,12 +33,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{ReasoningEffort, SessionTelemetryHandle};
 use crate::gemini::StreamPreviewHandle;
-use crate::llm_profile::LlmProfileHandle;
+use crate::llm_profile::{LlmProfileHandle, LlmProvider};
 use crate::pack::SharedPackStore;
 use crate::session::UiIdlePump;
 use crate::subagent::{
     MergePreviewState, SUBAGENT_PROPOSAL_CMD_PREFIX, SubagentHandle, effective_merge_decision,
 };
+use crate::time_debug::TimeDebugState;
 use crate::tui_input::WorkspaceFileIndex;
 use crate::vault::session_display_label;
 
@@ -432,6 +433,20 @@ pub struct WebSubagentSnapshot {
     pub summary: String,
 }
 
+/// `SDD-07` Fase 4A: proyección web del depurador temporal (`TimeFreeze`).
+/// `pending_revert_files` sale de `live_effects` (grafo vivo, 0 I/O): es
+/// exacto aunque `agents` proyecte el `preview_graph(cursor)`.
+#[derive(Clone, Debug, Serialize)]
+pub struct WebTimeDebugSnapshot {
+    pub frozen: bool,
+    pub cursor_tick: u64,
+    pub present_tick: u64,
+    pub available_ticks: Vec<u64>,
+    pub pending_revert_files: Vec<String>,
+    /// Sinergia `SDD-05` §9.4: comando copiable `openonyx bench --snapshot-dir <dir> --tick <cursor> --models <provider>:<model>` (solo si hay store de snapshots y objetivo LLM vivo con provider+modelo).
+    pub bench_hint: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WebStateSnapshot {
     pub schema: &'static str,
@@ -461,6 +476,9 @@ pub struct WebStateSnapshot {
     pub services: Option<String>,
     pub telemetry: WebTelemetrySnapshot,
     pub queued_prompts: Vec<String>,
+    /// `SDD-07` Fase 4A: paridad TimeFreeze (TUI F1): `None` si la sesión no
+    /// tiene depurador temporal (p. ej. `run`/`replay` headless).
+    pub time_debug: Option<WebTimeDebugSnapshot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +512,25 @@ struct WebHub {
     input_cv: Condvar,
     quit: Arc<AtomicBool>,
     sse_clients: AtomicUsize,
+    /// `SDD-07` Fase 4A: depurador temporal (mismo estado del bucle de
+    /// sesión): `POST /api/v1/time/scrub` y el 409 de `POST /api/v1/command`
+    /// bajo freeze lo leen directamente del hub. `Mutex` porque el
+    /// `WebDriver` se construye **antes** del bucle de sesión: el
+    /// `TimeDebugState` se inyecta en caliente vía `with_time_debug`
+    /// (wiring diferido, 0 reconstrucción del hub).
+    time_debug: Mutex<Option<TimeDebugState>>,
+    /// `SDD-07` Fase 4A: scrub pendiente de republicar. El endpoint lo
+    /// levanta (+`input_cv`); `pump_idle` lo consume **solo** cuando el
+    /// `graph` recibido ya refleja el nuevo cursor (véase la lógica de
+    /// defer dentro de `pump_idle`).
+    time_scrub_dirty: AtomicBool,
+}
+
+/// Rechazo de `POST /api/v1/command`. `BadRequest` → `400`; `TimeFrozen` →
+/// `409 Conflict` (paridad TimeFreeze, `SDD-07` Fase 4A).
+enum WebCommandRejection {
+    BadRequest(String),
+    TimeFrozen(String),
 }
 
 impl WebHub {
@@ -530,6 +567,8 @@ impl WebHub {
             input_cv: Condvar::new(),
             quit: Arc::new(AtomicBool::new(false)),
             sse_clients: AtomicUsize::new(0),
+            time_debug: Mutex::new(None),
+            time_scrub_dirty: AtomicBool::new(false),
         }))
     }
 
@@ -548,19 +587,50 @@ impl WebHub {
         constant_time_eq(candidate.as_bytes(), self.session_token.as_bytes())
     }
 
-    fn push_web_command(&self, raw_cmd: &str) -> Result<(), String> {
+    /// `SDD-07` Fase 4A: paridad TimeFreeze en Web (igual que el `F1 Chat`
+    /// del TUI). Bajo congelación (o con el cursor anclado en el pasado) un
+    /// prompt **plano** no se encola al bus — un turno desordenado rompería la
+    /// bit-a-bit del replay. Los comandos `/…` y `!…` sí se encolan (vías de
+    /// escape: `/go`, `/inject`, `/graph`, `/step`, `/step-llm`).
+    ///
+    /// Devuelve `Err(TimeFrozenRejection)` si el prompt plano está bloqueado
+    /// (el handler lo mapea a `409 Conflict`); el resto de rechazos (prefix
+    /// reservado, vacío) siguen siendo `400`.
+    fn push_web_command(&self, raw_cmd: &str) -> Result<(), WebCommandRejection> {
         let cmd = raw_cmd.trim();
         if cmd.is_empty() {
-            return Err("command cannot be empty".to_string());
+            return Err(WebCommandRejection::BadRequest(
+                "command cannot be empty".to_string(),
+            ));
         }
         if cmd.starts_with(SUBAGENT_PROPOSAL_CMD_PREFIX.trim_end()) || cmd.starts_with("/__onyx_") {
-            return Err("reserved internal command prefix".to_string());
+            return Err(WebCommandRejection::BadRequest(
+                "reserved internal command prefix".to_string(),
+            ));
+        }
+        // `SDD-07` Fase 4A: el handle se clona bajo lock breve (Arcs baratos);
+        // el resto de la lectura es thread-safe en `TimeDebugState` (atomics).
+        let td = self
+            .time_debug
+            .lock()
+            .map(|guard| guard.as_ref().cloned())
+            .unwrap_or(None);
+        if let Some(td) = td {
+            if (td.is_frozen() || td.cursor() < td.present())
+                && !cmd.starts_with('/')
+                && !cmd.starts_with('!')
+            {
+                return Err(WebCommandRejection::TimeFrozen(
+                    "Paused in TIME FROZEN: use /go to resume or /inject to stage memory (or return to present)"
+                        .to_string(),
+                ));
+            }
         }
         let mut guard = self
             .state
             .lock()
-            .map_err(|_| "web hub lock poisoned".to_string())?;
-        if guard.root_busy && !is_immediate_web_slash(cmd) {
+            .map_err(|_| WebCommandRejection::BadRequest("web hub lock poisoned".to_string()))?;
+        if guard.root_busy && !crate::command::is_immediate_session_command(cmd) {
             guard.queued_prompts.push_back(cmd.to_string());
             guard.state_dirty = true;
         } else {
@@ -580,6 +650,89 @@ impl WebHub {
         }
         self.input_cv.notify_all();
         Ok(())
+    }
+
+    /// `SDD-07` Fase 4A: aplica un scrub efímero al depurador temporal y
+    /// levanta `time_scrub_dirty` + `input_cv` para el push SSE inmediato.
+    ///
+    /// Payload flexible (JSON):
+    /// - `{ "action": "freeze" | "unfreeze" | "return_to_present" |
+    ///   "scrub_to" | "scrub_delta", "tick"?: u64, "delta"?: i64 }`
+    /// - Shorthands: `{ "freeze": true }`, `{ "tick": 5 }`, `{ "delta": -1 }`.
+    ///
+    /// **100% efímero**: solo muta `TimeDebugState`; nunca escribe en
+    /// `ONYXTR2` ni avanza ticks. Devuelve el snapshot `time_debug` actualizado
+    /// (para el body `{"ok":true,"time_debug":...}`) o `Err` accionable
+    /// (p. ej. tick purgado/futuro → `400`).
+    fn apply_time_scrub(&self, body: &[u8]) -> Result<WebTimeDebugSnapshot, String> {
+        let td = self
+            .time_debug
+            .lock()
+            .map_err(|_| "web hub time_debug lock poisoned".to_string())?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "time debug is not available in this session".to_string())?;
+        let v: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|_| "expected a JSON object for time/scrub".to_string())?;
+        if !v.is_object() {
+            return Err("expected a JSON object for time/scrub".to_string());
+        }
+        let action = v
+            .get("action")
+            .and_then(|a| a.as_str())
+            .map(|a| a.to_ascii_lowercase());
+        let tick = v.get("tick").and_then(|t| t.as_u64());
+        let delta = v.get("delta").and_then(|d| d.as_i64());
+
+        match action.as_deref() {
+            // `action` explícito (forma canónica).
+            Some(a) => match a {
+                "freeze" => td.freeze(),
+                "unfreeze" => td.unfreeze(),
+                "return_to_present" => td.return_to_present(),
+                "scrub_to" => {
+                    let t = tick.ok_or("scrub_to requires `tick`")?;
+                    td.scrub_to(t).map_err(|e| e.0.clone())?;
+                }
+                "scrub_delta" => {
+                    let d = delta.ok_or("scrub_delta requires `delta`")?;
+                    td.scrub_delta(d).map_err(|e| e.0.clone())?;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown time/scrub action `{other}` (expected freeze | unfreeze | \
+                         return_to_present | scrub_to | scrub_delta)"
+                    ));
+                }
+            },
+            // Shorthands: `{ "freeze": true }` / `{ "tick": N }` / `{ "delta": N }`.
+            None => {
+                if v.get("freeze").and_then(|f| f.as_bool()) == Some(true) {
+                    td.freeze();
+                } else if v.get("unfreeze").and_then(|f| f.as_bool()) == Some(true) {
+                    td.unfreeze();
+                } else if v.get("return_to_present").and_then(|f| f.as_bool()) == Some(true) {
+                    td.return_to_present();
+                } else if let Some(t) = tick {
+                    td.scrub_to(t).map_err(|e| e.0.clone())?;
+                } else if let Some(d) = delta {
+                    td.scrub_delta(d).map_err(|e| e.0.clone())?;
+                } else {
+                    return Err(
+                        "time/scrub needs an `action` (or shorthand `freeze`/`tick`/`delta`)"
+                            .to_string(),
+                    );
+                }
+            }
+        };
+
+        // Push SSE inmediato: despierta `pump_idle`, que republica el
+        // `WebStateSnapshot` con el nuevo `preview_graph(cursor)` (0 ticks,
+        // 0 `ONYXTR2`).
+        self.time_scrub_dirty.store(true, Ordering::Release);
+        self.input_cv.notify_all();
+
+        Ok(web_time_debug_snapshot(&td, None))
     }
 
     fn push_web_approval(
@@ -657,37 +810,6 @@ impl WebHub {
     }
 }
 
-fn is_immediate_web_slash(cmd: &str) -> bool {
-    let lower = cmd.trim().to_ascii_lowercase();
-    lower == "/mode"
-        || lower.starts_with("/mode ")
-        || lower == "/profile"
-        || lower.starts_with("/profile ")
-        || lower == "/provider"
-        || lower.starts_with("/provider ")
-        || lower == "/model"
-        || lower.starts_with("/model ")
-        || lower == "/effort"
-        || lower.starts_with("/effort ")
-        || lower == "/services"
-        || lower.starts_with("/services ")
-        || lower == "/service"
-        || lower.starts_with("/service ")
-        || lower == "/subagents"
-        || lower == "/subagent"
-        || lower == "/spawn"
-        || lower.starts_with("/spawn ")
-        || lower.starts_with("/merge ")
-        || lower.starts_with("/discard ")
-        || lower == "/trust"
-        || lower.starts_with("/trust ")
-        || lower == "/undo"
-        || lower == "/cancel"
-        || lower.starts_with("/cancel ")
-        || lower == "/stop"
-        || lower.starts_with("/stop ")
-}
-
 // ---------------------------------------------------------------------------
 // WebDriver (`PlatformDriver`) y WebHandle (`UiIdlePump`)
 // ---------------------------------------------------------------------------
@@ -711,6 +833,10 @@ struct WebRuntimeInner {
     reasoning_effort: Option<ReasoningEffort>,
     session_label: Option<String>,
     snapshot_store: Option<SharedPackStore>,
+    /// `SDD-07` Fase 4A: depurador temporal (para `publish_snapshot`:
+    /// `WebStateSnapshot.time_debug`, proyección del `preview_graph(cursor)`
+    /// + `pending_revert_files` desde `live_effects`).
+    time_debug: Option<TimeDebugState>,
     native_driver: SandboxDriverKind,
     hub: Arc<WebHub>,
     cached_approval_diff: Option<String>,
@@ -743,18 +869,48 @@ impl UiIdlePump for WebHandle {
     }
 
     fn pump_idle(&self, graph: &dyn GraphView) {
+        // `SDD-07` Fase 4A: el `graph` recibido fue calculado por `run_session`
+        // justo antes de llamar (puede ser el `preview_graph(cursor)`). Captura
+        // el `(frozen, cursor, present)` de `TimeDebugState` en ese momento: si
+        // cambia DURANTE el wait, el `graph` queda obsoleto y la republicación
+        // debe esperar a la siguiente iteración del bucle (que recalcula el
+        // `preview_graph`), no a esta llamada.
+        // `TimeDebugState` es clonable (Arcs internos): se clona bajo lock breve
+        // y el resto de la lógica opera sobre el handle thread-safe.
+        let td = self
+            .hub
+            .time_debug
+            .lock()
+            .map(|guard| guard.as_ref().cloned())
+            .unwrap_or(None);
+        let key_at_call = td
+            .as_ref()
+            .map(|t| (t.is_frozen(), t.cursor(), t.present()));
+        let scrub_pending = self.hub.time_scrub_dirty.load(Ordering::Acquire);
+
         // Espera breve sobre Condvar (35ms): despierta al instante si llega un comando web,
-        // sin consumir CPU y sin avanzar `host.ticks()`.
+        // sin consumir CPU y sin avanzar `host.ticks()`. Con un scrub pendiente
+        // no se espera: se regresa al bucle para que `run_session` recalculé el
+        // `preview_graph` y la siguiente llamada republicá de inmediato.
         if let Ok(guard) = self.hub.state.lock() {
             // `SDD-04` 4C-audit: `Acquire` emparejado con el `Release` del
             // watcher de apago (`spawn_shutdown_watcher`).
-            if guard.incoming_events.is_empty() && !self.hub.quit.load(Ordering::Acquire) {
+            let needs_wait = guard.incoming_events.is_empty()
+                && !self.hub.quit.load(Ordering::Acquire)
+                && !scrub_pending;
+            if needs_wait {
                 let _ = self
                     .hub
                     .input_cv
                     .wait_timeout(guard, Duration::from_millis(35));
             }
         }
+        // ¿El depurador cambió durante el wait? (scrub/`/go`/`/rewind` en caliente)
+        let key_after = td.map(|t| (t.is_frozen(), t.cursor(), t.present()));
+        let graph_is_fresh = match (key_at_call, key_after) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
         if let Ok(mut inner) = self.inner.lock() {
             let stream_dirty = inner.stream_preview.take_dirty();
             let telemetry_dirty = inner.telemetry.take_dirty();
@@ -767,9 +923,18 @@ impl UiIdlePump for WebHandle {
             let dispatched = inner.dispatch_queued_if_idle(graph);
             let hub_dirty = self.hub.take_state_dirty();
 
+            // `SDD-07` Fase 4A: se consume el flag de scrub SOLO si el `graph`
+            // es fresco; si no, se deja puesto para que la siguiente llamada
+            // (con el `preview_graph` recalculado) haga el push SSE.
+            let scrub_dirty = if graph_is_fresh {
+                self.hub.time_scrub_dirty.swap(false, Ordering::AcqRel)
+            } else {
+                false
+            };
+
             // Solo serializamos y difundimos `event: state` completo cuando realmente cambió
-            // el estado de sesión/telemetría/cola/objetivo LLM (0 trabajo de grafo en reposo o durante streaming).
-            if telemetry_dirty || dispatched || hub_dirty || llm_dirty {
+            // el estado de sesión/telemetría/cola/objetivo LLM/TimeFreeze (0 trabajo de grafo en reposo o durante streaming).
+            if telemetry_dirty || dispatched || hub_dirty || llm_dirty || scrub_dirty {
                 inner.publish_snapshot(graph, true);
             }
 
@@ -784,6 +949,16 @@ impl UiIdlePump for WebHandle {
                 inner.last_stream_emit = Instant::now();
                 inner.publish_stream_preview(graph);
             }
+        }
+    }
+
+    /// `SDD-07` Fase 2: encola el comando sellado; el próximo
+    /// `WebDriver::poll` drena `incoming_events` vía `bridge.push`
+    /// (queda grabado en `ONYXTR2`).
+    fn queue_ingress(&self, event: OnyxEvent) {
+        if let Ok(mut guard) = self.hub.state.lock() {
+            guard.incoming_events.push_back(event);
+            self.hub.input_cv.notify_all();
         }
     }
 }
@@ -829,6 +1004,7 @@ impl WebDriver {
             reasoning_effort: None,
             session_label: None,
             snapshot_store: None,
+            time_debug: None,
             native_driver,
             hub: Arc::clone(&hub),
             cached_approval_diff: None,
@@ -934,6 +1110,20 @@ impl WebDriver {
         if let Ok(mut inner) = self.inner.lock() {
             inner.session_label = session_label;
             inner.snapshot_store = snapshot_store;
+        }
+        self
+    }
+
+    /// `SDD-07` Fase 4A: paridad TimeFreeze en Web. El mismo `TimeDebugState`
+    /// del bucle de sesión (clon barato: Arcs internos) alimenta
+    /// `WebStateSnapshot.time_debug` (preview + `pending_revert_files` desde
+    /// `live_effects`) y el endpoint efímero `POST /api/v1/time/scrub`.
+    pub fn with_time_debug(self, time_debug: TimeDebugState) -> Self {
+        if let Ok(mut guard) = self.hub.time_debug.lock() {
+            *guard = Some(time_debug.clone());
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.time_debug = Some(time_debug);
         }
         self
     }
@@ -1327,6 +1517,14 @@ impl WebRuntimeInner {
                     Vec::new(),
                 ),
             };
+        // `SDD-07` Fase 4A: paridad TimeFreeze. `agents` ya proyecta el
+        // `preview_graph(cursor)` (0 reconstrucción en JS); `pending_revert_files`
+        // sale de `live_effects` (grafo vivo) y `bench_hint` es la sinergia
+        // `SDD-05` §9.4 (solo con store de snapshots + objetivo LLM vivo).
+        let time_debug_snap = self
+            .time_debug
+            .as_ref()
+            .map(|td| web_time_debug_snapshot(td, time_debug_bench_hint(td, &provider, &model)));
         let snap = WebStateSnapshot {
             schema: "onyx.web.state.v1",
             version: next_version,
@@ -1358,6 +1556,7 @@ impl WebRuntimeInner {
                 estimated_cost_usd: tel.estimated_cost_usd,
             },
             queued_prompts: guard.queued_prompts.iter().cloned().collect(),
+            time_debug: time_debug_snap,
         };
 
         if let Ok(json) = serde_json::to_string(&snap) {
@@ -1372,6 +1571,42 @@ impl WebRuntimeInner {
             }
         }
     }
+}
+
+/// `SDD-07` Fase 4A: proyección `TimeDebugState` → [`WebTimeDebugSnapshot`].
+/// 0 I/O: solo atomics + `live_effects` (RAM).
+fn web_time_debug_snapshot(
+    td: &TimeDebugState,
+    bench_hint: Option<String>,
+) -> WebTimeDebugSnapshot {
+    WebTimeDebugSnapshot {
+        frozen: td.is_frozen(),
+        cursor_tick: td.cursor(),
+        present_tick: td.present(),
+        available_ticks: td.available_ticks(),
+        pending_revert_files: td.pending_revert_file_names(),
+        bench_hint,
+    }
+}
+
+/// `SDD-05` §9.4 (sinergia `SDD-07` Fase 4A): comando copiable para comparar
+/// el modelo vivo contra un `bench` determinista desde el mismo cursor:
+/// `openonyx bench --snapshot-dir <dir> --tick <cursor> --models <provider>:<model>`.
+/// `None` si no hay store de snapshots (sin `--snapshot-dir`) o el objetivo
+/// LLM no expone `provider`+`model` (el candidato vivo exige ambos).
+fn time_debug_bench_hint(td: &TimeDebugState, provider: &str, model: &str) -> Option<String> {
+    let dir = td.pack_store()?.current_dir();
+    // El candidato vivo de `bench` exige `provider:model` con un provider real;
+    // el parser del LLM es la fuente única de qué providers existen (el
+    // fallback estático `default` no califica).
+    if dir.as_os_str().is_empty() || LlmProvider::parse(provider).is_err() || model.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "openonyx bench --snapshot-dir {} --tick {} --models {provider}:{model}",
+        dir.display(),
+        td.cursor()
+    ))
 }
 
 fn strip_version(json: &str) -> &str {
@@ -1846,6 +2081,35 @@ fn dispatch_http_request<W: Write>(
                     br#"{"ok":true}"#,
                     &base_extra,
                 )?,
+                Err(WebCommandRejection::BadRequest(msg)) => {
+                    write_json_error(out, 400, "Bad Request", &msg, &base_extra)?
+                }
+                // `SDD-07` Fase 4A: prompt plano bajo TimeFreeze → 409 (no se
+                // encola al bus); `/…` y `!…` pasan normal.
+                Err(WebCommandRejection::TimeFrozen(msg)) => {
+                    write_json_error(out, 409, "Conflict", &msg, &base_extra)?
+                }
+            }
+            Ok(None)
+        }
+        ("POST", "/api/v1/time/scrub") => {
+            // `SDD-07` Fase 4A: el único endpoint efímero del Time Debugger.
+            // 100% efímero: opera solo sobre `TimeDebugState` (0 escritura en
+            // `ONYXTR2`, 0 avance de ticks) y levanta `time_scrub_dirty` +
+            // `input_cv` para el push SSE inmediato de `pump_idle`.
+            match hub.apply_time_scrub(&req.body) {
+                Ok(snapshot) => {
+                    let body =
+                        serde_json::json!({ "ok": true, "time_debug": snapshot }).to_string();
+                    write_http_response(
+                        out,
+                        200,
+                        "OK",
+                        "application/json; charset=utf-8",
+                        body.as_bytes(),
+                        &base_extra,
+                    )?
+                }
                 Err(msg) => write_json_error(out, 400, "Bad Request", &msg, &base_extra)?,
             }
             Ok(None)
@@ -2244,7 +2508,10 @@ fn write_http_response<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onyx_soul_agents::{AgentConfig, AgentHost, AgentView, RecordingBridge, Reply};
+    use onyx_soul_agents::{
+        AgentConfig, AgentHost, AgentView, AttrRegistry, Ctx, Graph, HeadlessDriver, OnyxError,
+        OnyxSystem, RecordingBridge, Reply,
+    };
     use onyx_workspace::{WorkspaceLedgerSystem, WorkspaceMode, WorkspaceToolBridge};
     use std::env;
 
@@ -2830,5 +3097,368 @@ mod tests {
             .join()
             .expect("el watcher termina tras propagar el apago");
         reset_serve_shutdown_request();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // `SDD-07` Fase 4A — TEST-07.7: paridad Web del Time Debugger (0 navegador
+    // real: exchanges HTTP en memoria sobre el hub + contratos estáticos PWA).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    const TD_KEY: &str = "td-web-api-key-1122334455";
+
+    /// `TimeDebugState` con ticks 0..=2 en el anillo (present = 2, cursor = 2).
+    fn td_state_with_ticks() -> TimeDebugState {
+        let td = TimeDebugState::new(None);
+        td.record_tick(0, &[0]);
+        td.record_tick(1, &[0]);
+        td.record_tick(2, &[0]);
+        td
+    }
+
+    fn web_driver_with_time_debug(
+        host: &AgentHost,
+        td: TimeDebugState,
+    ) -> (WebDriver, Arc<WebHub>) {
+        let cfg = WebServerConfig::resolve("127.0.0.1:0", Some(TD_KEY.to_string()), None).unwrap();
+        let driver = WebDriver::start(host.vocab(), &cfg, None, None)
+            .unwrap()
+            .with_time_debug(td);
+        let hub = Arc::clone(&driver.hub);
+        (driver, hub)
+    }
+
+    fn td_post(hub: &Arc<WebHub>, body: &str, extra_headers: &str) -> String {
+        let (resp, _) = in_memory_exchange(
+            hub,
+            &format!(
+                "POST /api/v1/time/scrub HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        resp
+    }
+
+    fn td_cmd(hub: &Arc<WebHub>, command: &str) -> String {
+        let body = format!("{{\"command\":{}}}", serde_json::json!(command));
+        let (resp, _) = in_memory_exchange(
+            hub,
+            &format!(
+                "POST /api/v1/command HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TD_KEY}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        resp
+    }
+
+    #[test]
+    fn test_07_7_1_time_scrub_endpoint_auth_csrf_ephemeral_and_actionable_400() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // ancla en el pasado → auto-freeze (cursor=1, present=2)
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td.clone());
+
+        // 1a. 401 sin credenciales (el endpoint hereda el guard de auth).
+        let unauth = td_post(&hub, "{\"action\":\"scrub_to\",\"tick\":2}", "");
+        assert!(unauth.starts_with("HTTP/1.1 401 Unauthorized"), "{unauth}");
+        assert_eq!(td.cursor(), 1, "el 401 no debe mutar el depurador");
+
+        // 1b. 403 cross-site por el guard CSRF (Sec-Fetch-Site), sin Bearer.
+        let csrf = td_post(
+            &hub,
+            "{\"action\":\"scrub_to\",\"tick\":2}",
+            "Sec-Fetch-Site: cross-site\r\n",
+        );
+        assert!(csrf.starts_with("HTTP/1.1 403 Forbidden"), "{csrf}");
+
+        // 1c. 200 con scrub válido: el body lleva el snapshot `time_debug`
+        // actualizado (cursor en el presente, descongelado).
+        let ok = td_post(
+            &hub,
+            "{\"action\":\"scrub_to\",\"tick\":2}",
+            &format!("Authorization: Bearer {TD_KEY}\r\n"),
+        );
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+        assert!(ok.contains("\"ok\":true"), "{ok}");
+        assert!(ok.contains("\"time_debug\":{"), "{ok}");
+        assert!(ok.contains("\"cursor_tick\":2"), "{ok}");
+        assert!(ok.contains("\"frozen\":false"), "{ok}");
+        assert_eq!(td.cursor(), 2, "el scrub debe mutar el estado compartido");
+
+        // 1d. 400 accionable: tick futuro.
+        let future = td_post(
+            &hub,
+            "{\"action\":\"scrub_to\",\"tick\":99}",
+            "Authorization: Bearer td-web-api-key-1122334455\r\n",
+        );
+        assert!(future.starts_with("HTTP/1.1 400 Bad Request"), "{future}");
+        assert!(future.contains("futuro"), "{future}");
+
+        // 1e. 400 accionable: acción desconocida.
+        let bad_action = td_post(
+            &hub,
+            "{\"action\":\"warp\"}",
+            "Authorization: Bearer td-web-api-key-1122334455\r\n",
+        );
+        assert!(
+            bad_action.starts_with("HTTP/1.1 400 Bad Request"),
+            "{bad_action}"
+        );
+        assert!(
+            bad_action.contains("unknown time/scrub action"),
+            "{bad_action}"
+        );
+
+        // 1f. 100% efímero: 0 eventos encolados en el bus por el scrub.
+        let queued = hub
+            .state
+            .lock()
+            .map(|g| g.incoming_events.len())
+            .unwrap_or(usize::MAX);
+        assert_eq!(queued, 0, "el scrub no encola eventos en incoming_events");
+    }
+
+    #[test]
+    fn test_07_7_2_time_frozen_command_409_and_escape_slashes_pass() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // congelado mirando el pasado
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td);
+
+        // 2a. Prefix interno reservado → 400 (aun bajo freeze).
+        let reserved = td_cmd(&hub, "/__onyx_time_warp");
+        assert!(
+            reserved.starts_with("HTTP/1.1 400 Bad Request"),
+            "{reserved}"
+        );
+        assert!(
+            reserved.contains("reserved internal command prefix"),
+            "{reserved}"
+        );
+
+        // 2b. Prompt plano bajo TIME FROZEN → 409 Conflict accionable.
+        let frozen = td_cmd(&hub, "hello onyx, edit the file");
+        assert!(frozen.starts_with("HTTP/1.1 409 Conflict"), "{frozen}");
+        assert!(frozen.contains("Paused in TIME FROZEN"), "{frozen}");
+
+        // 2c. Vías de escape selladas pasan → 200.
+        let go = td_cmd(&hub, "/go");
+        assert!(go.starts_with("HTTP/1.1 200 OK"), "{go}");
+        let inspect = td_cmd(&hub, "/graph inspect mem");
+        assert!(inspect.starts_with("HTTP/1.1 200 OK"), "{inspect}");
+        let bang = td_cmd(&hub, "!echo hi");
+        assert!(bang.starts_with("HTTP/1.1 200 OK"), "{bang}");
+
+        // 2d. Los escapes sí encolan comandos en el bus (el 409 no encoló nada).
+        let queued = hub
+            .state
+            .lock()
+            .map(|g| g.incoming_events.len())
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            queued, 3,
+            "/go + /graph + !echo encolan; el 409 y el 400 no"
+        );
+    }
+
+    /// `SDD-07` Fase 4B (fix de auditoría — regresión del deadlock): con el
+    /// agente raíz ocupado (`root_busy`, Thinking) **y** TIME FROZEN (el
+    /// breakpoint principal pre-LLM de SDD-07), las vías de escape deben
+    /// llegar al bus inmediato (`incoming_events`), NO a la cola de prompts
+    /// pendientes (donde esperarían un idle que nunca llega mientras el
+    /// tiempo sigue congelado → el usuario queda atrapado en el freeze).
+    #[test]
+    fn test_07_7_5_escape_commands_immediate_while_root_busy_frozen() {
+        let host = AgentHost::builder(1).build().unwrap();
+        let td = td_state_with_ticks();
+        td.scrub_to(1).unwrap(); // frozen + cursor < present (breakpoint pre-LLM)
+
+        let (_driver, hub) = web_driver_with_time_debug(&host, td);
+        // Escenario crítico: el agente está pausado en Thinking y congelado.
+        hub.state.lock().unwrap().root_busy = true;
+
+        for cmd in ["/go", "/step-llm", "/graph drop-mem 1", "!echo hi"] {
+            let resp = td_cmd(&hub, cmd);
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{cmd} → {resp}");
+        }
+
+        let guard = hub.state.lock().unwrap();
+        assert_eq!(
+            guard.incoming_events.len(),
+            4,
+            "las 4 vías de escape entran al bus inmediato"
+        );
+        assert!(
+            guard.queued_prompts.is_empty(),
+            "nada se encola en queued_prompts (deadlock: idle que nunca llega)"
+        );
+    }
+
+    /// Sistema de test: siembra 1 efecto registrado (`hello.txt`, tick 2) en el
+    /// grafo vivo para que `sync_live_effects` capture algo real (0 I/O).
+    struct TdEffectSeeder {
+        wv: Option<WorkspaceVocab>,
+        seeded: bool,
+    }
+
+    impl OnyxSystem for TdEffectSeeder {
+        fn name(&self) -> &str {
+            "test_td_effect_seeder"
+        }
+
+        fn init(&mut self, attrs: &mut dyn AttrRegistry) -> Result<(), OnyxError> {
+            self.wv = Some(WorkspaceVocab::resolve(attrs));
+            Ok(())
+        }
+
+        fn run(&mut self, ctx: &mut Ctx) {
+            if self.seeded {
+                return;
+            }
+            let Some(wv) = self.wv else {
+                return;
+            };
+            let id = ctx.graph.create();
+            ctx.graph.set(id, wv.effect_tick, Value::Int(2));
+            ctx.graph.set(id, wv.effect_agent, Value::Int(1));
+            ctx.graph
+                .set(id, wv.effect_tool, Value::Text("fs_edit".to_string()));
+            ctx.graph
+                .set(id, wv.effect_target, Value::Text("hello.txt".to_string()));
+            ctx.graph
+                .set(id, wv.effect_reversibility, Value::Text("git".to_string()));
+            ctx.graph.set(
+                id,
+                wv.effect_summary,
+                Value::Text("test effect".to_string()),
+            );
+            self.seeded = true;
+        }
+    }
+
+    #[test]
+    fn test_07_7_3_state_snapshot_time_debug_full_after_scrub_with_live_effects() {
+        let mut host = AgentHost::builder(1)
+            .system(Box::new(TdEffectSeeder {
+                wv: None,
+                seeded: false,
+            }))
+            .build()
+            .unwrap();
+        let ws_vocab = onyx_workspace::WorkspaceVocab::resolve_with(|n| host.attr(n));
+        host.run(&mut HeadlessDriver::new(), 3); // el seeder escribe el efecto (tick 2)
+
+        let td = TimeDebugState::new(None);
+        td.record_tick(0, &host.graph().export());
+        td.record_tick(1, &host.graph().export());
+        td.record_tick(2, &host.graph().export());
+        // Borde de sesión: captura los efectos del grafo vivo (fuente de
+        // `pending_revert_files` — el preview(cursor) no los contiene).
+        td.sync_live_effects(host.graph(), &ws_vocab);
+        td.scrub_to(1).unwrap(); // ancla en el pasado → auto-freeze
+
+        let (driver, hub) = web_driver_with_time_debug(&host, td);
+
+        // Publica el snapshot con la proyección del cursor scrubbeado
+        // (render = publish_snapshot sin broadcast SSE).
+        driver.handle().render(host.graph());
+
+        let (resp, _) = in_memory_exchange(
+            &hub,
+            &format!(
+                "GET /api/v1/state HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TD_KEY}\r\n\r\n"
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(
+            resp.contains("\"time_debug\":{"),
+            "el snapshot debe llevar time_debug, {resp}"
+        );
+        assert!(resp.contains("\"frozen\":true"), "{resp}");
+        assert!(resp.contains("\"cursor_tick\":1"), "{resp}");
+        assert!(resp.contains("\"present_tick\":2"), "{resp}");
+        assert!(
+            resp.contains("\"available_ticks\":[0,1,2]"),
+            "available = anillo ∪ presente, {resp}"
+        );
+        assert!(
+            resp.contains("\"pending_revert_files\":[\"hello.txt\"]"),
+            "pending_revert_files sale de live_effects (tick 2 > cursor 1), {resp}"
+        );
+    }
+
+    #[test]
+    fn test_07_7_4_pwa_assets_contract_time_debugger() {
+        // index.html: `#tick-pill` es un <button> (la etiqueta de apertura
+        // más cercana antes del id debe ser <button sin cierre intermedio).
+        let pos = ASSET_INDEX_HTML
+            .find("id=\"tick-pill\"")
+            .expect("tick-pill");
+        let before = &ASSET_INDEX_HTML[..pos];
+        let btn_start = before
+            .rfind("<button")
+            .expect("debe existir un <button antes del id tick-pill");
+        assert!(
+            !before[btn_start..].contains("</button>"),
+            "tick-pill debe ser el id de un <button> abierto (no de un span)"
+        );
+        // Barra ámbar + diálogo de edición de memoria + controles.
+        for needle in [
+            "id=\"time-debug-bar\"",
+            "id=\"tdb-status\"",
+            "id=\"tdb-slider\"",
+            "id=\"tdb-prev\"",
+            "id=\"tdb-next\"",
+            "id=\"tdb-freeze\"",
+            "id=\"tdb-step\"",
+            "id=\"tdb-step-llm\"",
+            "id=\"tdb-resume\"",
+            "id=\"tdb-revert-warn\"",
+            "id=\"tdb-bench-copy\"",
+            "id=\"edit-mem-dialog\"",
+            "id=\"edit-mem-input\"",
+        ] {
+            assert!(
+                ASSET_INDEX_HTML.contains(needle),
+                "index.html falta {needle}"
+            );
+        }
+
+        // app.js: endpoint scrub, comandos sellados, hints y 0 innerHTML.
+        for needle in [
+            "/api/v1/time/scrub",
+            "scrub_delta",
+            "return_to_present",
+            "/graph drop-mem",
+            "/graph edit-mem",
+            "{ key: '/time',",
+            "{ key: '/go',",
+            "{ key: '/step',",
+            "{ key: '/step-llm',",
+            "{ key: '/read',",
+            "{ key: '/inject',",
+            "TIME FROZEN",
+            "attachMemActions",
+        ] {
+            assert!(ASSET_APP_JS.contains(needle), "app.js falta {needle}");
+        }
+        assert!(
+            !ASSET_APP_JS.contains("innerHTML"),
+            "app.js no puede usar innerHTML (CSP estricto)"
+        );
+
+        // styles.css: barra ámbar, pill congelada y botones de memoria.
+        for needle in [
+            ".time-debug-bar",
+            "#tick-pill.is-frozen",
+            ".mem-actions",
+            ".tdb-bench",
+        ] {
+            assert!(
+                ASSET_STYLES_CSS.contains(needle),
+                "styles.css falta {needle}"
+            );
+        }
     }
 }
