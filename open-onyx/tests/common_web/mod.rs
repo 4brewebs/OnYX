@@ -139,6 +139,8 @@ pub struct ServeOpts<'a> {
     pub bind: Option<&'a str>,
     pub api_key: Option<&'a str>,
     pub cors_origin: Option<&'a str>,
+    /// FIX-16: modo seguro explícito detrás de proxy TLS (`--behind-tls`).
+    pub behind_tls: bool,
     pub prepare: Option<&'a dyn Fn(&Path)>,
 }
 
@@ -171,6 +173,9 @@ impl ServeGuard {
         }
         if let Some(o) = opts.cors_origin {
             cmd.args(["--cors-origin", o]);
+        }
+        if opts.behind_tls {
+            cmd.arg("--behind-tls");
         }
         let mut child = cmd
             .stdin(Stdio::null())

@@ -190,15 +190,25 @@ fn login_validates_body_and_key_and_sets_hardened_cookie() {
     assert_eq!(srv.get("/api/v1/state", &[("Cookie", &mixed)]).status, 200);
 }
 
+/// FIX-16 (arreglado): detrás de un proxy que termina TLS, el modo seguro se declara
+/// EXPLÍCITAMENTE con `--behind-tls` (el bind expuesto también lo activa). La cabecera
+/// `X-Forwarded-Proto` del cliente ya no se consulta: un atacante directo podía forzarla.
+/// Aquí se manda `X-Forwarded-Proto: http` a propósito para probar que ya no importa.
 #[test]
 fn login_behind_https_proxy_uses_host_prefixed_secure_cookie() {
-    let srv = ServeGuard::start("auth_host_prefix");
+    let srv = ServeGuard::start_with(
+        "auth_host_prefix",
+        ServeOpts {
+            behind_tls: true,
+            ..ServeOpts::default()
+        },
+    );
     let body = format!(r#"{{"api_key":"{}"}}"#, srv.api_key);
     let r = srv.post(
         "/api/v1/auth/login",
         &[
             ("Sec-Fetch-Site", "same-origin"),
-            ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Proto", "http"),
         ],
         &body,
     );

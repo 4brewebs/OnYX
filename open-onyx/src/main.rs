@@ -179,6 +179,11 @@ enum Mode {
         bind: String,
         api_key: Option<String>,
         cors_origin: Option<String>,
+        /// FIX-16/36: `--behind-tls` — proxy que termina TLS delante (cookie
+        /// `__Host-…; Secure` + HSTS, sin fiarse de `X-Forwarded-Proto`).
+        behind_tls: bool,
+        /// FIX-17: `--allowed-hosts a,b` — lista estricta de `Host` permitidos.
+        allowed_hosts: Vec<String>,
     },
     /// Benchmarking reproducible multi-modelo (`SDD-05` REQ-05.6).
     Bench {
@@ -238,6 +243,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut web_bind: Option<String> = None;
     let mut web_api_key: Option<String> = None;
     let mut web_cors_origin: Option<String> = None;
+    let mut web_behind_tls = false;
+    let mut web_allowed_hosts: Vec<String> = Vec::new();
     let mut positional = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -302,6 +309,25 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--cors-origin must not be empty".to_string());
                 }
                 web_cors_origin = Some(o);
+            }
+            "--behind-tls" => {
+                // FIX-16/36: modo seguro explícito (el proxy termina TLS).
+                web_behind_tls = true;
+            }
+            "--allowed-hosts" => {
+                // FIX-17: lista estricta de `Host` permitidos (comas).
+                let h = args
+                    .next()
+                    .ok_or("--allowed-hosts requires a comma-separated host list")?;
+                let items: Vec<String> = h
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if items.is_empty() {
+                    return Err("--allowed-hosts must not be empty".to_string());
+                }
+                web_allowed_hosts = items;
             }
             "--auto-approve" => auto_approve = true,
             "--ignore-deny" => ignore_deny = true,
@@ -530,6 +556,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     .ok()
                     .filter(|s| !s.trim().is_empty())
             }),
+            behind_tls: web_behind_tls,
+            allowed_hosts: web_allowed_hosts,
         },
         "bench" => Mode::Bench { tick: tick_opt },
         _ => return Err(usage()),
@@ -2386,8 +2414,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             api_key,
             cors_origin,
+            behind_tls,
+            allowed_hosts,
         } => {
-            let web_cfg = WebServerConfig::resolve(bind, api_key.clone(), cors_origin.clone())?;
+            let mut web_cfg = WebServerConfig::resolve(bind, api_key.clone(), cors_origin.clone())?;
+            if *behind_tls {
+                web_cfg = web_cfg.behind_tls();
+            }
+            if !allowed_hosts.is_empty() {
+                web_cfg = web_cfg.with_allowed_hosts(allowed_hosts.clone());
+            }
             launch_web_serve(
                 &cli,
                 &policy,
@@ -4606,6 +4642,9 @@ ready_log = "READY_BUS"
                 "my-serve-secret-key-2026",
                 "--cors-origin",
                 "http://localhost:5173",
+                "--behind-tls",
+                "--allowed-hosts",
+                "vps.example.com, ui.example.com",
             ]
             .into_iter()
             .map(String::from),
@@ -4616,10 +4655,15 @@ ready_log = "READY_BUS"
                 bind,
                 api_key,
                 cors_origin,
+                behind_tls,
+                allowed_hosts,
             } => {
                 assert_eq!(bind, "127.0.0.1:9090");
                 assert_eq!(api_key.as_deref(), Some("my-serve-secret-key-2026"));
                 assert_eq!(cors_origin.as_deref(), Some("http://localhost:5173"));
+                // FIX-16/36/17: flags explícitos de modo expuesto.
+                assert!(behind_tls);
+                assert_eq!(allowed_hosts, vec!["vps.example.com", "ui.example.com"]);
             }
             _ => panic!("expected Mode::Serve"),
         }

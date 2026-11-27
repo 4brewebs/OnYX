@@ -64,8 +64,15 @@ fn launch(prefix: &[&str], extra: &[&str], api_base: &str, key_via_env: bool) ->
         None => Command::new(bin),
     };
     cmd.env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", &home.0)
+        .env("PATH", std::env::var("PATH").unwrap_or_default());
+    // Windows: lo mínimo del sistema para que el hijo inicialice Winsock y encuentre
+    // las DLL (mismo conjunto que `common_web::hermetic_command`; en Linux es un no-op).
+    for keep in ["SystemRoot", "SYSTEMROOT", "TEMP", "TMP"] {
+        if let Some(v) = std::env::var_os(keep) {
+            cmd.env(keep, v);
+        }
+    }
+    cmd.env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
         .env("TMPDIR", root.0.join("tmp"))
         .env("ONYX_TRUST_FILE", home.0.join("trusted.toml"))
@@ -246,7 +253,6 @@ fn cors_cross_site_post_with_valid_bearer_is_allowed() {
 /// cookie basta para saltarse la guarda Sec-Fetch-Site: la guarda mira si hay Bearer (no si
 /// es válido) y luego la cookie autentica.
 #[test]
-#[ignore = "BUG: FIX-37 con --cors-origin, cookie + Authorization: Bearer inválido + Sec-Fetch-Site: cross-site da 200: la guarda CSRF acepta cualquier Bearer presente y luego autentica la cookie (open-onyx/src/web.rs:1687-1689, :2146-2156)"]
 fn cors_cross_site_post_with_cookie_and_bogus_bearer_is_forbidden() {
     let srv = launch(
         &[],
@@ -296,7 +302,6 @@ fn text_plain_cookie_post_with_cross_site_fetch_metadata_is_forbidden() {
 /// ejecuta comandos: sin `Sec-Fetch-Site` no hay ninguna otra defensa CSRF (ni
 /// Content-Type JSON obligatorio, ni Origin, ni token).
 #[test]
-#[ignore = "BUG: FIX-42 POST /api/v1/command con cookie, Content-Type: text/plain y sin Sec-Fetch-Site da 200: la guarda CSRF solo actúa si llega Sec-Fetch-Site (open-onyx/src/web.rs:1684-1701)"]
 fn text_plain_cookie_post_without_fetch_metadata_is_rejected() {
     let srv = launch(&[], &[], DEAD_API, false);
     let cookie = login(srv.port);
@@ -380,16 +385,16 @@ fn listener_survives_burst_below_thread_limit() {
     assert_eq!(health(srv.port), 200);
 }
 
-/// FIX-35: al agotar hilos, `thread::spawn` hace pánico DENTRO del hilo de `accept_loop`;
-/// el listener muere para siempre y el proceso sigue vivo (sin reinicio por systemd).
+/// FIX-35 (arreglado): al agotar hilos, `thread::Builder::spawn` devuelve `Err`
+/// (EAGAIN por RLIMIT_NPROC) y la conexión se cierra con EOF SIN matar al hilo de
+/// `accept_loop`: el listener sigue aceptando. El camino de fallo se cubre además con
+/// un test unitario determinista (spawner inyectado, `web.rs`), que no depende de
+/// user namespaces.
 ///
-/// OJO: sin user namespaces (o sin `prlimit`) este test imprime `SKIP: …` y SALE EN VERDE sin
-/// haber evaluado nada. Con `-- --ignored` en un host así pasa aunque el bug siga ahí: ese
-/// verde NO significa que FIX-35 esté arreglado. Hay que verlo en un host con `unshare` y
-/// `prlimit` (ejecutar con `--nocapture` y comprobar que no aparece `SKIP`).
+/// OJO: sin user namespaces (o sin `prlimit`) este test imprime `SKIP: …` y sale sin
+/// evaluar: en un host así la comprobación la hace el test unitario.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "BUG: FIX-35 si thread::spawn falla (EAGAIN por RLIMIT_NPROC), el pánico mata el hilo de accept_loop; el proceso sigue vivo pero no vuelve a aceptar conexiones (open-onyx/src/web.rs:1520). Sin userns/prlimit sale `SKIP` EN VERDE: eso no significa que esté arreglado"]
 fn listener_survives_thread_exhaustion() {
     let Some(prefix) = nproc_prefix_or_skip("listener_survives_thread_exhaustion") else {
         return;
@@ -524,12 +529,14 @@ fn has_header(resp: &str, name: &str) -> bool {
     })
 }
 
-/// Control FIX-36: detrás de un proxy que SÍ manda `X-Forwarded-Proto: https`, la cookie va
-/// con `__Host-` y `Secure`.
+/// Control FIX-36/16: detrás de un proxy que termina TLS, declarado EXPLÍCITAMENTE con
+/// `--behind-tls` (el arreglo no consulta `X-Forwarded-Proto`: un cliente directo podía
+/// forzarla), la cookie va con `__Host-` y `Secure` y la respuesta lleva HSTS. Se manda
+/// `X-Forwarded-Proto: http` a propósito para probar que la cabecera del proxy ya no importa.
 #[test]
 fn login_behind_https_proxy_sets_secure_host_cookie() {
-    let srv = launch(&[], &[], DEAD_API, false);
-    let (status, resp) = login_with(srv.port, &["X-Forwarded-Proto: https"]);
+    let srv = launch(&[], &["--behind-tls"], DEAD_API, false);
+    let (status, resp) = login_with(srv.port, &["X-Forwarded-Proto: http"]);
     assert_eq!(status, 200, "{resp}");
     let cookie = set_cookie_line(&resp);
     assert!(cookie.contains("__Host-"), "{cookie}");
@@ -537,6 +544,7 @@ fn login_behind_https_proxy_sets_secure_host_cookie() {
     assert!(cookie.contains("HttpOnly"), "{cookie}");
     assert!(cookie.contains("SameSite=Lax"), "{cookie}");
     assert!(cookie.contains("Path=/"), "{cookie}");
+    assert!(has_header(&resp, "Strict-Transport-Security"), "{resp}");
 }
 
 /// Control FIX-36: en loopback puro y sin proxy el login funciona y deja una cookie de
@@ -555,15 +563,13 @@ fn login_on_plain_loopback_keeps_local_http_cookie() {
     assert!(cookie.contains("HttpOnly"), "{cookie}");
 }
 
-/// FIX-36: con un bind NO loopback (despliegue en un VPS) y un proxy que no manda
-/// `X-Forwarded-Proto` (nginx no lo manda por defecto), el login emite la cookie sin
-/// `Secure` ni `__Host-` y la respuesta no lleva `Strict-Transport-Security`.
+/// FIX-36 (arreglado): con un bind NO loopback (despliegue en un VPS) y un proxy que no
+/// manda `X-Forwarded-Proto` (nginx no lo manda por defecto), el login emite la cookie con
+/// `Secure` y `__Host-` y la respuesta lleva `Strict-Transport-Security`: el modo seguro
+/// es el bind expuesto (o `--behind-tls`), nunca la cabecera del cliente.
 ///
-/// Se conecta por 127.0.0.1 a un servidor enlazado a 0.0.0.0. La ficha admite dos arreglos
-/// (bind no loopback, o un flag explícito `--behind-tls`); este test cubre el primero: si el
-/// arreglo es solo el flag, hay que añadirlo a los `extra` del test.
+/// Se conecta por 127.0.0.1 a un servidor enlazado a 0.0.0.0.
 #[test]
-#[ignore = "BUG: FIX-36 en bind no loopback y sin X-Forwarded-Proto: https, el login emite onyx_session sin Secure ni __Host- y sin Strict-Transport-Security: el modo seguro depende de la cabecera del proxy (open-onyx/src/web.rs:1726-1740, :2217-2231)"]
 fn exposed_bind_login_without_forwarded_proto_is_secure_and_sends_hsts() {
     let srv = launch(&[], &["--bind", "0.0.0.0:0"], DEAD_API, false);
     let (status, resp) = login_with(srv.port, &[]);
@@ -678,11 +684,11 @@ fn well_formed_requests_are_served() {
     assert_eq!(status, 200, "{resp}");
 }
 
-/// FIX-41: `read_http_request` acepta framing ambiguo o inválido; detrás de un proxy es
-/// superficie de desincronización. Cada caso debe ser 400. Se recogen todos los que no lo
-/// son para que el informe diga cuáles (con el arreglo, la lista queda vacía).
+/// FIX-41 (arreglado): `read_http_request` estricto: cada framing ambiguo o inválido se
+/// contesta con 400 (antes se aceptaba; detrás de un proxy es superficie de
+/// desincronización). Se recogen todos los que no lo sean para que el informe diga
+/// cuáles (con el arreglo, la lista queda vacía).
 #[test]
-#[ignore = "BUG: FIX-41 el parser HTTP acepta espacio antes de ':', obs-fold, TE+CL (gana CL), Content-Length negativo o no numérico (tomado como 0), petición sin versión y solo LF en vez de contestar 400 (open-onyx/src/web.rs:2080-2091)"]
 fn malformed_http_requests_are_rejected_with_400() {
     let srv = launch(&[], &[], DEAD_API, false);
     let mut accepted = Vec::new();
@@ -697,5 +703,68 @@ fn malformed_http_requests_are_rejected_with_400() {
         accepted.is_empty(),
         "not rejected with 400:\n{}",
         accepted.join("\n")
+    );
+}
+
+// ───────────── FIX-66: el stream SSE desactiva el buffering del proxy ─────────────
+
+/// Lee SOLO la cabecera de la respuesta (hasta la línea vacía): para streams que no
+/// terminan (SSE) no se puede `read_to_end`.
+fn head_only(port: u16, req: &str) -> (u16, String) {
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+        return (0, "connect failed".into());
+    };
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    if s.write_all(req.as_bytes()).is_err() {
+        return (0, "write failed".into());
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut one = [0u8; 1];
+    loop {
+        match s.read(&mut one) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                buf.push(one[0]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (status, head)
+}
+
+/// FIX-66: la respuesta SSE autenticada lleva `X-Accel-Buffering: no` (un proxy con
+/// buffering «apila» el `event-stream` y la vista Live avanza a rachas); las demás
+/// respuestas NO llevan el header (es específico del stream, no un banner global).
+#[test]
+fn sse_stream_disables_proxy_buffering_other_responses_do_not() {
+    let srv = launch(&[], &[], DEAD_API, false);
+    let cookie = login(srv.port);
+    let (status, head) = head_only(
+        srv.port,
+        &format!("GET /api/v1/events HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {cookie}\r\n\r\n"),
+    );
+    assert_eq!(status, 200, "{head}");
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    assert!(head.contains("X-Accel-Buffering: no"), "{head}");
+
+    // Control: una respuesta normal (health) no incluye el header.
+    let (status, health_head) = head_only(
+        srv.port,
+        "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+    );
+    assert_eq!(status, 200, "{health_head}");
+    assert!(
+        !health_head
+            .to_ascii_lowercase()
+            .contains("x-accel-buffering"),
+        "X-Accel-Buffering solo debe ir en el stream SSE: {health_head}"
     );
 }
