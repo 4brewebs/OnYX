@@ -563,8 +563,7 @@ pub(crate) fn is_transport_read_timeout(t: &ureq::Transport) -> bool {
     use std::error::Error as _;
     use std::io::ErrorKind as IoKind;
     t.kind() == ureq::ErrorKind::Io
-        && t
-            .source()
+        && t.source()
             .and_then(|s| s.downcast_ref::<std::io::Error>())
             .is_some_and(|e| matches!(e.kind(), IoKind::TimedOut | IoKind::WouldBlock))
 }
@@ -1032,10 +1031,7 @@ mod tests {
         use std::time::Instant;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!(
-            "http://{}/chat/completions",
-            listener.local_addr().unwrap()
-        );
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
         // Acepta (connect OK) y se queda mudo hasta que el test lo libere.
         let (release, wait_release) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {

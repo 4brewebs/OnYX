@@ -105,7 +105,8 @@ fn hung_llm_request_keeps_health_up_and_rewind_works_after_timeout() {
         thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
-        state_now, "failed",
+        state_now,
+        "failed",
         "el agente debe fallar con el timeout acotado (state: {state_now}); stderr: {}",
         serve.stderr()
     );
