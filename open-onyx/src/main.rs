@@ -34,7 +34,9 @@ use gemini::{
     DEFAULT_GEMINI_MODEL, GeminiResponder, StreamPreviewHandle, load_project_instructions,
 };
 use llm_driver::DynamicLlmDriver;
-use llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider, ResolvedLlmTarget, validate_api_base};
+use llm_profile::{
+    LlmConfig, LlmProfileHandle, LlmProvider, LlmTimeouts, ResolvedLlmTarget, validate_api_base,
+};
 use onyx_soul_agents::{
     AgentConfig, AgentView, HeadlessDriver, RecordingBridge, ReplayBridge, Reply, Responder,
     Transcript, Verb,
@@ -90,6 +92,10 @@ struct CliArgs {
     max_steps: Option<i64>,
     max_subagents: Option<usize>,
     shell_timeout_secs: Option<u64>,
+    /// `FIX-02`: `--llm-timeout-connect <secs>` — TCP/TLS a los proveedores LLM.
+    llm_timeout_connect_secs: Option<u64>,
+    /// `FIX-02`: `--llm-timeout-read <secs>` — entre bytes/chunks de la respuesta.
+    llm_timeout_read_secs: Option<u64>,
     save_transcript: Option<PathBuf>,
     snapshot_dir: Option<PathBuf>,
     auto_save: bool,
@@ -130,6 +136,8 @@ impl CliArgs {
             max_steps: None,
             max_subagents: None,
             shell_timeout_secs: None,
+            llm_timeout_connect_secs: None,
+            llm_timeout_read_secs: None,
             save_transcript: None,
             snapshot_dir: None,
             auto_save: false,
@@ -221,6 +229,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
     let mut max_steps: Option<i64> = None;
     let mut max_subagents: Option<usize> = None;
     let mut shell_timeout_secs: Option<u64> = None;
+    let mut llm_timeout_connect_secs: Option<u64> = None;
+    let mut llm_timeout_read_secs: Option<u64> = None;
     let mut save_transcript = None;
     let mut snapshot_dir = None;
     let mut auto_save = false;
@@ -389,6 +399,31 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
                     return Err("--shell-timeout must be > 0".to_string());
                 }
                 shell_timeout_secs = Some(parsed);
+            }
+            // `FIX-02`: timeouts HTTP de las llamadas a los proveedores LLM
+            // (acotados en los tres `post_*`: un proveedor colgado no puede
+            // dejar el bucle de sesión bloqueado para siempre en VPS).
+            "--llm-timeout-connect" | "--llm-timeout-read" => {
+                let is_connect = arg == "--llm-timeout-connect";
+                let flag = if is_connect {
+                    "--llm-timeout-connect"
+                } else {
+                    "--llm-timeout-read"
+                };
+                let s = args
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires seconds as a positive integer"))?;
+                let parsed = s
+                    .parse::<u64>()
+                    .map_err(|_| format!("{flag} must be a positive integer"))?;
+                if parsed == 0 {
+                    return Err(format!("{flag} must be > 0"));
+                }
+                if is_connect {
+                    llm_timeout_connect_secs = Some(parsed);
+                } else {
+                    llm_timeout_read_secs = Some(parsed);
+                }
             }
             "--save-transcript" | "--record" => {
                 let p = args.next().ok_or("--save-transcript requires a path")?;
@@ -590,6 +625,8 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
         max_steps,
         max_subagents,
         shell_timeout_secs,
+        llm_timeout_connect_secs,
+        llm_timeout_read_secs,
         save_transcript,
         snapshot_dir,
         auto_save,
@@ -608,7 +645,7 @@ fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<CliArgs, S
 }
 
 fn usage() -> String {
-    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [--workspace <dir>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--shell-timeout <secs>] [--auto-approve] [--trust-workspace] [--api-base <url>] [--allow-custom-auth-host] [--effort <low|medium|high>] [--thinking-budget <tokens>]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
+    "Usage:\n  openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]\n  openonyx inspect <snapshot_dir> [--tick <n>] [--list] [--json]\n  openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --tui] [--fork-dir <dir>] [--truncate-future] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--dry-run]\n  openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [--workspace <dir>] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--shell-timeout <secs>] [--auto-approve] [--trust-workspace] [--api-base <url>] [--allow-custom-auth-host] [--effort <low|medium|high>] [--thinking-budget <tokens>]\n  openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]\n  openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]\n  openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <tokens>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]\n  openonyx [--help | -h | --version | -V]".to_string()
 }
 
 fn help_text() -> String {
@@ -769,10 +806,39 @@ fn allow_custom_auth_host_from_env() -> bool {
         })
 }
 
+/// `FIX-02`: segundos de timeout desde env, si hay (`ONYX_LLM_TIMEOUT_*_SECS`).
+fn llm_timeout_secs_from_env(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// `FIX-02`: timeouts HTTP de los proveedores LLM. Precedencia: CLI
+/// (`--llm-timeout-connect` / `--llm-timeout-read`) > env
+/// (`ONYX_LLM_TIMEOUT_CONNECT_SECS` / `ONYX_LLM_TIMEOUT_READ_SECS`) >
+/// [`LlmTimeouts::DEFAULT`] (connect 30 s / read 120 s). Todo configurable
+/// para que CI y tests lo bajen a 1–2 s.
+fn resolve_llm_timeouts(cli: &CliArgs) -> LlmTimeouts {
+    let connect = cli
+        .llm_timeout_connect_secs
+        .or_else(|| llm_timeout_secs_from_env("ONYX_LLM_TIMEOUT_CONNECT_SECS"))
+        .unwrap_or(LlmTimeouts::DEFAULT.connect.as_secs());
+    let read = cli
+        .llm_timeout_read_secs
+        .or_else(|| llm_timeout_secs_from_env("ONYX_LLM_TIMEOUT_READ_SECS"))
+        .unwrap_or(LlmTimeouts::DEFAULT.read.as_secs());
+    LlmTimeouts {
+        connect: Duration::from_secs(connect),
+        read: Duration::from_secs(read),
+    }
+}
+
 fn resolve_llm_config(
     cli: &CliArgs,
     workspace: &Path,
 ) -> Result<LlmConfig, Box<dyn std::error::Error>> {
+    let timeouts = resolve_llm_timeouts(cli);
     let provider = match cli.provider {
         Some(p) => p,
         None => match env::var("ONYX_PROVIDER") {
@@ -858,6 +924,7 @@ fn resolve_llm_config(
                 thinking_budget,
                 api_base,
                 project_instructions,
+                timeouts,
             })
         }
         LlmProvider::OpenAi => {
@@ -899,6 +966,7 @@ fn resolve_llm_config(
                 thinking_budget,
                 api_base,
                 project_instructions,
+                timeouts,
             })
         }
         LlmProvider::Anthropic => {
@@ -937,6 +1005,7 @@ fn resolve_llm_config(
                 thinking_budget,
                 api_base,
                 project_instructions,
+                timeouts,
             })
         }
     }
@@ -1016,6 +1085,8 @@ fn resolve_replay_llm_config(cli: &CliArgs) -> Result<LlmConfig, Box<dyn std::er
         thinking_budget: None,
         api_base,
         project_instructions: String::new(),
+        // Replay: 0 llamadas HTTP — los timeouts no aplican.
+        timeouts: LlmTimeouts::default(),
     })
 }
 
@@ -1033,6 +1104,7 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
+                .with_llm_timeouts(llm.timeouts)
                 .with_external_driver_ids(driver_ids.to_vec())
                 .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
@@ -1046,6 +1118,7 @@ fn build_sync_responder(
                 .with_project_instructions(llm.project_instructions.clone())
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
+                .with_llm_timeouts(llm.timeouts)
                 .with_external_driver_ids(driver_ids.to_vec())
                 .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
@@ -1060,6 +1133,7 @@ fn build_sync_responder(
                 .with_context_config(ctx_cfg)
                 .with_effort(llm.effort)
                 .with_thinking_budget(llm.thinking_budget)
+                .with_llm_timeouts(llm.timeouts)
                 .with_external_driver_ids(driver_ids.to_vec())
                 .with_mcp_schemas(Arc::clone(mcp_schemas));
             if let Some(tel) = telemetry {
@@ -1081,6 +1155,10 @@ fn llm_config_from_target(target: &ResolvedLlmTarget) -> LlmConfig {
         thinking_budget: target.thinking_budget,
         api_base: target.api_base.clone(),
         project_instructions: target.project_instructions.to_string(),
+        // El objetivo congelado no lleva timeouts (son de sesión, no de
+        // perfil): lo aplica [`pin_subagent_responder_factory`] con los de
+        // la sesión de arranque.
+        timeouts: LlmTimeouts::default(),
     }
 }
 
@@ -1089,10 +1167,16 @@ fn llm_config_from_target(target: &ResolvedLlmTarget) -> LlmConfig {
 /// instante) y devuelve la fábrica interna que el worker thread usa para
 /// construir su `Responder` — un cambio en caliente posterior no aplica a un
 /// subagente ya lanzado.
-fn pin_subagent_responder_factory(handle: LlmProfileHandle) -> PinnedResponderFactory {
+fn pin_subagent_responder_factory(
+    handle: LlmProfileHandle,
+    timeouts: LlmTimeouts,
+) -> PinnedResponderFactory {
     Arc::new(move || {
         let target = handle.active_target();
-        let llm = llm_config_from_target(&target);
+        // El objetivo congelado no lleva timeouts (son de sesión): se aplican
+        // los de la sesión de arranque (`FIX-02`).
+        let mut llm = llm_config_from_target(&target);
+        llm.timeouts = timeouts;
         Box::new(move || build_sync_responder(&llm, None, &[], &Arc::default()))
     })
 }
@@ -1339,7 +1423,10 @@ fn launch_interactive_chat(
     let sub_factory: ResponderFactory =
         Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
-        .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
+        .with_pinned_responder_factory(pin_subagent_responder_factory(
+            profile_handle.clone(),
+            llm.timeouts,
+        ))
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_root_tools(tools.clone());
@@ -1470,6 +1557,7 @@ fn launch_interactive_chat(
         .with_time_debug(time_debug.clone())
         .with_external_driver_ids(driver_ids.to_vec())
         .with_mcp_schemas(Arc::clone(mcp_schemas))
+        .with_llm_timeouts(llm.timeouts)
         .wrapping(sub_driver),
     );
 
@@ -1603,7 +1691,10 @@ fn launch_web_serve(
     let sub_factory: ResponderFactory =
         Arc::new(move || build_sync_responder(&sub_llm, None, &[], &Arc::default()));
     let sub_manager = SubagentManager::new(policy.clone(), 1, sub_factory)
-        .with_pinned_responder_factory(pin_subagent_responder_factory(profile_handle.clone()))
+        .with_pinned_responder_factory(pin_subagent_responder_factory(
+            profile_handle.clone(),
+            llm.timeouts,
+        ))
         .with_max_concurrent(resolve_max_subagents(cli.max_subagents))
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_root_tools(tools.clone());
@@ -1755,6 +1846,7 @@ fn launch_web_serve(
         .with_time_debug(time_debug.clone())
         .with_external_driver_ids(driver_ids.to_vec())
         .with_mcp_schemas(Arc::clone(mcp_schemas))
+        .with_llm_timeouts(llm.timeouts)
         .wrapping(sub_driver),
     );
 
@@ -2852,6 +2944,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let profiles = vec![
             onyx_workspace::LlmProfileConfig {
@@ -3014,6 +3107,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let profiles = vec![onyx_workspace::LlmProfileConfig {
             id: "fast".to_string(),
@@ -3136,6 +3230,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let profiles = vec![onyx_workspace::LlmProfileConfig {
             id: "fast".to_string(),
@@ -3191,6 +3286,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let replay_handle = LlmProfileHandle::new_for_replay(&replay_startup, &profiles);
         // Sin `fast_key_env` en el entorno, el perfil sigue disponible: en replay

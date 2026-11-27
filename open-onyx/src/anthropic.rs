@@ -42,9 +42,10 @@ use crate::gemini::{
     PendingCallQueue, QueuedToolCall, StreamPreviewHandle, next_queued_call, push_queued_calls,
     system_instruction_text,
 };
-use crate::llm_profile::{api_base_host, is_loopback_host};
+use crate::llm_profile::{LlmTimeouts, api_base_host, is_loopback_host};
 use crate::openai::{
     MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_MS, is_retryable_stream_error, lowercase_json_schema_types,
+    transport_detail,
 };
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
@@ -98,6 +99,8 @@ pub(crate) struct AnthropicSharedState {
     /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
     /// declaran en el body filtradas por los tools del spec del agente.
     pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub(crate) timeouts: LlmTimeouts,
 }
 
 /// Bloque de contenido asistente en curso de un stream `content_block_*`.
@@ -874,8 +877,17 @@ fn post_anthropic_json(
     stream: bool,
     agent: ConceptId,
     request: u64,
+    timeouts: LlmTimeouts,
 ) -> Result<ureq::Response, AnthropicHttpError> {
-    let mut req = ureq::post(url)
+    // `FIX-02`: timeouts explícitos por petición (connect corto + read por
+    // chunk SSE). Sin `timeout_read`, un proveedor mudo bloquea el read
+    // eternamente (ureq por defecto: "requests may block forever on reads").
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .build();
+    let mut req = http
+        .post(url)
         .set("x-api-key", api_key)
         .set("anthropic-version", ANTHROPIC_API_VERSION)
         .set("content-type", "application/json");
@@ -901,7 +913,7 @@ fn post_anthropic_json(
                 format!(
                     "anthropic transport error ({:?}): {}",
                     t.kind(),
-                    t.message().unwrap_or("request failed")
+                    transport_detail(&t)
                 ),
             ),
             retryable: true,
@@ -936,8 +948,9 @@ pub(crate) fn execute_anthropic_http(
     model: &str,
     is_local_endpoint: bool,
 ) -> Reply {
+    let timeouts = shared.timeouts;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
-        let resp = match post_anthropic_json(url, api_key, &body, false, agent, request) {
+        let resp = match post_anthropic_json(url, api_key, &body, false, agent, request, timeouts) {
             Ok(r) => r,
             Err(err) => {
                 if err.retryable {
@@ -994,6 +1007,7 @@ pub(crate) fn execute_anthropic_stream_http(
     target: AnthropicStreamTarget<'_>,
     body: JsonValue,
 ) -> Reply {
+    let timeouts = target.shared.timeouts;
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         let resp = match post_anthropic_json(
             target.url,
@@ -1002,6 +1016,7 @@ pub(crate) fn execute_anthropic_stream_http(
             true,
             target.agent,
             target.request,
+            timeouts,
         ) {
             Ok(r) => r,
             Err(err) => {
@@ -1124,6 +1139,12 @@ impl AnthropicResponder {
     /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
     pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
         self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
+
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub fn with_llm_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.shared.timeouts = timeouts;
         self
     }
 }

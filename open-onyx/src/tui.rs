@@ -2963,7 +2963,7 @@ mod tests {
     /// fallback sin handle). Regresión: el header "mentía" hasta reiniciar.
     #[test]
     fn live_llm_header_follows_hot_swapped_target() {
-        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider};
+        use crate::llm_profile::{LlmConfig, LlmProfileHandle, LlmProvider, LlmTimeouts};
 
         let startup = LlmConfig {
             provider: LlmProvider::Gemini,
@@ -2973,6 +2973,7 @@ mod tests {
             thinking_budget: None,
             api_base: None,
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         };
         let handle = LlmProfileHandle::new(&startup, &[], false);
 

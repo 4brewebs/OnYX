@@ -25,7 +25,8 @@ use crate::context::{
     ContextBudget, ProjectedTurn, ReasoningEffort, SessionTelemetryHandle, TieredContextConfig,
     extract_gemini_usage, project_memory,
 };
-use crate::llm_profile::{api_base_host, is_loopback_host};
+use crate::llm_profile::{LlmTimeouts, api_base_host, is_loopback_host};
+use crate::openai::transport_detail;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -121,6 +122,8 @@ pub(crate) struct GeminiSharedState {
     /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
     /// declaran en el body filtradas por los tools del spec del agente.
     pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub(crate) timeouts: LlmTimeouts,
 }
 
 /// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
@@ -541,8 +544,17 @@ fn post_gemini_json(
     body: JsonValue,
     agent: ConceptId,
     request: u64,
+    timeouts: LlmTimeouts,
 ) -> Result<ureq::Response, Reply> {
-    match ureq::post(url)
+    // `FIX-02`: timeouts explícitos por petición (connect corto + read por
+    // chunk SSE). Sin `timeout_read`, un proveedor mudo bloquea el read
+    // eternamente (ureq por defecto: "requests may block forever on reads").
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .build();
+    match http
+        .post(url)
         .set("x-goog-api-key", api_key)
         .send_json(body)
     {
@@ -561,7 +573,7 @@ fn post_gemini_json(
             format!(
                 "gemini transport error ({:?}): {}",
                 t.kind(),
-                t.message().unwrap_or("request failed")
+                transport_detail(&t)
             ),
         )),
     }
@@ -671,7 +683,7 @@ pub(crate) fn execute_gemini_http(
     model: &str,
     is_local_endpoint: bool,
 ) -> Reply {
-    let resp = match post_gemini_json(url, api_key, body, agent, request) {
+    let resp = match post_gemini_json(url, api_key, body, agent, request, shared.timeouts) {
         Ok(r) => r,
         Err(reply) => return reply,
     };
@@ -715,6 +727,7 @@ pub(crate) fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: J
         body,
         target.agent,
         target.request,
+        target.shared.timeouts,
     ) {
         Ok(r) => r,
         Err(reply) => {
@@ -809,6 +822,12 @@ impl GeminiResponder {
     /// Schemas MCP `mcp__*` a declarar en el body (`SDD-04 REQ-04.3`).
     pub fn with_mcp_schemas(mut self, mcp_schemas: Arc<Vec<ToolSchema>>) -> Self {
         self.shared.mcp_schemas = mcp_schemas;
+        self
+    }
+
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub fn with_llm_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.shared.timeouts = timeouts;
         self
     }
 }
