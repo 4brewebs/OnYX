@@ -1525,6 +1525,11 @@ fn launch_interactive_chat(
         .with_time_debug(time_debug.clone());
     let tui_handle = tui.handle();
     let quit = tui.quit_flag();
+    // `FIX-01`/`FIX-31`: la época de sesión la posee el host (la sube el
+    // runtime en `on_restore`, en cada restore que se aplica de verdad);
+    // las capas con registros que solo crecen reusan el handle y lo leen
+    // en `present()`.
+    let restore_epoch = host.restore_epoch_handle();
     let action_ctx = SessionActionContext {
         workspace_root: cli.workspace.clone(),
         config: chat_config,
@@ -1544,12 +1549,14 @@ fn launch_interactive_chat(
         .with_checkpoints(checkpoints)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .require_read_before_edit(true)
+        .with_restore_epoch(Arc::clone(&restore_epoch))
         .wrapping(tui);
     let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
         .with_policy(policy.clone())
         .with_mode_handle(mode_handle)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_proactive_notifications(true)
+        .with_restore_epoch(Arc::clone(&restore_epoch))
         .with_workspace_bridge(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
@@ -1570,6 +1577,7 @@ fn launch_interactive_chat(
         .with_external_driver_ids(driver_ids.to_vec())
         .with_mcp_schemas(Arc::clone(mcp_schemas))
         .with_llm_timeouts(llm.timeouts)
+        .with_restore_epoch(Arc::clone(&restore_epoch))
         .wrapping(sub_driver),
     );
 
@@ -1816,6 +1824,11 @@ fn launch_web_serve(
     println!("  API State:  GET http://{bound}/api/v1/state (Authorization: Bearer <key>)");
     println!("  Press Ctrl+C to stop cleanly.");
 
+    // `FIX-01`/`FIX-31`: la época de sesión la posee el host (la sube el
+    // runtime en `on_restore`, en cada restore que se aplica de verdad);
+    // las capas con registros que solo crecen reusan el handle y lo leen
+    // en `present()`.
+    let restore_epoch = host.restore_epoch_handle();
     let action_ctx = SessionActionContext {
         workspace_root: cli.workspace.clone(),
         config: serve_config,
@@ -1835,12 +1848,14 @@ fn launch_web_serve(
         .with_checkpoints(checkpoints)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .require_read_before_edit(true)
+        .with_restore_epoch(Arc::clone(&restore_epoch))
         .wrapping(web_driver);
     let sub_driver = SubagentManagerDriver::new(host.vocab(), sub_handle)
         .with_policy(policy.clone())
         .with_mode_handle(mode_handle)
         .with_ready_flag(Arc::clone(&bridge_ready))
         .with_proactive_notifications(true)
+        .with_restore_epoch(Arc::clone(&restore_epoch))
         .with_workspace_bridge(ws_bridge);
     let llm_in_flight = Arc::new(AtomicUsize::new(0));
     let llm_ready = Arc::new(AtomicBool::new(false));
@@ -1859,6 +1874,7 @@ fn launch_web_serve(
         .with_external_driver_ids(driver_ids.to_vec())
         .with_mcp_schemas(Arc::clone(mcp_schemas))
         .with_llm_timeouts(llm.timeouts)
+        .with_restore_epoch(Arc::clone(&restore_epoch))
         .wrapping(sub_driver),
     );
 

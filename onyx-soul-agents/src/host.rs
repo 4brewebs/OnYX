@@ -14,6 +14,8 @@
 //! [`AgentHost::request_restore`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use onyx_core::{
     AttrOnly, AttrRegistry, ConceptId, EventBus, GraphView, OnyxError, OnyxEvent, OnyxSystem,
@@ -180,8 +182,15 @@ impl HostBuilder {
         let mut systems =
             loader.load_app(&mut registry, &factories, &[blueprint], &self.stage_name)?;
 
-        if self.memory.is_some() || self.scripted.is_some() || self.approval.is_some() {
-            let mut runtime = AgentRuntime::new(config.clone());
+        // `FIX-31`: el host es dueño del contador de época; el runtime lo
+        // comparte (bump en `on_restore`, tras cada restore aplicado). La
+        // construcción unificada usa `config` directamente: `to_params`/
+        // `from_params` es inversa exacta salvo saturación > i64::MAX, que el
+        // chequeo de round-trip de `execution` ya rechaza.
+        let restore_epoch = Arc::new(AtomicU64::new(0));
+        {
+            let mut runtime =
+                AgentRuntime::new(config.clone()).with_restore_epoch(Arc::clone(&restore_epoch));
             if let Some(m) = self.memory {
                 runtime = runtime.with_memory(m);
             }
@@ -224,6 +233,7 @@ impl HostBuilder {
             config,
             seed: self.seed,
             n: 0,
+            restore_epoch,
         })
     }
 }
@@ -238,6 +248,9 @@ pub struct AgentHost {
     config: AgentConfig,
     seed: u64,
     n: u64,
+    /// `FIX-31`: contador de época de la sesión (restore aplicados con éxito),
+    /// compartido con el `AgentRuntime`.
+    restore_epoch: Arc<AtomicU64>,
 }
 
 impl AgentHost {
@@ -270,6 +283,22 @@ impl AgentHost {
     /// tick que guardó. No se llama desde [`request_restore`](Self::request_restore).
     pub fn set_tick(&mut self, n: u64) {
         self.n = n;
+    }
+
+    /// `FIX-31`: época de la sesión: número de restore aplicados con éxito.
+    /// Sube +1 en cada restore correcto (el runtime lo hace en `on_restore`,
+    /// que el core solo llama tras la importación); un `request_restore`
+    /// fallido no la sube. Es un metadato de la sesión viva, no del grafo:
+    /// no viaja en los snapshots.
+    pub fn restore_epoch(&self) -> u64 {
+        self.restore_epoch.load(Ordering::Acquire)
+    }
+
+    /// `FIX-31`: handle compartido del contador de época, para capas que
+    /// deben resetear su estado al cambiar (p. ej. los drivers de la app) o
+    /// stampear respuestas.
+    pub fn restore_epoch_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.restore_epoch)
     }
 
     pub fn system_names(&self) -> Vec<&str> {

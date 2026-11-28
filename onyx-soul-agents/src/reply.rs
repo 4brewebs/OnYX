@@ -72,6 +72,12 @@ pub struct Reply {
     pub payload: String,
     /// Identificador opcional de correlación para llamadas a herramientas (v2).
     pub call_id: Option<String>,
+    /// `FIX-31`: época de sesión en que se produjo la respuesta (restores
+    /// aplicados con éxito; contador compartido por el `AgentHost` y los
+    /// drivers). `None` = sin época (v1/v2: el runtime no la comprueba);
+    /// `Some(e)` = v3: el runtime la descarta si `e` difiere de la época
+    /// actual de la sesión (ni tarde, ni duplicada, ni ajena).
+    pub epoch: Option<u64>,
 }
 
 impl Reply {
@@ -82,11 +88,21 @@ impl Reply {
             verb,
             payload: payload.into(),
             call_id: None,
+            epoch: None,
         }
     }
 
     pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
         self.call_id = Some(call_id.into());
+        self
+    }
+
+    /// `FIX-31`: stampea la época de sesión (formato v3). Las transcripciones
+    /// graban una copia con `epoch = None` (v1/v2 byte-idénticos); el
+    /// transporte lleva la época para que el runtime descarte respuestas que
+    /// cruzan un restore.
+    pub fn with_epoch(mut self, epoch: u64) -> Self {
+        self.epoch = Some(epoch);
         self
     }
 
@@ -173,7 +189,26 @@ impl Reply {
 
     /// Formato v1: `agent \t request \t verb \t payload` en UTF-8.
     /// Formato v2 (cuando hay `call_id`): `v2 \t agent \t request \t verb \t len:call_id \t payload`.
+    /// Formato v3 (cuando hay `epoch`): `v3 \t agent \t request \t verb \t epoch \t len:call_id \t payload`;
+    /// el slot de `call_id` va SIEMPRE presente (un cid vacío es `0:` → sin `call_id`).
     pub fn to_bytes(&self) -> Vec<u8> {
+        if let Some(e) = self.epoch {
+            let (cid_len, cid) = match &self.call_id {
+                None => (0usize, ""),
+                Some(c) => (c.len(), c.as_str()),
+            };
+            return format!(
+                "v3\t{}\t{}\t{}\t{}\t{}:{}\t{}",
+                self.agent.0,
+                self.request,
+                self.verb.as_str(),
+                e,
+                cid_len,
+                cid,
+                self.payload
+            )
+            .into_bytes();
+        }
         match &self.call_id {
             None => format!(
                 "{}\t{}\t{}\t{}",
@@ -196,8 +231,42 @@ impl Reply {
         }
     }
 
+    /// `FIX-31`: v1/v2 no llevan época (`epoch = None`); v3 la lleva
+    /// (`epoch = Some(e)`) con el slot de `call_id` siempre presente
+    /// (`0:` → sin `call_id`).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let s = std::str::from_utf8(bytes).map_err(|_| "reply is not UTF-8".to_string())?;
+        if let Some(rest) = s.strip_prefix("v3\t") {
+            let mut parts = rest.splitn(5, '\t');
+            let agent = parts.next().and_then(|p| p.parse::<u64>().ok());
+            let request = parts.next().and_then(|p| p.parse::<u64>().ok());
+            let verb = parts.next().and_then(Verb::parse);
+            let epoch = parts.next().and_then(|p| p.parse::<u64>().ok());
+            let tail = parts.next();
+            let (Some(a), Some(r), Some(v), Some(e), Some(tail)) =
+                (agent, request, verb, epoch, tail)
+            else {
+                return Err("malformed reply".to_string());
+            };
+            let Some((len_str, after_colon)) = tail.split_once(':') else {
+                return Err("malformed reply".to_string());
+            };
+            let Ok(cid_len) = len_str.parse::<usize>() else {
+                return Err("malformed reply".to_string());
+            };
+            if after_colon.len() <= cid_len
+                || !after_colon.is_char_boundary(cid_len)
+                || after_colon.as_bytes()[cid_len] != b'\t'
+            {
+                return Err("malformed reply".to_string());
+            }
+            let mut reply =
+                Self::new(ConceptId(a), r, v, &after_colon[cid_len + 1..]).with_epoch(e);
+            if cid_len > 0 {
+                reply = reply.with_call_id(&after_colon[..cid_len]);
+            }
+            return Ok(reply);
+        }
         if let Some(rest) = s.strip_prefix("v2\t") {
             let mut parts = rest.splitn(4, '\t');
             let agent = parts.next().and_then(|p| p.parse::<u64>().ok());

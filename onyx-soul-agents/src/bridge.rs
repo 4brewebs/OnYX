@@ -18,6 +18,8 @@
 //! el host elige el offset. El core aún no define un protocolo de recuperación.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use onyx_core::{EventBus, GraphView, IngressEvent, OnyxEvent, PlatformDriver, SurfaceBinding};
 
@@ -254,6 +256,10 @@ pub struct RecordingBridge<R: Responder> {
     dispatched: BTreeSet<(u64, u64)>,
     polls: u64,
     transcript: Transcript,
+    /// `FIX-31`: handle de la época de sesión del host (opcional).
+    restore_epoch: Option<Arc<AtomicU64>>,
+    /// Última época vista en `present` (solo con handle).
+    seen_epoch: u64,
 }
 
 impl<R: Responder> RecordingBridge<R> {
@@ -266,7 +272,20 @@ impl<R: Responder> RecordingBridge<R> {
             dispatched: BTreeSet::new(),
             polls: 0,
             transcript: Transcript::default(),
+            restore_epoch: None,
+            seen_epoch: 0,
         }
+    }
+
+    /// `FIX-31`: comparte la época de sesión del `AgentHost`. Al cambiar la
+    /// época (un restore aplicado), las peticiones pendientes son peticiones
+    /// NUEVAS: `dispatched` se limpia para re-despacharlas, y las respuestas
+    /// encoladas se stampean con la época en que nacen (criterio 3 de la spec:
+    /// cada respuesta se compara con la época). Sin el handle (por ejemplo en
+    /// replays y tests sin restore en vivo) el comportamiento es el anterior.
+    pub fn with_restore_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.restore_epoch = Some(epoch);
+        self
     }
 
     /// Envuelve otro driver: sus eventos y su `present` siguen funcionando.
@@ -299,7 +318,10 @@ impl EventBus for RecordingBus<'_> {
     fn push(&mut self, event: OnyxEvent) {
         match &event {
             OnyxEvent::Ingress(IngressEvent::Raw { source, bytes }) if source == REPLY_SOURCE => {
-                if let Ok(reply) = Reply::from_bytes(bytes) {
+                if let Ok(mut reply) = Reply::from_bytes(bytes) {
+                    // `FIX-31` (c): la transcripción no viaja con época (v1/v2
+                    // byte-idénticos); el evento al bus la conserva.
+                    reply.epoch = None;
                     self.entries.push(Logged {
                         poll: self.poll,
                         reply,
@@ -339,9 +361,13 @@ impl<R: Responder> PlatformDriver for RecordingBridge<R> {
         }
         for reply in self.queued.drain(..) {
             bus.push(reply.to_event());
+            // `FIX-31` (c): el evento al bus conserva la época; la copia
+            // grabada la pierde (transcripción v1/v2 byte-idéntica).
+            let mut logged = reply.clone();
+            logged.epoch = None;
             self.transcript.entries.push(Logged {
                 poll: self.polls,
-                reply,
+                reply: logged,
             });
         }
         self.polls += 1;
@@ -351,10 +377,35 @@ impl<R: Responder> PlatformDriver for RecordingBridge<R> {
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
-        for request in pending_requests(graph, &self.vocab) {
+        let pending = pending_requests(graph, &self.vocab);
+        // `FIX-31`: cambio de época (restore aplicado) → línea temporal nueva:
+        // las peticiones pendientes son peticiones NUEVAS y el `dispatched`
+        // anterior ya no las protege (sin esto, la petición restaurada se
+        // salta y el agente queda colgado: el bug de FIX-31).
+        if let Some(epoch) = &self.restore_epoch {
+            let now = epoch.load(Ordering::Acquire);
+            if now != self.seen_epoch {
+                self.seen_epoch = now;
+                self.dispatched.clear();
+            }
+        }
+        // `FIX-31` (d): una petición que ya no está pendiente deja de estar
+        // protegida: si reaparece (rebobinado de contadores sin restore) debe
+        // re-despacharse.
+        let pending_keys: BTreeSet<(u64, u64)> =
+            pending.iter().map(|r| (r.agent.0, r.request)).collect();
+        self.dispatched.retain(|key| pending_keys.contains(key));
+        for request in &pending {
             // Cada petición se atiende una vez, aunque siga pendiente varios ticks.
             if self.dispatched.insert((request.agent.0, request.request)) {
-                if let Some(reply) = self.responder.respond(&request) {
+                if let Some(reply) = self.responder.respond(request) {
+                    // Cierra la ventana `present` → restore → `poll`: la respuesta
+                    // encolada viaja con la época en que nació, y el runtime la
+                    // descarta si cruza un restore.
+                    let reply = match (&self.restore_epoch, reply.epoch) {
+                        (Some(epoch), None) => reply.with_epoch(epoch.load(Ordering::Acquire)),
+                        _ => reply,
+                    };
                     self.queued.push(reply);
                 }
             }
@@ -423,7 +474,12 @@ impl PlatformDriver for ReplayBridge {
             if entry.poll != self.polls {
                 break;
             }
-            bus.push(entry.reply.to_event());
+            // `FIX-31` (c, defensivo): el replay nunca reinyecta épocas
+            // viejas: una transcripción grabada no las lleva (v1/v2), y una
+            // construida a mano no debe contaminar la sesión en curso.
+            let mut reply = entry.reply.clone();
+            reply.epoch = None;
+            bus.push(reply.to_event());
             self.cursor += 1;
         }
         self.polls += 1;
