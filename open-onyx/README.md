@@ -58,7 +58,7 @@ Loaded files are filtered through `scrub_secrets`, combined with the host OS she
 
 ```text
 openonyx chat [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <n>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
-openonyx serve [--bind <host:port>] [--api-key <key>] [--cors-origin <origin>] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <n>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
+openonyx serve [--bind <host:port>] [--api-key <key>] [--cors-origin <origin>] [--behind-tls] [--allowed-hosts <a,b>] [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <n>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>] [--resume <dir> [--tick <n>] [--fork-dir <dir>] [--truncate-future]]
 openonyx run <goal> [--workspace <dir>] [--provider <gemini|openai|anthropic>] [--model <name>] [--effort <low|medium|high>] [--thinking-budget <n>] [--api-base <url>] [--allow-custom-auth-host] [--trust-workspace] [--sandbox <off|workspace-write|strict-container>] [--sandbox-net <offline|localhost|unrestricted>] [--auto-approve] [--ignore-deny] [--max-steps <n>] [--max-subagents <n>] [--shell-timeout <secs>] [--llm-timeout-connect <secs>] [--llm-timeout-read <secs>] [--auto-save] [--save-transcript <file> | --record <file>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
 openonyx trust [add|list|check|revoke] [--workspace <dir>]
 openonyx replay <transcript> [--workspace <dir>] [--snapshot-dir <dir>] [--snapshot-every <n>] [--max-snapshots <n>]
@@ -142,7 +142,7 @@ cargo run -p open-onyx -- trust add --workspace .
 cargo run -p open-onyx -- trust list
 ```
 
-Serve the embedded mobile-first Web UI / PWA over HTTP/1.1 + SSE (loopback generates an ephemeral 256-bit API key; non-loopback requires an explicit `--api-key` `>= 16` chars):
+Serve the embedded mobile-first Web UI / PWA over HTTP/1.1 + SSE (loopback generates an ephemeral 256-bit API key; non-loopback requires an explicit `--api-key` `>= 16` chars). Behind a TLS-terminating reverse proxy, pass `--behind-tls` to enable exposed/secure mode (HSTS, `__Host-`/`Secure` cookies, `https` links) without trusting `X-Forwarded-Proto`; `--allowed-hosts <a,b>` optionally enforces a strict `Host` allowlist (a foreign or missing `Host` → `421`):
 
 ```sh
 # Local browser preview (prints URL + ephemeral API key)
@@ -150,6 +150,9 @@ cargo run -p open-onyx -- serve --workspace . --auto-save
 
 # Remote/proxy bind or external Svelte SPA via explicit CORS origin
 cargo run -p open-onyx -- serve --bind 0.0.0.0:8787 --api-key "your-long-secret-key" --cors-origin http://localhost:5173 --auto-save
+
+# Behind a TLS-terminating reverse proxy (enables exposed/secure mode) with a strict Host allowlist
+cargo run -p open-onyx -- serve --bind 127.0.0.1:8787 --behind-tls --allowed-hosts onyx.example.com --auto-save
 ```
 
 ## Session Vault (`.onyx/vault/`) & `--auto-save`

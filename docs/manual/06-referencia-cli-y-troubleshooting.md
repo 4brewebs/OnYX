@@ -17,7 +17,7 @@ openonyx rewind <snapshot_dir> <tick> [--transcript <file>] [--interactive | --t
 openonyx bench --snapshot-dir <dir> --tick <n> --models <list> [--goal <text>] [--verify <cmd>] [--out <file.json>] [--max-steps <n>] [OPCIONES]
 openonyx doctor [--workspace <dir>] [--snapshot-dir <dir>] [--transcript <file>]
 openonyx trust [--workspace <dir>] [add | list | check | revoke] [--list | --check | --revoke]
-openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [OPCIONES]
+openonyx serve [--workspace <dir>] [--bind <ip:port>] [--api-key <key>] [--cors-origin <origin>] [--behind-tls] [--allowed-hosts <a,b>] [OPCIONES]
 openonyx [--help | -h | --version | -V]
 ```
 
@@ -35,9 +35,11 @@ openonyx [--help | -h | --version | -V]
 | `--api-base <url>` | `chat`, `run`, `rewind` | URL base personalizada (`http://` permitido solo en loopback `localhost`/`127.0.0.1`/`[::1]`; hosts remotos exigen `https://`). |
 | `--allow-custom-auth-host` | `chat`, `run`, `rewind` | Opt-in explícito para enviar API keys a hosts HTTPS remotos no oficiales (o `ONYX_ALLOW_CUSTOM_AUTH_HOST=1`). |
 | `--trust-workspace` | `chat`, `run`, `rewind`, `serve` | Confía el workspace actual en memoria durante la sesión (sin modificar `~/.onyx/trusted_workspaces.toml`). |
-| `--bind <ip:port>` | `serve` | Dirección HTTP/SSE (default: `127.0.0.1:8787`; direcciones no loopback exigen `--api-key` explícita `>= 16` chars). |
-| `--api-key <key>` | `serve` | API key para autenticación (cookie `HttpOnly` o `Authorization: Bearer`; en loopback se genera aleatoria si se omite). |
-| `--cors-origin <url>` | `serve` | Origen explícito permitido para frontales externos (p. ej. SPA Svelte en `http://localhost:5173`; nunca `*`). |
+| `--bind <ip:port>` | `serve` | Dirección HTTP/SSE de bind (default: `127.0.0.1:8787`; un bind no loopback exige una `--api-key` explícita `>= 16` chars y activa el modo expuesto/seguro, al igual que `--behind-tls`). |
+| `--api-key <key>` | `serve` | API key para autenticación (cookie `HttpOnly` o `Authorization: Bearer`; en loopback se genera aleatoria si se omite; obligatoria, `>= 16` chars, en binds no loopback). |
+| `--cors-origin <url>` | `serve` | Origen explícito permitido para frontales externos (p. ej. SPA Svelte en `http://localhost:5173`; nunca `*`; el modo expuesto solo acepta `https://`). |
+| `--behind-tls` | `serve` | Hay un reverse proxy que termina TLS delante: activa el modo expuesto/seguro (HSTS, cookies `__Host-`/`Secure`, enlaces `https`) sin fiarse de `X-Forwarded-Proto`. |
+| `--allowed-hosts <a,b>` | `serve` | Allowlist estricta (opt-in) de valores de cabecera `Host` aceptados; un `Host` ausente o ajeno se rechaza con `421 Misdirected Request`. |
 | `--sandbox <off\|workspace-write\|strict-container>` | `chat`, `run`, `rewind` | Perfil de sandbox OS para `shell_exec` (default: `workspace-write`). |
 | `--sandbox-net <offline\|localhost\|unrestricted>` | `chat`, `run`, `rewind` | Política de red del sandbox (default: `offline`). |
 | `--auto-approve` | `chat`, `run`, `rewind` | Omite confirmaciones interactivas para herramientas mutantes (`deny` sigue aplicando y eleva sandbox `off` → `workspace-write` + `offline` salvo `--sandbox off`). |
@@ -45,8 +47,8 @@ openonyx [--help | -h | --version | -V]
 | `--max-steps <n>` | `chat`, `run` | Límite de pasos por turno del agente raíz (default: `128` en `chat`, `64` en `run`; subagentes `32` por defecto). |
 | `--max-subagents <n>` | `chat`, `run`, `serve`, `rewind --interactive` | Máximo de worktrees Git en paralelo para subagentes asíncronos (default: `3`, o `ONYX_MAX_SUBAGENTS`). |
 | `--shell-timeout <secs>` | `chat`, `run` | Timeout en segundos por comando `shell_exec` (default: `30s`). |
-| `--llm-timeout-connect <secs>` | `chat`, `run`, `serve` | Timeout en segundos del connect HTTP (TCP/TLS) al LLM (default: `30s`; o `ONYX_LLM_TIMEOUT_CONNECT_SECS`). |
-| `--llm-timeout-read <secs>` | `chat`, `run`, `serve` | Timeout en segundos del read HTTP entre bytes/chunks SSE del LLM (default: `120s`; o `ONYX_LLM_TIMEOUT_READ_SECS`). Un proveedor colgado falla el turno en tiempo acotado en vez de bloquear la sesión para siempre. |
+| `--llm-timeout-connect <secs>` | `chat`, `run`, `rewind`, `bench`, `serve` | Timeout en segundos del connect HTTP (TCP/TLS) al LLM (default: `30s`; o `ONYX_LLM_TIMEOUT_CONNECT_SECS`). |
+| `--llm-timeout-read <secs>` | `chat`, `run`, `rewind`, `bench`, `serve` | Timeout en segundos del read HTTP entre bytes/chunks SSE del LLM (default: `120s`; o `ONYX_LLM_TIMEOUT_READ_SECS`). Un proveedor colgado falla el turno en tiempo acotado en vez de bloquear la sesión para siempre. |
 | `--auto-save` | `chat`, `run` | Crea automáticamente `.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama\|goal>]/` con `snapshots.onyxpack` + `.tr` juntos (o `ONYX_AUTO_SAVE=1`). |
 | `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Guarda transcripción determinista `ONYXTR2` (nombres cortos van dentro de `--snapshot-dir`, o en `.onyx/vault/unassigned/` si no hay snapshot dir). |
 | `--snapshot-dir <dir>` | `chat`, `run`, `replay`, `doctor` | Directorio para `snapshots.onyxpack` (nombres cortos se resuelven en `.onyx/vault/<dir>/`). |
@@ -109,6 +111,9 @@ openonyx bench \
 | `ONYX_MAX_SUBAGENTS` | Ambos | Máximo de worktrees en paralelo para subagentes asíncronos (usado cuando no se pasa `--max-subagents <n>`; default: `3`). |
 | `ONYX_LLM_TIMEOUT_CONNECT_SECS` | Todos | Timeout en segundos del connect HTTP al LLM (default: `30`; fallback de `--llm-timeout-connect`). |
 | `ONYX_LLM_TIMEOUT_READ_SECS` | Todos | Timeout en segundos del read HTTP entre bytes/chunks SSE del LLM (default: `120`; fallback de `--llm-timeout-read`). |
+| `ONYX_WEB_BIND` | `serve` | Dirección de bind por defecto de `openonyx serve` (default: `127.0.0.1:8787`; fallback de `--bind`). |
+| `ONYX_WEB_API_KEY` | `serve` | API key explícita para `openonyx serve` (exigida en binds no loopback; fallback de `--api-key`). |
+| `ONYX_WEB_CORS_ORIGIN` | `serve` | Origen de navegador permitido para SPAs externas (fallback de `--cors-origin`). |
 | `GEMINI_API_BASE` | Gemini | Endpoint personalizado para Gemini. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Endpoint compatible con OpenAI (default: `https://api.openai.com/v1`). |
 | `ANTHROPIC_API_BASE` | Anthropic | Endpoint personalizado de la API de Anthropic (default: `https://api.anthropic.com`). |
@@ -184,6 +189,15 @@ Es el guard de `TimeFreeze` (capítulo 04, sección 9): la sesión está **conge
 - `/inject <texto>` / `/graph …` / `/read …` / `/step [n]` / `/step-llm` / `! <cmd>`: siguen funcionando bajo freeze (primitivas 0-tokens selladas).
 - En la Web, la barra ámbar (pulsar `#tick-pill`) tiene `Resume`; en la TUI, `Esc` vuelve al presente sin salir y `Ctrl+T` alterna el freeze.
 - En `POST /api/v1/command` el 409 incluye el mensaje accionable completo; un `400` en `POST /api/v1/time/scrub` significa tick futuro/purgado o acción desconocida (el body lo explica).
+
+### 12. `openonyx serve` devuelve un `4xx` al desplegar en VPS
+El hardening de `serve` responde con errores accionables en vez de aceptar tráfico dudoso:
+- `429 Too Many Requests` + `Retry-After`: más de 5 intentos por IP en 60 s (o 20 globales) antes de validar la clave.
+- `421 Misdirected Request`: con `--allowed-hosts`, la cabecera `Host` está ausente o no está en la lista.
+- `400 Bad Request`: cabeceras duplicadas (p. ej. `Content-Length` doble) u otra violación del parser HTTP estricto.
+- `431 Request Header Fields Too Large` / `413 Request Entity Too Large`: cabeceras o cuerpo por encima del tope.
+- `403 Forbidden`: POST con cookie sin `Sec-Fetch-Site` cuyo `Origin` no es el propio host ni el origen CORS emparejado.
+- `415 Unsupported Media Type`: POST con cookie cuyo `Content-Type` no es `application/json`.
 
 ---
 
