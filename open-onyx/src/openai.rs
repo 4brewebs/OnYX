@@ -647,7 +647,7 @@ pub(crate) fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: J
             Ok(r) => r,
             Err(err) => {
                 if let Some(prev) = target.preview {
-                    prev.clear();
+                    prev.clear_for(target.agent.0, target.request);
                 }
                 if err.retryable {
                     if let Some(&delay_ms) = RETRY_BACKOFF_MS.get(attempt) {
@@ -668,7 +668,7 @@ pub(crate) fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: J
             Ok(v) => v,
             Err(e) => {
                 if let Some(prev) = target.preview {
-                    prev.clear();
+                    prev.clear_for(target.agent.0, target.request);
                 }
                 if is_retryable_stream_error(&e) {
                     if let Some(&delay_ms) = RETRY_BACKOFF_MS.get(attempt) {
@@ -684,7 +684,7 @@ pub(crate) fn execute_openai_stream_http(target: OpenAiStreamTarget<'_>, body: J
             }
         };
         if let Some(prev) = target.preview {
-            prev.clear();
+            prev.clear_for(target.agent.0, target.request);
         }
         return parse_openai_response(
             &json,
@@ -965,7 +965,12 @@ mod tests {
         assert!(format!("{r1:?}").contains("fs_read"), "{r1:?}");
         assert!(format!("{r1:?}").contains("lib.rs"), "{r1:?}");
 
-        let next = next_queued_call(&pending, &dummy_agent_view(2, 7)).unwrap();
+        let mut follow_req = dummy_agent_view(2, 7);
+        follow_req.memory = vec![
+            ("call".to_string(), "fs_read {}".to_string()),
+            ("observe".to_string(), "ok".to_string()),
+        ];
+        let next = next_queued_call(&pending, &follow_req).unwrap();
         assert!(format!("{next:?}").contains("git_status"), "{next:?}");
     }
 

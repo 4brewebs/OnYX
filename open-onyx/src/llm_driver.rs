@@ -192,7 +192,7 @@ impl PlatformDriver for DynamicLlmDriver {
         self.has_ready.store(false, Ordering::Release);
         while let Ok(reply) = self.rx.try_recv() {
             if let Some(prev) = &self.stream_preview {
-                prev.clear();
+                prev.clear_for(reply.agent.0, reply.request);
             }
             bus.push(reply.to_event());
         }
@@ -219,6 +219,8 @@ impl PlatformDriver for DynamicLlmDriver {
                 if let Ok(mut queue) = self.gemini_shared.pending_calls.lock() {
                     queue.clear();
                 }
+                self.gemini_shared.clear_thought_signatures();
+                self.anthropic_shared.clear_thinking_blocks();
             }
         }
         if let Some(inner) = self.inner.as_mut() {
@@ -281,6 +283,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     shared.context_config = ctx_cfg;
                     shared.effort = effort;
                     shared.project_instructions = project_instructions.clone();
+                    shared.prune_thought_signatures_from(req.agent.0, call_index);
                     let body = {
                         let sigs = shared
                             .thought_signatures
@@ -295,6 +298,7 @@ impl PlatformDriver for DynamicLlmDriver {
                             shared.effort,
                             &shared.driver_ids,
                             &shared.mcp_schemas,
+                            &model,
                         )
                     };
                     let ready_flag = Arc::clone(&self.has_ready);

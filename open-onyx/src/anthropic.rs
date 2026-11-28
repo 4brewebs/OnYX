@@ -103,6 +103,14 @@ pub(crate) struct AnthropicSharedState {
     pub(crate) timeouts: LlmTimeouts,
 }
 
+impl AnthropicSharedState {
+    pub(crate) fn clear_thinking_blocks(&self) {
+        if let Ok(mut guard) = self.thinking_blocks.lock() {
+            guard.clear();
+        }
+    }
+}
+
 /// Bloque de contenido asistente en curso de un stream `content_block_*`.
 enum BlockState {
     Text,
@@ -1024,7 +1032,7 @@ pub(crate) fn execute_anthropic_stream_http(
             Ok(r) => r,
             Err(err) => {
                 if let Some(prev) = target.preview {
-                    prev.clear();
+                    prev.clear_for(target.agent.0, target.request);
                 }
                 if err.retryable {
                     if let Some(delay) = retry_delay_ms(attempt, err.retry_after_ms) {
@@ -1045,7 +1053,7 @@ pub(crate) fn execute_anthropic_stream_http(
             Ok(v) => v,
             Err(e) => {
                 if let Some(prev) = target.preview {
-                    prev.clear();
+                    prev.clear_for(target.agent.0, target.request);
                 }
                 if is_retryable_stream_error(&e) {
                     if let Some(delay) = retry_delay_ms(attempt, None) {
@@ -1061,7 +1069,7 @@ pub(crate) fn execute_anthropic_stream_http(
             }
         };
         if let Some(prev) = target.preview {
-            prev.clear();
+            prev.clear_for(target.agent.0, target.request);
         }
         return parse_anthropic_result(
             result,
@@ -1425,7 +1433,12 @@ mod tests {
         let first = format!("{reply:?}");
         assert!(first.contains("fs_read"), "{first}");
         // El segundo tool call queda en cola para el siguiente tick.
-        let next = next_queued_call(&pending, &dummy_agent_view(2, 7)).unwrap();
+        let mut follow_req = dummy_agent_view(2, 7);
+        follow_req.memory = vec![
+            ("call".to_string(), "fs_read {}".to_string()),
+            ("observe".to_string(), "ok".to_string()),
+        ];
+        let next = next_queued_call(&pending, &follow_req).unwrap();
         let second = format!("{next:?}");
         assert!(second.contains("git_status"), "{second}");
     }
