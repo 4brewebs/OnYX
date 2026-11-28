@@ -742,6 +742,15 @@ pub fn project_memory(
     memory: &[(String, String)],
     cfg: &TieredContextConfig,
 ) -> ProjectedMemory {
+    project_memory_with_offset(goal, memory, cfg, 0)
+}
+
+fn project_memory_with_offset(
+    goal: &str,
+    memory: &[(String, String)],
+    cfg: &TieredContextConfig,
+    base_call_offset: usize,
+) -> ProjectedMemory {
     let compact_pos = memory
         .iter()
         .rposition(|(k, t)| k == "system" && t.starts_with(COMPACT_MARKER));
@@ -756,14 +765,15 @@ pub fn project_memory(
             let initial = vec![ProjectedTurn::User(format!(
                 "[session_summary]\n{summary_body}"
             ))];
-            let prior_calls = memory[..=idx].iter().filter(|(k, _)| k == "call").count();
+            let prior_calls =
+                base_call_offset + memory[..=idx].iter().filter(|(k, _)| k == "call").count();
             (&memory[idx + 1..], initial, true, prior_calls)
         }
         None => (
             memory,
             vec![ProjectedTurn::User(format!("Goal: {goal}"))],
             false,
-            0usize,
+            base_call_offset,
         ),
     };
 
@@ -917,13 +927,17 @@ pub fn project_memory(
         let mut compacted_turns = vec![ProjectedTurn::User(format!(
             "[session_summary]\n{prefix_summary}"
         ))];
-        let mut tail_turns = project_memory(
+        let tail_slice = &active_slice[keep_slice..];
+        let tail_calls = tail_slice.iter().filter(|(k, _)| k == "call").count();
+        let tail_call_offset = call_index.saturating_sub(tail_calls);
+        let mut tail_turns = project_memory_with_offset(
             goal,
-            &active_slice[keep_slice..],
+            tail_slice,
             &TieredContextConfig {
                 auto_compact_ratio: 1.0,
                 ..*cfg
             },
+            tail_call_offset,
         )
         .turns;
         if !tail_turns.is_empty() {
@@ -1622,5 +1636,36 @@ mod tests {
         // opus: (1M * 15.00) + (1M * 75.00) = 90.0
         let opus = estimate_usage_cost_usd("claude-opus-4", opus_usage);
         assert!((opus - 90.0).abs() < 1e-9, "{opus}");
+    }
+
+    #[test]
+    fn tier2_auto_compaction_preserves_real_call_index_offset() {
+        let mut memory = Vec::new();
+        for i in 0..5 {
+            memory.push((
+                "call".to_string(),
+                format!("fs_read {{\"path\":\"f{i}.rs\"}}"),
+            ));
+            memory.push((
+                "observe".to_string(),
+                format!("content-{}", "x".repeat(400)),
+            ));
+        }
+        let cfg = TieredContextConfig {
+            model_context_tokens: 256,
+            auto_compact_ratio: 0.25,
+            ..TieredContextConfig::default()
+        };
+        let projected = project_memory("check files", &memory, &cfg);
+        assert_eq!(projected.highest_tier, ToolOutputTier::Tier2Compacted);
+        let retained_indices: Vec<usize> = projected
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                ProjectedTurn::ToolCall { call_index, .. } => Some(*call_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retained_indices, vec![3, 4]);
     }
 }
