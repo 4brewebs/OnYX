@@ -25,7 +25,11 @@ use crate::context::{
     ContextBudget, ProjectedTurn, ReasoningEffort, SessionTelemetryHandle, TieredContextConfig,
     extract_gemini_usage, project_memory,
 };
-use crate::llm_profile::{api_base_host, is_loopback_host};
+use crate::llm_profile::{LlmTimeouts, api_base_host, is_loopback_host};
+use crate::openai::{
+    MAX_TRANSIENT_RETRIES, RETRY_BACKOFF_MS, is_retryable_stream_error, is_transport_read_timeout,
+    transport_detail,
+};
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -87,9 +91,22 @@ impl StreamPreviewHandle {
         }
     }
 
+    #[cfg(test)]
     pub fn clear(&self) {
         if let Ok(mut guard) = self.inner.lock() {
             if guard.take().is_some() {
+                self.dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    pub fn clear_for(&self, agent: u64, request: u64) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard
+                .as_ref()
+                .is_some_and(|p| p.agent == agent && p.request == request)
+            {
+                guard.take();
                 self.dirty.store(true, Ordering::Release);
             }
         }
@@ -121,6 +138,22 @@ pub(crate) struct GeminiSharedState {
     /// Schemas MCP `mcp__*` del registro de arranque (`SDD-04 REQ-04.3`): se
     /// declaran en el body filtradas por los tools del spec del agente.
     pub(crate) mcp_schemas: Arc<Vec<ToolSchema>>,
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub(crate) timeouts: LlmTimeouts,
+}
+
+impl GeminiSharedState {
+    pub(crate) fn clear_thought_signatures(&self) {
+        if let Ok(mut guard) = self.thought_signatures.lock() {
+            guard.clear();
+        }
+    }
+
+    pub(crate) fn prune_thought_signatures_from(&self, agent: u64, from_call_index: usize) {
+        if let Ok(mut guard) = self.thought_signatures.lock() {
+            guard.retain(|&(a, idx), _| a != agent || idx < from_call_index);
+        }
+    }
 }
 
 /// Carga instrucciones de proyecto desde `~/.onyx/{AGENTS,ONYX}.md` y `<workspace>/{AGENTS,ONYX}.md`,
@@ -184,10 +217,7 @@ pub(crate) struct QueuedToolCall {
 
 pub(crate) fn next_queued_call(pending_calls: &PendingCallQueue, req: &AgentView) -> Option<Reply> {
     let mut guard = pending_calls.lock().ok()?;
-    if matches!(
-        req.memory.last().map(|(k, _)| k.as_str()),
-        Some("tool_error" | "denied")
-    ) {
+    if req.memory.last().map(|(k, _)| k.as_str()) != Some("observe") {
         guard.remove(&req.agent.0);
         return None;
     }
@@ -236,7 +266,16 @@ fn build_request_body_with_budget(
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
     budget: ContextBudget,
 ) -> JsonValue {
-    build_request_body_with_context(req, thought_signatures, budget.into(), "", None, &[], &[])
+    build_request_body_with_context(
+        req,
+        thought_signatures,
+        budget.into(),
+        "",
+        None,
+        &[],
+        &[],
+        DEFAULT_GEMINI_MODEL,
+    )
 }
 
 const BASE_INSTRUCTION: &str = "You are openOnyx, a precise software engineering agent. When mapping architecture or inspecting unfamiliar crates, call `scent_outline` first to get compact @TOON v1 signatures and line ranges, call `scent_impact` before editing shared symbols, and use `fs_read` with bounded `start_line`/`end_line` ranges rather than reading whole files unnecessarily. Do not re-read unchanged files or repeat `scent_outline` queries already summarized in your history unless the file was modified. Never create temporary helper scripts or scratch directories inside the workspace repository; use built-in tools (`glob_files`, `code_search`, `scent_outline`) for counting and inspection. Never use `shell_exec` to read, list, search files (such as `nl`, `cat`, `grep`, `find`), or inspect git status/diff; always use `fs_read`, `fs_list`, `code_search`, `scent_outline`, `scent_impact`, `scent_references`, `git_status`, `git_diff`, and `load_skill` (which are read-only and require no approval), reserving `shell_exec` strictly for builds, tests, or mutating commands. When handling multi-step workspace tasks, maintain progress visibly with `plan_update` (`pending`, `in_progress`, `completed`), but never call `plan_update` multiple times in a row without executing real workspace tools in between; for purely conceptual questions or single-step answers that do not inspect or modify the workspace, omit `plan_update` (or call it at most once). Call `load_skill` whenever a specialized skill (e.g. `scent`, `rust`, or a listed workspace skill) applies. Verify exact dependency and enum names with `fs_read` before citing them. Never invent or paraphrase symbol, struct, trait, enum, or function names that did not literally appear in `scent_outline`, `scent_impact`, or `fs_read` output; if `scent_outline` returns `# next_cursor=...`, paginate with `cursor` before summarizing unread symbols. For multi-region updates to a single file, prefer multi-hunk `fs_edit` (`edits: [{ old_text, new_text }]`). You can delegate bounded subtasks with `spawn_agent` when useful. Read files before editing them, keep changes minimal, and summarize your final answer clearly when done.";
@@ -264,6 +303,58 @@ pub(crate) fn system_instruction_text(project_instructions: &str) -> String {
 /// firmas de pensamiento y esfuerzo de razonamiento. `pub(crate)` para
 /// `DynamicLlmDriver` (`SDD-03` Fase 2), que construye el body síncrono en el
 /// hilo principal antes de `thread::spawn`.
+fn push_turn_parts(contents: &mut Vec<JsonValue>, role: &str, mut parts: Vec<JsonValue>) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(last) = contents.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                existing.append(&mut parts);
+                return;
+            }
+        }
+    }
+    contents.push(json!({
+        "role": role,
+        "parts": parts
+    }));
+}
+
+fn gemini_thinking_config(model: &str, effort: ReasoningEffort) -> Option<JsonValue> {
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("gemini-1.") {
+        return None;
+    }
+    if lower.starts_with("gemini-2.0") {
+        if lower.contains("thinking") {
+            return Some(json!({ "includeThoughts": true }));
+        }
+        return None;
+    }
+    if lower.starts_with("gemini-2.5") {
+        let budget = match effort {
+            ReasoningEffort::Low => 2048,
+            ReasoningEffort::Medium => 8192,
+            ReasoningEffort::High => 24576,
+        };
+        return Some(json!({
+            "thinkingBudget": budget,
+            "includeThoughts": true
+        }));
+    }
+    let level = if lower.starts_with("gemini-3-pro") && effort == ReasoningEffort::Medium {
+        "HIGH"
+    } else {
+        effort.as_gemini_level()
+    };
+    Some(json!({
+        "thinkingLevel": level,
+        "includeThoughts": true
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_request_body_with_context(
     req: &AgentView,
     thought_signatures: &HashMap<(u64, usize), JsonValue>,
@@ -272,67 +363,73 @@ pub(crate) fn build_request_body_with_context(
     effort: Option<ReasoningEffort>,
     driver_ids: &[String],
     mcp_schemas: &[ToolSchema],
+    model: &str,
 ) -> JsonValue {
     let projected = project_memory(&req.goal, &req.memory, &budget);
     let mut contents: Vec<JsonValue> = Vec::with_capacity(projected.turns.len());
     for turn in projected.turns {
         match turn {
-            ProjectedTurn::User(text) => contents.push(json!({
-                "role": "user",
-                "parts": [{ "text": text }]
-            })),
-            ProjectedTurn::AssistantText(text) => contents.push(json!({
-                "role": "model",
-                "parts": [{ "text": text }]
-            })),
+            ProjectedTurn::User(text) => {
+                push_turn_parts(&mut contents, "user", vec![json!({ "text": text })]);
+            }
+            ProjectedTurn::AssistantText(text) => {
+                push_turn_parts(&mut contents, "model", vec![json!({ "text": text })]);
+            }
             ProjectedTurn::ToolCall {
                 call_index,
                 name,
                 args_json,
                 ..
             } => {
-                let parsed_args: JsonValue = serde_json::from_str(&args_json)
-                    .unwrap_or_else(|_| json!({ "raw": args_json }));
+                let parsed_args = match serde_json::from_str::<JsonValue>(&args_json) {
+                    Ok(JsonValue::Object(map)) => JsonValue::Object(map),
+                    Ok(JsonValue::Null) => json!({}),
+                    _ => json!({ "raw": args_json }),
+                };
                 let mut part = json!({
                     "functionCall": { "name": name, "args": parsed_args }
                 });
                 if let Some(sig) = thought_signatures.get(&(req.agent.0, call_index)) {
                     part["thoughtSignature"] = sig.clone();
                 }
-                contents.push(json!({
-                    "role": "model",
-                    "parts": [part]
-                }));
+                push_turn_parts(&mut contents, "model", vec![part]);
             }
-            ProjectedTurn::ToolObserve { name, content, .. } => contents.push(json!({
-                "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        "name": name,
-                        "response": { "result": content }
-                    }
-                }]
-            })),
-            ProjectedTurn::ToolError { name, error, .. } => contents.push(json!({
-                "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        "name": name,
-                        "response": { "error": error }
-                    }
-                }]
-            })),
+            ProjectedTurn::ToolObserve { name, content, .. } => {
+                push_turn_parts(
+                    &mut contents,
+                    "user",
+                    vec![json!({
+                        "functionResponse": {
+                            "name": name,
+                            "response": { "result": content }
+                        }
+                    })],
+                );
+            }
+            ProjectedTurn::ToolError { name, error, .. } => {
+                push_turn_parts(
+                    &mut contents,
+                    "user",
+                    vec![json!({
+                        "functionResponse": {
+                            "name": name,
+                            "response": { "error": error }
+                        }
+                    })],
+                );
+            }
             ProjectedTurn::ToolDenied { name, reason, .. } => {
                 let msg_text = format!("Tool call denied: {reason}. Adjust your plan.");
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{
+                push_turn_parts(
+                    &mut contents,
+                    "user",
+                    vec![json!({
                         "functionResponse": {
                             "name": name,
                             "response": { "error": msg_text }
                         }
-                    }]
-                }));
+                    })],
+                );
             }
         }
     }
@@ -380,11 +477,11 @@ pub(crate) fn build_request_body_with_context(
         body["tools"] = json!([{ "functionDeclarations": declarations }]);
     }
     if let Some(eff) = effort {
-        body["generationConfig"] = json!({
-            "thinkingConfig": {
-                "thinkingLevel": eff.as_gemini_level()
-            }
-        });
+        if let Some(thinking_cfg) = gemini_thinking_config(model, eff) {
+            body["generationConfig"] = json!({
+                "thinkingConfig": thinking_cfg
+            });
+        }
     }
     body
 }
@@ -397,7 +494,7 @@ pub(crate) fn build_request_body_with_context(
 ///   `additionalProperties`, `$id`, `$defs`, `definitions`, `default`, `examples`,
 ///   `title`.
 fn sanitize_gemini_mcp_schema(val: &mut JsonValue) {
-    const STRIP_KEYS: [&str; 8] = [
+    const STRIP_KEYS: [&str; 25] = [
         "$schema",
         "additionalProperties",
         "$id",
@@ -406,14 +503,58 @@ fn sanitize_gemini_mcp_schema(val: &mut JsonValue) {
         "default",
         "examples",
         "title",
+        "$ref",
+        "$comment",
+        "$anchor",
+        "$dynamicRef",
+        "$vocabulary",
+        "oneOf",
+        "allOf",
+        "not",
+        "const",
+        "patternProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "dependentRequired",
+        "dependentSchemas",
+    ];
+    const EXTRA_STRIP_KEYS: [&str; 9] = [
+        "if",
+        "then",
+        "else",
+        "contentMediaType",
+        "contentEncoding",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
+        "discriminator",
     ];
     match val {
         JsonValue::Object(map) => {
-            if let Some(ty) = map.get("type").and_then(|v| v.as_str()) {
-                map.insert(
-                    "type".to_string(),
-                    JsonValue::String(ty.to_ascii_uppercase()),
-                );
+            if let Some(JsonValue::String(s)) = map.get("const").cloned() {
+                if !map.contains_key("enum") {
+                    map.insert(
+                        "enum".to_string(),
+                        JsonValue::Array(vec![JsonValue::String(s)]),
+                    );
+                    if !map.contains_key("type") {
+                        map.insert("type".to_string(), JsonValue::String("STRING".to_string()));
+                    }
+                }
+            }
+            if let Some(ty) = map.get("type").and_then(|v| v.as_str()).map(str::to_owned) {
+                if ty.eq_ignore_ascii_case("null") {
+                    map.remove("type");
+                    map.insert("nullable".to_string(), JsonValue::Bool(true));
+                } else {
+                    map.insert(
+                        "type".to_string(),
+                        JsonValue::String(ty.to_ascii_uppercase()),
+                    );
+                }
             } else if let Some(JsonValue::Array(tys)) = map.get("type") {
                 // Clonamos el array: mutar `map` con `tys` vivo no compila
                 // (préstamo inmutable pendiente del `map.get`).
@@ -427,25 +568,44 @@ fn sanitize_gemini_mcp_schema(val: &mut JsonValue) {
                 let kept: Vec<JsonValue> = tys
                     .into_iter()
                     .filter(|t| t.as_str().is_none_or(|s| !s.eq_ignore_ascii_case("null")))
-                    .map(|t| match t.as_str() {
-                        Some(s) => JsonValue::String(s.to_ascii_uppercase()),
-                        None => t,
+                    .filter_map(|t| {
+                        t.as_str()
+                            .map(|s| JsonValue::String(s.to_ascii_uppercase()))
                     })
                     .collect();
                 match kept.len() {
+                    0 => {
+                        map.remove("type");
+                    }
                     1 => {
                         map.insert("type".to_string(), kept.into_iter().next().unwrap());
                     }
                     _ => {
-                        map.insert("type".to_string(), JsonValue::Array(kept));
+                        map.remove("type");
+                        if !map.contains_key("anyOf") {
+                            let union: Vec<JsonValue> =
+                                kept.into_iter().map(|t| json!({ "type": t })).collect();
+                            map.insert("anyOf".to_string(), JsonValue::Array(union));
+                        }
                     }
-                };
+                }
             }
-            for key in STRIP_KEYS {
-                map.remove(key);
+            for key in STRIP_KEYS.iter().chain(EXTRA_STRIP_KEYS.iter()) {
+                map.remove(*key);
             }
-            for v in map.values_mut() {
-                sanitize_gemini_mcp_schema(v);
+            for (k, v) in map.iter_mut() {
+                if k == "properties" {
+                    // Las claves de `"properties"` son nombres de argumentos de la tool
+                    // (p. ej. `title`, `default`, `const`, `readOnly`, `deprecated`),
+                    // no keywords JSON Schema: sanitizar solo el esquema de cada propiedad.
+                    if let JsonValue::Object(props) = v {
+                        for prop_schema in props.values_mut() {
+                            sanitize_gemini_mcp_schema(prop_schema);
+                        }
+                    }
+                } else {
+                    sanitize_gemini_mcp_schema(v);
+                }
             }
         }
         JsonValue::Array(arr) => {
@@ -475,6 +635,18 @@ pub(crate) fn parse_gemini_response(
             telemetry.record_turn_for(model, is_local_endpoint, usage);
         }
     }
+    if let Some(err) = json.get("error") {
+        let code = err
+            .get("code")
+            .and_then(|v| v.as_i64())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let msg = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Reply::fail(agent, request, format!("gemini API error ({code}): {msg}"));
+    }
     let parts = json["candidates"][0]["content"]["parts"]
         .as_array()
         .cloned()
@@ -490,22 +662,38 @@ pub(crate) fn parse_gemini_response(
     if !function_calls.is_empty() {
         let mut parsed = Vec::with_capacity(function_calls.len());
         let mut batch_sig: Option<JsonValue> = None;
-        for (offset, (part, fc)) in function_calls.into_iter().enumerate() {
+        for (part, fc) in function_calls {
             if let Some(sig) = part.get("thoughtSignature") {
                 batch_sig = Some(sig.clone());
             }
+            let name = fc["name"].as_str().unwrap_or_default().trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
             if let Some(ref sig) = batch_sig {
                 if let Ok(mut guard) = shared.thought_signatures.lock() {
-                    guard.insert((agent.0, call_index + offset), sig.clone());
+                    guard.insert((agent.0, call_index + parsed.len()), sig.clone());
                 }
             }
-            let name = fc["name"].as_str().unwrap_or_default().to_string();
-            let args = serde_json::to_string(&fc["args"]).unwrap_or_else(|_| "{}".to_string());
+            let args = match fc.get("args") {
+                Some(JsonValue::Object(map)) => {
+                    serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string())
+                }
+                _ => "{}".to_string(),
+            };
             parsed.push(QueuedToolCall { name, args });
         }
 
+        if parsed.is_empty() {
+            return Reply::fail(
+                agent,
+                request,
+                "gemini: malformed functionCall with empty name",
+            );
+        }
+
         let mut iter = parsed.into_iter();
-        let first = iter.next().expect("non-empty function_calls");
+        let first = iter.next().expect("non-empty parsed function_calls");
         push_queued_calls(&shared.pending_calls, agent, iter);
         return Reply::call_structured(agent, request, first.name, first.args);
     }
@@ -522,6 +710,16 @@ pub(crate) fn parse_gemini_response(
         .join("\n");
 
     if text.is_empty() {
+        if let Some(block_reason) = json
+            .pointer("/promptFeedback/blockReason")
+            .and_then(|v| v.as_str())
+        {
+            return Reply::fail(
+                agent,
+                request,
+                format!("gemini: prompt blocked ({block_reason})"),
+            );
+        }
         let reason = json["candidates"][0]["finishReason"]
             .as_str()
             .unwrap_or("unknown");
@@ -535,35 +733,94 @@ pub(crate) fn parse_gemini_response(
     }
 }
 
+const MAX_RETRY_AFTER_MS: u64 = 10_000;
+
+fn is_retryable_http_status(code: u16) -> bool {
+    matches!(code, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn parse_retry_after_ms(resp: &ureq::Response) -> Option<u64> {
+    let raw = resp.header("retry-after")?.trim();
+    let secs: u64 = raw.parse().ok()?;
+    Some(secs.saturating_mul(1_000).min(MAX_RETRY_AFTER_MS))
+}
+
+fn is_retryable_gemini_stream_error(msg: &str) -> bool {
+    is_retryable_stream_error(msg)
+        || msg.contains("truncated SSE stream")
+        || msg.contains("retryable SSE error")
+}
+
+fn is_retryable_sse_error_obj(err: &JsonValue) -> bool {
+    let code = err.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+    if matches!(code, 408 | 429 | 500 | 502 | 503 | 504) {
+        return true;
+    }
+    matches!(
+        err.get("status").and_then(|v| v.as_str()),
+        Some("UNAVAILABLE" | "RESOURCE_EXHAUSTED" | "DEADLINE_EXCEEDED" | "INTERNAL")
+    )
+}
+
+struct GeminiHttpError {
+    reply: Reply,
+    retryable: bool,
+    retry_after_ms: Option<u64>,
+}
+
+fn gemini_retry_delay_ms(attempt: usize, retry_after_ms: Option<u64>) -> Option<u64> {
+    let &base = RETRY_BACKOFF_MS.get(attempt)?;
+    let delay = match retry_after_ms {
+        Some(r) => base.max(r.min(MAX_RETRY_AFTER_MS)),
+        None => base,
+    };
+    Some(delay)
+}
+
 fn post_gemini_json(
     url: &str,
     api_key: &str,
-    body: JsonValue,
+    body: &JsonValue,
     agent: ConceptId,
     request: u64,
-) -> Result<ureq::Response, Reply> {
-    match ureq::post(url)
+    timeouts: LlmTimeouts,
+) -> Result<ureq::Response, GeminiHttpError> {
+    // `FIX-02`: timeouts explícitos por petición (connect corto + read por
+    // chunk SSE). Sin `timeout_read`, un proveedor mudo bloquea el read
+    // eternamente (ureq por defecto: "requests may block forever on reads").
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(timeouts.read)
+        .build();
+    match http
+        .post(url)
         .set("x-goog-api-key", api_key)
         .send_json(body)
     {
         Ok(r) => Ok(r),
         Err(ureq::Error::Status(code, r)) => {
+            let retry_after_ms = parse_retry_after_ms(&r);
             let err_body = r.into_string().unwrap_or_default();
-            Err(Reply::fail(
+            Err(GeminiHttpError {
+                reply: Reply::fail(agent, request, format!("gemini HTTP {code}: {err_body}")),
+                retryable: is_retryable_http_status(code),
+                retry_after_ms,
+            })
+        }
+        Err(ureq::Error::Transport(t)) => Err(GeminiHttpError {
+            reply: Reply::fail(
                 agent,
                 request,
-                format!("gemini HTTP {code}: {err_body}"),
-            ))
-        }
-        Err(ureq::Error::Transport(t)) => Err(Reply::fail(
-            agent,
-            request,
-            format!(
-                "gemini transport error ({:?}): {}",
-                t.kind(),
-                t.message().unwrap_or("request failed")
+                format!(
+                    "gemini transport error ({:?}): {}",
+                    t.kind(),
+                    transport_detail(&t)
+                ),
             ),
-        )),
+            // `FIX-02` (cierre de auditoría): read timeout NO es reintenable.
+            retryable: !is_transport_read_timeout(&t),
+            retry_after_ms: None,
+        }),
     }
 }
 
@@ -578,19 +835,55 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
     let mut call_parts: Vec<JsonValue> = Vec::new();
     let mut last_finish_reason: Option<String> = None;
     let mut last_usage: Option<JsonValue> = None;
+    let mut last_error: Option<JsonValue> = None;
+    let mut last_prompt_feedback: Option<JsonValue> = None;
+    let mut last_non_call_sig: Option<JsonValue> = None;
     let mut saw_sse_data = false;
+    let mut saw_done = false;
     let mut raw_fallback = String::new();
 
     for line_res in reader.lines() {
-        let line = line_res.map_err(|e| e.to_string())?;
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                if (saw_done || last_finish_reason.is_some())
+                    && (!text_acc.is_empty() || !call_parts.is_empty())
+                {
+                    break;
+                }
+                return Err(e.to_string());
+            }
+        };
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("data:") {
             let data = rest.trim();
-            if data.is_empty() || data == "[DONE]" {
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                saw_done = true;
                 continue;
             }
             let chunk: JsonValue = serde_json::from_str(data).map_err(|e| e.to_string())?;
             saw_sse_data = true;
+            if let Some(err) = chunk.get("error") {
+                if !err.is_null() {
+                    if is_retryable_sse_error_obj(err) {
+                        let code = err.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let msg = err
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        return Err(format!("retryable SSE error ({code}): {msg}"));
+                    }
+                    last_error = Some(err.clone());
+                }
+            }
+            if let Some(pf) = chunk.get("promptFeedback") {
+                if !pf.is_null() {
+                    last_prompt_feedback = Some(pf.clone());
+                }
+            }
             if let Some(usage) = chunk.get("usageMetadata") {
                 if !usage.is_null() {
                     last_usage = Some(usage.clone());
@@ -615,18 +908,23 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
                                     prev.set(agent.0, request, format!("[calling `{name}`...]"));
                                 }
                             }
-                        } else if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
-                            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                thought_acc.push_str(t);
-                                if let Some(prev) = preview {
-                                    prev.set_thought(agent.0, request, &thought_acc);
-                                }
+                        } else {
+                            if let Some(sig) = part.get("thoughtSignature") {
+                                last_non_call_sig = Some(sig.clone());
                             }
-                            continue;
-                        } else if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            text_acc.push_str(t);
-                            if let Some(prev) = preview {
-                                prev.set(agent.0, request, &text_acc);
+                            if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                    thought_acc.push_str(t);
+                                    if let Some(prev) = preview {
+                                        prev.set_thought(agent.0, request, &thought_acc);
+                                    }
+                                }
+                                continue;
+                            } else if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                text_acc.push_str(t);
+                                if let Some(prev) = preview {
+                                    prev.set(agent.0, request, &text_acc);
+                                }
                             }
                         }
                     }
@@ -639,19 +937,58 @@ pub(crate) fn accumulate_gemini_sse_reader<R: std::io::BufRead>(
     }
 
     if saw_sse_data {
+        if let Some(err) = last_error {
+            let mut out = json!({ "error": err });
+            if let Some(usage) = last_usage {
+                out["usageMetadata"] = usage;
+            }
+            return Ok(out);
+        }
+
         let mut parts = Vec::new();
         if !text_acc.is_empty() {
-            parts.push(json!({ "text": text_acc }));
+            let mut text_part = json!({ "text": text_acc });
+            if call_parts.is_empty() {
+                if let Some(sig) = last_non_call_sig.take() {
+                    text_part["thoughtSignature"] = sig;
+                }
+            }
+            parts.push(text_part);
+        }
+        if let (Some(first_call), Some(sig)) = (call_parts.first_mut(), last_non_call_sig.take()) {
+            if first_call.get("thoughtSignature").is_none() {
+                first_call["thoughtSignature"] = sig;
+            }
         }
         parts.extend(call_parts);
+
+        if parts.is_empty() {
+            if let Some(pf) = last_prompt_feedback {
+                let mut out = json!({ "promptFeedback": pf, "candidates": [] });
+                if let Some(usage) = last_usage {
+                    out["usageMetadata"] = usage;
+                }
+                return Ok(out);
+            }
+        }
+
+        if !saw_done && last_finish_reason.is_none() {
+            return Err("truncated SSE stream: missing finishReason".to_string());
+        }
+
+        let mut cand_obj = serde_json::Map::new();
+        cand_obj.insert("content".to_string(), json!({ "parts": parts }));
+        if let Some(fr) = last_finish_reason {
+            cand_obj.insert("finishReason".to_string(), JsonValue::String(fr));
+        }
         let mut out = json!({
-            "candidates": [{
-                "content": { "parts": parts },
-                "finishReason": last_finish_reason.unwrap_or_else(|| "STOP".to_string())
-            }]
+            "candidates": [JsonValue::Object(cand_obj)]
         });
         if let Some(usage) = last_usage {
             out["usageMetadata"] = usage;
+        }
+        if let Some(pf) = last_prompt_feedback {
+            out["promptFeedback"] = pf;
         }
         Ok(out)
     } else {
@@ -671,26 +1008,44 @@ pub(crate) fn execute_gemini_http(
     model: &str,
     is_local_endpoint: bool,
 ) -> Reply {
-    let resp = match post_gemini_json(url, api_key, body, agent, request) {
-        Ok(r) => r,
-        Err(reply) => return reply,
-    };
-    let json: JsonValue = match resp.into_json() {
-        Ok(v) => v,
-        Err(e) => {
-            return Reply::fail(agent, request, format!("gemini json error: {e}"));
-        }
-    };
+    for attempt in 0..=MAX_TRANSIENT_RETRIES {
+        let resp = match post_gemini_json(url, api_key, &body, agent, request, shared.timeouts) {
+            Ok(r) => r,
+            Err(err) => {
+                if err.retryable {
+                    if let Some(delay_ms) = gemini_retry_delay_ms(attempt, err.retry_after_ms) {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        continue;
+                    }
+                }
+                return err.reply;
+            }
+        };
+        let json: JsonValue = match resp.into_json() {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_retryable_gemini_stream_error(&msg) {
+                    if let Some(delay_ms) = gemini_retry_delay_ms(attempt, None) {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        continue;
+                    }
+                }
+                return Reply::fail(agent, request, format!("gemini json error: {e}"));
+            }
+        };
 
-    parse_gemini_response(
-        &json,
-        agent,
-        request,
-        call_index,
-        shared,
-        model,
-        is_local_endpoint,
-    )
+        return parse_gemini_response(
+            &json,
+            agent,
+            request,
+            call_index,
+            shared,
+            model,
+            is_local_endpoint,
+        );
+    }
+    unreachable!("retry loop always returns on final attempt")
 }
 
 /// Parámetros inmutables de una llamada SSE `streamGenerateContent`
@@ -709,28 +1064,54 @@ pub(crate) struct GeminiStreamTarget<'a> {
 }
 
 pub(crate) fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: JsonValue) -> Reply {
-    let resp = match post_gemini_json(
-        target.url,
-        target.api_key,
-        body,
-        target.agent,
-        target.request,
-    ) {
-        Ok(r) => r,
-        Err(reply) => {
-            if let Some(prev) = target.preview {
-                prev.clear();
+    for attempt in 0..=MAX_TRANSIENT_RETRIES {
+        let resp = match post_gemini_json(
+            target.url,
+            target.api_key,
+            &body,
+            target.agent,
+            target.request,
+            target.shared.timeouts,
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                if let Some(prev) = target.preview {
+                    prev.clear_for(target.agent.0, target.request);
+                }
+                if err.retryable {
+                    if let Some(delay_ms) = gemini_retry_delay_ms(attempt, err.retry_after_ms) {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        continue;
+                    }
+                }
+                return err.reply;
             }
-            return reply;
-        }
-    };
-    let reader = std::io::BufReader::new(resp.into_reader());
-    let json =
+        };
+        let reader = std::io::BufReader::new(resp.into_reader());
         match accumulate_gemini_sse_reader(reader, target.agent, target.request, target.preview) {
-            Ok(v) => v,
+            Ok(json) => {
+                if let Some(prev) = target.preview {
+                    prev.clear_for(target.agent.0, target.request);
+                }
+                return parse_gemini_response(
+                    &json,
+                    target.agent,
+                    target.request,
+                    target.call_index,
+                    target.shared,
+                    target.model,
+                    target.is_local_endpoint,
+                );
+            }
             Err(e) => {
                 if let Some(prev) = target.preview {
-                    prev.clear();
+                    prev.clear_for(target.agent.0, target.request);
+                }
+                if is_retryable_gemini_stream_error(&e) {
+                    if let Some(delay_ms) = gemini_retry_delay_ms(attempt, None) {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        continue;
+                    }
                 }
                 return Reply::fail(
                     target.agent,
@@ -738,19 +1119,9 @@ pub(crate) fn execute_gemini_stream_http(target: GeminiStreamTarget<'_>, body: J
                     format!("gemini stream error: {e}"),
                 );
             }
-        };
-    if let Some(prev) = target.preview {
-        prev.clear();
+        }
     }
-    parse_gemini_response(
-        &json,
-        target.agent,
-        target.request,
-        target.call_index,
-        target.shared,
-        target.model,
-        target.is_local_endpoint,
-    )
+    unreachable!("stream retry loop always returns on final attempt")
 }
 
 /// Adaptador síncrono para Google AI Studio (Gemini `generateContent` REST API).
@@ -811,6 +1182,12 @@ impl GeminiResponder {
         self.shared.mcp_schemas = mcp_schemas;
         self
     }
+
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (connect/read).
+    pub fn with_llm_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.shared.timeouts = timeouts;
+        self
+    }
 }
 
 impl Responder for GeminiResponder {
@@ -820,6 +1197,9 @@ impl Responder for GeminiResponder {
         }
         let is_local = is_loopback_host(api_base_host(&self.api_base));
         let url = format!("{}/models/{}:generateContent", self.api_base, self.model);
+        let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
+        self.shared
+            .prune_thought_signatures_from(req.agent.0, call_index);
         let body = {
             let sigs = self
                 .shared
@@ -835,9 +1215,9 @@ impl Responder for GeminiResponder {
                 self.shared.effort,
                 &self.shared.driver_ids,
                 &self.shared.mcp_schemas,
+                &self.model,
             )
         };
-        let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
         Some(execute_gemini_http(
             &url,
             &self.api_key,
@@ -934,6 +1314,9 @@ impl AsyncGeminiDriver {
             "{}/models/{}:streamGenerateContent?alt=sse",
             self.api_base, self.model
         );
+        let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
+        self.shared
+            .prune_thought_signatures_from(req.agent.0, call_index);
         let body = {
             let sigs = self
                 .shared
@@ -949,9 +1332,9 @@ impl AsyncGeminiDriver {
                 self.shared.effort,
                 &self.shared.driver_ids,
                 &self.shared.mcp_schemas,
+                &self.model,
             )
         };
-        let call_index = req.memory.iter().filter(|(k, _)| k == "call").count();
 
         spawn_fn(
             url,
@@ -977,7 +1360,7 @@ impl PlatformDriver for AsyncGeminiDriver {
         self.has_ready.store(false, Ordering::Release);
         while let Ok(reply) = self.rx.try_recv() {
             if let Some(prev) = &self.stream_preview {
-                prev.clear();
+                prev.clear_for(reply.agent.0, reply.request);
             }
             bus.push(reply.to_event());
         }
@@ -1386,6 +1769,7 @@ mod tests {
             Some(ReasoningEffort::High),
             &[],
             &[],
+            DEFAULT_GEMINI_MODEL,
         );
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(serialized.contains("Follow-up question."), "{serialized}");
@@ -1473,6 +1857,332 @@ mod tests {
         assert_eq!(
             shared.thought_signatures.lock().unwrap().get(&(3, 0)),
             Some(&json!("sig-sse"))
+        );
+    }
+
+    #[test]
+    fn build_request_body_merges_consecutive_same_roles_and_selects_thinking_config() {
+        let mut req = dummy_agent_view(1, 2);
+        req.memory = vec![
+            ("say".to_string(), "Ans".to_string()),
+            ("user".to_string(), "Follow-up".to_string()),
+            ("system".to_string(), "[/undo]".to_string()),
+        ];
+        let body_25 = build_request_body_with_context(
+            &req,
+            &HashMap::new(),
+            TieredContextConfig::default(),
+            "",
+            Some(ReasoningEffort::Medium),
+            &[],
+            &[],
+            "gemini-2.5-pro",
+        );
+        let contents = body_25["contents"].as_array().unwrap();
+        let roles: Vec<&str> = contents
+            .iter()
+            .map(|c| c["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "model", "user"]);
+        assert_eq!(contents[2]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body_25["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            8192
+        );
+        assert_eq!(
+            body_25["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+        assert!(
+            body_25["generationConfig"]["thinkingConfig"]
+                .get("thinkingLevel")
+                .is_none()
+        );
+
+        let body_3pro = build_request_body_with_context(
+            &req,
+            &HashMap::new(),
+            TieredContextConfig::default(),
+            "",
+            Some(ReasoningEffort::Medium),
+            &[],
+            &[],
+            "gemini-3-pro-preview",
+        );
+        assert_eq!(
+            body_3pro["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+        assert_eq!(
+            body_3pro["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+
+        let body_20_thinking = build_request_body_with_context(
+            &req,
+            &HashMap::new(),
+            TieredContextConfig::default(),
+            "",
+            Some(ReasoningEffort::High),
+            &[],
+            &[],
+            "gemini-2.0-flash-thinking-exp",
+        );
+        assert!(
+            body_20_thinking["generationConfig"]["thinkingConfig"]
+                .get("thinkingLevel")
+                .is_none()
+        );
+        assert_eq!(
+            body_20_thinking["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+
+        let body_20_plain = build_request_body_with_context(
+            &req,
+            &HashMap::new(),
+            TieredContextConfig::default(),
+            "",
+            Some(ReasoningEffort::High),
+            &[],
+            &[],
+            "gemini-2.0-flash",
+        );
+        assert!(body_20_plain.get("generationConfig").is_none());
+    }
+
+    #[test]
+    fn gemini_sse_reader_propagates_errors_prompt_feedback_and_fix03_truncation() {
+        let err_sse = "data: {\"error\":{\"code\":400,\"message\":\"Invalid arg\"}}\n\n";
+        let err_json = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(err_sse.as_bytes()),
+            ConceptId(1),
+            1,
+            None,
+        )
+        .unwrap();
+        let shared = GeminiSharedState::default();
+        let reply = parse_gemini_response(&err_json, ConceptId(1), 1, 0, &shared, "m", false);
+        assert_eq!(reply.verb, onyx_soul_agents::Verb::Fail);
+        assert!(reply.payload.contains("400"), "{reply:?}");
+        assert!(reply.payload.contains("Invalid arg"), "{reply:?}");
+
+        let retryable_sse =
+            "data: {\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"busy\"}}\n\n";
+        let retry_err = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(retryable_sse.as_bytes()),
+            ConceptId(1),
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(is_retryable_gemini_stream_error(&retry_err), "{retry_err}");
+
+        let blocked_sse = "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n";
+        let blocked_json = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(blocked_sse.as_bytes()),
+            ConceptId(1),
+            1,
+            None,
+        )
+        .unwrap();
+        let blocked_reply =
+            parse_gemini_response(&blocked_json, ConceptId(1), 1, 0, &shared, "m", false);
+        assert!(
+            blocked_reply.payload.contains("SAFETY"),
+            "{blocked_reply:?}"
+        );
+
+        // FIX-03: truncated SSE without finishReason or [DONE] must error (not fake STOP).
+        let truncated_sse =
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}]}}]}\n\n";
+        let trunc_err = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(truncated_sse.as_bytes()),
+            ConceptId(1),
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(trunc_err.contains("truncated SSE stream"), "{trunc_err}");
+        assert!(is_retryable_gemini_stream_error(&trunc_err));
+
+        // ThoughtSignature on non-call part preceding functionCall is inherited.
+        let sig_sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\",\"thoughtSignature\":\"sig-prev\"},{\"functionCall\":{\"name\":\"git_status\"}}]},\"finishReason\":\"STOP\"}]}\n\n"
+        );
+        let sig_json = accumulate_gemini_sse_reader(
+            std::io::BufReader::new(sig_sse.as_bytes()),
+            ConceptId(1),
+            2,
+            None,
+        )
+        .unwrap();
+        let call_reply = parse_gemini_response(&sig_json, ConceptId(1), 2, 0, &shared, "m", false);
+        assert_eq!(call_reply.verb, onyx_soul_agents::Verb::Call);
+        assert!(call_reply.payload.ends_with("{}"), "{call_reply:?}");
+        assert_eq!(
+            shared.thought_signatures.lock().unwrap().get(&(1, 0)),
+            Some(&json!("sig-prev"))
+        );
+    }
+
+    #[test]
+    fn sanitize_mcp_schema_handles_unions_null_const_and_strip_keys() {
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "id": { "type": ["string", "integer", "null"] },
+                "mode": { "const": "fast" },
+                "only_null": { "type": ["null"] },
+                "count": { "type": "integer", "exclusiveMinimum": 0, "$ref": "#/$defs/n" }
+            }
+        });
+        sanitize_gemini_mcp_schema(&mut schema);
+        assert_eq!(schema["type"], "OBJECT");
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema.get("$schema").is_none());
+
+        let id = &schema["properties"]["id"];
+        assert!(id.get("type").is_none());
+        assert_eq!(id["nullable"], true);
+        assert_eq!(
+            id["anyOf"],
+            json!([{ "type": "STRING" }, { "type": "INTEGER" }])
+        );
+
+        let mode = &schema["properties"]["mode"];
+        assert_eq!(mode["type"], "STRING");
+        assert_eq!(mode["enum"], json!(["fast"]));
+        assert!(mode.get("const").is_none());
+
+        let only_null = &schema["properties"]["only_null"];
+        assert!(only_null.get("type").is_none());
+        assert_eq!(only_null["nullable"], true);
+
+        let count = &schema["properties"]["count"];
+        assert_eq!(count["type"], "INTEGER");
+        assert!(count.get("exclusiveMinimum").is_none());
+        assert!(count.get("$ref").is_none());
+    }
+
+    #[test]
+    fn next_queued_call_requires_observe_and_clears_on_user_or_system_and_prunes_signatures() {
+        let shared = GeminiSharedState::default();
+        push_queued_calls(
+            &shared.pending_calls,
+            ConceptId(4),
+            [QueuedToolCall {
+                name: "fs_read".to_string(),
+                args: "{}".to_string(),
+            }],
+        );
+
+        let mut interrupted = dummy_agent_view(4, 1);
+        interrupted.memory = vec![("user".to_string(), "stop and do X".to_string())];
+        assert!(next_queued_call(&shared.pending_calls, &interrupted).is_none());
+        assert!(shared.pending_calls.lock().unwrap().get(&4).is_none());
+
+        {
+            let mut sigs = shared.thought_signatures.lock().unwrap();
+            sigs.insert((4, 0), json!("sig-0"));
+            sigs.insert((4, 1), json!("sig-1"));
+            sigs.insert((4, 2), json!("sig-2"));
+            sigs.insert((9, 2), json!("other-agent"));
+        }
+        shared.prune_thought_signatures_from(4, 1);
+        let sigs = shared.thought_signatures.lock().unwrap();
+        assert_eq!(sigs.get(&(4, 0)), Some(&json!("sig-0")));
+        assert!(sigs.get(&(4, 1)).is_none());
+        assert!(sigs.get(&(4, 2)).is_none());
+        assert_eq!(sigs.get(&(9, 2)), Some(&json!("other-agent")));
+    }
+
+    #[test]
+    fn stream_preview_clear_for_only_clears_matching_request() {
+        let preview = StreamPreviewHandle::new();
+        preview.set(5, 10, "active stream");
+        preview.clear_for(5, 9);
+        assert_eq!(preview.get().unwrap().text, "active stream");
+        preview.clear_for(6, 10);
+        assert_eq!(preview.get().unwrap().text, "active stream");
+        preview.clear_for(5, 10);
+        assert!(preview.get().is_none());
+    }
+
+    #[test]
+    fn sanitize_mcp_schema_preserves_parameter_names_matching_json_schema_keywords() {
+        let mut schema = json!({
+            "type": "object",
+            "title": "OuterSchemaTitle",
+            "additionalProperties": false,
+            "properties": {
+                "title": { "type": "string", "title": "InnerTitle", "default": "fallback" },
+                "default": { "type": "boolean" },
+                "const": { "type": "string" },
+                "readOnly": { "type": "boolean" },
+                "deprecated": { "type": "boolean" },
+                "if": { "type": "string" },
+                "not": { "type": "string" },
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": { "type": "string", "default": "n" },
+                        "default": { "type": "string" }
+                    }
+                }
+            }
+        });
+        sanitize_gemini_mcp_schema(&mut schema);
+
+        assert_eq!(schema["type"], "OBJECT");
+        assert!(schema.get("title").is_none());
+        assert!(schema.get("additionalProperties").is_none());
+
+        let props = schema["properties"].as_object().unwrap();
+        for key in [
+            "title",
+            "default",
+            "const",
+            "readOnly",
+            "deprecated",
+            "if",
+            "not",
+            "nested",
+        ] {
+            assert!(
+                props.contains_key(key),
+                "missing MCP param `{key}`: {props:?}"
+            );
+        }
+        assert_eq!(props["title"]["type"], "STRING");
+        assert!(props["title"].get("title").is_none());
+        assert!(props["title"].get("default").is_none());
+        assert_eq!(props["default"]["type"], "BOOLEAN");
+
+        let nested = &props["nested"];
+        assert_eq!(nested["type"], "OBJECT");
+        assert!(nested.get("additionalProperties").is_none());
+        let nested_props = nested["properties"].as_object().unwrap();
+        assert_eq!(nested_props["title"]["type"], "STRING");
+        assert!(nested_props["title"].get("default").is_none());
+        assert_eq!(nested_props["default"]["type"], "STRING");
+    }
+
+    #[test]
+    fn gemini_retry_delay_respects_backoff_floor_and_caps_retry_after() {
+        assert_eq!(gemini_retry_delay_ms(0, None), Some(RETRY_BACKOFF_MS[0]));
+        assert_eq!(gemini_retry_delay_ms(0, Some(0)), Some(RETRY_BACKOFF_MS[0]));
+        assert_eq!(gemini_retry_delay_ms(1, Some(2_000)), Some(2_000));
+        assert_eq!(
+            gemini_retry_delay_ms(0, Some(60_000)),
+            Some(MAX_RETRY_AFTER_MS)
+        );
+        assert_eq!(
+            gemini_retry_delay_ms(MAX_TRANSIENT_RETRIES, Some(1_000)),
+            None
         );
     }
 }

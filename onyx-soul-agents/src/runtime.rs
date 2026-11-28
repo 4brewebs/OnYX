@@ -47,8 +47,11 @@
 //! restantes, no como tick absoluto: un snapshot restaurado en otro proceso
 //! no hace expirar de golpe a los agentes que esperaban.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use onyx_core::{
-    AttrRegistry, ConceptId, Ctx, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, Value,
+    AttrRegistry, ConceptId, Ctx, GraphView, IngressEvent, OnyxError, OnyxEvent, OnyxSystem, Value,
 };
 
 use crate::config::AgentConfig;
@@ -69,6 +72,10 @@ pub struct AgentRuntime {
     scripted: Box<dyn ScriptedPolicy>,
     approval: Box<dyn ApprovalPolicy>,
     vocab: Option<Vocab>,
+    /// `FIX-31`: contador de época de la sesión (restore aplicados con éxito).
+    /// Lo comparte el `AgentHost` (`host.restore_epoch_handle()`): el host y
+    /// las capas de la app ven el mismo contador.
+    restore_epoch: Arc<AtomicU64>,
 }
 
 impl AgentRuntime {
@@ -81,7 +88,20 @@ impl AgentRuntime {
             scripted: Box::new(UniformTool),
             approval: Box::new(NeverApprove),
             vocab: None,
+            restore_epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Comparte el contador de época con otro poseedor (el `AgentHost`), de
+    /// modo que el bump de [`OnyxSystem::on_restore`] sea visible fuera.
+    pub fn with_restore_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.restore_epoch = epoch;
+        self
+    }
+
+    /// Handle compartido del contador de época de la sesión.
+    pub fn restore_epoch_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.restore_epoch)
     }
 
     /// Sustituye la política de memoria.
@@ -119,6 +139,13 @@ impl OnyxSystem for AgentRuntime {
         Ok(())
     }
 
+    fn on_restore(&mut self, _graph: &dyn GraphView) {
+        // `FIX-31`: la raíz de la línea temporal cambió → nueva época. El core
+        // solo llama a este hook tras una importación correcta (tick.rs),
+        // así que un `request_restore` fallido no sube el contador.
+        self.restore_epoch.fetch_add(1, Ordering::Release);
+    }
+
     fn run(&mut self, ctx: &mut Ctx) {
         let Some(v) = self.vocab else { return };
         let Some(now) = current_tick(ctx.inbox) else {
@@ -129,6 +156,7 @@ impl OnyxSystem for AgentRuntime {
             mem: &*self.memory,
             approval: &*self.approval,
             now,
+            epoch: &self.restore_epoch,
         };
         let inbox = ctx.inbox;
 
@@ -209,6 +237,8 @@ struct Step<'a> {
     mem: &'a dyn MemoryPolicy,
     approval: &'a dyn ApprovalPolicy,
     now: u64,
+    /// `FIX-31`: contador de época de la sesión (compartido con el host).
+    epoch: &'a Arc<AtomicU64>,
 }
 
 impl Step<'_> {
@@ -426,6 +456,19 @@ impl Step<'_> {
     fn apply(&self, ctx: &mut Ctx, r: Reply) {
         let v = &self.v;
         let id = r.agent;
+        // `FIX-31`: una respuesta stampeada con una época distinta de la
+        // actual pertenece a una línea temporal que ya no existe (se restauró
+        // encima): se descarta aunque su `(agent, request)` coincida con la
+        // petición pendiente, que el restore rebobinó hasta la misma clave.
+        if let Some(e) = r.epoch {
+            let current = self.epoch.load(Ordering::Acquire);
+            if e != current {
+                return ctx.outbox.push(fault(format!(
+                    "stale reply for agent {} (epoch {e} != session epoch {current})",
+                    id.0
+                )));
+            }
+        }
         let Some(state) = self.state_of(ctx, id) else {
             return ctx
                 .outbox

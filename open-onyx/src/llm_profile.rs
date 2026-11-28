@@ -18,6 +18,7 @@
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::anthropic::DEFAULT_ANTHROPIC_MODEL;
 use crate::context::ReasoningEffort;
@@ -85,6 +86,36 @@ impl LlmProvider {
     }
 }
 
+/// `FIX-02`: timeouts de las peticiones HTTP a los proveedores LLM.
+///
+/// `connect` = TCP/TLS hasta la conexión establecida (corto: 10–30 s).
+/// `read` = tiempo máximo entre bytes/chunks de la respuesta (SSE: 60–120 s
+/// por chunk; los streams LLM pueden tardar mucho entre chunks). Sin timeouts
+/// explícitos ureq **no tiene tope de read** y un proveedor colgado deja el
+/// bucle de sesión `serve`/`chat` bloqueado para siempre (`session.rs:718`).
+///
+/// Resolución: CLI (`--llm-timeout-connect` / `--llm-timeout-read`) > env
+/// (`ONYX_LLM_TIMEOUT_CONNECT_SECS` / `ONYX_LLM_TIMEOUT_READ_SECS`) > default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LlmTimeouts {
+    pub(crate) connect: Duration,
+    pub(crate) read: Duration,
+}
+
+impl LlmTimeouts {
+    /// Defaults: connect corto (30 s) y read por chunk (120 s).
+    pub(crate) const DEFAULT: Self = Self {
+        connect: Duration::from_secs(30),
+        read: Duration::from_secs(120),
+    };
+}
+
+impl Default for LlmTimeouts {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Configuración LLM efectiva de una sesión (arranque CLI o objetivo activo).
 #[derive(Clone)]
 pub(crate) struct LlmConfig {
@@ -98,6 +129,8 @@ pub(crate) struct LlmConfig {
     pub(crate) thinking_budget: Option<u64>,
     pub(crate) api_base: Option<String>,
     pub(crate) project_instructions: String,
+    /// `FIX-02`: timeouts HTTP de las llamadas al proveedor (por sesión).
+    pub(crate) timeouts: LlmTimeouts,
 }
 
 /// `true` si un host de base URL es loopback (`localhost`, `127.0.0.1`, `::1`, `*.localhost`):
@@ -832,6 +865,7 @@ mod tests {
             thinking_budget: None,
             api_base: api_base.map(|s| s.to_string()),
             project_instructions: String::new(),
+            timeouts: LlmTimeouts::default(),
         }
     }
 

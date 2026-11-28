@@ -45,6 +45,8 @@ openonyx [--help | -h | --version | -V]
 | `--max-steps <n>` | `chat`, `run` | Límite de pasos por turno del agente raíz (default: `128` en `chat`, `64` en `run`; subagentes `32` por defecto). |
 | `--max-subagents <n>` | `chat`, `run`, `serve`, `rewind --interactive` | Máximo de worktrees Git en paralelo para subagentes asíncronos (default: `3`, o `ONYX_MAX_SUBAGENTS`). |
 | `--shell-timeout <secs>` | `chat`, `run` | Timeout en segundos por comando `shell_exec` (default: `30s`). |
+| `--llm-timeout-connect <secs>` | `chat`, `run`, `serve` | Timeout en segundos del connect HTTP (TCP/TLS) al LLM (default: `30s`; o `ONYX_LLM_TIMEOUT_CONNECT_SECS`). |
+| `--llm-timeout-read <secs>` | `chat`, `run`, `serve` | Timeout en segundos del read HTTP entre bytes/chunks SSE del LLM (default: `120s`; o `ONYX_LLM_TIMEOUT_READ_SECS`). Un proveedor colgado falla el turno en tiempo acotado en vez de bloquear la sesión para siempre. |
 | `--auto-save` | `chat`, `run` | Crea automáticamente `.onyx/vault/<YYYYMMDD-HHMMSS>_<modelo>[_<rama\|goal>]/` con `snapshots.onyxpack` + `.tr` juntos (o `ONYX_AUTO_SAVE=1`). |
 | `--record <f>`, `--save-transcript <f>` | `chat`, `run` | Guarda transcripción determinista `ONYXTR2` (nombres cortos van dentro de `--snapshot-dir`, o en `.onyx/vault/unassigned/` si no hay snapshot dir). |
 | `--snapshot-dir <dir>` | `chat`, `run`, `replay`, `doctor` | Directorio para `snapshots.onyxpack` (nombres cortos se resuelven en `.onyx/vault/<dir>/`). |
@@ -87,7 +89,7 @@ openonyx bench \
 - **Ejecución por candidato (secuencial):** rewind del worktree al tick → host fresco restaurado → si no hay agente activo en el tick, se spawnea un agente raíz con `--goal` → se ejecuta hasta asentarse (tope interno de 256 ticks) con telemetría real (tokens/coste) en candidatos vivos (replay: tokens/coste `0`).
 - **`--auto-approve`:** para ejecución **desatendida** en worktrees desechables: cada candidato corre solo en su worktree, la raíz nunca se toca; `[permissions].deny` sigue aplicando.
 - **Salida:** tabla Markdown de 9 columnas en `stdout` — `| model | passed_verify | ticks | tool_calls | input_tokens | cached_tokens | output_tokens | estimated_cost_usd | wall_time_ms |` — y, con `--out`, el informe JSON (`metadata` con snapshot/tick/models/verify + `results` por candidato con todas las columnas).
-- **Flags reutilizados:** `--workspace <dir>`, `--sandbox <off|workspace-write|strict-container>`, `--sandbox-net <offline|localhost|unrestricted>`, `--shell-timeout <secs>`, `--trust-workspace`, `--api-base <url>`, `--allow-custom-auth-host`, `--effort <low|medium|high>`, `--thinking-budget <n>` (el candidato vivo determina su propio `provider:model`).
+- **Flags reutilizados:** `--workspace <dir>`, `--sandbox <off|workspace-write|strict-container>`, `--sandbox-net <offline|localhost|unrestricted>`, `--shell-timeout <secs>`, `--llm-timeout-connect <secs>`, `--llm-timeout-read <secs>`, `--trust-workspace`, `--api-base <url>`, `--allow-custom-auth-host`, `--effort <low|medium|high>`, `--thinking-budget <n>` (el candidato vivo determina su propio `provider:model`).
 - **Validación accionable:** sin `--snapshot-dir`/`--tick`/`--models` el error indica la flag que falta; proveedor desconocido → `unsupported provider ... (expected `gemini`, `openai` or `anthropic`)`; snapshot ausente → aviso de suelo (floor), no error.
 
 ---
@@ -105,6 +107,8 @@ openonyx bench \
 | `ONYX_EFFORT` | Todos | Esfuerzo por defecto (`low` \| `medium` \| `high`; fallbacks: `GEMINI_THINKING_LEVEL`, `OPENAI_REASONING_EFFORT`; en Anthropic lo gobierna `ANTHROPIC_THINKING_BUDGET`). |
 | `ONYX_AUTO_SAVE` | Ambos | Activa `--auto-save` por defecto (`1` \| `true` \| `yes` \| `on`) guardando en `.onyx/vault/`. |
 | `ONYX_MAX_SUBAGENTS` | Ambos | Máximo de worktrees en paralelo para subagentes asíncronos (usado cuando no se pasa `--max-subagents <n>`; default: `3`). |
+| `ONYX_LLM_TIMEOUT_CONNECT_SECS` | Todos | Timeout en segundos del connect HTTP al LLM (default: `30`; fallback de `--llm-timeout-connect`). |
+| `ONYX_LLM_TIMEOUT_READ_SECS` | Todos | Timeout en segundos del read HTTP entre bytes/chunks SSE del LLM (default: `120`; fallback de `--llm-timeout-read`). |
 | `GEMINI_API_BASE` | Gemini | Endpoint personalizado para Gemini. |
 | `OPENAI_API_BASE` / `OPENAI_BASE_URL` | OpenAI | Endpoint compatible con OpenAI (default: `https://api.openai.com/v1`). |
 | `ANTHROPIC_API_BASE` | Anthropic | Endpoint personalizado de la API de Anthropic (default: `https://api.anthropic.com`). |
@@ -118,9 +122,10 @@ openonyx bench \
 
 En servidores locales o proxies corporativos (vLLM, LiteLLM, nginx, Cloudflare) es frecuente que la conexión *chunked* SSE se cierre bruscamente tras emitir `finish_reason` o que devuelva un error transitorio (`408`, `429`, `500`, `502`, `503`, `504` o corte temporal de red).
 
-El adaptador `open-onyx/src/openai.rs` incorpora dos protecciones automáticas:
+El adaptador `open-onyx/src/openai.rs` incorpora tres protecciones automáticas:
 1. **Tolerancia a EOF tras respuesta completada**: si el stream SSE falla al decodificar el último chunk pero ya se recibió `finish_reason` / `[DONE]` con respuesta o `tool_calls` completos, la respuesta se acepta sin abortar el turno.
 2. **Reintentos automáticos con backoff**: ante fallos HTTP o de transporte transitorios, reintenta automáticamente hasta **2 veces** (`400ms`, `1200ms`) antes de reportar error al agente.
+3. **Timeouts HTTP explícitos (`FIX-02`)**: cada petición a los tres proveedores fija `timeout_connect` (default `30s`) y `timeout_read` (default `120s`, por chunk SSE) configurables vía `--llm-timeout-connect` / `--llm-timeout-read` (o `ONYX_LLM_TIMEOUT_CONNECT_SECS` / `ONYX_LLM_TIMEOUT_READ_SECS`). Un proveedor que acepta la conexión y luego se queda en silencio produce un error de transporte clasificado en tiempo acotado en vez de bloquear la sesión (p. ej. `serve`) para siempre. El timeout de read **no** se reintenta según la política transitoria (apartado 2): un proveedor mudo falla una vez, dentro del presupuesto de read, porque reintentar ciegamente tras enviar el prompt completo podría disparar inferencias duplicadas; los fallos de connect, resets y `408`/`429`/`5xx` siguen reintentándose con backoff.
 
 El adaptador nativo `open-onyx/src/anthropic.rs` aplica la misma política de reintentos (`408`, `429`, `500`, `502`, `503`, `504` y el `overloaded_error` `529` propio de Anthropic), respetando el header `retry-after` cuando el servidor lo envía.
 

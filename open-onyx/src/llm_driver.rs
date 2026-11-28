@@ -13,7 +13,7 @@
 //! call se entregue por el mismo provider aunque el objetivo cambie de perfil.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -55,6 +55,12 @@ pub struct DynamicLlmDriver {
     /// `SDD-07`: gate de congelación — con `frozen` y sin presupuesto de
     /// `/step-llm`, `present()` no despacha (ni marca `dispatched`).
     time_debug: Option<TimeDebugState>,
+    /// `FIX-01`: época de sesión compartida (la sube `/rewind` en
+    /// [`crate::session::apply_session_action`]). Al detectar un cambio en
+    /// `present()`, se limpia `dispatched`, se drenan las respuestas en
+    /// buffer del canal `rx` y la cola compartida de tool calls.
+    restore_epoch: Option<Arc<AtomicU64>>,
+    last_restore_epoch: u64,
     rx: mpsc::Receiver<Reply>,
     tx: mpsc::Sender<Reply>,
     inner: Option<Box<dyn PlatformDriver>>,
@@ -93,6 +99,8 @@ impl DynamicLlmDriver {
             has_ready,
             stream_preview: None,
             time_debug: None,
+            restore_epoch: None,
+            last_restore_epoch: 0,
             rx,
             tx,
             inner: None,
@@ -137,6 +145,23 @@ impl DynamicLlmDriver {
         self.time_debug = Some(time_debug);
         self
     }
+
+    /// `FIX-02`: timeouts HTTP (connect/read) de las llamadas a los tres
+    /// proveedores, por sesión (no por perfil: un hot-swap de `/profile`
+    /// no muta el timeout de las peticiones en vuelo ni el de la sesión).
+    pub fn with_llm_timeouts(mut self, timeouts: crate::llm_profile::LlmTimeouts) -> Self {
+        self.gemini_shared.timeouts = timeouts;
+        self.openai_shared.timeouts = timeouts;
+        self.anthropic_shared.timeouts = timeouts;
+        self
+    }
+
+    /// `FIX-01`: época de sesión para el reset en pull tras `/rewind`. Sin
+    /// ella (replay/bench/tests unitarios sin restore en vivo) no hay reset.
+    pub fn with_restore_epoch(mut self, epoch: Arc<AtomicU64>) -> Self {
+        self.restore_epoch = Some(epoch);
+        self
+    }
 }
 
 /// `SDD-07` (fix de auditoría): decisión de despacho de un request pendiente.
@@ -167,16 +192,43 @@ impl PlatformDriver for DynamicLlmDriver {
         self.has_ready.store(false, Ordering::Release);
         while let Ok(reply) = self.rx.try_recv() {
             if let Some(prev) = &self.stream_preview {
-                prev.clear();
+                prev.clear_for(reply.agent.0, reply.request);
             }
             bus.push(reply.to_event());
         }
     }
 
     fn present(&mut self, graph: &dyn GraphView, surfaces: &[SurfaceBinding]) {
+        // `FIX-01`: `/rewind` subió la época → la línea temporal anterior
+        // dejó de existir. Se limpian los restos que enlazaban (agent, request)
+        // de la época vieja: el registro `dispatched` (sin esto un turno nuevo
+        // que reutilice una clave jamás llegaría al proveedor — el bug del
+        // dossier) y las respuestas que un hilo HTTP pudo dejar en buffer
+        // entre la comprobación `in_flight == 0` y el rewind: el guard de
+        // session bloquea el rewind con HTTP real en vuelo, pero la respuesta
+        // puede llegar al canal antes de que el guard decaiga.
+        if let Some(epoch) = &self.restore_epoch {
+            let current = epoch.load(Ordering::Acquire);
+            if current != self.last_restore_epoch {
+                self.last_restore_epoch = current;
+                self.dispatched.clear();
+                while self.rx.try_recv().is_ok() {}
+                // La cola compartida de tool calls está keyed SOLO por agente
+                // (`next_queued_call`): una continuation de la línea vieja se
+                // entregaría al primer request nuevo de ese agente.
+                if let Ok(mut queue) = self.gemini_shared.pending_calls.lock() {
+                    queue.clear();
+                }
+                self.gemini_shared.clear_thought_signatures();
+                self.anthropic_shared.clear_thinking_blocks();
+            }
+        }
         if let Some(inner) = self.inner.as_mut() {
             inner.present(graph, surfaces);
         }
+        // `FIX-31` criterio 3: cada respuesta se compara con la época de la
+        // sesión; se stampea en el momento en que entra al transporte.
+        let epoch_handle = self.restore_epoch.clone();
         let preview = self.stream_preview.clone();
         for req in pending_requests(graph, &self.vocab) {
             // `SDD-07`: congelado sin presupuesto de `/step-llm` → no se
@@ -191,7 +243,12 @@ impl PlatformDriver for DynamicLlmDriver {
             }
             self.dispatched.insert(key);
             // Continuation de tool call: se entrega sin HTTP (cola compartida).
-            if let Some(queued_reply) = next_queued_call(&self.gemini_shared.pending_calls, &req) {
+            if let Some(mut queued_reply) =
+                next_queued_call(&self.gemini_shared.pending_calls, &req)
+            {
+                if let Some(e) = &epoch_handle {
+                    queued_reply = queued_reply.with_epoch(e.load(Ordering::Acquire));
+                }
                 if self.tx.send(queued_reply).is_ok() {
                     self.has_ready.store(true, Ordering::Release);
                 }
@@ -226,6 +283,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     shared.context_config = ctx_cfg;
                     shared.effort = effort;
                     shared.project_instructions = project_instructions.clone();
+                    shared.prune_thought_signatures_from(req.agent.0, call_index);
                     let body = {
                         let sigs = shared
                             .thought_signatures
@@ -240,10 +298,12 @@ impl PlatformDriver for DynamicLlmDriver {
                             shared.effort,
                             &shared.driver_ids,
                             &shared.mcp_schemas,
+                            &model,
                         )
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
+                    let epoch = epoch_handle.clone();
                     thread::spawn(move || {
                         let _guard = guard;
                         let reply = execute_gemini_stream_http(
@@ -260,6 +320,10 @@ impl PlatformDriver for DynamicLlmDriver {
                             },
                             body,
                         );
+                        let reply = match &epoch {
+                            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+                            None => reply,
+                        };
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
                         }
@@ -287,6 +351,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     );
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
+                    let epoch = epoch_handle.clone();
                     thread::spawn(move || {
                         let _guard = guard;
                         let reply = execute_openai_stream_http(
@@ -302,6 +367,10 @@ impl PlatformDriver for DynamicLlmDriver {
                             },
                             body,
                         );
+                        let reply = match &epoch {
+                            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+                            None => reply,
+                        };
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
                         }
@@ -339,6 +408,7 @@ impl PlatformDriver for DynamicLlmDriver {
                     };
                     let ready_flag = Arc::clone(&self.has_ready);
                     let tx = self.tx.clone();
+                    let epoch = epoch_handle.clone();
                     thread::spawn(move || {
                         let _guard = guard;
                         let reply = execute_anthropic_stream_http(
@@ -355,6 +425,10 @@ impl PlatformDriver for DynamicLlmDriver {
                             },
                             body,
                         );
+                        let reply = match &epoch {
+                            Some(e) => reply.with_epoch(e.load(Ordering::Acquire)),
+                            None => reply,
+                        };
                         if tx.send(reply).is_ok() {
                             ready_flag.store(true, Ordering::Release);
                         }
